@@ -1,19 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(cargo:*)",
-      "Bash(python3:*)",
-      "Bash(ls:*)",
-      "Bash(cargo run:*)",
-      "Bash(move \"D:\\\\code\\\\papers-mcp\\\\src\" \"D:\\\\code\\\\papers-mcp\\\\papers-mcp\\\\src\")",
-      "WebFetch(domain:docs.openalex.org)",
-      "WebFetch(domain:api.openalex.org)",
       "WebSearch",
-      "WebFetch(domain:docs.rs)",
+      "WebFetch",
+      "Bash(cargo:*)",
+      "Bash(ls:*)",
       "Bash(curl:*)",
-      "Bash(for f in D:/code/papers-mcp/openalex/tests/fixtures/*.json)",
-      "Bash(done)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3:*)"
     ]
   }
 }
