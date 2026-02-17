@@ -133,7 +133,6 @@ let response = client.find_works(&params).await?;
 | Topics | `Topic` | `list_topics` | `get_topic` | -- |
 | Publishers | `Publisher` | `list_publishers` | `get_publisher` | `autocomplete_publishers` |
 | Funders | `Funder` | `list_funders` | `get_funder` | `autocomplete_funders` |
-| Concepts (deprecated) | -- | -- | -- | `autocomplete_concepts` |
 
 - **Works** — scholarly outputs: journal articles, preprints, books, datasets, and other research products. 240M+ records. Each work carries authorship, venue, open-access status, citation count, topics, abstract (reconstructed from OpenAlex's inverted index), and links to referenced and related works. Identifiable by OpenAlex ID, DOI, PMID, or PMCID.
 

@@ -141,7 +141,6 @@ pub struct AutocompleteMeta {
 /// - **authors:** last known institution and country
 /// - **sources:** host organization
 /// - **institutions:** city and country
-/// - **concepts:** hierarchy level
 /// - **publishers:** country
 /// - **funders:** country and description
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,12 +164,12 @@ pub struct AutocompleteResult {
     pub works_count: Option<i64>,
 
     /// Entity type: one of `"work"`, `"author"`, `"source"`, `"institution"`,
-    /// `"concept"`, `"publisher"`, `"funder"`. Returns `null` for subfield
-    /// autocomplete (known API quirk).
+    /// `"publisher"`, `"funder"`. Returns `null` for subfield autocomplete
+    /// (known API quirk).
     pub entity_type: Option<String>,
 
-    /// External identifier (e.g. ISSN for sources, ROR for institutions,
-    /// Wikidata for concepts). `None` if not available.
+    /// External identifier (e.g. ISSN for sources, ROR for institutions).
+    /// `None` if not available.
     pub external_id: Option<String>,
 
     /// The filter field name to use this result in subsequent list queries. For

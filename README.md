@@ -19,7 +19,10 @@ Commands:
   topic        Research topic hierarchy (domain → field → subfield → topic)
   publisher    Publishing organizations (e.g. Elsevier, Springer Nature)
   funder       Grant-making organizations (e.g. NIH, NSF, ERC)
-  concept      Deprecated concept taxonomy (autocomplete only)
+  domain       Research domains (broadest level of topic hierarchy, 4 total)
+  field        Academic fields (second level of topic hierarchy, 26 total)
+  subfield     Research subfields (third level of topic hierarchy, ~252 total)
+  help         Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help

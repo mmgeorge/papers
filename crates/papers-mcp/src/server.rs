@@ -226,12 +226,6 @@ impl PapersMcp {
         json_result(papers::api::institution_autocomplete(&self.client, &params.q).await)
     }
 
-    /// Type-ahead search for concepts (deprecated but functional). Returns up to 10 results.
-    #[tool]
-    pub async fn concept_autocomplete(&self, Parameters(params): Parameters<AutocompleteToolParams>) -> Result<String, String> {
-        json_result(papers::api::concept_autocomplete(&self.client, &params.q).await)
-    }
-
     /// Type-ahead search for publishers. Returns up to 10 results.
     #[tool]
     pub async fn publisher_autocomplete(&self, Parameters(params): Parameters<AutocompleteToolParams>) -> Result<String, String> {

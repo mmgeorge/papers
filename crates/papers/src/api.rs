@@ -166,13 +166,6 @@ pub async fn institution_autocomplete(
     client.autocomplete_institutions(q).await
 }
 
-pub async fn concept_autocomplete(
-    client: &OpenAlexClient,
-    q: &str,
-) -> Result<AutocompleteResponse, OpenAlexError> {
-    client.autocomplete_concepts(q).await
-}
-
 pub async fn publisher_autocomplete(
     client: &OpenAlexClient,
     q: &str,

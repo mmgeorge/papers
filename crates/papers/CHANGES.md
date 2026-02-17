@@ -44,7 +44,6 @@ MCP tool names follow `{entity_singular}_{verb}` rather than the
 | `author_autocomplete` | `GET /autocomplete/authors` |
 | `source_autocomplete` | `GET /autocomplete/sources` |
 | `institution_autocomplete` | `GET /autocomplete/institutions` |
-| `concept_autocomplete` | `GET /autocomplete/concepts` |
 | `publisher_autocomplete` | `GET /autocomplete/publishers` |
 | `funder_autocomplete` | `GET /autocomplete/funders` |
 | `subfield_autocomplete` | `GET /autocomplete/subfields` |
@@ -256,7 +255,7 @@ entity data is needed after identifying items via a `*_list` tool.
 
 ## Autocomplete tools — no response changes
 
-All 8 `*_autocomplete` tools return the full `AutocompleteResponse`. These
+All 7 `*_autocomplete` tools return the full `AutocompleteResponse`. These
 already return compact 10-result lists, so no slimming is needed.
 
 Note: only subfields support autocomplete among the hierarchy entities.

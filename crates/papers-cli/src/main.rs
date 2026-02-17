@@ -3,7 +3,7 @@ mod format;
 
 use clap::Parser;
 use cli::{
-    AuthorCommand, AuthorFilterArgs, Cli, ConceptCommand, DomainCommand, DomainFilterArgs,
+    AuthorCommand, AuthorFilterArgs, Cli, DomainCommand, DomainFilterArgs,
     EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand, FunderFilterArgs,
     InstitutionCommand, InstitutionFilterArgs, PublisherCommand, PublisherFilterArgs,
     SourceCommand, SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand,
@@ -624,19 +624,5 @@ async fn main() {
             }
         },
 
-        EntityCommand::Concept { cmd } => match cmd {
-            ConceptCommand::Autocomplete { query, json } => {
-                match papers::api::concept_autocomplete(&client, &query).await {
-                    Ok(resp) => {
-                        if json {
-                            print_json(&resp);
-                        } else {
-                            print!("{}", format::format_autocomplete(&resp));
-                        }
-                    }
-                    Err(e) => exit_err(&e.to_string()),
-                }
-            }
-        },
     }
 }

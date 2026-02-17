@@ -209,10 +209,10 @@ async fn test_api_error_returns_error_result() {
 // ── Tool listing tests ───────────────────────────────────────────────
 
 #[test]
-fn test_tool_router_has_29_tools() {
+fn test_tool_router_has_28_tools() {
     let router = PapersMcp::tool_router();
     let tools = router.list_all();
-    assert_eq!(tools.len(), 29);
+    assert_eq!(tools.len(), 28);
 }
 
 #[test]
@@ -246,7 +246,6 @@ fn test_all_tool_names_present() {
         "author_autocomplete",
         "source_autocomplete",
         "institution_autocomplete",
-        "concept_autocomplete",
         "publisher_autocomplete",
         "funder_autocomplete",
         "subfield_autocomplete",

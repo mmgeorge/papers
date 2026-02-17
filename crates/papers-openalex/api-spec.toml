@@ -41,8 +41,8 @@ values = ["parent", "child", "related"]
 description = "Relationship between associated institutions. parent=governing org, child=subsidiary, related=affiliated."
 
 [enums.entity_type]
-values = ["author", "concept", "domain", "field", "institution", "source", "subfield", "publisher", "funder", "work"]
-description = "Entity types returned by autocomplete. 'concept' is deprecated but still works in autocomplete. Subfield autocomplete returns entity_type: null (API quirk)."
+values = ["author", "domain", "field", "institution", "source", "subfield", "publisher", "funder", "work"]
+description = "Entity types returned by autocomplete. Subfield autocomplete returns entity_type: null (API quirk)."
 
 [enums.indexed_in]
 values = ["arxiv", "crossref", "doaj", "pubmed"]
@@ -293,15 +293,6 @@ rust_method = "autocomplete_institutions"
 response_type = "AutocompleteResponse"
 query_params = ["q"]
 description = "Autocomplete for institutions. Hint shows city and country."
-
-[[endpoints]]
-id = "autocomplete_concepts"
-method = "GET"
-path = "/autocomplete/concepts"
-rust_method = "autocomplete_concepts"
-response_type = "AutocompleteResponse"
-query_params = ["q"]
-description = "Autocomplete for concepts (deprecated entity type, but autocomplete still works)."
 
 [[endpoints]]
 id = "autocomplete_publishers"

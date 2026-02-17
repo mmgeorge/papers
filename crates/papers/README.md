@@ -5,7 +5,7 @@ Used by `papers-mcp` (MCP server) and `papers-cli` (CLI tool).
 
 ## What's in here
 
-- **`src/api.rs`** — 22 async functions wrapping the OpenAlex REST API (7 list, 7 get, 7 autocomplete, 1 find)
+- **`src/api.rs`** — 28 async functions wrapping the OpenAlex REST API (10 list, 10 get, 7 autocomplete, 1 find)
 - **`src/summary.rs`** — Slim summary structs returned by list functions; large arrays omitted for conciseness
 - **`src/lib.rs`** — Re-exports all `papers-openalex` types that consumers need
 
@@ -54,7 +54,6 @@ api::work_autocomplete(client, query)
 api::author_autocomplete(client, query)
 api::source_autocomplete(client, query)
 api::institution_autocomplete(client, query)
-api::concept_autocomplete(client, query)
 api::publisher_autocomplete(client, query)
 api::funder_autocomplete(client, query)
 

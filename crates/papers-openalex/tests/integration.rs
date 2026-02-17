@@ -264,14 +264,6 @@ async fn test_live_autocomplete_institutions() {
 
 #[tokio::test]
 #[ignore]
-async fn test_live_autocomplete_concepts() {
-    let resp = client().autocomplete_concepts("physics").await.unwrap();
-    assert!(!resp.results.is_empty());
-    assert_eq!(resp.results[0].entity_type.as_deref(), Some("concept"));
-}
-
-#[tokio::test]
-#[ignore]
 async fn test_live_autocomplete_publishers() {
     let resp = client().autocomplete_publishers("elsevier").await.unwrap();
     assert!(!resp.results.is_empty());

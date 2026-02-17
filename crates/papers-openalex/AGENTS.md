@@ -37,7 +37,7 @@ This crate is a Rust API client for the [OpenAlex REST API](https://docs.openale
 | Author | Yes | Yes | Yes | `types/author.rs` |
 | Source | Yes | Yes | Yes | `types/source.rs` |
 | Institution | Yes | Yes | Yes | `types/institution.rs` |
-| Topic | Yes | Yes | Yes (via concepts) | `types/topic.rs` |
+| Topic | Yes | Yes | No | `types/topic.rs` |
 | Publisher | Yes | Yes | Yes | `types/publisher.rs` |
 | Funder | Yes | Yes | Yes | `types/funder.rs` |
 | Domain | Yes | Yes | **No** (404) | `types/domain.rs` |

@@ -13,7 +13,7 @@ via `papers::*`.
 src/
   lib.rs       — pub mod declarations + re-exports from papers-openalex
   summary.rs   — 10 slim summary structs + From<FullEntity> impls + SlimListResponse
-  api.rs       — 29 async wrapper functions (10 list, 10 get, 8 autocomplete, 1 find)
+  api.rs       — 28 async wrapper functions (10 list, 10 get, 7 autocomplete, 1 find)
   filter.rs    — work filter alias resolution (search strings → entity IDs)
 tests/
   api.rs       — 27 wiremock tests covering all api functions and CHANGES.md rules
@@ -36,13 +36,13 @@ See `CHANGES.md` for exactly which fields are kept and why.
 
 ### api.rs
 
-22 public async functions organized by verb:
+28 public async functions organized by verb:
 
 | Group | Count | Return type |
 |-------|-------|-------------|
-| `work_list`, `author_list`, ..., `funder_list` | 7 | `Result<SlimListResponse<XxxSummary>, OpenAlexError>` |
-| `work_get`, `author_get`, ..., `funder_get` | 7 | `Result<FullEntity, OpenAlexError>` |
-| `work_autocomplete`, ..., `funder_autocomplete` + `concept_autocomplete` | 7 | `Result<AutocompleteResponse, OpenAlexError>` |
+| `work_list`, `author_list`, ..., `subfield_list` | 10 | `Result<SlimListResponse<XxxSummary>, FilterError>` |
+| `work_get`, `author_get`, ..., `subfield_get` | 10 | `Result<FullEntity, OpenAlexError>` |
+| `work_autocomplete`, ..., `funder_autocomplete`, `subfield_autocomplete` | 7 | `Result<AutocompleteResponse, OpenAlexError>` |
 | `work_find` | 1 | `Result<FindWorksResponse, OpenAlexError>` |
 
 `work_find` automatically selects POST when `params.query.len() > 2048`.

@@ -59,11 +59,6 @@ pub enum EntityCommand {
         #[command(subcommand)]
         cmd: SubfieldCommand,
     },
-    /// Deprecated concept taxonomy (autocomplete only)
-    Concept {
-        #[command(subcommand)]
-        cmd: ConceptCommand,
-    },
 }
 
 /// Shared args for all list commands
@@ -602,12 +597,3 @@ pub enum SubfieldCommand {
     },
 }
 
-#[derive(Subcommand)]
-pub enum ConceptCommand {
-    /// Type-ahead search for concepts (deprecated taxonomy)
-    Autocomplete {
-        query: String,
-        #[arg(long)]
-        json: bool,
-    },
-}

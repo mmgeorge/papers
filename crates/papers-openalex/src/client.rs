@@ -873,30 +873,6 @@ impl OpenAlexClient {
         self.autocomplete_entity("institutions", q).await
     }
 
-    /// Autocomplete for concepts (deprecated entity type, but autocomplete still
-    /// works). Hint shows concept hierarchy level.
-    ///
-    /// `GET /autocomplete/concepts?q=...`
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # async fn example() -> papers_openalex::Result<()> {
-    /// use papers_openalex::OpenAlexClient;
-    ///
-    /// let client = OpenAlexClient::new();
-    /// let response = client.autocomplete_concepts("physics").await?;
-    /// for result in &response.results {
-    ///     println!("{} (level {})", result.display_name,
-    ///         result.hint.as_deref().unwrap_or("?"));
-    /// }
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn autocomplete_concepts(&self, q: &str) -> Result<AutocompleteResponse> {
-        self.autocomplete_entity("concepts", q).await
-    }
-
     /// Autocomplete for publishers. Searches display names. Returns up to 10
     /// results sorted by citation count. Hint shows country.
     ///
@@ -1600,22 +1576,6 @@ mod tests {
             .await;
         let client = setup_client(&server).await;
         let resp = client.autocomplete_institutions("harvard").await.unwrap();
-        assert_eq!(resp.results.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_autocomplete_concepts() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/autocomplete/concepts"))
-            .and(query_param("q", "physics"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(minimal_autocomplete_json()),
-            )
-            .mount(&server)
-            .await;
-        let client = setup_client(&server).await;
-        let resp = client.autocomplete_concepts("physics").await.unwrap();
         assert_eq!(resp.results.len(), 1);
     }
 

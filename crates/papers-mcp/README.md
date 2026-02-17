@@ -29,7 +29,6 @@ topics, publishers, and funders — all queryable from Claude.
 | `funder_list` | Search grant-making organizations |
 | `funder_get` | Get a single funder |
 | `funder_autocomplete` | Type-ahead search for funders |
-| `concept_autocomplete` | Type-ahead search for concepts (deprecated) |
 
 ## Setup
 

@@ -8,7 +8,7 @@ MCP server wrapping the `papers` crate (which wraps `papers-openalex`), built wi
 src/
   lib.rs       — module declarations
   main.rs      — entry point: create PapersMcp, serve on stdio
-  server.rs    — PapersMcp struct + 22 tool methods + ServerHandler impl
+  server.rs    — PapersMcp struct + 28 tool methods + ServerHandler impl
   params.rs    — 4 tool parameter structs (schemars + serde)
 tests/
   tools.rs     — wiremock integration tests for tool invocation
@@ -16,7 +16,7 @@ tests/
 
 The `papers` crate (at `../papers`) owns all business logic:
 - Slim summary structs for list responses
-- 22 async API wrapper functions
+- 28 async API wrapper functions
 - Re-exports of all `papers-openalex` types
 
 `papers-mcp` only contains the MCP layer (rmcp macros, parameter structs, JSON serialization).
@@ -30,7 +30,7 @@ See `../papers/CHANGES.md` for how responses differ from the raw OpenAlex API.
 - `#[tool_handler]` on the `ServerHandler` impl generates `call_tool`, `list_tools`, `get_tool`
 - Each tool method takes `Parameters<T>` and returns `Result<String, String>`
 - Success: JSON-serialized API response. Error: error message string.
-- All 22 tools delegate to `papers::api::*` functions (no direct papers-openalex imports)
+- All 28 tools delegate to `papers::api::*` functions (no direct papers-openalex imports)
 - List tools return slim `SlimListResponse<XxxSummary>` via `papers::api::*_list()`
 - Get/autocomplete/find tools return full entities via `papers::api::*_get/autocomplete/find()`
 

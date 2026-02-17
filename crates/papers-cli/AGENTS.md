@@ -16,7 +16,7 @@ tests/
 
 Imports only `papers::*` — no direct dependency on `papers-openalex`.
 
-## CLI commands (22 total)
+## CLI commands (21 total)
 
 ```
 papers work list   [-s <query>] [-f <filter>] [--sort <field>] [-n <per_page=10>]
@@ -31,7 +31,6 @@ papers institution list / get / autocomplete
 papers topic list / get
 papers publisher list / get / autocomplete
 papers funder list / get / autocomplete
-papers concept autocomplete <query> [--json]
 ```
 
 Default output is human-readable text. Add `--json` for raw JSON.
