@@ -1,11 +1,11 @@
 [package]
 name = "papers-openalex"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 bon.workspace = true
-dirs = "6"
+dirs.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -13,4 +13,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
-wiremock = "0.6"
+wiremock.workspace = true
