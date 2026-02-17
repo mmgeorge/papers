@@ -816,6 +816,44 @@ pub struct ParsedName {
     pub nickname: Option<String>,
 }
 
+// ── Hierarchy types (domain > field > subfield > topic) ───────────────
+
+/// A reference to a parent, child, or sibling entity in the topic hierarchy
+/// (domain > field > subfield > topic).
+///
+/// Used in [`Domain::fields`](crate::Domain), [`Field::subfields`](crate::Field),
+/// [`Subfield::topics`](crate::Subfield), and `siblings` arrays.
+///
+/// ```json
+/// {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"}
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HierarchyEntity {
+    /// OpenAlex ID URI (e.g. `"https://openalex.org/fields/17"`).
+    pub id: Option<String>,
+
+    /// Human-readable name (e.g. `"Computer Science"`).
+    pub display_name: Option<String>,
+}
+
+/// External identifiers for a [`Domain`](crate::Domain), [`Field`](crate::Field),
+/// or [`Subfield`](crate::Subfield).
+///
+/// ```json
+/// {"openalex": "https://openalex.org/domains/3", "wikidata": "https://www.wikidata.org/wiki/Q14632398", "wikipedia": "https://en.wikipedia.org/wiki/..."}
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HierarchyIds {
+    /// OpenAlex ID URL.
+    pub openalex: Option<String>,
+
+    /// Wikidata URL.
+    pub wikidata: Option<String>,
+
+    /// Wikipedia article URL.
+    pub wikipedia: Option<String>,
+}
+
 // ── Per-entity ID types ────────────────────────────────────────────────
 
 /// External identifiers for a [`Work`](crate::Work).

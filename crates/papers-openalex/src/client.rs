@@ -8,8 +8,8 @@ const DEFAULT_BASE_URL: &str = "https://api.openalex.org";
 
 /// Async client for the [OpenAlex REST API](https://docs.openalex.org).
 ///
-/// Provides 23 methods covering all OpenAlex endpoints: 7 list, 7 get,
-/// 7 autocomplete, and 2 semantic search.
+/// Provides 30 methods covering all OpenAlex endpoints: 10 list, 10 get,
+/// 8 autocomplete, and 2 semantic search.
 ///
 /// # Creating a client
 ///
@@ -370,6 +370,84 @@ impl OpenAlexClient {
         self.list_entities("/publishers", params).await
     }
 
+    /// List research domains (broadest level of topic hierarchy). 4 domains
+    /// total: Life Sciences, Social Sciences, Physical Sciences, Health
+    /// Sciences. Each domain contains multiple academic fields.
+    ///
+    /// `GET /domains`
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> papers_openalex::Result<()> {
+    /// use papers_openalex::{OpenAlexClient, ListParams};
+    ///
+    /// let client = OpenAlexClient::new();
+    /// let response = client.list_domains(&ListParams::default()).await?;
+    /// for domain in &response.results {
+    ///     println!("{}: {} works",
+    ///         domain.display_name.as_deref().unwrap_or("?"),
+    ///         domain.works_count.unwrap_or(0));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_domains(&self, params: &ListParams) -> Result<ListResponse<Domain>> {
+        self.list_entities("/domains", params).await
+    }
+
+    /// List academic fields (second level of topic hierarchy). 26 fields total
+    /// (e.g. Computer Science, Medicine, Mathematics). Each field has a parent
+    /// domain and contains multiple subfields.
+    ///
+    /// `GET /fields`
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> papers_openalex::Result<()> {
+    /// use papers_openalex::{OpenAlexClient, ListParams};
+    ///
+    /// let client = OpenAlexClient::new();
+    /// let response = client.list_fields(&ListParams::default()).await?;
+    /// for field in &response.results {
+    ///     println!("{}: {} works",
+    ///         field.display_name.as_deref().unwrap_or("?"),
+    ///         field.works_count.unwrap_or(0));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_fields(&self, params: &ListParams) -> Result<ListResponse<Field>> {
+        self.list_entities("/fields", params).await
+    }
+
+    /// List research subfields (third level of topic hierarchy). ~252 subfields
+    /// total (e.g. Artificial Intelligence, Organic Chemistry). Each subfield
+    /// has a parent field and domain, and contains multiple topics.
+    ///
+    /// `GET /subfields`
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> papers_openalex::Result<()> {
+    /// use papers_openalex::{OpenAlexClient, ListParams};
+    ///
+    /// let client = OpenAlexClient::new();
+    /// let response = client.list_subfields(&ListParams::default()).await?;
+    /// for subfield in &response.results {
+    ///     println!("{}: {} works",
+    ///         subfield.display_name.as_deref().unwrap_or("?"),
+    ///         subfield.works_count.unwrap_or(0));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_subfields(&self, params: &ListParams) -> Result<ListResponse<Subfield>> {
+        self.list_entities("/subfields", params).await
+    }
+
     /// List research funding organizations (e.g. NIH, NSF, ERC). Linked to
     /// Crossref funder registry. Includes grant counts, funded works, and impact
     /// metrics.
@@ -558,6 +636,81 @@ impl OpenAlexClient {
         self.get_entity("/publishers", id, params).await
     }
 
+    /// Get a single research domain. Returns description, child fields,
+    /// sibling domains, and work/citation counts.
+    ///
+    /// `GET /domains/{id}`
+    ///
+    /// Accepts: numeric ID (e.g. `"3"` for Physical Sciences).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> papers_openalex::Result<()> {
+    /// use papers_openalex::{OpenAlexClient, GetParams};
+    ///
+    /// let client = OpenAlexClient::new();
+    /// let domain = client.get_domain("3", &GetParams::default()).await?;
+    /// println!("{}: {} fields",
+    ///     domain.display_name.as_deref().unwrap_or("?"),
+    ///     domain.fields.as_ref().map(|f| f.len()).unwrap_or(0));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_domain(&self, id: &str, params: &GetParams) -> Result<Domain> {
+        self.get_entity("/domains", id, params).await
+    }
+
+    /// Get a single academic field. Returns parent domain, child subfields,
+    /// sibling fields, and work/citation counts.
+    ///
+    /// `GET /fields/{id}`
+    ///
+    /// Accepts: numeric ID (e.g. `"17"` for Computer Science).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> papers_openalex::Result<()> {
+    /// use papers_openalex::{OpenAlexClient, GetParams};
+    ///
+    /// let client = OpenAlexClient::new();
+    /// let field = client.get_field("17", &GetParams::default()).await?;
+    /// println!("{}: {} subfields",
+    ///     field.display_name.as_deref().unwrap_or("?"),
+    ///     field.subfields.as_ref().map(|s| s.len()).unwrap_or(0));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_field(&self, id: &str, params: &GetParams) -> Result<Field> {
+        self.get_entity("/fields", id, params).await
+    }
+
+    /// Get a single research subfield. Returns parent field and domain, child
+    /// topics, sibling subfields, and work/citation counts.
+    ///
+    /// `GET /subfields/{id}`
+    ///
+    /// Accepts: numeric ID (e.g. `"1702"` for Artificial Intelligence).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> papers_openalex::Result<()> {
+    /// use papers_openalex::{OpenAlexClient, GetParams};
+    ///
+    /// let client = OpenAlexClient::new();
+    /// let subfield = client.get_subfield("1702", &GetParams::default()).await?;
+    /// println!("{}: {} topics",
+    ///     subfield.display_name.as_deref().unwrap_or("?"),
+    ///     subfield.topics.as_ref().map(|t| t.len()).unwrap_or(0));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_subfield(&self, id: &str, params: &GetParams) -> Result<Subfield> {
+        self.get_entity("/subfields", id, params).await
+    }
+
     /// Get a single funder. Returns Wikidata description, Crossref funder ID,
     /// grant/award counts, country, and research impact metrics.
     ///
@@ -734,6 +887,40 @@ impl OpenAlexClient {
     /// ```
     pub async fn autocomplete_publishers(&self, q: &str) -> Result<AutocompleteResponse> {
         self.autocomplete_entity("publishers", q).await
+    }
+
+    /// Autocomplete for subfields. Searches display names. Returns up to 10
+    /// results sorted by citation count. Hint shows description.
+    ///
+    /// `GET /autocomplete/subfields?q=...`
+    ///
+    /// Note: autocomplete is only available for subfields, not domains or
+    /// fields (`/autocomplete/domains` and `/autocomplete/fields` return 404).
+    ///
+    /// # Quirks
+    ///
+    /// The subfield autocomplete endpoint returns `entity_type: null` and
+    /// `short_id: "Nones/..."` — these are known API quirks. The
+    /// [`AutocompleteResult`](crate::AutocompleteResult) fields are
+    /// `Option<String>` to handle this.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> papers_openalex::Result<()> {
+    /// use papers_openalex::OpenAlexClient;
+    ///
+    /// let client = OpenAlexClient::new();
+    /// let response = client.autocomplete_subfields("artificial").await?;
+    /// for result in &response.results {
+    ///     println!("{} — {}", result.display_name,
+    ///         result.hint.as_deref().unwrap_or(""));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn autocomplete_subfields(&self, q: &str) -> Result<AutocompleteResponse> {
+        self.autocomplete_entity("subfields", q).await
     }
 
     /// Autocomplete for funders. Searches display names. Returns up to 10
@@ -969,6 +1156,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_list_domains() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/domains"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+            .mount(&server)
+            .await;
+        let client = setup_client(&server).await;
+        let resp = client.list_domains(&ListParams::default()).await.unwrap();
+        assert_eq!(resp.meta.count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/fields"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+            .mount(&server)
+            .await;
+        let client = setup_client(&server).await;
+        let resp = client.list_fields(&ListParams::default()).await.unwrap();
+        assert_eq!(resp.meta.count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_subfields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/subfields"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+            .mount(&server)
+            .await;
+        let client = setup_client(&server).await;
+        let resp = client
+            .list_subfields(&ListParams::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.meta.count, 1);
+    }
+
+    #[tokio::test]
     async fn test_list_with_all_params() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1197,6 +1426,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_domain() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/domains/3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"id":"https://openalex.org/domains/3"}"#),
+            )
+            .mount(&server)
+            .await;
+        let client = setup_client(&server).await;
+        let domain = client
+            .get_domain("3", &GetParams::default())
+            .await
+            .unwrap();
+        assert_eq!(domain.id, "https://openalex.org/domains/3");
+    }
+
+    #[tokio::test]
+    async fn test_get_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/fields/17"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"id":"https://openalex.org/fields/17"}"#),
+            )
+            .mount(&server)
+            .await;
+        let client = setup_client(&server).await;
+        let field = client
+            .get_field("17", &GetParams::default())
+            .await
+            .unwrap();
+        assert_eq!(field.id, "https://openalex.org/fields/17");
+    }
+
+    #[tokio::test]
+    async fn test_get_subfield() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/subfields/1702"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"id":"https://openalex.org/subfields/1702"}"#),
+            )
+            .mount(&server)
+            .await;
+        let client = setup_client(&server).await;
+        let subfield = client
+            .get_subfield("1702", &GetParams::default())
+            .await
+            .unwrap();
+        assert_eq!(subfield.id, "https://openalex.org/subfields/1702");
+    }
+
+    #[tokio::test]
     async fn test_get_with_select() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1325,6 +1611,22 @@ mod tests {
             .await;
         let client = setup_client(&server).await;
         let resp = client.autocomplete_funders("nsf").await.unwrap();
+        assert_eq!(resp.results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_autocomplete_subfields() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/autocomplete/subfields"))
+            .and(query_param("q", "artificial"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(minimal_autocomplete_json()),
+            )
+            .mount(&server)
+            .await;
+        let client = setup_client(&server).await;
+        let resp = client.autocomplete_subfields("artificial").await.unwrap();
         assert_eq!(resp.results.len(), 1);
     }
 

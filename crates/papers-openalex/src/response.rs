@@ -165,8 +165,9 @@ pub struct AutocompleteResult {
     pub works_count: Option<i64>,
 
     /// Entity type: one of `"work"`, `"author"`, `"source"`, `"institution"`,
-    /// `"concept"`, `"publisher"`, `"funder"`.
-    pub entity_type: String,
+    /// `"concept"`, `"publisher"`, `"funder"`. Returns `null` for subfield
+    /// autocomplete (known API quirk).
+    pub entity_type: Option<String>,
 
     /// External identifier (e.g. ISSN for sources, ROR for institutions,
     /// Wikidata for concepts). `None` if not available.
@@ -288,7 +289,7 @@ mod tests {
         assert_eq!(resp.meta.count, 955);
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].display_name, "Einstein");
-        assert_eq!(resp.results[0].entity_type, "author");
+        assert_eq!(resp.results[0].entity_type.as_deref(), Some("author"));
         assert_eq!(
             resp.results[0].filter_key.as_deref(),
             Some("authorships.author.id")

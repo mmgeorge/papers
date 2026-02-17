@@ -15,18 +15,34 @@ This crate is a Rust API client for the [OpenAlex REST API](https://docs.openale
    - https://docs.openalex.org/api-entities/topics/topic-object
    - https://docs.openalex.org/api-entities/publishers/publisher-object
    - https://docs.openalex.org/api-entities/funders/funder-object
+   - Domains, fields, and subfields were verified via curl against the live API (no dedicated docs page)
 3. Every endpoint was called against the live API to verify actual response shapes
 4. The results were codified into `api-spec.toml` as the single source of truth
 
 ## Architecture
 
 - `api-spec.toml` — Machine-readable API specification: endpoints, parameters, response types, enum values
-- `src/client.rs` — `OpenAlexClient` struct with 23 public methods (one per endpoint)
+- `src/client.rs` — `OpenAlexClient` struct with 30 public methods (one per endpoint)
 - `src/types/` — Serde-deserializable Rust structs for every entity and nested object
 - `src/params.rs` — Parameter structs with `#[derive(Default, bon::Builder)]` for both struct-update and builder patterns
 - `src/response.rs` — Generic response wrappers: `ListResponse<T>`, `AutocompleteResponse`, `FindWorksResponse`
 - `src/error.rs` — Error types for HTTP, JSON, and API errors
 - `tests/fixtures/` — JSON response fixtures captured from the live API
+
+## Entity Types
+
+| Entity | List | Get | Autocomplete | Type file |
+|--------|------|-----|--------------|-----------|
+| Work | Yes | Yes | Yes | `types/work.rs` |
+| Author | Yes | Yes | Yes | `types/author.rs` |
+| Source | Yes | Yes | Yes | `types/source.rs` |
+| Institution | Yes | Yes | Yes | `types/institution.rs` |
+| Topic | Yes | Yes | Yes (via concepts) | `types/topic.rs` |
+| Publisher | Yes | Yes | Yes | `types/publisher.rs` |
+| Funder | Yes | Yes | Yes | `types/funder.rs` |
+| Domain | Yes | Yes | **No** (404) | `types/domain.rs` |
+| Field | Yes | Yes | **No** (404) | `types/field.rs` |
+| Subfield | Yes | Yes | Yes | `types/subfield.rs` |
 
 ## How to Update When the API Changes
 
@@ -66,6 +82,21 @@ Add/modify endpoints, parameters, entity fields, or enum values in the TOML spec
 - Run `cargo test -p papers-openalex` (unit + mock tests)
 - Run `cargo test -p papers-openalex -- --ignored` (live API tests)
 
+### Checklist for New Entities/Endpoints
+
+Every new entity or endpoint **must** include all of the following:
+
+1. **Type struct** in `src/types/<entity>.rs` with full doc comments (JSON example, ID format notes, quirks)
+2. **Field-level doc comments** on every struct field
+3. **Client methods** in `src/client.rs` with full doc comments (`# Example` with `no_run` code block)
+4. **`api-spec.toml` entries** for every new endpoint
+5. **Fixture JSON file** in `tests/fixtures/` captured from the live API
+6. **Unit deserialization test** in the type file (`#[cfg(test)] mod tests`)
+7. **Wiremock unit tests** in `client.rs` for each new method
+8. **Live integration tests** (ignored) in `tests/integration.rs`
+9. **Re-exports** in `src/types/mod.rs` and `src/lib.rs` (via `pub use types::*`)
+10. **AGENTS.md** entity table updated
+
 ## Key Gotchas
 
 - **`type` keyword:** Works, sources, institutions all have a `type` field. Use Rust raw identifier `r#type`
@@ -78,3 +109,5 @@ Add/modify endpoints, parameters, entity fields, or enum values in the TOML spec
 - **API key:** Read from `OPENALEX_KEY` env var. Required for `/find/works` (semantic search). Optional but recommended for other endpoints (higher rate limits)
 - **`mag` fields are strings:** `WorkIds.mag`, `SourceIds.mag`, `InstitutionIds.mag` are returned as strings (e.g. `"2741809807"`), not integers. Use `Option<String>`, not `Option<i64>`
 - **Null elements in arrays:** `host_organization_lineage` can contain null elements (e.g. `[null]`). Use `Option<Vec<Option<String>>>` instead of `Option<Vec<String>>`
+- **Autocomplete availability:** Domains and fields do **not** support autocomplete (404). Only subfields do among hierarchy entities
+- **Subfield autocomplete quirks:** Returns `entity_type: null` and `short_id: "Nones/..."` — `AutocompleteResult` uses `Option` fields to handle this

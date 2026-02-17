@@ -41,8 +41,8 @@ values = ["parent", "child", "related"]
 description = "Relationship between associated institutions. parent=governing org, child=subsidiary, related=affiliated."
 
 [enums.entity_type]
-values = ["author", "concept", "institution", "source", "publisher", "funder", "work"]
-description = "Entity types returned by autocomplete. 'concept' is deprecated but still works in autocomplete."
+values = ["author", "concept", "domain", "field", "institution", "source", "subfield", "publisher", "funder", "work"]
+description = "Entity types returned by autocomplete. 'concept' is deprecated but still works in autocomplete. Subfield autocomplete returns entity_type: null (API quirk)."
 
 [enums.indexed_in]
 values = ["arxiv", "crossref", "doaj", "pubmed"]
@@ -116,6 +116,33 @@ rust_method = "list_funders"
 response_type = "ListResponse<Funder>"
 param_struct = "ListParams"
 description = "List research funding organizations (e.g. NIH, NSF, ERC)."
+
+[[endpoints]]
+id = "list_domains"
+method = "GET"
+path = "/domains"
+rust_method = "list_domains"
+response_type = "ListResponse<Domain>"
+param_struct = "ListParams"
+description = "List research domains (broadest level of topic hierarchy). 4 total."
+
+[[endpoints]]
+id = "list_fields"
+method = "GET"
+path = "/fields"
+rust_method = "list_fields"
+response_type = "ListResponse<Field>"
+param_struct = "ListParams"
+description = "List academic fields (second level of topic hierarchy). 26 total."
+
+[[endpoints]]
+id = "list_subfields"
+method = "GET"
+path = "/subfields"
+rust_method = "list_subfields"
+response_type = "ListResponse<Subfield>"
+param_struct = "ListParams"
+description = "List research subfields (third level of topic hierarchy). ~252 total."
 
 # ── Single Entity Endpoints ─────────────────────────────────────────────
 
@@ -196,6 +223,39 @@ path_params = ["id"]
 id_formats = ["OpenAlex ID (F...)"]
 description = "Get a single funder."
 
+[[endpoints]]
+id = "get_domain"
+method = "GET"
+path = "/domains/{id}"
+rust_method = "get_domain"
+response_type = "Domain"
+param_struct = "GetParams"
+path_params = ["id"]
+id_formats = ["numeric ID (1-4)"]
+description = "Get a single research domain."
+
+[[endpoints]]
+id = "get_field"
+method = "GET"
+path = "/fields/{id}"
+rust_method = "get_field"
+response_type = "Field"
+param_struct = "GetParams"
+path_params = ["id"]
+id_formats = ["numeric ID (e.g. 17)"]
+description = "Get a single academic field."
+
+[[endpoints]]
+id = "get_subfield"
+method = "GET"
+path = "/subfields/{id}"
+rust_method = "get_subfield"
+response_type = "Subfield"
+param_struct = "GetParams"
+path_params = ["id"]
+id_formats = ["numeric ID (e.g. 1702)"]
+description = "Get a single research subfield."
+
 # ── Autocomplete Endpoints ──────────────────────────────────────────────
 
 [[endpoints]]
@@ -260,6 +320,15 @@ rust_method = "autocomplete_funders"
 response_type = "AutocompleteResponse"
 query_params = ["q"]
 description = "Autocomplete for funders. Hint shows country and description."
+
+[[endpoints]]
+id = "autocomplete_subfields"
+method = "GET"
+path = "/autocomplete/subfields"
+rust_method = "autocomplete_subfields"
+response_type = "AutocompleteResponse"
+query_params = ["q"]
+description = "Autocomplete for subfields. Hint shows description. Note: domains and fields do NOT have autocomplete."
 
 # ── Semantic Search Endpoints ───────────────────────────────────────────
 
@@ -391,3 +460,9 @@ description = "Filter expression to constrain results."
 
 # 3. The /autocomplete/publishers endpoint has been observed returning
 #    HTTP 500 errors intermittently (server-side issue, not client bug).
+
+# 4. /autocomplete/domains and /autocomplete/fields return 404 — these
+#    hierarchy levels do not support autocomplete. Only subfields do.
+
+# 5. Subfield autocomplete returns entity_type: null and short_id: "Nones/..."
+#    (e.g. "Nones/1702"). Our AutocompleteResult uses Option fields to handle this.

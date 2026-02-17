@@ -46,13 +46,13 @@
 //!
 //! # Endpoints
 //!
-//! The client provides 23 methods covering all OpenAlex API endpoints:
+//! The client provides 30 methods covering all OpenAlex API endpoints:
 //!
-//! - **7 list endpoints** — paginated entity lists with filtering, searching,
+//! - **10 list endpoints** — paginated entity lists with filtering, searching,
 //!   sorting, sampling, and grouping
-//! - **7 get endpoints** — single entity retrieval by ID (OpenAlex, DOI, ORCID,
+//! - **10 get endpoints** — single entity retrieval by ID (OpenAlex, DOI, ORCID,
 //!   ROR, ISSN, PMID, etc.)
-//! - **7 autocomplete endpoints** — fast type-ahead search (~200ms, up to 10
+//! - **8 autocomplete endpoints** — fast type-ahead search (~200ms, up to 10
 //!   results)
 //! - **2 semantic search endpoints** — AI-powered similarity search via GET or
 //!   POST

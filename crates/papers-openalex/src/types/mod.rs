@@ -6,6 +6,9 @@ pub mod institution;
 pub mod topic;
 pub mod publisher;
 pub mod funder;
+pub mod domain;
+pub mod field;
+pub mod subfield;
 
 pub use common::*;
 pub use work::Work;
@@ -15,3 +18,6 @@ pub use institution::Institution;
 pub use topic::Topic;
 pub use publisher::Publisher;
 pub use funder::Funder;
+pub use domain::Domain;
+pub use field::Field;
+pub use subfield::Subfield;

@@ -50,42 +50,49 @@ impl PapersMcp {
     // ── List tools ───────────────────────────────────────────────────────
 
     /// Search, filter, and paginate scholarly works (articles, preprints, datasets, etc.). 240M+ records.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/works/filter-works
     #[tool]
     pub async fn work_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
         json_result(papers::api::work_list(&self.client, &params.into_list_params()).await)
     }
 
     /// Search, filter, and paginate author profiles. 110M+ records.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/authors/filter-authors
     #[tool]
     pub async fn author_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
         json_result(papers::api::author_list(&self.client, &params.into_list_params()).await)
     }
 
     /// Search, filter, and paginate publishing venues (journals, repositories, conferences).
+    /// Advanced filtering: https://docs.openalex.org/api-entities/sources/filter-sources
     #[tool]
     pub async fn source_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
         json_result(papers::api::source_list(&self.client, &params.into_list_params()).await)
     }
 
     /// Search, filter, and paginate research institutions and organizations.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/institutions/filter-institutions
     #[tool]
     pub async fn institution_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
         json_result(papers::api::institution_list(&self.client, &params.into_list_params()).await)
     }
 
     /// Search, filter, and paginate research topics (3-level hierarchy: domain > field > subfield > topic).
+    /// Advanced filtering: https://docs.openalex.org/api-entities/topics/filter-topics
     #[tool]
     pub async fn topic_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
         json_result(papers::api::topic_list(&self.client, &params.into_list_params()).await)
     }
 
     /// Search, filter, and paginate publishing organizations (e.g. Elsevier, Springer Nature).
+    /// Advanced filtering: https://docs.openalex.org/api-entities/publishers/filter-publishers
     #[tool]
     pub async fn publisher_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
         json_result(papers::api::publisher_list(&self.client, &params.into_list_params()).await)
     }
 
     /// Search, filter, and paginate funding organizations (e.g. NIH, NSF, ERC).
+    /// Advanced filtering: https://docs.openalex.org/api-entities/funders/filter-funders
     #[tool]
     pub async fn funder_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
         json_result(papers::api::funder_list(&self.client, &params.into_list_params()).await)

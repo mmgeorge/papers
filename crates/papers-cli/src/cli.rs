@@ -94,6 +94,7 @@ pub struct ListArgs {
 #[derive(Subcommand)]
 pub enum WorkCommand {
     /// List works with optional search/filter/sort
+    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/works/filter-works")]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -121,7 +122,7 @@ pub enum WorkCommand {
         /// Number of results (1-100)
         #[arg(long, short = 'n')]
         count: Option<u32>,
-        /// Filter expression
+        /// Filter expression (https://docs.openalex.org/api-entities/works/filter-works)
         #[arg(long, short = 'f')]
         filter: Option<String>,
         /// Output raw JSON
@@ -133,6 +134,7 @@ pub enum WorkCommand {
 #[derive(Subcommand)]
 pub enum AuthorCommand {
     /// List authors with optional search/filter/sort
+    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/authors/filter-authors")]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -154,6 +156,7 @@ pub enum AuthorCommand {
 #[derive(Subcommand)]
 pub enum SourceCommand {
     /// List sources with optional search/filter/sort
+    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/sources/filter-sources")]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -175,6 +178,7 @@ pub enum SourceCommand {
 #[derive(Subcommand)]
 pub enum InstitutionCommand {
     /// List institutions with optional search/filter/sort
+    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/institutions/filter-institutions")]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -196,6 +200,7 @@ pub enum InstitutionCommand {
 #[derive(Subcommand)]
 pub enum TopicCommand {
     /// List topics with optional search/filter/sort
+    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/topics/filter-topics")]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -211,6 +216,7 @@ pub enum TopicCommand {
 #[derive(Subcommand)]
 pub enum PublisherCommand {
     /// List publishers with optional search/filter/sort
+    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/publishers/filter-publishers")]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -232,6 +238,7 @@ pub enum PublisherCommand {
 #[derive(Subcommand)]
 pub enum FunderCommand {
     /// List funders with optional search/filter/sort
+    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/funders/filter-funders")]
     List {
         #[command(flatten)]
         args: ListArgs,
