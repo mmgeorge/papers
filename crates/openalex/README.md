@@ -135,7 +135,21 @@ let response = client.find_works(&params).await?;
 | Funders | `Funder` | `list_funders` | `get_funder` | `autocomplete_funders` |
 | Concepts (deprecated) | -- | -- | -- | `autocomplete_concepts` |
 
-Plus `find_works` / `find_works_post` for semantic search.
+- **Works** — scholarly outputs: journal articles, preprints, books, datasets, and other research products. 240M+ records. Each work carries authorship, venue, open-access status, citation count, topics, abstract (reconstructed from OpenAlex's inverted index), and links to referenced and related works. Identifiable by OpenAlex ID, DOI, PMID, or PMCID.
+
+- **Authors** — disambiguated researcher profiles. 110M+ records. Each author aggregates works across name variants and institutions, with an h-index, ORCID link, affiliation history, and top research topics. Identifiable by OpenAlex ID or ORCID.
+
+- **Sources** — publishing venues: journals, conference proceedings, repositories, ebook platforms, and book series. Includes ISSN, open-access status, DOAJ membership, APC pricing, and host organization. Identifiable by OpenAlex ID or any ISSN.
+
+- **Institutions** — research organizations: universities, hospitals, companies, government agencies, and other bodies. Linked to ROR identifiers. Includes geographic location, institution type, parent/child relationships, and research output metrics. Identifiable by OpenAlex ID or ROR.
+
+- **Topics** — a 4-level content hierarchy (domain → field → subfield → topic) covering ~4,500 topics. Each topic has an AI-generated description, keywords, and counts of works assigned to it. Works are assigned up to 3 topics with relevance scores. Identifiable by OpenAlex ID only.
+
+- **Publishers** — publishing organizations (e.g. Elsevier, Springer Nature, Wiley). Structured as a hierarchy: top-level publishers with subsidiary imprints at lower levels. Includes country of origin and citation metrics across all sources they publish. Identifiable by OpenAlex ID only.
+
+- **Funders** — grant-making organizations (e.g. NIH, NSF, ERC, Wellcome Trust). Linked to the Crossref funder registry. Includes grant counts, funded works count, country, and a Wikidata description. Identifiable by OpenAlex ID only.
+
+Plus `find_works` / `find_works_post` for AI semantic search (requires API key, costs 1,000 credits per call).
 
 ### Parameters
 
