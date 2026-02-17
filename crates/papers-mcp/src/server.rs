@@ -98,6 +98,27 @@ impl PapersMcp {
         json_result(papers::api::funder_list(&self.client, &params.into_list_params()).await)
     }
 
+    /// Search, filter, and paginate research domains (broadest level of topic hierarchy). 4 domains total.
+    /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
+    #[tool]
+    pub async fn domain_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
+        json_result(papers::api::domain_list(&self.client, &params.into_list_params()).await)
+    }
+
+    /// Search, filter, and paginate academic fields (second level of topic hierarchy). 26 fields total.
+    /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
+    #[tool]
+    pub async fn field_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
+        json_result(papers::api::field_list(&self.client, &params.into_list_params()).await)
+    }
+
+    /// Search, filter, and paginate research subfields (third level of topic hierarchy). ~252 subfields total.
+    /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
+    #[tool]
+    pub async fn subfield_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
+        json_result(papers::api::subfield_list(&self.client, &params.into_list_params()).await)
+    }
+
     // ── Get tools ────────────────────────────────────────────────────────
 
     /// Get a single work by ID (OpenAlex ID, DOI, PMID, or PMCID).
@@ -142,6 +163,24 @@ impl PapersMcp {
         json_result(papers::api::funder_get(&self.client, &params.id, &params.into_get_params()).await)
     }
 
+    /// Get a single domain by numeric ID (1-4).
+    #[tool]
+    pub async fn domain_get(&self, Parameters(params): Parameters<GetToolParams>) -> Result<String, String> {
+        json_result(papers::api::domain_get(&self.client, &params.id, &params.into_get_params()).await)
+    }
+
+    /// Get a single academic field by numeric ID (e.g. 17 for Computer Science).
+    #[tool]
+    pub async fn field_get(&self, Parameters(params): Parameters<GetToolParams>) -> Result<String, String> {
+        json_result(papers::api::field_get(&self.client, &params.id, &params.into_get_params()).await)
+    }
+
+    /// Get a single research subfield by numeric ID (e.g. 1702 for Artificial Intelligence).
+    #[tool]
+    pub async fn subfield_get(&self, Parameters(params): Parameters<GetToolParams>) -> Result<String, String> {
+        json_result(papers::api::subfield_get(&self.client, &params.id, &params.into_get_params()).await)
+    }
+
     // ── Autocomplete tools ───────────────────────────────────────────────
 
     /// Type-ahead search for works by title. Returns up to 10 results sorted by citation count.
@@ -184,6 +223,12 @@ impl PapersMcp {
     #[tool]
     pub async fn funder_autocomplete(&self, Parameters(params): Parameters<AutocompleteToolParams>) -> Result<String, String> {
         json_result(papers::api::funder_autocomplete(&self.client, &params.q).await)
+    }
+
+    /// Type-ahead search for subfields. Returns up to 10 results.
+    #[tool]
+    pub async fn subfield_autocomplete(&self, Parameters(params): Parameters<AutocompleteToolParams>) -> Result<String, String> {
+        json_result(papers::api::subfield_autocomplete(&self.client, &params.q).await)
     }
 
     // ── Semantic search ──────────────────────────────────────────────────

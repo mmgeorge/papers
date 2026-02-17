@@ -6,7 +6,7 @@ use serde::Deserialize;
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ListToolParams {
     /// Filter expression. Comma-separated AND conditions, pipe (`|`) for OR.
-    /// Example: `"publication_year:2024,is_oa:true"`
+    /// Example: `"publication_year:2024,is_oa:true"` for works, `"country_code:US"` for institutions.
     pub filter: Option<String>,
 
     /// Full-text search query. Searches title, abstract, and fulltext for works;

@@ -44,6 +44,21 @@ pub enum EntityCommand {
         #[command(subcommand)]
         cmd: FunderCommand,
     },
+    /// Research domains (broadest level of topic hierarchy, 4 total)
+    Domain {
+        #[command(subcommand)]
+        cmd: DomainCommand,
+    },
+    /// Academic fields (second level of topic hierarchy, 26 total)
+    Field {
+        #[command(subcommand)]
+        cmd: FieldCommand,
+    },
+    /// Research subfields (third level of topic hierarchy, ~252 total)
+    Subfield {
+        #[command(subcommand)]
+        cmd: SubfieldCommand,
+    },
     /// Deprecated concept taxonomy (autocomplete only)
     Concept {
         #[command(subcommand)]
@@ -58,7 +73,7 @@ pub struct ListArgs {
     #[arg(long, short = 's')]
     pub search: Option<String>,
 
-    /// Filter expression (e.g. "publication_year:2024,is_oa:true")
+    /// Filter expression (comma-separated AND conditions, pipe for OR)
     #[arg(long, short = 'f')]
     pub filter: Option<String>,
 
@@ -250,6 +265,60 @@ pub enum FunderCommand {
         json: bool,
     },
     /// Type-ahead search for funders
+    Autocomplete {
+        query: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DomainCommand {
+    /// List domains with optional search/filter/sort
+    #[command(after_help = "Example filters: works_count:>100000000, display_name.search:physical\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists")]
+    List {
+        #[command(flatten)]
+        args: ListArgs,
+    },
+    /// Get a single domain by numeric ID (1-4)
+    Get {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FieldCommand {
+    /// List fields with optional search/filter/sort
+    #[command(after_help = "Example filters: domain.id:domains/3, works_count:>1000000\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists")]
+    List {
+        #[command(flatten)]
+        args: ListArgs,
+    },
+    /// Get a single field by numeric ID (e.g. 17)
+    Get {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SubfieldCommand {
+    /// List subfields with optional search/filter/sort
+    #[command(after_help = "Example filters: field.id:fields/17, works_count:>100000\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists")]
+    List {
+        #[command(flatten)]
+        args: ListArgs,
+    },
+    /// Get a single subfield by numeric ID (e.g. 1702)
+    Get {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Type-ahead search for subfields
     Autocomplete {
         query: String,
         #[arg(long)]

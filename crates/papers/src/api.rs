@@ -1,11 +1,13 @@
 use papers_openalex::{
-    Author, AutocompleteResponse, FindWorksParams, FindWorksResponse, Funder, GetParams,
-    Institution, ListParams, OpenAlexClient, OpenAlexError, Publisher, Source, Topic, Work,
+    Author, AutocompleteResponse, Domain, Field, FindWorksParams, FindWorksResponse, Funder,
+    GetParams, Institution, ListParams, OpenAlexClient, OpenAlexError, Publisher, Source, Subfield,
+    Topic, Work,
 };
 
 use crate::summary::{
-    AuthorSummary, FunderSummary, InstitutionSummary, PublisherSummary, SourceSummary,
-    SlimListResponse, TopicSummary, WorkSummary, summary_list_result,
+    AuthorSummary, DomainSummary, FieldSummary, FunderSummary, InstitutionSummary,
+    PublisherSummary, SlimListResponse, SourceSummary, SubfieldSummary, TopicSummary, WorkSummary,
+    summary_list_result,
 };
 
 // ── List ─────────────────────────────────────────────────────────────────
@@ -57,6 +59,27 @@ pub async fn funder_list(
     params: &ListParams,
 ) -> Result<SlimListResponse<FunderSummary>, OpenAlexError> {
     summary_list_result(client.list_funders(params).await, FunderSummary::from)
+}
+
+pub async fn domain_list(
+    client: &OpenAlexClient,
+    params: &ListParams,
+) -> Result<SlimListResponse<DomainSummary>, OpenAlexError> {
+    summary_list_result(client.list_domains(params).await, DomainSummary::from)
+}
+
+pub async fn field_list(
+    client: &OpenAlexClient,
+    params: &ListParams,
+) -> Result<SlimListResponse<FieldSummary>, OpenAlexError> {
+    summary_list_result(client.list_fields(params).await, FieldSummary::from)
+}
+
+pub async fn subfield_list(
+    client: &OpenAlexClient,
+    params: &ListParams,
+) -> Result<SlimListResponse<SubfieldSummary>, OpenAlexError> {
+    summary_list_result(client.list_subfields(params).await, SubfieldSummary::from)
 }
 
 // ── Get ──────────────────────────────────────────────────────────────────
@@ -117,6 +140,30 @@ pub async fn funder_get(
     client.get_funder(id, params).await
 }
 
+pub async fn domain_get(
+    client: &OpenAlexClient,
+    id: &str,
+    params: &GetParams,
+) -> Result<Domain, OpenAlexError> {
+    client.get_domain(id, params).await
+}
+
+pub async fn field_get(
+    client: &OpenAlexClient,
+    id: &str,
+    params: &GetParams,
+) -> Result<Field, OpenAlexError> {
+    client.get_field(id, params).await
+}
+
+pub async fn subfield_get(
+    client: &OpenAlexClient,
+    id: &str,
+    params: &GetParams,
+) -> Result<Subfield, OpenAlexError> {
+    client.get_subfield(id, params).await
+}
+
 // ── Autocomplete ─────────────────────────────────────────────────────────
 
 pub async fn work_autocomplete(
@@ -166,6 +213,13 @@ pub async fn funder_autocomplete(
     q: &str,
 ) -> Result<AutocompleteResponse, OpenAlexError> {
     client.autocomplete_funders(q).await
+}
+
+pub async fn subfield_autocomplete(
+    client: &OpenAlexClient,
+    q: &str,
+) -> Result<AutocompleteResponse, OpenAlexError> {
+    client.autocomplete_subfields(q).await
 }
 
 // ── Find ─────────────────────────────────────────────────────────────────

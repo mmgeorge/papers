@@ -209,10 +209,10 @@ async fn test_api_error_returns_error_result() {
 // ── Tool listing tests ───────────────────────────────────────────────
 
 #[test]
-fn test_tool_router_has_22_tools() {
+fn test_tool_router_has_29_tools() {
     let router = PapersMcp::tool_router();
     let tools = router.list_all();
-    assert_eq!(tools.len(), 22);
+    assert_eq!(tools.len(), 29);
 }
 
 #[test]
@@ -229,6 +229,9 @@ fn test_all_tool_names_present() {
         "topic_list",
         "publisher_list",
         "funder_list",
+        "domain_list",
+        "field_list",
+        "subfield_list",
         "work_get",
         "author_get",
         "source_get",
@@ -236,6 +239,9 @@ fn test_all_tool_names_present() {
         "topic_get",
         "publisher_get",
         "funder_get",
+        "domain_get",
+        "field_get",
+        "subfield_get",
         "work_autocomplete",
         "author_autocomplete",
         "source_autocomplete",
@@ -243,6 +249,7 @@ fn test_all_tool_names_present() {
         "concept_autocomplete",
         "publisher_autocomplete",
         "funder_autocomplete",
+        "subfield_autocomplete",
         "work_find",
     ];
 
@@ -269,10 +276,10 @@ fn test_all_tools_have_descriptions() {
 
 mod summary_unit {
     use papers::summary::{
-        AuthorSummary, FunderSummary, InstitutionSummary, PublisherSummary, SourceSummary,
-        TopicSummary, WorkSummary,
+        AuthorSummary, DomainSummary, FieldSummary, FunderSummary, InstitutionSummary,
+        PublisherSummary, SourceSummary, SubfieldSummary, TopicSummary, WorkSummary,
     };
-    use papers::{Author, Funder, Institution, Publisher, Source, Topic, Work};
+    use papers::{Author, Domain, Field, Funder, Institution, Publisher, Source, Subfield, Topic, Work};
 
     fn minimal_work() -> Work {
         serde_json::from_str(r#"{
@@ -547,6 +554,114 @@ mod summary_unit {
         assert!(!json.contains("roles"));
         assert!(json.contains("awards_count"));
         assert!(json.contains("country_code"));
+    }
+
+    fn minimal_domain() -> Domain {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/domains/3",
+            "display_name": "Physical Sciences",
+            "description": "branch of natural science",
+            "fields": [
+                {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"},
+                {"id": "https://openalex.org/fields/22", "display_name": "Engineering"}
+            ],
+            "siblings": [{"id": "https://openalex.org/domains/1", "display_name": "Life Sciences"}],
+            "works_count": 134263529,
+            "cited_by_count": 1500000000
+        }"#).unwrap()
+    }
+
+    fn minimal_field() -> Field {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/fields/17",
+            "display_name": "Computer Science",
+            "description": "study of computation",
+            "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+            "subfields": [
+                {"id": "https://openalex.org/subfields/1702", "display_name": "Artificial Intelligence"},
+                {"id": "https://openalex.org/subfields/1703", "display_name": "Computational Theory"}
+            ],
+            "siblings": [{"id": "https://openalex.org/fields/22", "display_name": "Engineering"}],
+            "works_count": 22038624,
+            "cited_by_count": 500000000
+        }"#).unwrap()
+    }
+
+    fn minimal_subfield() -> Subfield {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/subfields/1702",
+            "display_name": "Artificial Intelligence",
+            "description": "study of intelligent agents",
+            "field": {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"},
+            "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+            "topics": [{"id": "https://openalex.org/T10028", "display_name": "Topic Modeling"}],
+            "siblings": [{"id": "https://openalex.org/subfields/1703", "display_name": "Computational Theory"}],
+            "works_count": 9059921,
+            "cited_by_count": 200000000
+        }"#).unwrap()
+    }
+
+    #[test]
+    fn domain_summary_maps_essential_fields() {
+        let s = DomainSummary::from(minimal_domain());
+        assert_eq!(s.id, "https://openalex.org/domains/3");
+        assert_eq!(s.display_name.as_deref(), Some("Physical Sciences"));
+        assert_eq!(s.description.as_deref(), Some("branch of natural science"));
+        assert_eq!(s.fields, vec!["Computer Science", "Engineering"]);
+        assert_eq!(s.works_count, Some(134263529));
+        assert_eq!(s.cited_by_count, Some(1500000000));
+    }
+
+    #[test]
+    fn domain_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&DomainSummary::from(minimal_domain())).unwrap();
+        assert!(!json.contains("siblings"));
+        assert!(!json.contains("display_name_alternatives"));
+        assert!(!json.contains("works_api_url"));
+        assert!(json.contains("fields"));
+        assert!(json.contains("works_count"));
+    }
+
+    #[test]
+    fn field_summary_maps_essential_fields() {
+        let s = FieldSummary::from(minimal_field());
+        assert_eq!(s.id, "https://openalex.org/fields/17");
+        assert_eq!(s.display_name.as_deref(), Some("Computer Science"));
+        assert_eq!(s.domain.as_deref(), Some("Physical Sciences"));
+        assert_eq!(s.subfield_count, 2);
+        assert_eq!(s.works_count, Some(22038624));
+        assert_eq!(s.cited_by_count, Some(500000000));
+    }
+
+    #[test]
+    fn field_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&FieldSummary::from(minimal_field())).unwrap();
+        assert!(!json.contains("siblings"));
+        assert!(!json.contains("display_name_alternatives"));
+        assert!(!json.contains("subfields"));
+        assert!(json.contains("subfield_count"));
+        assert!(json.contains("domain"));
+    }
+
+    #[test]
+    fn subfield_summary_maps_essential_fields() {
+        let s = SubfieldSummary::from(minimal_subfield());
+        assert_eq!(s.id, "https://openalex.org/subfields/1702");
+        assert_eq!(s.display_name.as_deref(), Some("Artificial Intelligence"));
+        assert_eq!(s.field.as_deref(), Some("Computer Science"));
+        assert_eq!(s.domain.as_deref(), Some("Physical Sciences"));
+        assert_eq!(s.works_count, Some(9059921));
+        assert_eq!(s.cited_by_count, Some(200000000));
+    }
+
+    #[test]
+    fn subfield_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&SubfieldSummary::from(minimal_subfield())).unwrap();
+        assert!(!json.contains("siblings"));
+        assert!(!json.contains("topics"));
+        assert!(!json.contains("display_name_alternatives"));
+        assert!(json.contains("\"field\""));
+        assert!(json.contains("\"domain\""));
     }
 }
 
@@ -837,6 +952,123 @@ async fn test_list_funders_returns_slim_response() {
     assert!(text.contains("awards_count"));
     assert!(!text.contains("alternate_titles"), "alternate_titles should be absent");
     assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+}
+
+fn domain_list_json() -> String {
+    r#"{
+        "meta": {"count": 4, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/domains/3",
+            "display_name": "Physical Sciences",
+            "description": "branch of natural science",
+            "fields": [{"id": "https://openalex.org/fields/17", "display_name": "Computer Science"}],
+            "siblings": [{"id": "https://openalex.org/domains/1", "display_name": "Life Sciences"}],
+            "display_name_alternatives": [],
+            "works_count": 134263529,
+            "cited_by_count": 1500000000,
+            "works_api_url": "https://api.openalex.org/works?filter=primary_topic.domain.id:domains/3"
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn field_list_json() -> String {
+    r#"{
+        "meta": {"count": 26, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/fields/17",
+            "display_name": "Computer Science",
+            "description": "study of computation",
+            "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+            "subfields": [{"id": "https://openalex.org/subfields/1702", "display_name": "Artificial Intelligence"}],
+            "siblings": [{"id": "https://openalex.org/fields/22", "display_name": "Engineering"}],
+            "display_name_alternatives": [],
+            "works_count": 22038624,
+            "cited_by_count": 500000000,
+            "works_api_url": "https://api.openalex.org/works?filter=primary_topic.field.id:fields/17"
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn subfield_list_json() -> String {
+    r#"{
+        "meta": {"count": 252, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/subfields/1702",
+            "display_name": "Artificial Intelligence",
+            "description": "study of intelligent agents",
+            "field": {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"},
+            "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+            "topics": [{"id": "https://openalex.org/T10028", "display_name": "Topic Modeling"}],
+            "siblings": [{"id": "https://openalex.org/subfields/1703", "display_name": "Computational Theory"}],
+            "display_name_alternatives": [],
+            "works_count": 9059921,
+            "cited_by_count": 200000000,
+            "works_api_url": "https://api.openalex.org/works?filter=primary_topic.subfield.id:subfields/1702"
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+#[tokio::test]
+async fn test_list_domains_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/domains"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(domain_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.domain_list(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("Physical Sciences"));
+    assert!(text.contains("Computer Science")); // field display_name kept
+    assert!(!text.contains("siblings"), "siblings should be absent");
+    assert!(!text.contains("works_api_url"), "works_api_url should be absent");
+    assert!(!text.contains("display_name_alternatives"), "display_name_alternatives should be absent");
+}
+
+#[tokio::test]
+async fn test_list_fields_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(field_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.field_list(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("Computer Science"));
+    assert!(text.contains("Physical Sciences")); // domain display_name kept
+    assert!(text.contains("subfield_count")); // count instead of full list
+    assert!(!text.contains("siblings"), "siblings should be absent");
+    assert!(!text.contains("Artificial Intelligence"), "subfields list should be absent");
+}
+
+#[tokio::test]
+async fn test_list_subfields_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/subfields"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(subfield_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.subfield_list(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("Artificial Intelligence"));
+    assert!(text.contains("Computer Science")); // field display_name kept
+    assert!(text.contains("Physical Sciences")); // domain display_name kept
+    assert!(!text.contains("siblings"), "siblings should be absent");
+    assert!(!text.contains("topics"), "topics should be absent");
 }
 
 // ── Schema tests ─────────────────────────────────────────────────────

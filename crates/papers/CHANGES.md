@@ -27,6 +27,9 @@ MCP tool names follow `{entity_singular}_{verb}` rather than the
 | `topic_list` | `GET /topics` |
 | `publisher_list` | `GET /publishers` |
 | `funder_list` | `GET /funders` |
+| `domain_list` | `GET /domains` |
+| `field_list` | `GET /fields` |
+| `subfield_list` | `GET /subfields` |
 | `work_get` | `GET /works/{id}` |
 | `author_get` | `GET /authors/{id}` |
 | `source_get` | `GET /sources/{id}` |
@@ -34,6 +37,9 @@ MCP tool names follow `{entity_singular}_{verb}` rather than the
 | `topic_get` | `GET /topics/{id}` |
 | `publisher_get` | `GET /publishers/{id}` |
 | `funder_get` | `GET /funders/{id}` |
+| `domain_get` | `GET /domains/{id}` |
+| `field_get` | `GET /fields/{id}` |
+| `subfield_get` | `GET /subfields/{id}` |
 | `work_autocomplete` | `GET /autocomplete/works` |
 | `author_autocomplete` | `GET /autocomplete/authors` |
 | `source_autocomplete` | `GET /autocomplete/sources` |
@@ -41,6 +47,7 @@ MCP tool names follow `{entity_singular}_{verb}` rather than the
 | `concept_autocomplete` | `GET /autocomplete/concepts` |
 | `publisher_autocomplete` | `GET /autocomplete/publishers` |
 | `funder_autocomplete` | `GET /autocomplete/funders` |
+| `subfield_autocomplete` | `GET /autocomplete/subfields` |
 | `work_find` | `GET /find/works` (or `POST` for long queries) |
 
 **Reason:** Grouping by entity first makes the tool list sort and scan naturally
@@ -52,7 +59,7 @@ etc. — rather than by verb, which clusters unrelated entities.
 ## List endpoints — slim summary structs
 
 **Implemented in:** `src/summary.rs`
-**Applied in:** `src/server.rs` — all 7 `*_list` tools use `summary_list_result()`
+**Applied in:** `src/server.rs` — all 10 `*_list` tools use `summary_list_result()`
 
 ### Response shape change
 
@@ -194,17 +201,66 @@ objects or IDs), `alternate_titles`, `counts_by_year`, `roles`, `summary_stats`,
 
 ---
 
+### `list_domains` → `DomainSummary`
+
+**Reason:** Full `Domain` includes `ids`, `display_name_alternatives`, `siblings`
+(other 3 domains), `works_api_url`, `updated_date`, and `created_date`. These
+are not needed for discovery. The `fields` list is flattened to display_name
+strings for quick scanning.
+
+| Kept | Dropped |
+|------|---------|
+| `id`, `display_name`, `description` | `ids`, `display_name_alternatives` |
+| `fields` (display_name strings only) | `siblings` |
+| `works_count`, `cited_by_count` | `works_api_url`, `updated_date`, `created_date` |
+
+---
+
+### `list_fields` → `FieldSummary`
+
+**Reason:** Full `Field` includes `ids`, `display_name_alternatives`, `subfields`
+(full list of child entities), `siblings` (all 25 other fields), `works_api_url`,
+`updated_date`, and `created_date`. The subfields list is summarized as a count.
+
+| Kept | Dropped |
+|------|---------|
+| `id`, `display_name`, `description` | `ids`, `display_name_alternatives` |
+| `domain` (display_name only) | `subfields` (replaced by `subfield_count`) |
+| `subfield_count` (number of child subfields) | `siblings` |
+| `works_count`, `cited_by_count` | `works_api_url`, `updated_date`, `created_date` |
+
+---
+
+### `list_subfields` → `SubfieldSummary`
+
+**Reason:** Full `Subfield` includes `ids`, `display_name_alternatives`, `topics`
+(can be 50+ child topics), `siblings` (all subfields in the same field),
+`works_api_url`, `updated_date`, and `created_date`. The topics list is dropped
+entirely since it can be very large.
+
+| Kept | Dropped |
+|------|---------|
+| `id`, `display_name`, `description` | `ids`, `display_name_alternatives` |
+| `field`, `domain` (display_names only, hierarchy flattened) | `topics` |
+| `works_count`, `cited_by_count` | `siblings` |
+| | `works_api_url`, `updated_date`, `created_date` |
+
+---
+
 ## Get tools — no response changes
 
-All 7 `*_get` tools (`work_get`, `author_get`, `source_get`, `institution_get`,
-`topic_get`, `publisher_get`, `funder_get`) return the full deserialized API
-response. Use these when full entity data is needed after identifying items
-via a `*_list` tool.
+All 10 `*_get` tools (`work_get`, `author_get`, `source_get`, `institution_get`,
+`topic_get`, `publisher_get`, `funder_get`, `domain_get`, `field_get`,
+`subfield_get`) return the full deserialized API response. Use these when full
+entity data is needed after identifying items via a `*_list` tool.
 
 ## Autocomplete tools — no response changes
 
-All 7 `*_autocomplete` tools return the full `AutocompleteResponse`. These
+All 8 `*_autocomplete` tools return the full `AutocompleteResponse`. These
 already return compact 10-result lists, so no slimming is needed.
+
+Note: only subfields support autocomplete among the hierarchy entities.
+Domains and fields do not have autocomplete endpoints (the API returns 404).
 
 ## `work_find` — no response changes
 

@@ -224,6 +224,105 @@ fn funder_get_body() -> String {
     }"#.to_string()
 }
 
+fn domain_list_body() -> String {
+    r#"{
+        "meta": {"count": 4, "db_response_time_ms": 5, "page": 1, "per_page": 10, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/domains/3",
+            "display_name": "Physical Sciences",
+            "description": "branch of natural science that studies non-living systems",
+            "fields": [{"id": "https://openalex.org/fields/17", "display_name": "Computer Science"}],
+            "siblings": [],
+            "works_count": 134263529,
+            "cited_by_count": 1500000000
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn domain_get_body() -> String {
+    r#"{
+        "id": "https://openalex.org/domains/3",
+        "display_name": "Physical Sciences",
+        "description": "branch of natural science that studies non-living systems",
+        "fields": [
+            {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"},
+            {"id": "https://openalex.org/fields/22", "display_name": "Engineering"}
+        ],
+        "siblings": [{"id": "https://openalex.org/domains/1", "display_name": "Life Sciences"}],
+        "works_count": 134263529,
+        "cited_by_count": 1500000000
+    }"#.to_string()
+}
+
+fn field_list_body() -> String {
+    r#"{
+        "meta": {"count": 26, "db_response_time_ms": 5, "page": 1, "per_page": 10, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/fields/17",
+            "display_name": "Computer Science",
+            "description": "study of computation and information",
+            "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+            "subfields": [
+                {"id": "https://openalex.org/subfields/1702", "display_name": "Artificial Intelligence"},
+                {"id": "https://openalex.org/subfields/1703", "display_name": "Computational Theory"}
+            ],
+            "siblings": [],
+            "works_count": 22038624,
+            "cited_by_count": 500000000
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn field_get_body() -> String {
+    r#"{
+        "id": "https://openalex.org/fields/17",
+        "display_name": "Computer Science",
+        "description": "study of computation and information",
+        "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+        "subfields": [
+            {"id": "https://openalex.org/subfields/1702", "display_name": "Artificial Intelligence"},
+            {"id": "https://openalex.org/subfields/1703", "display_name": "Computational Theory"}
+        ],
+        "siblings": [{"id": "https://openalex.org/fields/22", "display_name": "Engineering"}],
+        "works_count": 22038624,
+        "cited_by_count": 500000000
+    }"#.to_string()
+}
+
+fn subfield_list_body() -> String {
+    r#"{
+        "meta": {"count": 252, "db_response_time_ms": 5, "page": 1, "per_page": 10, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/subfields/1702",
+            "display_name": "Artificial Intelligence",
+            "description": "study of intelligent agents",
+            "field": {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"},
+            "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+            "topics": [{"id": "https://openalex.org/T10028", "display_name": "Topic Modeling"}],
+            "siblings": [],
+            "works_count": 9059921,
+            "cited_by_count": 200000000
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn subfield_get_body() -> String {
+    r#"{
+        "id": "https://openalex.org/subfields/1702",
+        "display_name": "Artificial Intelligence",
+        "description": "study of intelligent agents",
+        "field": {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"},
+        "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+        "topics": [{"id": "https://openalex.org/T10028", "display_name": "Topic Modeling"}],
+        "siblings": [{"id": "https://openalex.org/subfields/1703", "display_name": "Computational Theory"}],
+        "works_count": 9059921,
+        "cited_by_count": 200000000
+    }"#.to_string()
+}
+
 fn autocomplete_body() -> String {
     r#"{
         "meta": {"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 10},
@@ -570,13 +669,131 @@ async fn test_api_error_returns_clean_message() {
     assert!(err.contains("404") || err.contains("not found") || err.len() > 0);
 }
 
+// ── Domain tests ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_domain_list_text() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/domains"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(domain_list_body()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let result = papers::api::domain_list(&client, &ListParams::default()).await.unwrap();
+    let text = papers_cli_format::format_domain_list(&result);
+
+    assert!(text.contains("Physical Sciences"));
+    assert!(text.contains("Computer Science"));
+    assert!(text.contains("134263529 works"));
+}
+
+#[tokio::test]
+async fn test_domain_get_text() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/domains/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(domain_get_body()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let domain = papers::api::domain_get(&client, "3", &GetParams::default()).await.unwrap();
+    let text = papers_cli_format::format_domain_get(&domain);
+
+    assert!(text.contains("Physical Sciences"));
+    assert!(text.contains("Computer Science"));
+    assert!(text.contains("Engineering"));
+}
+
+// ── Field tests ───────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_field_list_text() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(field_list_body()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let result = papers::api::field_list(&client, &ListParams::default()).await.unwrap();
+    let text = papers_cli_format::format_field_list(&result);
+
+    assert!(text.contains("Computer Science"));
+    assert!(text.contains("Physical Sciences"));
+    assert!(text.contains("2 subfields"));
+}
+
+#[tokio::test]
+async fn test_field_get_text() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fields/17"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(field_get_body()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let field = papers::api::field_get(&client, "17", &GetParams::default()).await.unwrap();
+    let text = papers_cli_format::format_field_get(&field);
+
+    assert!(text.contains("Computer Science"));
+    assert!(text.contains("Physical Sciences"));
+    assert!(text.contains("Artificial Intelligence"));
+}
+
+// ── Subfield tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_subfield_list_text() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/subfields"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(subfield_list_body()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let result = papers::api::subfield_list(&client, &ListParams::default()).await.unwrap();
+    let text = papers_cli_format::format_subfield_list(&result);
+
+    assert!(text.contains("Artificial Intelligence"));
+    assert!(text.contains("Computer Science"));
+    assert!(text.contains("Physical Sciences"));
+}
+
+#[tokio::test]
+async fn test_subfield_get_text() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/subfields/1702"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(subfield_get_body()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let subfield = papers::api::subfield_get(&client, "1702", &GetParams::default()).await.unwrap();
+    let text = papers_cli_format::format_subfield_get(&subfield);
+
+    assert!(text.contains("Artificial Intelligence"));
+    assert!(text.contains("Computer Science"));
+    assert!(text.contains("study of intelligent agents"));
+}
+
 // Format functions exposed for testing (re-use from main crate's format module)
 mod papers_cli_format {
     use papers::summary::{
-        AuthorSummary, FunderSummary, InstitutionSummary, PublisherSummary, SourceSummary,
-        SlimListResponse, TopicSummary, WorkSummary,
+        AuthorSummary, DomainSummary, FieldSummary, FunderSummary, InstitutionSummary,
+        PublisherSummary, SlimListResponse, SourceSummary, SubfieldSummary, TopicSummary,
+        WorkSummary,
     };
-    use papers::{Author, AutocompleteResponse, Funder, Institution, ListMeta, Publisher, Source, Topic, Work};
+    use papers::{
+        Author, AutocompleteResponse, Domain, Field, Funder, Institution, ListMeta, Publisher,
+        Source, Subfield, Topic, Work,
+    };
 
     fn meta_line(meta: &ListMeta) -> String {
         let page = meta.page.unwrap_or(1);
@@ -788,6 +1005,99 @@ mod papers_cli_format {
         }
         if let Some(a) = f.awards_count {
             out.push_str(&format!("{a} awards\n"));
+        }
+        out
+    }
+
+    pub fn format_domain_list(resp: &SlimListResponse<DomainSummary>) -> String {
+        let mut out = format!("{}\n", meta_line(&resp.meta));
+        for (i, d) in resp.results.iter().enumerate() {
+            let name = d.display_name.as_deref().unwrap_or("?");
+            out.push_str(&format!("\n {:>2}  {name}\n", i + 1));
+            if !d.fields.is_empty() {
+                out.push_str(&format!("     Fields: {}\n", d.fields.join(", ")));
+            }
+            let mut stats = Vec::new();
+            if let Some(w) = d.works_count { stats.push(format!("{w} works")); }
+            if let Some(c) = d.cited_by_count { stats.push(format!("{c} citations")); }
+            if !stats.is_empty() { out.push_str(&format!("     {}\n", stats.join(" · "))); }
+        }
+        out
+    }
+
+    pub fn format_domain_get(d: &Domain) -> String {
+        let mut out = String::new();
+        let name = d.display_name.as_deref().unwrap_or("?");
+        out.push_str(&format!("Domain: {name}\n"));
+        if let Some(fields) = &d.fields {
+            for f in fields {
+                if let Some(name) = &f.display_name {
+                    out.push_str(&format!("  {name}\n"));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn format_field_list(resp: &SlimListResponse<FieldSummary>) -> String {
+        let mut out = format!("{}\n", meta_line(&resp.meta));
+        for (i, f) in resp.results.iter().enumerate() {
+            let name = f.display_name.as_deref().unwrap_or("?");
+            out.push_str(&format!("\n {:>2}  {name}\n", i + 1));
+            if let Some(domain) = &f.domain {
+                out.push_str(&format!("     Domain: {domain}\n"));
+            }
+            out.push_str(&format!("     {} subfields\n", f.subfield_count));
+        }
+        out
+    }
+
+    pub fn format_field_get(f: &Field) -> String {
+        let mut out = String::new();
+        let name = f.display_name.as_deref().unwrap_or("?");
+        out.push_str(&format!("Field: {name}\n"));
+        if let Some(domain) = &f.domain {
+            if let Some(dn) = &domain.display_name {
+                out.push_str(&format!("Domain: {dn}\n"));
+            }
+        }
+        if let Some(subfields) = &f.subfields {
+            for sf in subfields {
+                if let Some(name) = &sf.display_name {
+                    out.push_str(&format!("  {name}\n"));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn format_subfield_list(resp: &SlimListResponse<SubfieldSummary>) -> String {
+        let mut out = format!("{}\n", meta_line(&resp.meta));
+        for (i, s) in resp.results.iter().enumerate() {
+            let name = s.display_name.as_deref().unwrap_or("?");
+            out.push_str(&format!("\n {:>2}  {name}\n", i + 1));
+            let hierarchy: Vec<_> = [s.field.as_deref(), s.domain.as_deref()]
+                .into_iter().flatten().collect();
+            if !hierarchy.is_empty() {
+                out.push_str(&format!("     {}\n", hierarchy.join(" → ")));
+            }
+        }
+        out
+    }
+
+    pub fn format_subfield_get(s: &Subfield) -> String {
+        let mut out = String::new();
+        let name = s.display_name.as_deref().unwrap_or("?");
+        out.push_str(&format!("Subfield: {name}\n"));
+        let hierarchy: Vec<_> = [
+            s.field.as_ref().and_then(|f| f.display_name.as_deref()),
+            s.domain.as_ref().and_then(|d| d.display_name.as_deref()),
+        ].into_iter().flatten().collect();
+        if !hierarchy.is_empty() {
+            out.push_str(&format!("Hierarchy: {}\n", hierarchy.join(" → ")));
+        }
+        if let Some(desc) = &s.description {
+            out.push_str(&format!("{desc}\n"));
         }
         out
     }

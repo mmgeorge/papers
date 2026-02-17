@@ -1,4 +1,4 @@
-use papers_openalex::{Author, Funder, Institution, ListMeta, ListResponse, Publisher, Source, Topic, Work};
+use papers_openalex::{Author, Domain, Field, Funder, Institution, ListMeta, ListResponse, Publisher, Source, Subfield, Topic, Work};
 use papers_openalex::OpenAlexError;
 use serde::Serialize;
 
@@ -273,6 +273,98 @@ impl From<Funder> for FunderSummary {
             awards_count: f.awards_count,
             works_count: f.works_count,
             cited_by_count: f.cited_by_count,
+        }
+    }
+}
+
+// ── DomainSummary ────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct DomainSummary {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub fields: Vec<String>,
+    pub works_count: Option<i64>,
+    pub cited_by_count: Option<i64>,
+}
+
+impl From<Domain> for DomainSummary {
+    fn from(d: Domain) -> Self {
+        let fields = d
+            .fields
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|f| f.display_name)
+            .collect();
+
+        DomainSummary {
+            id: d.id,
+            display_name: d.display_name,
+            description: d.description,
+            fields,
+            works_count: d.works_count,
+            cited_by_count: d.cited_by_count,
+        }
+    }
+}
+
+// ── FieldSummary ─────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct FieldSummary {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub domain: Option<String>,
+    pub subfield_count: usize,
+    pub works_count: Option<i64>,
+    pub cited_by_count: Option<i64>,
+}
+
+impl From<Field> for FieldSummary {
+    fn from(f: Field) -> Self {
+        let domain = f.domain.and_then(|d| d.display_name);
+        let subfield_count = f.subfields.as_ref().map_or(0, |s| s.len());
+
+        FieldSummary {
+            id: f.id,
+            display_name: f.display_name,
+            description: f.description,
+            domain,
+            subfield_count,
+            works_count: f.works_count,
+            cited_by_count: f.cited_by_count,
+        }
+    }
+}
+
+// ── SubfieldSummary ──────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct SubfieldSummary {
+    pub id: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub field: Option<String>,
+    pub domain: Option<String>,
+    pub works_count: Option<i64>,
+    pub cited_by_count: Option<i64>,
+}
+
+impl From<Subfield> for SubfieldSummary {
+    fn from(s: Subfield) -> Self {
+        let field = s.field.and_then(|f| f.display_name);
+        let domain = s.domain.and_then(|d| d.display_name);
+
+        SubfieldSummary {
+            id: s.id,
+            display_name: s.display_name,
+            description: s.description,
+            field,
+            domain,
+            works_count: s.works_count,
+            cited_by_count: s.cited_by_count,
         }
     }
 }

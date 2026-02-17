@@ -128,6 +128,60 @@ fn funder_json() -> &'static str {
     }"#
 }
 
+fn domain_json() -> &'static str {
+    r#"{
+        "id": "https://openalex.org/domains/3",
+        "display_name": "Physical Sciences",
+        "description": "branch of natural science that studies non-living systems",
+        "fields": [
+            {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"},
+            {"id": "https://openalex.org/fields/22", "display_name": "Engineering"}
+        ],
+        "siblings": [{"id": "https://openalex.org/domains/1", "display_name": "Life Sciences"}],
+        "display_name_alternatives": [],
+        "works_count": 134263529,
+        "cited_by_count": 1500000000,
+        "works_api_url": "https://api.openalex.org/works?filter=primary_topic.domain.id:domains/3"
+    }"#
+}
+
+fn field_json() -> &'static str {
+    r#"{
+        "id": "https://openalex.org/fields/17",
+        "display_name": "Computer Science",
+        "description": "study of computation and information",
+        "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+        "subfields": [
+            {"id": "https://openalex.org/subfields/1702", "display_name": "Artificial Intelligence"},
+            {"id": "https://openalex.org/subfields/1703", "display_name": "Computational Theory and Mathematics"}
+        ],
+        "siblings": [{"id": "https://openalex.org/fields/22", "display_name": "Engineering"}],
+        "display_name_alternatives": [],
+        "works_count": 22038624,
+        "cited_by_count": 500000000,
+        "works_api_url": "https://api.openalex.org/works?filter=primary_topic.field.id:fields/17"
+    }"#
+}
+
+fn subfield_json() -> &'static str {
+    r#"{
+        "id": "https://openalex.org/subfields/1702",
+        "display_name": "Artificial Intelligence",
+        "description": "study of intelligent agents",
+        "field": {"id": "https://openalex.org/fields/17", "display_name": "Computer Science"},
+        "domain": {"id": "https://openalex.org/domains/3", "display_name": "Physical Sciences"},
+        "topics": [
+            {"id": "https://openalex.org/T10028", "display_name": "Topic Modeling"},
+            {"id": "https://openalex.org/T10029", "display_name": "Neural Architecture Search"}
+        ],
+        "siblings": [{"id": "https://openalex.org/subfields/1703", "display_name": "Computational Theory"}],
+        "display_name_alternatives": [],
+        "works_count": 9059921,
+        "cited_by_count": 200000000,
+        "works_api_url": "https://api.openalex.org/works?filter=primary_topic.subfield.id:subfields/1702"
+    }"#
+}
+
 fn autocomplete_response() -> String {
     r#"{
         "meta": {"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 10},
@@ -491,6 +545,119 @@ async fn test_work_find_uses_post_for_long_query() {
     let params = FindWorksParams::builder().query(long_query).build();
     let result = api::work_find(&client, &params).await.unwrap();
     assert_eq!(result.results.len(), 1);
+}
+
+#[tokio::test]
+async fn test_domain_list_applies_summary() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/domains"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(list_response(domain_json())))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let result = api::domain_list(&client, &ListParams::default()).await.unwrap();
+    let s = &result.results[0];
+
+    assert_eq!(s.fields, vec!["Computer Science", "Engineering"]);
+
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(!json.contains("siblings"));
+    assert!(!json.contains("display_name_alternatives"));
+    assert!(!json.contains("works_api_url"));
+}
+
+#[tokio::test]
+async fn test_domain_get_returns_full() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/domains/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(domain_json()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let domain = api::domain_get(&client, "3", &GetParams::default()).await.unwrap();
+    let json = serde_json::to_string(&domain).unwrap();
+    assert!(json.contains("siblings"));
+    assert!(json.contains("works_api_url"));
+}
+
+#[tokio::test]
+async fn test_field_list_applies_summary() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fields"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(list_response(field_json())))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let result = api::field_list(&client, &ListParams::default()).await.unwrap();
+    let s = &result.results[0];
+
+    assert_eq!(s.domain.as_deref(), Some("Physical Sciences"));
+    assert_eq!(s.subfield_count, 2);
+
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(!json.contains("siblings"));
+    assert!(!json.contains("display_name_alternatives"));
+    assert!(!json.contains("subfields"));
+}
+
+#[tokio::test]
+async fn test_field_get_returns_full() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fields/17"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(field_json()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let field = api::field_get(&client, "17", &GetParams::default()).await.unwrap();
+    let json = serde_json::to_string(&field).unwrap();
+    assert!(json.contains("siblings"));
+    assert!(json.contains("subfields"));
+}
+
+#[tokio::test]
+async fn test_subfield_list_applies_summary() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/subfields"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(list_response(subfield_json())))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let result = api::subfield_list(&client, &ListParams::default()).await.unwrap();
+    let s = &result.results[0];
+
+    assert_eq!(s.field.as_deref(), Some("Computer Science"));
+    assert_eq!(s.domain.as_deref(), Some("Physical Sciences"));
+
+    let json = serde_json::to_string(&result).unwrap();
+    assert!(!json.contains("siblings"));
+    assert!(!json.contains("topics"));
+    assert!(!json.contains("display_name_alternatives"));
+}
+
+#[tokio::test]
+async fn test_subfield_get_returns_full() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/subfields/1702"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(subfield_json()))
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let subfield = api::subfield_get(&client, "1702", &GetParams::default()).await.unwrap();
+    let json = serde_json::to_string(&subfield).unwrap();
+    assert!(json.contains("siblings"));
+    assert!(json.contains("topics"));
 }
 
 #[tokio::test]

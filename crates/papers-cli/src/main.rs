@@ -3,8 +3,9 @@ mod format;
 
 use clap::Parser;
 use cli::{
-    AuthorCommand, Cli, ConceptCommand, EntityCommand, FunderCommand, InstitutionCommand,
-    PublisherCommand, SourceCommand, TopicCommand, WorkCommand,
+    AuthorCommand, Cli, ConceptCommand, DomainCommand, EntityCommand, FieldCommand,
+    FunderCommand, InstitutionCommand, PublisherCommand, SourceCommand, SubfieldCommand,
+    TopicCommand, WorkCommand,
 };
 use papers::{FindWorksParams, GetParams, ListParams, OpenAlexClient};
 
@@ -319,6 +320,102 @@ async fn main() {
             }
             FunderCommand::Autocomplete { query, json } => {
                 match papers::api::funder_autocomplete(&client, &query).await {
+                    Ok(resp) => {
+                        if json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_autocomplete(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+        },
+
+        EntityCommand::Domain { cmd } => match cmd {
+            DomainCommand::List { args } => {
+                let params = list_params_from_args(&args);
+                match papers::api::domain_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_domain_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+            DomainCommand::Get { id, json } => {
+                match papers::api::domain_get(&client, &id, &GetParams::default()).await {
+                    Ok(domain) => {
+                        if json {
+                            print_json(&domain);
+                        } else {
+                            print!("{}", format::format_domain_get(&domain));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+        },
+
+        EntityCommand::Field { cmd } => match cmd {
+            FieldCommand::List { args } => {
+                let params = list_params_from_args(&args);
+                match papers::api::field_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_field_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+            FieldCommand::Get { id, json } => {
+                match papers::api::field_get(&client, &id, &GetParams::default()).await {
+                    Ok(field) => {
+                        if json {
+                            print_json(&field);
+                        } else {
+                            print!("{}", format::format_field_get(&field));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+        },
+
+        EntityCommand::Subfield { cmd } => match cmd {
+            SubfieldCommand::List { args } => {
+                let params = list_params_from_args(&args);
+                match papers::api::subfield_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_subfield_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+            SubfieldCommand::Get { id, json } => {
+                match papers::api::subfield_get(&client, &id, &GetParams::default()).await {
+                    Ok(subfield) => {
+                        if json {
+                            print_json(&subfield);
+                        } else {
+                            print!("{}", format::format_subfield_get(&subfield));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+            SubfieldCommand::Autocomplete { query, json } => {
+                match papers::api::subfield_autocomplete(&client, &query).await {
                     Ok(resp) => {
                         if json {
                             print_json(&resp);

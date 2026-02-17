@@ -1,10 +1,10 @@
 use papers::summary::{
-    AuthorSummary, FunderSummary, InstitutionSummary, PublisherSummary, SourceSummary,
-    SlimListResponse, TopicSummary, WorkSummary,
+    AuthorSummary, DomainSummary, FieldSummary, FunderSummary, InstitutionSummary,
+    PublisherSummary, SlimListResponse, SourceSummary, SubfieldSummary, TopicSummary, WorkSummary,
 };
 use papers::{
-    Author, AutocompleteResponse, FindWorksResponse, Funder, Institution, ListMeta, Publisher,
-    Source, Topic, Work,
+    Author, AutocompleteResponse, Domain, Field, FindWorksResponse, Funder, Institution, ListMeta,
+    Publisher, Source, Subfield, Topic, Work,
 };
 
 // ── Meta line ─────────────────────────────────────────────────────────────
@@ -500,6 +500,184 @@ pub fn format_funder_get(f: &Funder) -> String {
         out.push_str(&format!("Awards:  {a}\n"));
     }
     if let Some(c) = f.cited_by_count {
+        out.push_str(&format!("Citations: {c}\n"));
+    }
+    out
+}
+
+// ── Domain ────────────────────────────────────────────────────────────────
+
+pub fn format_domain_list(resp: &SlimListResponse<DomainSummary>) -> String {
+    let mut out = format!("{}\n", meta_line(&resp.meta));
+    for (i, d) in resp.results.iter().enumerate() {
+        let name = d.display_name.as_deref().unwrap_or("?");
+        out.push_str(&format!("\n {:>2}  {name}\n", i + 1));
+
+        if let Some(desc) = &d.description {
+            out.push_str(&format!("     {desc}\n"));
+        }
+        if !d.fields.is_empty() {
+            out.push_str(&format!("     Fields: {}\n", d.fields.join(", ")));
+        }
+        let mut stats = Vec::new();
+        if let Some(w) = d.works_count {
+            stats.push(format!("{w} works"));
+        }
+        if let Some(c) = d.cited_by_count {
+            stats.push(format!("{c} citations"));
+        }
+        if !stats.is_empty() {
+            out.push_str(&format!("     {}\n", stats.join(" · ")));
+        }
+    }
+    out
+}
+
+pub fn format_domain_get(d: &Domain) -> String {
+    let mut out = String::new();
+    let name = d.display_name.as_deref().unwrap_or("?");
+    out.push_str(&format!("Domain: {name}\n"));
+    out.push_str(&format!("ID:     {}\n", d.id));
+    if let Some(desc) = &d.description {
+        out.push_str(&format!("Description: {desc}\n"));
+    }
+    if let Some(fields) = &d.fields {
+        if !fields.is_empty() {
+            out.push_str("Fields:\n");
+            for f in fields {
+                if let Some(name) = &f.display_name {
+                    out.push_str(&format!("  {name}\n"));
+                }
+            }
+        }
+    }
+    if let Some(w) = d.works_count {
+        out.push_str(&format!("Works: {w}\n"));
+    }
+    if let Some(c) = d.cited_by_count {
+        out.push_str(&format!("Citations: {c}\n"));
+    }
+    out
+}
+
+// ── Field ─────────────────────────────────────────────────────────────────
+
+pub fn format_field_list(resp: &SlimListResponse<FieldSummary>) -> String {
+    let mut out = format!("{}\n", meta_line(&resp.meta));
+    for (i, f) in resp.results.iter().enumerate() {
+        let name = f.display_name.as_deref().unwrap_or("?");
+        out.push_str(&format!("\n {:>2}  {name}\n", i + 1));
+
+        if let Some(domain) = &f.domain {
+            out.push_str(&format!("     Domain: {domain}\n"));
+        }
+        let mut parts = Vec::new();
+        parts.push(format!("{} subfields", f.subfield_count));
+        if let Some(w) = f.works_count {
+            parts.push(format!("{w} works"));
+        }
+        if let Some(c) = f.cited_by_count {
+            parts.push(format!("{c} citations"));
+        }
+        out.push_str(&format!("     {}\n", parts.join(" · ")));
+
+        if let Some(desc) = &f.description {
+            let snippet = if desc.len() > 150 {
+                format!("{}…", &desc[..150])
+            } else {
+                desc.clone()
+            };
+            out.push_str(&format!("     {snippet}\n"));
+        }
+    }
+    out
+}
+
+pub fn format_field_get(f: &Field) -> String {
+    let mut out = String::new();
+    let name = f.display_name.as_deref().unwrap_or("?");
+    out.push_str(&format!("Field: {name}\n"));
+    out.push_str(&format!("ID:    {}\n", f.id));
+    if let Some(domain) = &f.domain {
+        if let Some(dn) = &domain.display_name {
+            out.push_str(&format!("Domain: {dn}\n"));
+        }
+    }
+    if let Some(desc) = &f.description {
+        out.push_str(&format!("Description: {desc}\n"));
+    }
+    if let Some(subfields) = &f.subfields {
+        if !subfields.is_empty() {
+            out.push_str("Subfields:\n");
+            for sf in subfields {
+                if let Some(name) = &sf.display_name {
+                    out.push_str(&format!("  {name}\n"));
+                }
+            }
+        }
+    }
+    if let Some(w) = f.works_count {
+        out.push_str(&format!("Works: {w}\n"));
+    }
+    if let Some(c) = f.cited_by_count {
+        out.push_str(&format!("Citations: {c}\n"));
+    }
+    out
+}
+
+// ── Subfield ──────────────────────────────────────────────────────────────
+
+pub fn format_subfield_list(resp: &SlimListResponse<SubfieldSummary>) -> String {
+    let mut out = format!("{}\n", meta_line(&resp.meta));
+    for (i, s) in resp.results.iter().enumerate() {
+        let name = s.display_name.as_deref().unwrap_or("?");
+        out.push_str(&format!("\n {:>2}  {name}\n", i + 1));
+
+        let hierarchy: Vec<_> = [s.field.as_deref(), s.domain.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !hierarchy.is_empty() {
+            out.push_str(&format!("     {}\n", hierarchy.join(" → ")));
+        }
+        if let Some(desc) = &s.description {
+            let snippet = if desc.len() > 150 {
+                format!("{}…", &desc[..150])
+            } else {
+                desc.clone()
+            };
+            out.push_str(&format!("     {snippet}\n"));
+        }
+        if let Some(c) = s.cited_by_count {
+            out.push_str(&format!("     {c} citations\n"));
+        }
+    }
+    out
+}
+
+pub fn format_subfield_get(s: &Subfield) -> String {
+    let mut out = String::new();
+    let name = s.display_name.as_deref().unwrap_or("?");
+    out.push_str(&format!("Subfield: {name}\n"));
+    out.push_str(&format!("ID:       {}\n", s.id));
+
+    let hierarchy: Vec<_> = [
+        s.field.as_ref().and_then(|f| f.display_name.as_deref()),
+        s.domain.as_ref().and_then(|d| d.display_name.as_deref()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !hierarchy.is_empty() {
+        out.push_str(&format!("Hierarchy: {}\n", hierarchy.join(" → ")));
+    }
+    if let Some(desc) = &s.description {
+        out.push_str(&format!("\nDescription:\n  {desc}\n"));
+    }
+    if let Some(w) = s.works_count {
+        out.push_str(&format!("Works: {w}\n"));
+    }
+    if let Some(c) = s.cited_by_count {
         out.push_str(&format!("Citations: {c}\n"));
     }
     out

@@ -2,7 +2,8 @@ pub mod api;
 pub mod summary;
 
 pub use papers_openalex::{
-    Author, Funder, Institution, Publisher, Source, Topic, Work,
+    Author, Domain, Field, Funder, HierarchyEntity, HierarchyIds, Institution, Publisher, Source,
+    Subfield, Topic, Work,
     OpenAlexClient, OpenAlexError, Result,
     ListParams, GetParams, FindWorksParams,
     ListMeta, ListResponse,
