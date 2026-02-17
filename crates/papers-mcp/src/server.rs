@@ -6,6 +6,10 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
 
 use crate::params::{AutocompleteToolParams, FindWorksToolParams, GetToolParams, ListToolParams};
+use crate::summary::{
+    AuthorSummary, FunderSummary, InstitutionSummary, PublisherSummary, SourceSummary,
+    TopicSummary, WorkSummary, summary_list_result,
+};
 
 #[derive(Clone)]
 pub struct PapersMcp {
@@ -52,43 +56,43 @@ impl PapersMcp {
     /// Search, filter, and paginate scholarly works (articles, preprints, datasets, etc.). 240M+ records.
     #[tool]
     pub async fn list_works(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(self.client.list_works(&params.into_list_params()).await)
+        summary_list_result(self.client.list_works(&params.into_list_params()).await, WorkSummary::from)
     }
 
     /// Search, filter, and paginate author profiles. 110M+ records.
     #[tool]
     pub async fn list_authors(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(self.client.list_authors(&params.into_list_params()).await)
+        summary_list_result(self.client.list_authors(&params.into_list_params()).await, AuthorSummary::from)
     }
 
     /// Search, filter, and paginate publishing venues (journals, repositories, conferences).
     #[tool]
     pub async fn list_sources(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(self.client.list_sources(&params.into_list_params()).await)
+        summary_list_result(self.client.list_sources(&params.into_list_params()).await, SourceSummary::from)
     }
 
     /// Search, filter, and paginate research institutions and organizations.
     #[tool]
     pub async fn list_institutions(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(self.client.list_institutions(&params.into_list_params()).await)
+        summary_list_result(self.client.list_institutions(&params.into_list_params()).await, InstitutionSummary::from)
     }
 
     /// Search, filter, and paginate research topics (3-level hierarchy: domain > field > subfield > topic).
     #[tool]
     pub async fn list_topics(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(self.client.list_topics(&params.into_list_params()).await)
+        summary_list_result(self.client.list_topics(&params.into_list_params()).await, TopicSummary::from)
     }
 
     /// Search, filter, and paginate publishing organizations (e.g. Elsevier, Springer Nature).
     #[tool]
     pub async fn list_publishers(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(self.client.list_publishers(&params.into_list_params()).await)
+        summary_list_result(self.client.list_publishers(&params.into_list_params()).await, PublisherSummary::from)
     }
 
     /// Search, filter, and paginate funding organizations (e.g. NIH, NSF, ERC).
     #[tool]
     pub async fn list_funders(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(self.client.list_funders(&params.into_list_params()).await)
+        summary_list_result(self.client.list_funders(&params.into_list_params()).await, FunderSummary::from)
     }
 
     // ── Get tools ────────────────────────────────────────────────────────

@@ -265,6 +265,580 @@ fn test_all_tools_have_descriptions() {
     }
 }
 
+// ── Summary mapping unit tests ────────────────────────────────────────
+
+mod summary_unit {
+    use papers_mcp::summary::{
+        AuthorSummary, FunderSummary, InstitutionSummary, PublisherSummary, SourceSummary,
+        TopicSummary, WorkSummary,
+    };
+    use openalex::{Author, Funder, Institution, Publisher, Source, Topic, Work};
+
+    fn minimal_work() -> Work {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/W1",
+            "doi": "https://doi.org/10.1234/test",
+            "display_name": "Test Work",
+            "publication_year": 2023,
+            "type": "article",
+            "cited_by_count": 42,
+            "open_access": {"is_oa": true, "oa_status": "gold", "oa_url": "https://example.com/oa"},
+            "authorships": [
+                {"author": {"id": "https://openalex.org/A1", "display_name": "Alice"}},
+                {"author": {"id": "https://openalex.org/A2", "display_name": "Bob"}}
+            ],
+            "primary_location": {
+                "source": {"id": "https://openalex.org/S1", "display_name": "Nature"}
+            },
+            "primary_topic": {"id": "https://openalex.org/T1", "display_name": "Machine Learning"}
+        }"#).unwrap()
+    }
+
+    fn minimal_author() -> Author {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/A1",
+            "display_name": "Alice Smith",
+            "orcid": "https://orcid.org/0000-0001-2345-6789",
+            "works_count": 50,
+            "cited_by_count": 1000,
+            "summary_stats": {"2yr_mean_citedness": 3.5, "h_index": 15, "i10_index": 20},
+            "last_known_institutions": [
+                {"id": "https://openalex.org/I1", "display_name": "MIT"}
+            ],
+            "topics": [
+                {"id": "https://openalex.org/T1", "display_name": "AI"},
+                {"id": "https://openalex.org/T2", "display_name": "ML"},
+                {"id": "https://openalex.org/T3", "display_name": "NLP"},
+                {"id": "https://openalex.org/T4", "display_name": "CV"}
+            ]
+        }"#).unwrap()
+    }
+
+    fn minimal_source() -> Source {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/S1",
+            "display_name": "Nature",
+            "issn_l": "0028-0836",
+            "type": "journal",
+            "is_oa": false,
+            "is_in_doaj": false,
+            "works_count": 450000,
+            "cited_by_count": 25000000,
+            "summary_stats": {"2yr_mean_citedness": 50.2, "h_index": 1200, "i10_index": 50000},
+            "host_organization_name": "Springer Nature"
+        }"#).unwrap()
+    }
+
+    fn minimal_institution() -> Institution {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/I1",
+            "display_name": "Harvard University",
+            "ror": "https://ror.org/03vek6s52",
+            "country_code": "US",
+            "type": "education",
+            "works_count": 800000,
+            "cited_by_count": 40000000,
+            "summary_stats": {"2yr_mean_citedness": 10.0, "h_index": 800, "i10_index": 200000},
+            "geo": {"city": "Cambridge", "country": "United States", "latitude": 42.37, "longitude": -71.11}
+        }"#).unwrap()
+    }
+
+    fn minimal_topic() -> Topic {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/T1",
+            "display_name": "Machine Learning",
+            "description": "Research on machine learning algorithms and applications.",
+            "subfield": {"id": 17, "display_name": "Artificial Intelligence"},
+            "field": {"id": 1, "display_name": "Computer Science"},
+            "domain": {"id": 1, "display_name": "Physical Sciences"},
+            "works_count": 500000,
+            "cited_by_count": 10000000
+        }"#).unwrap()
+    }
+
+    fn minimal_publisher() -> Publisher {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/P1",
+            "display_name": "Springer Nature",
+            "hierarchy_level": 0,
+            "country_codes": ["DE"],
+            "works_count": 2750825,
+            "cited_by_count": 75000000
+        }"#).unwrap()
+    }
+
+    fn minimal_funder() -> Funder {
+        serde_json::from_str(r#"{
+            "id": "https://openalex.org/F1",
+            "display_name": "National Institutes of Health",
+            "country_code": "US",
+            "description": "US federal biomedical research agency",
+            "awards_count": 500000,
+            "works_count": 3253779,
+            "cited_by_count": 150000000
+        }"#).unwrap()
+    }
+
+    #[test]
+    fn work_summary_maps_essential_fields() {
+        let s = WorkSummary::from(minimal_work());
+        assert_eq!(s.id, "https://openalex.org/W1");
+        assert_eq!(s.title.as_deref(), Some("Test Work"));
+        assert_eq!(s.doi.as_deref(), Some("https://doi.org/10.1234/test"));
+        assert_eq!(s.publication_year, Some(2023));
+        assert_eq!(s.r#type.as_deref(), Some("article"));
+        assert_eq!(s.cited_by_count, Some(42));
+        assert_eq!(s.is_oa, Some(true));
+        assert_eq!(s.oa_url.as_deref(), Some("https://example.com/oa"));
+        assert_eq!(s.journal.as_deref(), Some("Nature"));
+        assert_eq!(s.primary_topic.as_deref(), Some("Machine Learning"));
+        assert_eq!(s.authors, vec!["Alice", "Bob"]);
+    }
+
+    #[test]
+    fn work_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&WorkSummary::from(minimal_work())).unwrap();
+        // Verbose fields that should NOT appear
+        assert!(!json.contains("referenced_works"));
+        assert!(!json.contains("counts_by_year"));
+        assert!(!json.contains("locations"));
+        assert!(!json.contains("mesh"));
+        assert!(!json.contains("concepts"));
+        // Essential fields that SHOULD appear
+        assert!(json.contains("cited_by_count"));
+        assert!(json.contains("publication_year"));
+    }
+
+    #[test]
+    fn author_summary_maps_essential_fields() {
+        let s = AuthorSummary::from(minimal_author());
+        assert_eq!(s.id, "https://openalex.org/A1");
+        assert_eq!(s.display_name.as_deref(), Some("Alice Smith"));
+        assert_eq!(s.orcid.as_deref(), Some("https://orcid.org/0000-0001-2345-6789"));
+        assert_eq!(s.works_count, Some(50));
+        assert_eq!(s.cited_by_count, Some(1000));
+        assert_eq!(s.h_index, Some(15));
+        assert_eq!(s.last_known_institutions, vec!["MIT"]);
+        // Only first 3 topics kept
+        assert_eq!(s.top_topics, vec!["AI", "ML", "NLP"]);
+        assert_eq!(s.top_topics.len(), 3);
+    }
+
+    #[test]
+    fn author_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&AuthorSummary::from(minimal_author())).unwrap();
+        assert!(!json.contains("affiliations"));
+        assert!(!json.contains("counts_by_year"));
+        assert!(!json.contains("x_concepts"));
+        assert!(json.contains("h_index"));
+        assert!(json.contains("works_count"));
+    }
+
+    #[test]
+    fn source_summary_maps_essential_fields() {
+        let s = SourceSummary::from(minimal_source());
+        assert_eq!(s.id, "https://openalex.org/S1");
+        assert_eq!(s.display_name.as_deref(), Some("Nature"));
+        assert_eq!(s.issn_l.as_deref(), Some("0028-0836"));
+        assert_eq!(s.r#type.as_deref(), Some("journal"));
+        assert_eq!(s.is_oa, Some(false));
+        assert_eq!(s.is_in_doaj, Some(false));
+        assert_eq!(s.works_count, Some(450000));
+        assert_eq!(s.cited_by_count, Some(25000000));
+        assert_eq!(s.h_index, Some(1200));
+        assert_eq!(s.host_organization_name.as_deref(), Some("Springer Nature"));
+    }
+
+    #[test]
+    fn source_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&SourceSummary::from(minimal_source())).unwrap();
+        assert!(!json.contains("apc_prices"));
+        assert!(!json.contains("counts_by_year"));
+        assert!(!json.contains("topics"));
+        assert!(json.contains("h_index"));
+        assert!(json.contains("issn_l"));
+    }
+
+    #[test]
+    fn institution_summary_maps_essential_fields() {
+        let s = InstitutionSummary::from(minimal_institution());
+        assert_eq!(s.id, "https://openalex.org/I1");
+        assert_eq!(s.display_name.as_deref(), Some("Harvard University"));
+        assert_eq!(s.ror.as_deref(), Some("https://ror.org/03vek6s52"));
+        assert_eq!(s.country_code.as_deref(), Some("US"));
+        assert_eq!(s.r#type.as_deref(), Some("education"));
+        assert_eq!(s.city.as_deref(), Some("Cambridge"));
+        assert_eq!(s.works_count, Some(800000));
+        assert_eq!(s.cited_by_count, Some(40000000));
+        assert_eq!(s.h_index, Some(800));
+    }
+
+    #[test]
+    fn institution_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&InstitutionSummary::from(minimal_institution())).unwrap();
+        assert!(!json.contains("associated_institutions"));
+        assert!(!json.contains("counts_by_year"));
+        assert!(!json.contains("repositories"));
+        assert!(json.contains("h_index"));
+        assert!(json.contains("country_code"));
+    }
+
+    #[test]
+    fn topic_summary_maps_essential_fields() {
+        let s = TopicSummary::from(minimal_topic());
+        assert_eq!(s.id, "https://openalex.org/T1");
+        assert_eq!(s.display_name.as_deref(), Some("Machine Learning"));
+        assert!(s.description.as_deref().unwrap().contains("machine learning"));
+        assert_eq!(s.subfield.as_deref(), Some("Artificial Intelligence"));
+        assert_eq!(s.field.as_deref(), Some("Computer Science"));
+        assert_eq!(s.domain.as_deref(), Some("Physical Sciences"));
+        assert_eq!(s.works_count, Some(500000));
+        assert_eq!(s.cited_by_count, Some(10000000));
+    }
+
+    #[test]
+    fn topic_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&TopicSummary::from(minimal_topic())).unwrap();
+        assert!(!json.contains("keywords"));
+        assert!(!json.contains("siblings"));
+        assert!(!json.contains("works_api_url"));
+        assert!(json.contains("description"));
+        assert!(json.contains("works_count"));
+    }
+
+    #[test]
+    fn publisher_summary_maps_essential_fields() {
+        let s = PublisherSummary::from(minimal_publisher());
+        assert_eq!(s.id, "https://openalex.org/P1");
+        assert_eq!(s.display_name.as_deref(), Some("Springer Nature"));
+        assert_eq!(s.hierarchy_level, Some(0));
+        assert_eq!(s.country_codes.as_deref(), Some(["DE".to_string()].as_slice()));
+        assert_eq!(s.works_count, Some(2750825));
+        assert_eq!(s.cited_by_count, Some(75000000));
+    }
+
+    #[test]
+    fn publisher_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&PublisherSummary::from(minimal_publisher())).unwrap();
+        assert!(!json.contains("lineage"));
+        assert!(!json.contains("counts_by_year"));
+        assert!(!json.contains("alternate_titles"));
+        assert!(json.contains("hierarchy_level"));
+        assert!(json.contains("country_codes"));
+    }
+
+    #[test]
+    fn funder_summary_maps_essential_fields() {
+        let s = FunderSummary::from(minimal_funder());
+        assert_eq!(s.id, "https://openalex.org/F1");
+        assert_eq!(s.display_name.as_deref(), Some("National Institutes of Health"));
+        assert_eq!(s.country_code.as_deref(), Some("US"));
+        assert_eq!(s.description.as_deref(), Some("US federal biomedical research agency"));
+        assert_eq!(s.awards_count, Some(500000));
+        assert_eq!(s.works_count, Some(3253779));
+        assert_eq!(s.cited_by_count, Some(150000000));
+    }
+
+    #[test]
+    fn funder_summary_serializes_without_verbose_fields() {
+        let json = serde_json::to_string(&FunderSummary::from(minimal_funder())).unwrap();
+        assert!(!json.contains("alternate_titles"));
+        assert!(!json.contains("counts_by_year"));
+        assert!(!json.contains("roles"));
+        assert!(json.contains("awards_count"));
+        assert!(json.contains("country_code"));
+    }
+}
+
+// ── Summary integration tests (wiremock) ─────────────────────────────
+
+fn work_list_json() -> String {
+    r#"{
+        "meta": {"count": 1, "db_response_time_ms": 10, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/W1",
+            "display_name": "Bitonic Sort",
+            "doi": "https://doi.org/10.1234/test",
+            "publication_year": 2020,
+            "type": "article",
+            "cited_by_count": 99,
+            "open_access": {"is_oa": true, "oa_status": "gold", "oa_url": "https://example.com/oa"},
+            "authorships": [{"author": {"id": "https://openalex.org/A1", "display_name": "Alice"}}],
+            "primary_location": {"source": {"id": "https://openalex.org/S1", "display_name": "JACM"}},
+            "primary_topic": {"id": "https://openalex.org/T1", "display_name": "Algorithms"},
+            "abstract_inverted_index": {"Sorting": [0], "networks": [1]},
+            "referenced_works": ["https://openalex.org/W2"],
+            "counts_by_year": [{"year": 2020, "works_count": 1, "cited_by_count": 50}],
+            "locations": [{"is_oa": true}],
+            "mesh": [{"descriptor_name": "Algorithms"}]
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn author_list_json() -> String {
+    r#"{
+        "meta": {"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/A1",
+            "display_name": "Alice",
+            "orcid": "https://orcid.org/0000-0001-0000-0001",
+            "works_count": 10,
+            "cited_by_count": 200,
+            "summary_stats": {"2yr_mean_citedness": 2.0, "h_index": 8, "i10_index": 5},
+            "last_known_institutions": [{"id": "https://openalex.org/I1", "display_name": "MIT"}],
+            "topics": [{"id": "https://openalex.org/T1", "display_name": "AI"}],
+            "affiliations": [{"institution": {"id": "https://openalex.org/I1", "display_name": "MIT"}, "years": [2020]}],
+            "counts_by_year": [{"year": 2020, "works_count": 2, "cited_by_count": 50}]
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn source_list_json() -> String {
+    r#"{
+        "meta": {"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/S1",
+            "display_name": "Nature",
+            "issn_l": "0028-0836",
+            "type": "journal",
+            "is_oa": false,
+            "is_in_doaj": false,
+            "works_count": 450000,
+            "cited_by_count": 25000000,
+            "summary_stats": {"2yr_mean_citedness": 50.0, "h_index": 1200, "i10_index": 50000},
+            "host_organization_name": "Springer Nature",
+            "apc_prices": [{"price": 5000, "currency": "USD"}],
+            "counts_by_year": [{"year": 2020, "works_count": 1000, "cited_by_count": 500000}]
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn institution_list_json() -> String {
+    r#"{
+        "meta": {"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/I1",
+            "display_name": "Harvard University",
+            "ror": "https://ror.org/03vek6s52",
+            "country_code": "US",
+            "type": "education",
+            "works_count": 800000,
+            "cited_by_count": 40000000,
+            "summary_stats": {"2yr_mean_citedness": 10.0, "h_index": 800, "i10_index": 200000},
+            "geo": {"city": "Cambridge", "country": "United States", "latitude": 42.37, "longitude": -71.11},
+            "associated_institutions": [{"id": "https://openalex.org/I2", "display_name": "HMS", "relationship": "child"}],
+            "counts_by_year": [{"year": 2020, "works_count": 10000, "cited_by_count": 1000000}]
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn topic_list_json() -> String {
+    r#"{
+        "meta": {"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/T1",
+            "display_name": "Machine Learning",
+            "description": "Research on ML algorithms.",
+            "keywords": ["neural networks", "deep learning"],
+            "subfield": {"id": 17, "display_name": "Artificial Intelligence"},
+            "field": {"id": 1, "display_name": "Computer Science"},
+            "domain": {"id": 1, "display_name": "Physical Sciences"},
+            "works_count": 500000,
+            "cited_by_count": 10000000,
+            "siblings": [{"id": "https://openalex.org/T2", "display_name": "Deep Learning"}]
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn publisher_list_json() -> String {
+    r#"{
+        "meta": {"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/P1",
+            "display_name": "Springer Nature",
+            "hierarchy_level": 0,
+            "country_codes": ["DE"],
+            "works_count": 2750825,
+            "cited_by_count": 75000000,
+            "alternate_titles": ["Springer"],
+            "lineage": [{"id": "https://openalex.org/P1"}],
+            "counts_by_year": [{"year": 2020, "works_count": 100000, "cited_by_count": 5000000}]
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+fn funder_list_json() -> String {
+    r#"{
+        "meta": {"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 25, "next_cursor": null, "groups_count": null},
+        "results": [{
+            "id": "https://openalex.org/F1",
+            "display_name": "National Institutes of Health",
+            "country_code": "US",
+            "description": "US federal biomedical research agency",
+            "awards_count": 500000,
+            "works_count": 3253779,
+            "cited_by_count": 150000000,
+            "alternate_titles": ["NIH"],
+            "counts_by_year": [{"year": 2020, "works_count": 200000, "cited_by_count": 10000000}]
+        }],
+        "group_by": []
+    }"#.to_string()
+}
+
+#[tokio::test]
+async fn test_list_works_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(work_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.list_works(Parameters(params)).await.unwrap();
+
+    // Essential fields present
+    assert!(text.contains("Bitonic Sort"), "title missing");
+    assert!(text.contains("\"cited_by_count\""), "cited_by_count missing");
+    assert!(text.contains("Alice"), "author name missing");
+    assert!(text.contains("JACM"), "journal missing");
+    assert!(text.contains("Algorithms"), "primary_topic missing");
+    assert!(text.contains("Sorting networks"), "abstract_text missing");
+    // Verbose fields absent
+    assert!(!text.contains("referenced_works"), "referenced_works should be absent");
+    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+    assert!(!text.contains("\"locations\""), "locations should be absent");
+    assert!(!text.contains("mesh"), "mesh should be absent");
+    // group_by absent
+    assert!(!text.contains("group_by"), "group_by should be absent");
+}
+
+#[tokio::test]
+async fn test_list_authors_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(author_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.list_authors(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("Alice"));
+    assert!(text.contains("h_index"));
+    assert!(text.contains("MIT"));
+    assert!(!text.contains("affiliations"), "affiliations should be absent");
+    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+}
+
+#[tokio::test]
+async fn test_list_sources_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/sources"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(source_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.list_sources(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("Nature"));
+    assert!(text.contains("h_index"));
+    assert!(text.contains("Springer Nature"));
+    assert!(!text.contains("apc_prices"), "apc_prices should be absent");
+    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+}
+
+#[tokio::test]
+async fn test_list_institutions_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/institutions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(institution_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.list_institutions(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("Harvard University"));
+    assert!(text.contains("Cambridge"));
+    assert!(text.contains("h_index"));
+    assert!(!text.contains("associated_institutions"), "associated_institutions should be absent");
+    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+}
+
+#[tokio::test]
+async fn test_list_topics_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/topics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(topic_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.list_topics(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("Machine Learning"));
+    assert!(text.contains("Artificial Intelligence"));
+    assert!(text.contains("Computer Science"));
+    assert!(!text.contains("keywords"), "keywords should be absent");
+    assert!(!text.contains("siblings"), "siblings should be absent");
+}
+
+#[tokio::test]
+async fn test_list_publishers_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/publishers"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(publisher_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.list_publishers(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("Springer Nature"));
+    assert!(text.contains("hierarchy_level"));
+    assert!(!text.contains("alternate_titles"), "alternate_titles should be absent");
+    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+    assert!(!text.contains("lineage"), "lineage should be absent");
+}
+
+#[tokio::test]
+async fn test_list_funders_returns_slim_response() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/funders"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(funder_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let text = server.list_funders(Parameters(params)).await.unwrap();
+
+    assert!(text.contains("National Institutes of Health"));
+    assert!(text.contains("awards_count"));
+    assert!(!text.contains("alternate_titles"), "alternate_titles should be absent");
+    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+}
+
 // ── Schema tests ─────────────────────────────────────────────────────
 
 #[test]
