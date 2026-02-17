@@ -167,6 +167,10 @@ Plus `find_works` / `find_works_post` for AI semantic search (requires API key, 
 | `FindWorksResponse` | Semantic search | `results` (ranked by `score` 0.0--1.0) |
 
 
+## Higher-level bindings
+
+The [`papers`](../papers/) crate wraps `papers-openalex` with slimmed list responses, filter aliases, and a simpler function-based API. If you're building a tool on top of OpenAlex rather than working with the raw API, start there.
+
 ## Testing
 
 ```sh
