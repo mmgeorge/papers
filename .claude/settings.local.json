@@ -1,6 +1,8 @@
 {
   "permissions": {
     "allow": [
+      "WebFetch(domain:*)",
+      "WebSearch",
       "Bash(cargo:*)",
       "Bash(ls:*)",
       "Bash(curl:*)",
@@ -8,23 +10,14 @@
       "Bash(python3:*)",
       "Bash(dir:*)",
       "Bash(find:*)",
-      "WebFetch(domain:*)",
-      "WebSearch",
+      "Bash(echo:*)",
+      "Bash(git mv:*)",
       "mcp__papers-mcp__*",
       "mcp__papers-mcp__list_authors",
       "mcp__papers-mcp__list_institutions",
       "mcp__papers-mcp__work_list",
-      "Bash(del \"D:\\\\code\\\\papers-mcp\\\\crates\\\\papers-mcp\\\\src\\\\summary.rs\")",
-      "Bash(del \"D:\\\\code\\\\papers-mcp\\\\crates\\\\papers-mcp\\\\CHANGES.md\")",
-      "Bash(echo:*)",
-      "WebFetch(domain:docs.openalex.org)",
-      "Bash(git mv:*)",
       "mcp__papers-mcp__topic_list",
-      "mcp__papers-mcp__work_get",
-      "Bash($env:COLUMNS=100)",
-      "WebFetch(domain:docs.rs)",
-      "WebFetch(domain:github.com)",
-      "WebFetch(domain:api.openalex.org)"
+      "mcp__papers-mcp__work_get"
     ]
   },
   "enableAllProjectMcpServers": true,
