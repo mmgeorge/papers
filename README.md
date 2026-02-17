@@ -1,5 +1,7 @@
 # papers
 
+[![CI](https://github.com/mmgeorge/papers/actions/workflows/ci.yml/badge.svg)](https://github.com/mmgeorge/papers/actions/workflows/ci.yml)
+
 Monorepo for `papers` — a CLI and MCP server for searching academic research via OpenAlex.
 
 [OpenAlex](https://openalex.org) is a fully open catalog of the global research system: over
