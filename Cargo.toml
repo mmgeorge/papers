@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 authors = ["Matt George"]
 description = "CLI and MCP server for searching academic research and papers via OpenAlex"
@@ -12,8 +12,8 @@ readme = "README.md"
 repository = "https://github.com/mmgeorge/papers"
 
 [workspace.dependencies]
-papers-openalex = { path = "crates/papers-openalex", version = "0.1.3" }
-papers-core = { path = "crates/papers-core", version = "0.1.3" }
+papers-openalex = { path = "crates/papers-openalex", version = "0.1.4" }
+papers-core = { path = "crates/papers-core", version = "0.1.4" }
 dirs = "6"
 bon = "3"
 clap = { version = "4", features = ["derive", "wrap_help"] }

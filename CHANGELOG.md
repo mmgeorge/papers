@@ -1,8 +1,9 @@
-## [unreleased]
+## [0.1.4] - 2026-02-17
 
 ### Other
 
 - Setup cargo-dist for releases
+- Refactor release hook configuration
 
 ### Miscellaneous Tasks
 
@@ -10,6 +11,7 @@
 - Configure cargo-release with git-cliff integration
 - Release v0.1.3
 - Fix git-cliff workdir in release hook
+- Update cliff
 ## [papers-openalex-v0.1.2] - 2026-02-17
 
 ### Miscellaneous Tasks

@@ -1045,7 +1045,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "papers-cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "clap",
  "papers-core",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "papers-core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "papers-openalex",
  "serde",
@@ -1069,7 +1069,7 @@ dependencies = [
 
 [[package]]
 name = "papers-mcp"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "papers-core",
  "rmcp",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "papers-openalex"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bon",
  "dirs",
