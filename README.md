@@ -25,6 +25,8 @@ Options:
   -h, --help  Print help
 ```
 
+See [`papers-cli`](crates/papers-cli/)  for more usage examples.
+
 
 ## Crates
 
