@@ -4,6 +4,9 @@ Async Rust client for the [OpenAlex REST API](https://docs.openalex.org).
 
 OpenAlex is a free, open catalog of scholarly research: 240M+ works, 110M+ authors, and metadata across sources, institutions, topics, publishers, and funders.
 
+The [`papers`](../papers/) crate wraps `papers-openalex` with slimmed list responses, filter aliases, and a simpler function-based API.
+
+
 ## Quick start
 
 ```rust
@@ -166,10 +169,6 @@ Plus `find_works` / `find_works_post` for AI semantic search (requires API key, 
 | `AutocompleteResponse` | Autocomplete endpoints | `meta`, `results` (up to 10 matches) |
 | `FindWorksResponse` | Semantic search | `results` (ranked by `score` 0.0--1.0) |
 
-
-## Higher-level bindings
-
-The [`papers`](../papers/) crate wraps `papers-openalex` with slimmed list responses, filter aliases, and a simpler function-based API. If you're building a tool on top of OpenAlex rather than working with the raw API, start there.
 
 ## Testing
 
