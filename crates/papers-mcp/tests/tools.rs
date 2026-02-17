@@ -1,4 +1,4 @@
-use openalex::OpenAlexClient;
+use papers::OpenAlexClient;
 use papers_mcp::server::PapersMcp;
 use rmcp::handler::server::wrapper::Parameters;
 use wiremock::matchers::{method, path, query_param};
@@ -268,11 +268,11 @@ fn test_all_tools_have_descriptions() {
 // ── Summary mapping unit tests ────────────────────────────────────────
 
 mod summary_unit {
-    use papers_mcp::summary::{
+    use papers::summary::{
         AuthorSummary, FunderSummary, InstitutionSummary, PublisherSummary, SourceSummary,
         TopicSummary, WorkSummary,
     };
-    use openalex::{Author, Funder, Institution, Publisher, Source, Topic, Work};
+    use papers::{Author, Funder, Institution, Publisher, Source, Topic, Work};
 
     fn minimal_work() -> Work {
         serde_json::from_str(r#"{

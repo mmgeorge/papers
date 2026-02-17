@@ -1,0 +1,13 @@
+[package]
+name = "papers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+openalex = { path = "../openalex" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock = "0.6"

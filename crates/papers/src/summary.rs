@@ -2,7 +2,7 @@ use openalex::{Author, Funder, Institution, ListMeta, ListResponse, Publisher, S
 use openalex::OpenAlexError;
 use serde::Serialize;
 
-/// Slim wrapper returned by all list tools — keeps meta but drops group_by
+/// Slim wrapper returned by all list functions — keeps meta but drops group_by
 /// and maps full entities to their summary equivalents.
 #[derive(Serialize)]
 pub struct SlimListResponse<S: Serialize> {
@@ -13,15 +13,11 @@ pub struct SlimListResponse<S: Serialize> {
 pub fn summary_list_result<T, S: Serialize>(
     result: Result<ListResponse<T>, OpenAlexError>,
     f: impl Fn(T) -> S,
-) -> Result<String, String> {
-    match result {
-        Ok(r) => serde_json::to_string_pretty(&SlimListResponse {
-            meta: r.meta,
-            results: r.results.into_iter().map(f).collect(),
-        })
-        .map_err(|e| format!("JSON serialization error: {e}")),
-        Err(e) => Err(e.to_string()),
-    }
+) -> Result<SlimListResponse<S>, OpenAlexError> {
+    result.map(|r| SlimListResponse {
+        meta: r.meta,
+        results: r.results.into_iter().map(f).collect(),
+    })
 }
 
 // ── WorkSummary ───────────────────────────────────────────────────────────

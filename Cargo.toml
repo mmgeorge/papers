@@ -4,6 +4,7 @@ resolver = "3"
 
 [workspace.dependencies]
 bon = "3"
+clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 reqwest = { version = "0.13", features = ["json", "query", "stream"] }
 rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }

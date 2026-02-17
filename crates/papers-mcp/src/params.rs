@@ -43,8 +43,8 @@ pub struct ListToolParams {
 }
 
 impl ListToolParams {
-    pub fn into_list_params(self) -> openalex::ListParams {
-        openalex::ListParams {
+    pub fn into_list_params(self) -> papers::ListParams {
+        papers::ListParams {
             filter: self.filter,
             search: self.search,
             sort: self.sort,
@@ -71,8 +71,8 @@ pub struct GetToolParams {
 }
 
 impl GetToolParams {
-    pub fn into_get_params(&self) -> openalex::GetParams {
-        openalex::GetParams {
+    pub fn into_get_params(&self) -> papers::GetParams {
+        papers::GetParams {
             select: self.select.clone(),
         }
     }
@@ -100,8 +100,8 @@ pub struct FindWorksToolParams {
 }
 
 impl FindWorksToolParams {
-    pub fn into_find_params(self) -> openalex::FindWorksParams {
-        openalex::FindWorksParams {
+    pub fn into_find_params(self) -> papers::FindWorksParams {
+        papers::FindWorksParams {
             query: self.query,
             count: self.count,
             filter: self.filter,
