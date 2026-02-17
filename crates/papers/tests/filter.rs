@@ -1,5 +1,9 @@
 use papers::filter::{WorkFilterAliases, resolve_work_filters};
-use papers::OpenAlexClient;
+use papers::{
+    AuthorListParams, FieldListParams, FunderListParams, InstitutionListParams, OpenAlexClient,
+    PublisherListParams, SourceListParams, SubfieldListParams, TopicListParams,
+};
+use papers::api;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -274,6 +278,11 @@ async fn test_resolve_not_found_error() {
     assert!(err.contains("authors"));
 }
 
+/// Empty list response body for mocking entity list endpoints.
+fn empty_list_response_json() -> &'static str {
+    r#"{"meta": {"count": 0, "db_response_time_ms": 5, "page": 1, "per_page": 10, "next_cursor": null, "groups_count": null}, "results": [], "group_by": []}"#
+}
+
 #[tokio::test]
 async fn test_resolve_overlap_error() {
     let mock = MockServer::start().await;
@@ -339,4 +348,371 @@ async fn test_resolve_all_aliases_combined() {
     assert!(filter.contains("publication_year:>2020"));
     assert!(filter.contains("cited_by_count:>100"));
     assert!(filter.contains("is_oa:true"));
+}
+
+// ── Entity-specific filter alias integration tests (via api::*_list) ────
+
+#[tokio::test]
+async fn test_author_list_institution_search() {
+    let mock = MockServer::start().await;
+
+    // Mock institution search: resolve "harvard" → I123
+    Mock::given(method("GET"))
+        .and(path("/institutions"))
+        .and(query_param("filter", "display_name.search:harvard"))
+        .and(query_param("sort", "cited_by_count:desc"))
+        .and(query_param("per-page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(search_result_json("https://openalex.org/I123")),
+        )
+        .mount(&mock)
+        .await;
+
+    // Mock author list with resolved filter
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param("filter", "last_known_institutions.id:I123"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = AuthorListParams {
+        institution: Some("harvard".into()),
+        ..Default::default()
+    };
+    let result = api::author_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_author_list_country_direct() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param(
+            "filter",
+            "last_known_institutions.country_code:US",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = AuthorListParams {
+        country: Some("US".into()),
+        ..Default::default()
+    };
+    let result = api::author_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_author_list_citations_direct() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param("filter", "cited_by_count:>1000"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = AuthorListParams {
+        citations: Some(">1000".into()),
+        ..Default::default()
+    };
+    let result = api::author_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_source_list_publisher_search() {
+    let mock = MockServer::start().await;
+
+    // Mock publisher search: resolve "springer" → P123 (uses `search` param)
+    Mock::given(method("GET"))
+        .and(path("/publishers"))
+        .and(query_param("search", "springer"))
+        .and(query_param("sort", "cited_by_count:desc"))
+        .and(query_param("per-page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(search_result_json("https://openalex.org/P123")),
+        )
+        .mount(&mock)
+        .await;
+
+    // Mock source list with resolved filter
+    Mock::given(method("GET"))
+        .and(path("/sources"))
+        .and(query_param("filter", "host_organization_lineage:P123"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = SourceListParams {
+        publisher: Some("springer".into()),
+        ..Default::default()
+    };
+    let result = api::source_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_source_list_open_flag() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/sources"))
+        .and(query_param("filter", "is_oa:true"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = SourceListParams {
+        open: Some(true),
+        ..Default::default()
+    };
+    let result = api::source_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_source_list_type_direct() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/sources"))
+        .and(query_param("filter", "type:journal"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = SourceListParams {
+        r#type: Some("journal".into()),
+        ..Default::default()
+    };
+    let result = api::source_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_institution_list_country_type() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/institutions"))
+        .and(query_param("filter", "country_code:US,type:education"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = InstitutionListParams {
+        country: Some("US".into()),
+        r#type: Some("education".into()),
+        ..Default::default()
+    };
+    let result = api::institution_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_topic_list_domain_field() {
+    let mock = MockServer::start().await;
+
+    // Mock domain search: resolve "physical" → domains/3
+    Mock::given(method("GET"))
+        .and(path("/domains"))
+        .and(query_param("filter", "display_name.search:physical"))
+        .and(query_param("sort", "cited_by_count:desc"))
+        .and(query_param("per-page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(search_result_json("https://openalex.org/domains/3")),
+        )
+        .mount(&mock)
+        .await;
+
+    // Mock field search: resolve "computer science" → fields/17
+    Mock::given(method("GET"))
+        .and(path("/fields"))
+        .and(query_param(
+            "filter",
+            "display_name.search:computer science",
+        ))
+        .and(query_param("sort", "cited_by_count:desc"))
+        .and(query_param("per-page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(search_result_json("https://openalex.org/fields/17")),
+        )
+        .mount(&mock)
+        .await;
+
+    // Mock topic list with both resolved filters
+    Mock::given(method("GET"))
+        .and(path("/topics"))
+        .and(query_param(
+            "filter",
+            "domain.id:domains/3,field.id:fields/17",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = TopicListParams {
+        domain: Some("physical".into()),
+        field: Some("computer science".into()),
+        ..Default::default()
+    };
+    let result = api::topic_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_field_list_domain_search() {
+    let mock = MockServer::start().await;
+
+    // Mock domain search: resolve "life sciences" → domains/1
+    Mock::given(method("GET"))
+        .and(path("/domains"))
+        .and(query_param("filter", "display_name.search:life sciences"))
+        .and(query_param("sort", "cited_by_count:desc"))
+        .and(query_param("per-page", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(search_result_json("https://openalex.org/domains/1")),
+        )
+        .mount(&mock)
+        .await;
+
+    // Mock field list with resolved filter
+    Mock::given(method("GET"))
+        .and(path("/fields"))
+        .and(query_param("filter", "domain.id:domains/1"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = FieldListParams {
+        domain: Some("life sciences".into()),
+        ..Default::default()
+    };
+    let result = api::field_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_subfield_list_field_id() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/subfields"))
+        .and(query_param("filter", "field.id:fields/17"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = SubfieldListParams {
+        field: Some("17".into()),
+        ..Default::default()
+    };
+    let result = api::subfield_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_publisher_list_country_direct() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/publishers"))
+        .and(query_param("filter", "country_codes:US"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = PublisherListParams {
+        country: Some("US".into()),
+        ..Default::default()
+    };
+    let result = api::publisher_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_funder_list_works_direct() {
+    let mock = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/funders"))
+        .and(query_param("filter", "works_count:>100000"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(empty_list_response_json()),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_client(&mock);
+    let params = FunderListParams {
+        works: Some(">100000".into()),
+        ..Default::default()
+    };
+    let result = api::funder_list(&client, &params).await.unwrap();
+    assert_eq!(result.meta.count, 0);
+}
+
+#[tokio::test]
+async fn test_author_list_overlap_error() {
+    // No mock server needed — overlap is checked before any API calls
+    let mock = MockServer::start().await;
+    let client = make_client(&mock);
+
+    let params = AuthorListParams {
+        country: Some("US".into()),
+        filter: Some("last_known_institutions.country_code:GB".into()),
+        ..Default::default()
+    };
+    let result = api::author_list(&client, &params).await;
+    assert!(result.is_err());
+    let err = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("expected error but got Ok"),
+    };
+    assert!(err.contains("country"));
+    assert!(err.contains("last_known_institutions.country_code"));
 }

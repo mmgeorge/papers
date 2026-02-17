@@ -1,5 +1,9 @@
 use papers::api;
-use papers::{FindWorksParams, GetParams, ListParams, OpenAlexClient, WorkListParams};
+use papers::{
+    AuthorListParams, DomainListParams, FieldListParams, FindWorksParams, FunderListParams,
+    GetParams, InstitutionListParams, OpenAlexClient, PublisherListParams, SourceListParams,
+    SubfieldListParams, TopicListParams, WorkListParams,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -289,7 +293,7 @@ async fn test_author_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::author_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::author_list(&client, &AuthorListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.h_index, Some(30));
@@ -328,7 +332,7 @@ async fn test_source_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::source_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::source_list(&client, &SourceListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.h_index, Some(900));
@@ -364,7 +368,7 @@ async fn test_institution_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::institution_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::institution_list(&client, &InstitutionListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.city.as_deref(), Some("Cambridge"));
@@ -399,7 +403,7 @@ async fn test_topic_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::topic_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::topic_list(&client, &TopicListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.subfield.as_deref(), Some("Artificial Intelligence"));
@@ -437,7 +441,7 @@ async fn test_publisher_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::publisher_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::publisher_list(&client, &PublisherListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.hierarchy_level, Some(0));
@@ -474,7 +478,7 @@ async fn test_funder_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::funder_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::funder_list(&client, &FunderListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.awards_count, Some(100000));
@@ -557,7 +561,7 @@ async fn test_domain_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::domain_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::domain_list(&client, &DomainListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.fields, vec!["Computer Science", "Engineering"]);
@@ -594,7 +598,7 @@ async fn test_field_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::field_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::field_list(&client, &FieldListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.domain.as_deref(), Some("Physical Sciences"));
@@ -632,7 +636,7 @@ async fn test_subfield_list_applies_summary() {
         .await;
 
     let client = make_client(&mock);
-    let result = api::subfield_list(&client, &ListParams::default()).await.unwrap();
+    let result = api::subfield_list(&client, &SubfieldListParams::default()).await.unwrap();
     let s = &result.results[0];
 
     assert_eq!(s.field.as_deref(), Some("Computer Science"));

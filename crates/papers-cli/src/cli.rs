@@ -147,6 +147,10 @@ pub struct WorkFilterArgs {
     #[arg(long)]
     pub source: Option<String>,
 
+    /// Filter by institution name or ID. Uses lineage for broad matching (e.g. "mit" or "I136199984")
+    #[arg(long)]
+    pub institution: Option<String>,
+
     /// Filter by publication year (e.g. "2024", ">2008", "2008-2024", "2020|2021")
     #[arg(long)]
     pub year: Option<String>,
@@ -154,6 +158,208 @@ pub struct WorkFilterArgs {
     /// Filter by citation count (e.g. ">100", "10-50")
     #[arg(long)]
     pub citations: Option<String>,
+
+    /// Filter by country code of author institutions (e.g. "US", "GB")
+    #[arg(long)]
+    pub country: Option<String>,
+
+    /// Filter by continent of author institutions (e.g. "europe", "asia")
+    #[arg(long)]
+    pub continent: Option<String>,
+
+    /// Filter by work type (e.g. "article", "preprint", "dataset")
+    #[arg(long = "type")]
+    pub entity_type: Option<String>,
+
+    /// Filter for open access works only
+    #[arg(long)]
+    pub open: bool,
+}
+
+/// Shorthand filter flags for `author list`.
+#[derive(Args, Clone, Default)]
+pub struct AuthorFilterArgs {
+    /// Filter by institution name or ID (e.g. "harvard", "mit", or "I136199984")
+    #[arg(long)]
+    pub institution: Option<String>,
+
+    /// Filter by country code of last known institution (e.g. "US", "GB")
+    #[arg(long)]
+    pub country: Option<String>,
+
+    /// Filter by continent of last known institution (e.g. "europe", "asia")
+    #[arg(long)]
+    pub continent: Option<String>,
+
+    /// Filter by citation count (e.g. ">1000", "100-500")
+    #[arg(long)]
+    pub citations: Option<String>,
+
+    /// Filter by works count (e.g. ">500", "100-200")
+    #[arg(long)]
+    pub works: Option<String>,
+
+    /// Filter by h-index (e.g. ">50", "10-20"). The h-index measures sustained
+    /// research impact: an author with h-index h has h works each cited at least
+    /// h times.
+    #[arg(long)]
+    pub h_index: Option<String>,
+}
+
+/// Shorthand filter flags for `source list`.
+#[derive(Args, Clone, Default)]
+pub struct SourceFilterArgs {
+    /// Filter by publisher name or ID (e.g. "springer", "P4310319798")
+    #[arg(long)]
+    pub publisher: Option<String>,
+
+    /// Filter by country code (e.g. "US", "GB")
+    #[arg(long)]
+    pub country: Option<String>,
+
+    /// Filter by continent (e.g. "europe")
+    #[arg(long)]
+    pub continent: Option<String>,
+
+    /// Filter by source type (e.g. "journal", "repository", "conference")
+    #[arg(long = "type")]
+    pub entity_type: Option<String>,
+
+    /// Filter for open access sources only
+    #[arg(long)]
+    pub open: bool,
+
+    /// Filter by citation count (e.g. ">10000")
+    #[arg(long)]
+    pub citations: Option<String>,
+
+    /// Filter by works count (e.g. ">100000")
+    #[arg(long)]
+    pub works: Option<String>,
+}
+
+/// Shorthand filter flags for `institution list`.
+#[derive(Args, Clone, Default)]
+pub struct InstitutionFilterArgs {
+    /// Filter by country code (e.g. "US", "GB")
+    #[arg(long)]
+    pub country: Option<String>,
+
+    /// Filter by continent (e.g. "europe", "asia")
+    #[arg(long)]
+    pub continent: Option<String>,
+
+    /// Filter by institution type (e.g. "education", "healthcare", "company")
+    #[arg(long = "type")]
+    pub entity_type: Option<String>,
+
+    /// Filter by citation count (e.g. ">100000")
+    #[arg(long)]
+    pub citations: Option<String>,
+
+    /// Filter by works count (e.g. ">100000")
+    #[arg(long)]
+    pub works: Option<String>,
+}
+
+/// Shorthand filter flags for `topic list`.
+#[derive(Args, Clone, Default)]
+pub struct TopicFilterArgs {
+    /// Filter by domain name or ID (e.g. "life sciences", "3")
+    #[arg(long)]
+    pub domain: Option<String>,
+
+    /// Filter by field name or ID (e.g. "computer science", "17")
+    #[arg(long)]
+    pub field: Option<String>,
+
+    /// Filter by subfield name or ID (e.g. "artificial intelligence", "1702")
+    #[arg(long)]
+    pub subfield: Option<String>,
+
+    /// Filter by citation count (e.g. ">1000")
+    #[arg(long)]
+    pub citations: Option<String>,
+
+    /// Filter by works count (e.g. ">1000")
+    #[arg(long)]
+    pub works: Option<String>,
+}
+
+/// Shorthand filter flags for `publisher list`.
+#[derive(Args, Clone, Default)]
+pub struct PublisherFilterArgs {
+    /// Filter by country code (e.g. "US", "GB"). Note: uses `country_codes` (plural).
+    #[arg(long)]
+    pub country: Option<String>,
+
+    /// Filter by continent (e.g. "europe")
+    #[arg(long)]
+    pub continent: Option<String>,
+
+    /// Filter by citation count (e.g. ">10000")
+    #[arg(long)]
+    pub citations: Option<String>,
+
+    /// Filter by works count (e.g. ">1000000")
+    #[arg(long)]
+    pub works: Option<String>,
+}
+
+/// Shorthand filter flags for `funder list`.
+#[derive(Args, Clone, Default)]
+pub struct FunderFilterArgs {
+    /// Filter by country code (e.g. "US", "GB")
+    #[arg(long)]
+    pub country: Option<String>,
+
+    /// Filter by continent (e.g. "europe")
+    #[arg(long)]
+    pub continent: Option<String>,
+
+    /// Filter by citation count (e.g. ">10000")
+    #[arg(long)]
+    pub citations: Option<String>,
+
+    /// Filter by works count (e.g. ">100000")
+    #[arg(long)]
+    pub works: Option<String>,
+}
+
+/// Shorthand filter flags for `domain list`.
+#[derive(Args, Clone, Default)]
+pub struct DomainFilterArgs {
+    /// Filter by works count (e.g. ">100000000")
+    #[arg(long)]
+    pub works: Option<String>,
+}
+
+/// Shorthand filter flags for `field list`.
+#[derive(Args, Clone, Default)]
+pub struct FieldFilterArgs {
+    /// Filter by domain name or ID (e.g. "life sciences", "3")
+    #[arg(long)]
+    pub domain: Option<String>,
+
+    /// Filter by works count (e.g. ">1000000")
+    #[arg(long)]
+    pub works: Option<String>,
+}
+
+/// Shorthand filter flags for `subfield list`.
+#[derive(Args, Clone, Default)]
+pub struct SubfieldFilterArgs {
+    /// Filter by domain name or ID (e.g. "physical sciences", "3")
+    #[arg(long)]
+    pub domain: Option<String>,
+
+    /// Filter by field name or ID (e.g. "computer science", "17")
+    #[arg(long)]
+    pub field: Option<String>,
+
+    /// Filter by works count (e.g. ">1000000")
+    #[arg(long)]
+    pub works: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -205,6 +411,8 @@ pub enum AuthorCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: AuthorFilterArgs,
     },
     /// Get a single author by ID (OpenAlex ID or ORCID)
     Get {
@@ -227,6 +435,8 @@ pub enum SourceCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: SourceFilterArgs,
     },
     /// Get a single source by ID (OpenAlex ID or ISSN)
     Get {
@@ -249,6 +459,8 @@ pub enum InstitutionCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: InstitutionFilterArgs,
     },
     /// Get a single institution by ID (OpenAlex ID or ROR)
     Get {
@@ -271,6 +483,8 @@ pub enum TopicCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: TopicFilterArgs,
     },
     /// Get a single topic by OpenAlex ID
     Get {
@@ -287,6 +501,8 @@ pub enum PublisherCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: PublisherFilterArgs,
     },
     /// Get a single publisher by OpenAlex ID
     Get {
@@ -309,6 +525,8 @@ pub enum FunderCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: FunderFilterArgs,
     },
     /// Get a single funder by OpenAlex ID
     Get {
@@ -331,6 +549,8 @@ pub enum DomainCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: DomainFilterArgs,
     },
     /// Get a single domain by numeric ID (1-4)
     Get {
@@ -347,6 +567,8 @@ pub enum FieldCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: FieldFilterArgs,
     },
     /// Get a single field by numeric ID (e.g. 17)
     Get {
@@ -363,6 +585,8 @@ pub enum SubfieldCommand {
     List {
         #[command(flatten)]
         args: ListArgs,
+        #[command(flatten)]
+        filters: SubfieldFilterArgs,
     },
     /// Get a single subfield by numeric ID (e.g. 1702)
     Get {

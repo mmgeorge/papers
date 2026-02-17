@@ -1,10 +1,14 @@
 use papers_openalex::{
     Author, AutocompleteResponse, Domain, Field, FindWorksParams, FindWorksResponse, Funder,
-    GetParams, Institution, ListParams, OpenAlexClient, OpenAlexError, Publisher, Source, Subfield,
+    GetParams, Institution, OpenAlexClient, OpenAlexError, Publisher, Source, Subfield,
     Topic, Work,
 };
 
-use crate::filter::{FilterError, WorkListParams, resolve_work_filters};
+use crate::filter::{
+    AuthorListParams, DomainListParams, FieldListParams, FilterError, FunderListParams,
+    InstitutionListParams, PublisherListParams, SourceListParams, SubfieldListParams,
+    TopicListParams, WorkListParams, resolve_filters, WORK_ALIASES,
+};
 use crate::summary::{
     AuthorSummary, DomainSummary, FieldSummary, FunderSummary, InstitutionSummary,
     PublisherSummary, SlimListResponse, SourceSummary, SubfieldSummary, TopicSummary, WorkSummary,
@@ -17,73 +21,38 @@ pub async fn work_list(
     client: &OpenAlexClient,
     params: &WorkListParams,
 ) -> Result<SlimListResponse<WorkSummary>, FilterError> {
-    let (aliases, mut list_params) = params.into_aliases_and_list_params();
-    list_params.filter = resolve_work_filters(client, &aliases, list_params.filter.as_deref()).await?;
+    let (alias_values, mut list_params) = params.into_aliases_and_list_params();
+    list_params.filter = resolve_filters(client, WORK_ALIASES, &alias_values, list_params.filter.as_deref()).await?;
     Ok(summary_list_result(client.list_works(&list_params).await, WorkSummary::from)?)
 }
 
-pub async fn author_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<AuthorSummary>, OpenAlexError> {
-    summary_list_result(client.list_authors(params).await, AuthorSummary::from)
+macro_rules! entity_list_fn {
+    ($fn_name:ident, $params_type:ident, $summary_type:ident, $client_method:ident) => {
+        pub async fn $fn_name(
+            client: &OpenAlexClient,
+            params: &$params_type,
+        ) -> Result<SlimListResponse<$summary_type>, FilterError> {
+            let (alias_values, mut list_params) = params.into_aliases_and_list_params();
+            list_params.filter = resolve_filters(
+                client,
+                $params_type::alias_specs(),
+                &alias_values,
+                list_params.filter.as_deref(),
+            ).await?;
+            Ok(summary_list_result(client.$client_method(&list_params).await, $summary_type::from)?)
+        }
+    };
 }
 
-pub async fn source_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<SourceSummary>, OpenAlexError> {
-    summary_list_result(client.list_sources(params).await, SourceSummary::from)
-}
-
-pub async fn institution_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<InstitutionSummary>, OpenAlexError> {
-    summary_list_result(client.list_institutions(params).await, InstitutionSummary::from)
-}
-
-pub async fn topic_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<TopicSummary>, OpenAlexError> {
-    summary_list_result(client.list_topics(params).await, TopicSummary::from)
-}
-
-pub async fn publisher_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<PublisherSummary>, OpenAlexError> {
-    summary_list_result(client.list_publishers(params).await, PublisherSummary::from)
-}
-
-pub async fn funder_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<FunderSummary>, OpenAlexError> {
-    summary_list_result(client.list_funders(params).await, FunderSummary::from)
-}
-
-pub async fn domain_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<DomainSummary>, OpenAlexError> {
-    summary_list_result(client.list_domains(params).await, DomainSummary::from)
-}
-
-pub async fn field_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<FieldSummary>, OpenAlexError> {
-    summary_list_result(client.list_fields(params).await, FieldSummary::from)
-}
-
-pub async fn subfield_list(
-    client: &OpenAlexClient,
-    params: &ListParams,
-) -> Result<SlimListResponse<SubfieldSummary>, OpenAlexError> {
-    summary_list_result(client.list_subfields(params).await, SubfieldSummary::from)
-}
+entity_list_fn!(author_list, AuthorListParams, AuthorSummary, list_authors);
+entity_list_fn!(source_list, SourceListParams, SourceSummary, list_sources);
+entity_list_fn!(institution_list, InstitutionListParams, InstitutionSummary, list_institutions);
+entity_list_fn!(topic_list, TopicListParams, TopicSummary, list_topics);
+entity_list_fn!(publisher_list, PublisherListParams, PublisherSummary, list_publishers);
+entity_list_fn!(funder_list, FunderListParams, FunderSummary, list_funders);
+entity_list_fn!(domain_list, DomainListParams, DomainSummary, list_domains);
+entity_list_fn!(field_list, FieldListParams, FieldSummary, list_fields);
+entity_list_fn!(subfield_list, SubfieldListParams, SubfieldSummary, list_subfields);
 
 // ── Get ──────────────────────────────────────────────────────────────────
 

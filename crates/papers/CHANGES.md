@@ -268,35 +268,126 @@ Returns the full `FindWorksResponse` including similarity scores.
 
 ---
 
-## `work_list` / `work list` — filter aliases
+## Filter aliases — all list endpoints
 
 **Implemented in:** `src/filter.rs`
-**Applied in:** `papers-mcp/src/server.rs` (`work_list` tool), `papers-cli/src/main.rs` (`work list` command)
+**Applied in:** `papers-mcp/src/server.rs` (all `*_list` tools), `papers-cli/src/main.rs` (all `* list` commands)
 
-The `work_list` tool and `work list` CLI command accept 9 shorthand filter params
-that resolve to real OpenAlex filter expressions. ID-based filters accept either
-an OpenAlex entity ID or a search string (resolved via the API to the top result
-by citation count).
+All 10 list endpoints accept shorthand filter aliases that resolve to real
+OpenAlex filter expressions. There are three alias kinds:
 
-| Alias param | Resolves to OpenAlex filter key |
-|---|---|
-| `author` | `authorships.author.id` |
-| `topic` | `primary_topic.id` |
-| `domain` | `primary_topic.domain.id` |
-| `field` | `primary_topic.field.id` |
-| `subfield` | `primary_topic.subfield.id` |
-| `publisher` | `primary_location.source.publisher_lineage` |
-| `source` | `primary_location.source.id` |
-| `year` | `publication_year` |
-| `citations` | `cited_by_count` |
+- **Entity** — accepts an OpenAlex entity ID or a search string (resolved via
+  the API to the top result by citation count). One extra API call per alias.
+- **Direct** — passes the value through as-is to the filter key.
+- **Boolean** — when set to true, emits `filter_key:true`.
 
 **Reason:** Raw OpenAlex filter keys are long and require knowing entity IDs
 upfront. Aliases let callers use natural names (e.g. `--publisher acm` instead
-of `--filter "primary_location.source.publisher_lineage:P4310319798"`). The
-search-to-ID resolution makes one extra API call per search-based alias.
+of `--filter "primary_location.source.publisher_lineage:P4310319798"`).
 
 If an alias conflicts with a key already present in the raw `filter` param,
 an error is returned rather than silently overwriting.
+
+### `work_list` / `work list` — 14 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `author` | `authorships.author.id` | Entity |
+| `topic` | `primary_topic.id` | Entity |
+| `domain` | `primary_topic.domain.id` | Entity |
+| `field` | `primary_topic.field.id` | Entity |
+| `subfield` | `primary_topic.subfield.id` | Entity |
+| `publisher` | `primary_location.source.publisher_lineage` | Entity |
+| `source` | `primary_location.source.id` | Entity |
+| `institution` | `authorships.institutions.lineage` | Entity |
+| `year` | `publication_year` | Direct |
+| `citations` | `cited_by_count` | Direct |
+| `country` | `authorships.institutions.country_code` | Direct |
+| `continent` | `authorships.institutions.continent` | Direct |
+| `type` | `type` | Direct |
+| `open` | `is_oa` | Boolean |
+
+### `author_list` / `author list` — 6 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `institution` | `last_known_institutions.id` | Entity |
+| `country` | `last_known_institutions.country_code` | Direct |
+| `continent` | `last_known_institutions.continent` | Direct |
+| `citations` | `cited_by_count` | Direct |
+| `works` | `works_count` | Direct |
+| `h_index` | `summary_stats.h_index` | Direct |
+
+### `source_list` / `source list` — 7 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `publisher` | `host_organization_lineage` | Entity |
+| `country` | `country_code` | Direct |
+| `continent` | `continent` | Direct |
+| `type` | `type` | Direct |
+| `open` | `is_oa` | Boolean |
+| `citations` | `cited_by_count` | Direct |
+| `works` | `works_count` | Direct |
+
+### `institution_list` / `institution list` — 5 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `country` | `country_code` | Direct |
+| `continent` | `continent` | Direct |
+| `type` | `type` | Direct |
+| `citations` | `cited_by_count` | Direct |
+| `works` | `works_count` | Direct |
+
+### `topic_list` / `topic list` — 5 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `domain` | `domain.id` | Entity |
+| `field` | `field.id` | Entity |
+| `subfield` | `subfield.id` | Entity |
+| `citations` | `cited_by_count` | Direct |
+| `works` | `works_count` | Direct |
+
+### `publisher_list` / `publisher list` — 4 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `country` | `country_codes` | Direct |
+| `continent` | `continent` | Direct |
+| `citations` | `cited_by_count` | Direct |
+| `works` | `works_count` | Direct |
+
+### `funder_list` / `funder list` — 4 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `country` | `country_code` | Direct |
+| `continent` | `continent` | Direct |
+| `citations` | `cited_by_count` | Direct |
+| `works` | `works_count` | Direct |
+
+### `domain_list` / `domain list` — 1 alias
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `works` | `works_count` | Direct |
+
+### `field_list` / `field list` — 2 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `domain` | `domain.id` | Entity |
+| `works` | `works_count` | Direct |
+
+### `subfield_list` / `subfield list` — 3 aliases
+
+| Alias | OpenAlex filter key | Kind |
+|---|---|---|
+| `domain` | `domain.id` | Entity |
+| `field` | `field.id` | Entity |
+| `works` | `works_count` | Direct |
 
 ---
 

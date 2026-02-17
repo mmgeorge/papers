@@ -1369,3 +1369,188 @@ fn test_work_list_schema_includes_aliases() {
     assert!(props.contains_key("year"), "missing year");
     assert!(props.contains_key("citations"), "missing citations");
 }
+
+#[test]
+fn test_work_list_schema_includes_new_aliases() {
+    use papers_mcp::params::WorkListToolParams;
+    let schema = schemars::schema_for!(WorkListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("institution"), "missing institution");
+    assert!(props.contains_key("country"), "missing country");
+    assert!(props.contains_key("continent"), "missing continent");
+    assert!(props.contains_key("type"), "missing type");
+    assert!(props.contains_key("open"), "missing open");
+}
+
+#[test]
+fn test_author_list_schema() {
+    use papers_mcp::params::AuthorListToolParams;
+    let schema = schemars::schema_for!(AuthorListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("search"), "missing search");
+    assert!(props.contains_key("institution"), "missing institution");
+    assert!(props.contains_key("country"), "missing country");
+    assert!(props.contains_key("continent"), "missing continent");
+    assert!(props.contains_key("citations"), "missing citations");
+    assert!(props.contains_key("works"), "missing works");
+    assert!(props.contains_key("h_index"), "missing h_index");
+}
+
+#[test]
+fn test_source_list_schema() {
+    use papers_mcp::params::SourceListToolParams;
+    let schema = schemars::schema_for!(SourceListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("publisher"), "missing publisher");
+    assert!(props.contains_key("country"), "missing country");
+    assert!(props.contains_key("continent"), "missing continent");
+    assert!(props.contains_key("type"), "missing type");
+    assert!(props.contains_key("open"), "missing open");
+    assert!(props.contains_key("citations"), "missing citations");
+    assert!(props.contains_key("works"), "missing works");
+}
+
+#[test]
+fn test_institution_list_schema() {
+    use papers_mcp::params::InstitutionListToolParams;
+    let schema = schemars::schema_for!(InstitutionListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("country"), "missing country");
+    assert!(props.contains_key("continent"), "missing continent");
+    assert!(props.contains_key("type"), "missing type");
+    assert!(props.contains_key("citations"), "missing citations");
+    assert!(props.contains_key("works"), "missing works");
+}
+
+#[test]
+fn test_topic_list_schema() {
+    use papers_mcp::params::TopicListToolParams;
+    let schema = schemars::schema_for!(TopicListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("domain"), "missing domain");
+    assert!(props.contains_key("field"), "missing field");
+    assert!(props.contains_key("subfield"), "missing subfield");
+    assert!(props.contains_key("citations"), "missing citations");
+    assert!(props.contains_key("works"), "missing works");
+}
+
+#[test]
+fn test_publisher_list_schema() {
+    use papers_mcp::params::PublisherListToolParams;
+    let schema = schemars::schema_for!(PublisherListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("country"), "missing country");
+    assert!(props.contains_key("continent"), "missing continent");
+    assert!(props.contains_key("citations"), "missing citations");
+    assert!(props.contains_key("works"), "missing works");
+}
+
+#[test]
+fn test_funder_list_schema() {
+    use papers_mcp::params::FunderListToolParams;
+    let schema = schemars::schema_for!(FunderListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("country"), "missing country");
+    assert!(props.contains_key("continent"), "missing continent");
+    assert!(props.contains_key("citations"), "missing citations");
+    assert!(props.contains_key("works"), "missing works");
+}
+
+#[test]
+fn test_domain_list_schema() {
+    use papers_mcp::params::DomainListToolParams;
+    let schema = schemars::schema_for!(DomainListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("works"), "missing works");
+}
+
+#[test]
+fn test_field_list_schema() {
+    use papers_mcp::params::FieldListToolParams;
+    let schema = schemars::schema_for!(FieldListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("domain"), "missing domain");
+    assert!(props.contains_key("works"), "missing works");
+}
+
+#[test]
+fn test_subfield_list_schema() {
+    use papers_mcp::params::SubfieldListToolParams;
+    let schema = schemars::schema_for!(SubfieldListToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("domain"), "missing domain");
+    assert!(props.contains_key("field"), "missing field");
+    assert!(props.contains_key("works"), "missing works");
+}
+
+#[tokio::test]
+async fn test_author_list_with_institution_search() {
+    let mock = MockServer::start().await;
+    // Mock the institution search resolution
+    Mock::given(method("GET"))
+        .and(path("/institutions"))
+        .and(query_param("filter", "display_name.search:mit"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(search_result_json("https://openalex.org/I136199984")),
+        )
+        .mount(&mock)
+        .await;
+    // Mock the authors list with resolved filter
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param("filter", "last_known_institutions.id:I136199984"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"institution": "mit"})).unwrap();
+    let result = server.author_list(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_source_list_with_open_flag() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/sources"))
+        .and(query_param("filter", "is_oa:true"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+
+    let server = make_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"open": true})).unwrap();
+    let result = server.source_list(Parameters(params)).await;
+    assert!(result.is_ok());
+}

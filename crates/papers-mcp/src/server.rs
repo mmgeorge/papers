@@ -6,7 +6,12 @@ use rmcp::model::{ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
 
-use crate::params::{AutocompleteToolParams, FindWorksToolParams, GetToolParams, ListToolParams, WorkListToolParams};
+use crate::params::{
+    AutocompleteToolParams, AuthorListToolParams, DomainListToolParams, FieldListToolParams,
+    FindWorksToolParams, FunderListToolParams, GetToolParams, InstitutionListToolParams,
+    PublisherListToolParams, SourceListToolParams, SubfieldListToolParams, TopicListToolParams,
+    WorkListToolParams,
+};
 
 #[derive(Clone)]
 pub struct PapersMcp {
@@ -62,66 +67,75 @@ impl PapersMcp {
     }
 
     /// Search, filter, and paginate author profiles. 110M+ records.
+    /// Accepts shorthand filter aliases (institution, country, citations, etc.) that resolve to OpenAlex filter expressions.
     /// Advanced filtering: https://docs.openalex.org/api-entities/authors/filter-authors
     #[tool]
-    pub async fn author_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::author_list(&self.client, &params.into_list_params()).await)
+    pub async fn author_list(&self, Parameters(params): Parameters<AuthorListToolParams>) -> Result<String, String> {
+        json_result(papers::api::author_list(&self.client, &params.into_entity_params()).await)
     }
 
     /// Search, filter, and paginate publishing venues (journals, repositories, conferences).
+    /// Accepts shorthand filter aliases (publisher, country, type, open, etc.) that resolve to OpenAlex filter expressions.
     /// Advanced filtering: https://docs.openalex.org/api-entities/sources/filter-sources
     #[tool]
-    pub async fn source_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::source_list(&self.client, &params.into_list_params()).await)
+    pub async fn source_list(&self, Parameters(params): Parameters<SourceListToolParams>) -> Result<String, String> {
+        json_result(papers::api::source_list(&self.client, &params.into_entity_params()).await)
     }
 
     /// Search, filter, and paginate research institutions and organizations.
+    /// Accepts shorthand filter aliases (country, continent, type, etc.) that resolve to OpenAlex filter expressions.
     /// Advanced filtering: https://docs.openalex.org/api-entities/institutions/filter-institutions
     #[tool]
-    pub async fn institution_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::institution_list(&self.client, &params.into_list_params()).await)
+    pub async fn institution_list(&self, Parameters(params): Parameters<InstitutionListToolParams>) -> Result<String, String> {
+        json_result(papers::api::institution_list(&self.client, &params.into_entity_params()).await)
     }
 
     /// Search, filter, and paginate research topics (3-level hierarchy: domain > field > subfield > topic).
+    /// Accepts shorthand filter aliases (domain, field, subfield, etc.) that resolve to OpenAlex filter expressions.
     /// Advanced filtering: https://docs.openalex.org/api-entities/topics/filter-topics
     #[tool]
-    pub async fn topic_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::topic_list(&self.client, &params.into_list_params()).await)
+    pub async fn topic_list(&self, Parameters(params): Parameters<TopicListToolParams>) -> Result<String, String> {
+        json_result(papers::api::topic_list(&self.client, &params.into_entity_params()).await)
     }
 
     /// Search, filter, and paginate publishing organizations (e.g. Elsevier, Springer Nature).
+    /// Accepts shorthand filter aliases (country, continent, citations, works) that resolve to OpenAlex filter expressions.
     /// Advanced filtering: https://docs.openalex.org/api-entities/publishers/filter-publishers
     #[tool]
-    pub async fn publisher_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::publisher_list(&self.client, &params.into_list_params()).await)
+    pub async fn publisher_list(&self, Parameters(params): Parameters<PublisherListToolParams>) -> Result<String, String> {
+        json_result(papers::api::publisher_list(&self.client, &params.into_entity_params()).await)
     }
 
     /// Search, filter, and paginate funding organizations (e.g. NIH, NSF, ERC).
+    /// Accepts shorthand filter aliases (country, continent, citations, works) that resolve to OpenAlex filter expressions.
     /// Advanced filtering: https://docs.openalex.org/api-entities/funders/filter-funders
     #[tool]
-    pub async fn funder_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::funder_list(&self.client, &params.into_list_params()).await)
+    pub async fn funder_list(&self, Parameters(params): Parameters<FunderListToolParams>) -> Result<String, String> {
+        json_result(papers::api::funder_list(&self.client, &params.into_entity_params()).await)
     }
 
     /// Search, filter, and paginate research domains (broadest level of topic hierarchy). 4 domains total.
+    /// Accepts shorthand filter alias (works) that resolves to OpenAlex filter expression.
     /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
     #[tool]
-    pub async fn domain_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::domain_list(&self.client, &params.into_list_params()).await)
+    pub async fn domain_list(&self, Parameters(params): Parameters<DomainListToolParams>) -> Result<String, String> {
+        json_result(papers::api::domain_list(&self.client, &params.into_entity_params()).await)
     }
 
     /// Search, filter, and paginate academic fields (second level of topic hierarchy). 26 fields total.
+    /// Accepts shorthand filter aliases (domain, works) that resolve to OpenAlex filter expressions.
     /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
     #[tool]
-    pub async fn field_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::field_list(&self.client, &params.into_list_params()).await)
+    pub async fn field_list(&self, Parameters(params): Parameters<FieldListToolParams>) -> Result<String, String> {
+        json_result(papers::api::field_list(&self.client, &params.into_entity_params()).await)
     }
 
     /// Search, filter, and paginate research subfields (third level of topic hierarchy). ~252 subfields total.
+    /// Accepts shorthand filter aliases (domain, field, works) that resolve to OpenAlex filter expressions.
     /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
     #[tool]
-    pub async fn subfield_list(&self, Parameters(params): Parameters<ListToolParams>) -> Result<String, String> {
-        json_result(papers::api::subfield_list(&self.client, &params.into_list_params()).await)
+    pub async fn subfield_list(&self, Parameters(params): Parameters<SubfieldListToolParams>) -> Result<String, String> {
+        json_result(papers::api::subfield_list(&self.client, &params.into_entity_params()).await)
     }
 
     // ── Get tools ────────────────────────────────────────────────────────

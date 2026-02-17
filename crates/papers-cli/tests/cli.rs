@@ -1,4 +1,8 @@
-use papers::{GetParams, ListParams, OpenAlexClient, WorkListParams};
+use papers::{
+    AuthorListParams, DomainListParams, FieldListParams, FunderListParams, GetParams,
+    InstitutionListParams, OpenAlexClient, PublisherListParams, SourceListParams,
+    SubfieldListParams, TopicListParams, WorkListParams,
+};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -413,7 +417,7 @@ async fn test_author_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::author_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::author_list(&client, &AuthorListParams::default()).await.unwrap();
     let text = papers_cli_format::format_author_list(&result);
 
     assert!(text.contains("Alice Smith"));
@@ -451,7 +455,7 @@ async fn test_source_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::source_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::source_list(&client, &SourceListParams::default()).await.unwrap();
     let text = papers_cli_format::format_source_list(&result);
 
     assert!(text.contains("Nature"));
@@ -487,7 +491,7 @@ async fn test_institution_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::institution_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::institution_list(&client, &InstitutionListParams::default()).await.unwrap();
     let text = papers_cli_format::format_institution_list(&result);
 
     assert!(text.contains("MIT"));
@@ -524,7 +528,7 @@ async fn test_topic_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::topic_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::topic_list(&client, &TopicListParams::default()).await.unwrap();
     let text = papers_cli_format::format_topic_list(&result);
 
     assert!(text.contains("Machine Learning"));
@@ -560,7 +564,7 @@ async fn test_publisher_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::publisher_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::publisher_list(&client, &PublisherListParams::default()).await.unwrap();
     let text = papers_cli_format::format_publisher_list(&result);
 
     assert!(text.contains("Elsevier"));
@@ -595,7 +599,7 @@ async fn test_funder_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::funder_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::funder_list(&client, &FunderListParams::default()).await.unwrap();
     let text = papers_cli_format::format_funder_list(&result);
 
     assert!(text.contains("NIH"));
@@ -681,7 +685,7 @@ async fn test_domain_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::domain_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::domain_list(&client, &DomainListParams::default()).await.unwrap();
     let text = papers_cli_format::format_domain_list(&result);
 
     assert!(text.contains("Physical Sciences"));
@@ -719,7 +723,7 @@ async fn test_field_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::field_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::field_list(&client, &FieldListParams::default()).await.unwrap();
     let text = papers_cli_format::format_field_list(&result);
 
     assert!(text.contains("Computer Science"));
@@ -757,7 +761,7 @@ async fn test_subfield_list_text() {
         .await;
 
     let client = make_client(&mock);
-    let result = papers::api::subfield_list(&client, &ListParams::default()).await.unwrap();
+    let result = papers::api::subfield_list(&client, &SubfieldListParams::default()).await.unwrap();
     let text = papers_cli_format::format_subfield_list(&result);
 
     assert!(text.contains("Artificial Intelligence"));

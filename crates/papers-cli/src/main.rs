@@ -3,27 +3,18 @@ mod format;
 
 use clap::Parser;
 use cli::{
-    AuthorCommand, Cli, ConceptCommand, DomainCommand, EntityCommand, FieldCommand,
-    FunderCommand, InstitutionCommand, PublisherCommand, SourceCommand, SubfieldCommand,
-    TopicCommand, WorkCommand, WorkFilterArgs,
+    AuthorCommand, AuthorFilterArgs, Cli, ConceptCommand, DomainCommand, DomainFilterArgs,
+    EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand, FunderFilterArgs,
+    InstitutionCommand, InstitutionFilterArgs, PublisherCommand, PublisherFilterArgs,
+    SourceCommand, SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand,
+    TopicFilterArgs, WorkCommand, WorkFilterArgs,
 };
-use papers::{DiskCache, FindWorksParams, GetParams, ListParams, OpenAlexClient, WorkListParams};
+use papers::{
+    AuthorListParams, DiskCache, DomainListParams, FieldListParams, FindWorksParams,
+    FunderListParams, GetParams, InstitutionListParams, OpenAlexClient, PublisherListParams,
+    SourceListParams, SubfieldListParams, TopicListParams, WorkListParams,
+};
 use std::time::Duration;
-
-fn list_params_from_args(args: &cli::ListArgs) -> ListParams {
-    ListParams {
-        search: args.search.clone(),
-        filter: args.filter.clone(),
-        sort: args.sort.clone(),
-        per_page: Some(args.per_page),
-        page: args.page,
-        cursor: args.cursor.clone(),
-        sample: args.sample,
-        seed: args.seed,
-        select: None,
-        group_by: None,
-    }
-}
 
 fn work_list_params(args: &cli::ListArgs, wf: &WorkFilterArgs) -> WorkListParams {
     WorkListParams {
@@ -44,8 +35,185 @@ fn work_list_params(args: &cli::ListArgs, wf: &WorkFilterArgs) -> WorkListParams
         subfield: wf.subfield.clone(),
         publisher: wf.publisher.clone(),
         source: wf.source.clone(),
+        institution: wf.institution.clone(),
         year: wf.year.clone(),
         citations: wf.citations.clone(),
+        country: wf.country.clone(),
+        continent: wf.continent.clone(),
+        r#type: wf.entity_type.clone(),
+        open: if wf.open { Some(true) } else { None },
+    }
+}
+
+fn author_list_params(args: &cli::ListArgs, af: &AuthorFilterArgs) -> AuthorListParams {
+    AuthorListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        institution: af.institution.clone(),
+        country: af.country.clone(),
+        continent: af.continent.clone(),
+        citations: af.citations.clone(),
+        works: af.works.clone(),
+        h_index: af.h_index.clone(),
+    }
+}
+
+fn source_list_params(args: &cli::ListArgs, sf: &SourceFilterArgs) -> SourceListParams {
+    SourceListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        publisher: sf.publisher.clone(),
+        country: sf.country.clone(),
+        continent: sf.continent.clone(),
+        r#type: sf.entity_type.clone(),
+        open: if sf.open { Some(true) } else { None },
+        citations: sf.citations.clone(),
+        works: sf.works.clone(),
+    }
+}
+
+fn institution_list_params(args: &cli::ListArgs, inf: &InstitutionFilterArgs) -> InstitutionListParams {
+    InstitutionListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        country: inf.country.clone(),
+        continent: inf.continent.clone(),
+        r#type: inf.entity_type.clone(),
+        citations: inf.citations.clone(),
+        works: inf.works.clone(),
+    }
+}
+
+fn topic_list_params(args: &cli::ListArgs, tf: &TopicFilterArgs) -> TopicListParams {
+    TopicListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        domain: tf.domain.clone(),
+        field: tf.field.clone(),
+        subfield: tf.subfield.clone(),
+        citations: tf.citations.clone(),
+        works: tf.works.clone(),
+    }
+}
+
+fn publisher_list_params(args: &cli::ListArgs, pf: &PublisherFilterArgs) -> PublisherListParams {
+    PublisherListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        country: pf.country.clone(),
+        continent: pf.continent.clone(),
+        citations: pf.citations.clone(),
+        works: pf.works.clone(),
+    }
+}
+
+fn funder_list_params(args: &cli::ListArgs, ff: &FunderFilterArgs) -> FunderListParams {
+    FunderListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        country: ff.country.clone(),
+        continent: ff.continent.clone(),
+        citations: ff.citations.clone(),
+        works: ff.works.clone(),
+    }
+}
+
+fn domain_list_params(args: &cli::ListArgs, df: &DomainFilterArgs) -> DomainListParams {
+    DomainListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        works: df.works.clone(),
+    }
+}
+
+fn field_list_params(args: &cli::ListArgs, ff: &FieldFilterArgs) -> FieldListParams {
+    FieldListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        domain: ff.domain.clone(),
+        works: ff.works.clone(),
+    }
+}
+
+fn subfield_list_params(args: &cli::ListArgs, sf: &SubfieldFilterArgs) -> SubfieldListParams {
+    SubfieldListParams {
+        search: args.search.clone(),
+        filter: args.filter.clone(),
+        sort: args.sort.clone(),
+        per_page: Some(args.per_page),
+        page: args.page,
+        cursor: args.cursor.clone(),
+        sample: args.sample,
+        seed: args.seed,
+        select: None,
+        group_by: None,
+        domain: sf.domain.clone(),
+        field: sf.field.clone(),
+        works: sf.works.clone(),
     }
 }
 
@@ -133,8 +301,8 @@ async fn main() {
         },
 
         EntityCommand::Author { cmd } => match cmd {
-            AuthorCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            AuthorCommand::List { args, filters } => {
+                let params = author_list_params(&args, &filters);
                 match papers::api::author_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -173,8 +341,8 @@ async fn main() {
         },
 
         EntityCommand::Source { cmd } => match cmd {
-            SourceCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            SourceCommand::List { args, filters } => {
+                let params = source_list_params(&args, &filters);
                 match papers::api::source_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -213,8 +381,8 @@ async fn main() {
         },
 
         EntityCommand::Institution { cmd } => match cmd {
-            InstitutionCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            InstitutionCommand::List { args, filters } => {
+                let params = institution_list_params(&args, &filters);
                 match papers::api::institution_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -253,8 +421,8 @@ async fn main() {
         },
 
         EntityCommand::Topic { cmd } => match cmd {
-            TopicCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            TopicCommand::List { args, filters } => {
+                let params = topic_list_params(&args, &filters);
                 match papers::api::topic_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -281,8 +449,8 @@ async fn main() {
         },
 
         EntityCommand::Publisher { cmd } => match cmd {
-            PublisherCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            PublisherCommand::List { args, filters } => {
+                let params = publisher_list_params(&args, &filters);
                 match papers::api::publisher_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -321,8 +489,8 @@ async fn main() {
         },
 
         EntityCommand::Funder { cmd } => match cmd {
-            FunderCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            FunderCommand::List { args, filters } => {
+                let params = funder_list_params(&args, &filters);
                 match papers::api::funder_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -361,8 +529,8 @@ async fn main() {
         },
 
         EntityCommand::Domain { cmd } => match cmd {
-            DomainCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            DomainCommand::List { args, filters } => {
+                let params = domain_list_params(&args, &filters);
                 match papers::api::domain_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -389,8 +557,8 @@ async fn main() {
         },
 
         EntityCommand::Field { cmd } => match cmd {
-            FieldCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            FieldCommand::List { args, filters } => {
+                let params = field_list_params(&args, &filters);
                 match papers::api::field_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -417,8 +585,8 @@ async fn main() {
         },
 
         EntityCommand::Subfield { cmd } => match cmd {
-            SubfieldCommand::List { args } => {
-                let params = list_params_from_args(&args);
+            SubfieldCommand::List { args, filters } => {
+                let params = subfield_list_params(&args, &filters);
                 match papers::api::subfield_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
