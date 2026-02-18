@@ -4,7 +4,8 @@ use std::time::Duration;
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::service::RoleServer;
+use rmcp::{Peer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
 
 use crate::params::{
@@ -260,12 +261,250 @@ impl PapersMcp {
     /// Get the full text content of a scholarly work by downloading and extracting its PDF.
     /// Tries multiple sources: local Zotero library, remote Zotero API,
     /// direct open-access URLs, and the OpenAlex content API.
+    /// If no PDF is found, may ask the LLM for help finding one, or prompt the user
+    /// to add the paper to Zotero via its DOI page.
     /// Accepts OpenAlex IDs, DOIs, or other work identifiers.
     #[tool]
-    pub async fn work_text(&self, Parameters(params): Parameters<WorkTextToolParams>) -> Result<String, String> {
-        json_result(
-            papers_core::text::work_text(&self.client, self.zotero.as_ref(), &params.id).await
-        )
+    pub async fn work_text(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<WorkTextToolParams>,
+    ) -> Result<String, String> {
+        match papers_core::text::work_text(&self.client, self.zotero.as_ref(), &params.id).await {
+            Ok(result) => json_result::<_, String>(Ok(result)),
+            Err(papers_core::text::WorkTextError::NoPdfFound { work_id, title, doi }) => {
+                // Try the fallback chain: sampling → elicitation → error
+                if let Some(result) = self.work_text_fallback(&peer, &work_id, title.as_deref(), doi.as_deref()).await {
+                    return result;
+                }
+                let display = title.as_deref().unwrap_or(&work_id);
+                let mut msg = format!("No PDF found for \"{display}\".");
+                if let Some(doi) = &doi {
+                    let bare = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
+                    msg.push_str(&format!(
+                        "\n\nTo get this paper, ask the user to open https://doi.org/{bare} \
+                         and save it to their Zotero library using the Zotero browser connector. \
+                         Then call work_text again with the same ID."
+                    ));
+                }
+                if self.zotero.is_none() {
+                    msg.push_str(
+                        "\n\nNote: Zotero integration is not configured. \
+                         Set ZOTERO_USER_ID and ZOTERO_API_KEY environment variables to enable it."
+                    );
+                }
+                Err(msg)
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+impl PapersMcp {
+    /// Fallback chain when no PDF is found: sampling → elicitation + polling → None.
+    async fn work_text_fallback(
+        &self,
+        peer: &Peer<RoleServer>,
+        work_id: &str,
+        title: Option<&str>,
+        doi: Option<&str>,
+    ) -> Option<Result<String, String>> {
+        let display = title.unwrap_or(work_id);
+
+        // Step A: Try sampling — ask the LLM to find a PDF URL
+        if let Some(doi) = doi {
+            if peer.supports_sampling_tools() {
+                if let Some(result) = self.try_sampling_pdf(peer, work_id, title, doi).await {
+                    return Some(result);
+                }
+            }
+        }
+
+        // Step B: Try elicitation — ask the user to add to Zotero via DOI
+        if let (Some(doi), Some(zotero)) = (doi, self.zotero.as_ref()) {
+            let modes = peer.supported_elicitation_modes();
+            if modes.contains(&rmcp::service::ElicitationMode::Url) {
+                let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
+                let url = format!("https://doi.org/{bare_doi}");
+                let message = format!(
+                    "No PDF found for \"{display}\". Open the DOI page to save this paper to your Zotero library?"
+                );
+
+                match peer.elicit_url(&message, url::Url::parse(&url).unwrap(), format!("work_text_{work_id}")).await {
+                    Ok(rmcp::model::ElicitationAction::Accept) => {
+                        // Poll Zotero with progress notifications
+                        return Some(self.poll_with_progress(peer, zotero, work_id, title, bare_doi).await);
+                    }
+                    Ok(_) => {
+                        // User declined or cancelled
+                        return None;
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Ask the LLM to find a PDF URL via sampling, then try to download it.
+    async fn try_sampling_pdf(
+        &self,
+        peer: &Peer<RoleServer>,
+        work_id: &str,
+        title: Option<&str>,
+        doi: &str,
+    ) -> Option<Result<String, String>> {
+        use rmcp::model::{CreateMessageRequestParams, SamplingMessage};
+
+        let bare_doi = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
+        let display = title.unwrap_or(work_id);
+        let prompt = format!(
+            "Find a direct PDF download URL for the academic paper: \"{display}\" (DOI: {bare_doi}). \
+             Reply with ONLY the URL or the word 'none' if you cannot find one."
+        );
+
+        let result = peer.create_message(CreateMessageRequestParams {
+            meta: None,
+            task: None,
+            messages: vec![SamplingMessage::user_text(&prompt)],
+            model_preferences: None,
+            system_prompt: None,
+            temperature: None,
+            max_tokens: 200,
+            stop_sequences: None,
+            include_context: None,
+            metadata: None,
+            tools: None,
+            tool_choice: None,
+        }).await;
+
+        let result = match result {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+
+        // Extract text from response
+        let text = match result.message.content.first() {
+            Some(rmcp::model::SamplingMessageContent::Text(t)) => t.text.clone(),
+            _ => return None,
+        };
+        let text = text.trim();
+
+        if text.eq_ignore_ascii_case("none") || text.is_empty() || !text.starts_with("http") {
+            return None;
+        }
+
+        // Try downloading the URL
+        let http = reqwest::Client::new();
+        let resp = match http.get(text)
+            .header("User-Agent", "papers-mcp/0.1")
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => return None,
+        };
+
+        let is_pdf = resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("application/pdf"));
+
+        if !is_pdf {
+            return None;
+        }
+
+        let bytes = match resp.bytes().await {
+            Ok(b) if !b.is_empty() => b,
+            _ => return None,
+        };
+
+        let extracted = match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes)) {
+            Ok(Ok(t)) => t,
+            Ok(Err(_)) | Err(_) => return None,
+        };
+
+        Some(json_result::<_, String>(Ok(papers_core::text::WorkTextResult {
+            text: extracted,
+            source: papers_core::text::PdfSource::DirectUrl { url: text.to_string() },
+            work_id: work_id.to_string(),
+            title: title.map(String::from),
+            doi: Some(doi.to_string()),
+        })))
+    }
+
+    /// Poll Zotero for a work, sending progress notifications to the client.
+    async fn poll_with_progress(
+        &self,
+        peer: &Peer<RoleServer>,
+        zotero: &ZoteroClient,
+        work_id: &str,
+        title: Option<&str>,
+        doi: &str,
+    ) -> Result<String, String> {
+        use rmcp::model::ProgressNotificationParam;
+
+        let token = rmcp::model::ProgressToken(rmcp::model::NumberOrString::String(format!("poll_{work_id}").into()));
+        let total_steps = 56i64; // 1 initial + 55 polls
+
+        // Notify start
+        let _ = peer.notify_progress(ProgressNotificationParam {
+            progress_token: token.clone(),
+            progress: 0.0,
+            total: Some(total_steps as f64),
+            message: Some("Waiting for paper to appear in Zotero...".into()),
+        }).await;
+
+        // Initial wait
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _ = peer.notify_progress(ProgressNotificationParam {
+            progress_token: token.clone(),
+            progress: 1.0,
+            total: Some(total_steps as f64),
+            message: Some("Polling Zotero...".into()),
+        }).await;
+
+        for i in 0..55 {
+            match papers_core::text::try_zotero(zotero, doi, title).await {
+                Ok(Some((bytes, source))) => {
+                    let _ = peer.notify_progress(ProgressNotificationParam {
+                        progress_token: token.clone(),
+                        progress: total_steps as f64,
+                        total: Some(total_steps as f64),
+                        message: Some("PDF found!".into()),
+                    }).await;
+
+                    let text = match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(&bytes)) {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(e)) => return Err(format!("PDF extraction error: {e}")),
+                        Err(_) => return Err("PDF extraction error: pdf-extract panicked while processing this PDF".to_string()),
+                    };
+
+                    return json_result::<_, String>(Ok(papers_core::text::WorkTextResult {
+                        text,
+                        source,
+                        work_id: work_id.to_string(),
+                        title: title.map(String::from),
+                        doi: Some(doi.to_string()),
+                    }));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let _ = peer.notify_progress(ProgressNotificationParam {
+                progress_token: token.clone(),
+                progress: (i + 2) as f64,
+                total: Some(total_steps as f64),
+                message: Some(format!("Polling Zotero... ({}/55)", i + 1)),
+            }).await;
+        }
+
+        Err(format!(
+            "Timed out waiting for paper in Zotero: {}", title.unwrap_or(work_id)
+        ))
     }
 }
 

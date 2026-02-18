@@ -299,7 +299,7 @@ async fn main() {
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
-            WorkCommand::Text { id, json } => {
+            WorkCommand::Text { id, json, no_prompt } => {
                 let zotero = ZoteroClient::from_env().ok();
                 match papers_core::text::work_text(&client, zotero.as_ref(), &id).await {
                     Ok(result) => {
@@ -307,6 +307,52 @@ async fn main() {
                             print_json(&result);
                         } else {
                             print!("{}", format::format_work_text(&result));
+                        }
+                    }
+                    Err(papers_core::text::WorkTextError::NoPdfFound { ref work_id, ref title, ref doi }) => {
+                        let display_title = title.as_deref().unwrap_or(work_id);
+
+                        if no_prompt || doi.is_none() || zotero.is_none() {
+                            exit_err(&format!("No PDF found for {display_title}"));
+                        }
+
+                        let doi = doi.as_ref().unwrap();
+                        let bare = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
+                        eprintln!("No PDF found for \"{display_title}\".");
+                        eprintln!("Open https://doi.org/{bare} to save this paper to Zotero? [Y/n] ");
+
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input).unwrap_or(0);
+                        let input = input.trim().to_lowercase();
+
+                        if !input.is_empty() && input != "y" && input != "yes" {
+                            exit_err(&format!("No PDF found for {display_title}"));
+                        }
+
+                        // Open DOI URL in browser
+                        let url = format!("https://doi.org/{bare}");
+                        #[cfg(target_os = "windows")]
+                        let _ = std::process::Command::new("cmd").args(["/c", "start", &url]).spawn();
+                        #[cfg(target_os = "macos")]
+                        let _ = std::process::Command::new("open").arg(&url).spawn();
+                        #[cfg(target_os = "linux")]
+                        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+
+                        eprintln!("Waiting for paper to appear in Zotero...");
+                        match papers_core::text::poll_zotero_for_work(
+                            zotero.as_ref().unwrap(),
+                            work_id,
+                            title.as_deref(),
+                            bare,
+                        ).await {
+                            Ok(result) => {
+                                if json {
+                                    print_json(&result);
+                                } else {
+                                    print!("{}", format::format_work_text(&result));
+                                }
+                            }
+                            Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     Err(e) => exit_err(&e.to_string()),

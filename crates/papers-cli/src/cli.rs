@@ -404,6 +404,9 @@ pub enum WorkCommand {
         /// Output raw JSON (includes source metadata)
         #[arg(long)]
         json: bool,
+        /// Skip interactive prompt when no PDF is found
+        #[arg(long)]
+        no_prompt: bool,
     },
 }
 

@@ -45,6 +45,7 @@ pub enum WorkTextError {
     NoPdfFound {
         work_id: String,
         title: Option<String>,
+        doi: Option<String>,
     },
 }
 
@@ -62,9 +63,17 @@ const DIRECT_PDF_DOMAINS: &[&str] = &[
 ];
 
 /// Extract text from PDF bytes.
+///
+/// Wraps the call in `catch_unwind` because `pdf-extract` can panic on
+/// certain malformed or unsupported PDFs (e.g. unwrap on None internals).
 fn extract_text(pdf_bytes: &[u8]) -> Result<String, WorkTextError> {
-    pdf_extract::extract_text_from_mem(pdf_bytes)
-        .map_err(|e| WorkTextError::PdfExtract(e.to_string()))
+    match std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(pdf_bytes)) {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) => Err(WorkTextError::PdfExtract(e.to_string())),
+        Err(_) => Err(WorkTextError::PdfExtract(
+            "pdf-extract panicked while processing this PDF".to_string(),
+        )),
+    }
 }
 
 /// Strip the `https://doi.org/` prefix from a DOI URL, returning the bare DOI.
@@ -124,26 +133,41 @@ fn collect_pdf_urls(work: &Work) -> Vec<String> {
 }
 
 /// Try to find and download a PDF from Zotero (local storage first, then remote API).
-async fn try_zotero(
+pub async fn try_zotero(
     zotero: &ZoteroClient,
     doi: &str,
+    title: Option<&str>,
 ) -> Result<Option<(Vec<u8>, PdfSource)>, WorkTextError> {
-    let params = ItemListParams::builder()
-        .q(doi)
-        .qmode("everything")
-        .build();
+    // Zotero API's `q` parameter only searches title, creator, year, and full-text
+    // content — it does NOT search metadata fields like DOI (per Zotero docs:
+    // "Searching of other fields will be possible in the future").
+    // Search by title first, then fall back to DOI (which may match full-text content).
+    let mut candidate_queries: Vec<String> = Vec::new();
+    if let Some(t) = title {
+        candidate_queries.push(t.to_string());
+    }
+    candidate_queries.push(doi.to_string());
 
-    let results = zotero.list_items(&params).await?;
+    for query in &candidate_queries {
+        let params = ItemListParams::builder()
+            .q(query.as_str())
+            .qmode("everything")
+            .build();
 
-    for item in &results.items {
-        // Check that this item's DOI actually matches
-        let item_doi = match &item.data.doi {
-            Some(d) => d,
-            None => continue,
-        };
-        if !item_doi.eq_ignore_ascii_case(doi) {
+        let results = zotero.list_top_items(&params).await?;
+        if results.items.is_empty() {
             continue;
         }
+
+        for item in &results.items {
+            // Check that this item's DOI actually matches
+            let item_doi = match &item.data.doi {
+                Some(d) => d,
+                None => continue,
+            };
+            if !item_doi.eq_ignore_ascii_case(doi) {
+                continue;
+            }
 
         // Get children to find PDF attachment
         let children = zotero
@@ -156,13 +180,12 @@ async fn try_zotero(
                 .content_type
                 .as_deref()
                 == Some("application/pdf");
-            let is_imported = child
-                .data
-                .link_mode
-                .as_deref()
-                == Some("imported_file");
+            let has_local_file = matches!(
+                child.data.link_mode.as_deref(),
+                Some("imported_file" | "imported_url")
+            );
 
-            if !is_pdf || !is_imported {
+            if !is_pdf || !has_local_file {
                 continue;
             }
 
@@ -199,6 +222,7 @@ async fn try_zotero(
                 }
                 _ => continue,
             }
+        }
         }
     }
 
@@ -316,7 +340,7 @@ pub async fn work_text(
 
     // 2. Try Zotero (local then remote)
     if let (Some(zotero), Some(doi)) = (zotero, doi) {
-        if let Some((bytes, source)) = try_zotero(zotero, doi).await? {
+        if let Some((bytes, source)) = try_zotero(zotero, doi, title.as_deref()).await? {
             let text = extract_text(&bytes)?;
             return Ok(WorkTextResult {
                 text,
@@ -357,6 +381,41 @@ pub async fn work_text(
     Err(WorkTextError::NoPdfFound {
         work_id: work.id.clone(),
         title,
+        doi: doi_raw.map(String::from),
+    })
+}
+
+/// Poll Zotero for a work by DOI. Waits 5s initially, then polls every 2s for up to ~2 min.
+///
+/// This is used by callers (CLI prompt, MCP elicitation) after asking the user to add a paper
+/// to Zotero. Returns the extracted text if the paper appears in Zotero within the timeout.
+pub async fn poll_zotero_for_work(
+    zotero: &ZoteroClient,
+    work_id: &str,
+    title: Option<&str>,
+    doi: &str,
+) -> Result<WorkTextResult, WorkTextError> {
+    // Initial wait to give user time to save
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    for _ in 0..55 {
+        if let Some((bytes, source)) = try_zotero(zotero, doi, title).await? {
+            let text = extract_text(&bytes)?;
+            return Ok(WorkTextResult {
+                text,
+                source,
+                work_id: work_id.to_string(),
+                title: title.map(String::from),
+                doi: Some(doi.to_string()),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    Err(WorkTextError::NoPdfFound {
+        work_id: work_id.to_string(),
+        title: title.map(String::from),
+        doi: Some(doi.to_string()),
     })
 }
 

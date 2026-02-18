@@ -813,7 +813,7 @@ async fn test_work_text_no_pdf_found() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
-        text::WorkTextError::NoPdfFound { ref work_id, ref title } => {
+        text::WorkTextError::NoPdfFound { ref work_id, ref title, .. } => {
             assert_eq!(work_id, "https://openalex.org/W1");
             assert_eq!(title.as_deref(), Some("A Paper Without PDF"));
         }

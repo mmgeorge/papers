@@ -81,6 +81,56 @@ async fn test_live_search_items() {
     assert!(!resp.items.is_empty());
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_live_search_xz_ordering() {
+    let zotero = client();
+
+    // Test DOI-based search (what try_zotero actually uses)
+    let doi = "10.1007/3-540-48482-5_7";
+    println!("\n=== DOI search: {:?} ===", doi);
+    let doi_params = ItemListParams::builder().q(doi).qmode("everything").limit(5).build();
+    let doi_resp = zotero.list_items(&doi_params).await.unwrap();
+    println!("DOI search results: {:?}", doi_resp.total_results);
+    for item in &doi_resp.items {
+        println!("  key={} doi={:?} title={:?}", item.key, item.data.doi, item.data.title);
+    }
+
+    for query in &["XZ ordering", "XZ-Ordering", "GeoMesa"] {
+        println!("\n=== Search: {:?} ===", query);
+        let params = ItemListParams::builder().q(*query).limit(10).build();
+        let resp = zotero.list_items(&params).await.unwrap();
+        println!("Total results: {:?}", resp.total_results);
+
+        for item in &resp.items {
+            let title = item.data.title.as_deref().unwrap_or("<no title>");
+            let doi = item.data.doi.as_deref().unwrap_or("<no doi>");
+            println!("  key={} doi={:?} title={:?}", item.key, doi, title);
+
+            // Check for PDF children
+            let children = zotero
+                .list_item_children(&item.key, &ItemListParams::default())
+                .await
+                .unwrap();
+            for child in &children.items {
+                let content_type = child.data.content_type.as_deref().unwrap_or("");
+                let link_mode = child.data.link_mode.as_deref().unwrap_or("");
+                let filename = child.data.filename.as_deref().unwrap_or("");
+                println!(
+                    "    child={} content_type={:?} link_mode={:?} filename={:?}",
+                    child.key, content_type, link_mode, filename
+                );
+                // Check local file path
+                if !filename.is_empty() {
+                    let home = dirs::home_dir().unwrap_or_default();
+                    let local = home.join("Zotero").join("storage").join(&child.key).join(filename);
+                    println!("    local_path={} exists={}", local.display(), local.exists());
+                }
+            }
+        }
+    }
+}
+
 // ── Live collection tests ────────────────────────────────────────────
 
 #[tokio::test]

@@ -1307,11 +1307,14 @@ version = "0.1.4"
 dependencies = [
  "papers-core",
  "papers-zotero",
+ "pdf-extract",
+ "reqwest",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "tokio",
+ "url",
  "wiremock",
 ]
 
@@ -1677,6 +1680,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]

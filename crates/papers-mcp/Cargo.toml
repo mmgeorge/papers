@@ -10,11 +10,14 @@ repository.workspace = true
 [dependencies]
 papers-core.workspace = true
 papers-zotero.workspace = true
+pdf-extract.workspace = true
+reqwest.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+url = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
