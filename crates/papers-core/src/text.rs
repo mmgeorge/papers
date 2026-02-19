@@ -68,27 +68,14 @@ const DIRECT_PDF_DOMAINS: &[&str] = &[
     "plos.org",
 ];
 
-/// Extract text from PDF bytes using pdfium-render.
+/// Extract text from PDF bytes using pdf-extract.
 pub fn extract_text_bytes(pdf_bytes: &[u8]) -> Result<String, WorkTextError> {
     extract_text(pdf_bytes)
 }
 
 fn extract_text(pdf_bytes: &[u8]) -> Result<String, WorkTextError> {
-    let pdfium = pdfium_render::prelude::Pdfium::default();
-    let document = pdfium
-        .load_pdf_from_byte_slice(pdf_bytes, None)
-        .map_err(|e| WorkTextError::PdfExtract(e.to_string()))?;
-    let mut text = String::new();
-    for page in document.pages().iter() {
-        text.push_str(
-            &page
-                .text()
-                .map_err(|e| WorkTextError::PdfExtract(e.to_string()))?
-                .all(),
-        );
-        text.push('\n');
-    }
-    Ok(text)
+    pdf_extract::extract_text_from_mem(pdf_bytes)
+        .map_err(|e| WorkTextError::PdfExtract(e.to_string()))
 }
 
 /// Strip the `https://doi.org/` prefix from a DOI URL, returning the bare DOI.

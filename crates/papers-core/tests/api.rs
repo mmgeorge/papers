@@ -809,7 +809,7 @@ async fn test_work_text_no_pdf_found() {
         .await;
 
     let client = make_client(&mock);
-    let result = text::work_text(&client, None, "W1").await;
+    let result = text::work_text(&client, None, None, "W1").await;
     assert!(result.is_err());
     let err = result.unwrap_err();
     match err {
@@ -843,7 +843,7 @@ async fn test_work_text_no_pdf_found_with_non_whitelisted_url() {
         .await;
 
     let client = make_client(&mock);
-    let result = text::work_text(&client, None, "W2").await;
+    let result = text::work_text(&client, None, None, "W2").await;
     assert!(result.is_err());
     match result.unwrap_err() {
         text::WorkTextError::NoPdfFound { .. } => {}
