@@ -683,9 +683,9 @@ pub enum ZoteroWorkCommand {
         /// Quick text search (title, creator, year)
         #[arg(long, short = 's')]
         search: Option<String>,
-        /// Search scope: titleCreatorYear (default) or everything
+        /// Expand search to all fields (default: title/creator/year only)
         #[arg(long)]
-        qmode: Option<String>,
+        everything: bool,
         /// Filter by tag; use || for OR, - prefix for NOT
         #[arg(long, short = 't')]
         tag: Option<String>,
@@ -767,12 +767,9 @@ pub enum ZoteroWorkCommand {
     Tags {
         /// Item key (e.g. LF4MJWZK) or a title/creator search string
         key: String,
-        /// Filter tags by name
+        /// Filter tags by name (substring match)
         #[arg(long, short = 'q')]
         search: Option<String>,
-        /// Search mode: startsWith (default) or contains
-        #[arg(long)]
-        qmode: Option<String>,
         /// Results per page (1-100, default 25)
         #[arg(long, short = 'n')]
         limit: Option<u32>,
@@ -915,9 +912,9 @@ pub enum ZoteroCollectionCommand {
         /// Quick text search
         #[arg(long, short = 's')]
         search: Option<String>,
-        /// Search scope: titleCreatorYear or everything
+        /// Expand search to all fields (default: title/creator/year only)
         #[arg(long)]
-        qmode: Option<String>,
+        everything: bool,
         /// Filter by tag
         #[arg(long, short = 't')]
         tag: Option<String>,
@@ -1015,12 +1012,9 @@ pub enum ZoteroCollectionCommand {
     Tags {
         /// Collection key (e.g. AB12CDEF) or a name search string
         key: String,
-        /// Filter tags by name
+        /// Filter tags by name (substring match)
         #[arg(long, short = 'q')]
         search: Option<String>,
-        /// Search mode: startsWith or contains
-        #[arg(long)]
-        qmode: Option<String>,
         /// Results per page
         #[arg(long, short = 'n')]
         limit: Option<u32>,
@@ -1040,12 +1034,9 @@ pub enum ZoteroCollectionCommand {
 pub enum ZoteroTagCommand {
     /// List tags from the global library tag index (with per-tag item counts)
     List {
-        /// Search tag names
+        /// Search tag names (substring match)
         #[arg(long, short = 'q')]
         search: Option<String>,
-        /// Search mode: startsWith (default) or contains
-        #[arg(long)]
-        qmode: Option<String>,
         /// Sort field
         #[arg(long)]
         sort: Option<String>,

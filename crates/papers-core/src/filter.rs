@@ -494,8 +494,9 @@ pub(crate) fn normalize_id(raw_id: &str, entity_type: &str) -> String {
 
 /// Resolve a search string to an entity ID by querying the list endpoint.
 ///
-/// For most entities: `GET /{entity_type}?filter=display_name.search:{query}&sort=cited_by_count:desc&per_page=1&select=id`
+/// For works: `GET /works?filter=title.search:{query}&sort=relevance_score:desc&per_page=1&select=id`
 /// For publishers: `GET /publishers?search={query}&sort=cited_by_count:desc&per_page=1&select=id`
+/// For all other entities: `GET /{entity_type}?filter=display_name.search:{query}&sort=cited_by_count:desc&per_page=1&select=id`
 pub(crate) async fn resolve_entity_id(
     client: &OpenAlexClient,
     query: &str,
@@ -506,6 +507,16 @@ pub(crate) async fn resolve_entity_id(
         ListParams {
             search: Some(query.to_string()),
             sort: Some("cited_by_count:desc".to_string()),
+            per_page: Some(1),
+            select: Some("id,display_name".to_string()),
+            ..Default::default()
+        }
+    } else if entity_type == "works" {
+        // Works: sort by relevance so the best title match wins rather than
+        // the most-cited work that happens to contain the query keywords
+        ListParams {
+            filter: Some(format!("title.search:{query}")),
+            sort: Some("relevance_score:desc".to_string()),
             per_page: Some(1),
             select: Some("id,display_name".to_string()),
             ..Default::default()

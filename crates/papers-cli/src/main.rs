@@ -715,12 +715,12 @@ async fn main() {
             match cmd {
                 ZoteroCommand::Work { cmd } => match cmd {
                     ZoteroWorkCommand::List {
-                        search, qmode, tag, type_, sort, direction, limit, start, since, json,
+                        search, everything, tag, type_, sort, direction, limit, start, since, json,
                     } => {
                         let params = ItemListParams {
                             item_type: type_,
                             q: search,
-                            qmode,
+                            qmode: everything.then(|| "everything".to_string()),
                             tag,
                             sort,
                             direction,
@@ -794,9 +794,9 @@ async fn main() {
                         }
                         if json { print_json(&all_annotations); } else { print!("{}", format::format_zotero_annotation_list_vec(&all_annotations)); }
                     }
-                    ZoteroWorkCommand::Tags { key, search, qmode, limit, start, json } => {
+                    ZoteroWorkCommand::Tags { key, search, limit, start, json } => {
                         let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = TagListParams { q: search, qmode, limit, start, ..Default::default() };
+                        let params = TagListParams { q: search, qmode: Some("contains".to_string()), limit, start, ..Default::default() };
                         match zotero.list_item_tags(&key, &params).await {
                             Ok(resp) => {
                                 if json { print_json(&resp); } else { print!("{}", format::format_zotero_tag_list(&resp)); }
@@ -910,12 +910,12 @@ async fn main() {
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
-                    ZoteroCollectionCommand::Works { key, search, qmode, tag, type_, sort, direction, limit, start, json } => {
+                    ZoteroCollectionCommand::Works { key, search, everything, tag, type_, sort, direction, limit, start, json } => {
                         let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
                         let params = ItemListParams {
                             item_type: type_,
                             q: search,
-                            qmode,
+                            qmode: everything.then(|| "everything".to_string()),
                             tag,
                             sort,
                             direction,
@@ -976,9 +976,9 @@ async fn main() {
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
-                    ZoteroCollectionCommand::Tags { key, search, qmode, limit, start, top, json } => {
+                    ZoteroCollectionCommand::Tags { key, search, limit, start, top, json } => {
                         let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = TagListParams { q: search, qmode, limit, start, ..Default::default() };
+                        let params = TagListParams { q: search, qmode: Some("contains".to_string()), limit, start, ..Default::default() };
                         let result = if top {
                             zotero.list_collection_top_items_tags(&key, &params).await
                         } else {
@@ -994,8 +994,8 @@ async fn main() {
                 },
 
                 ZoteroCommand::Tag { cmd } => match cmd {
-                    ZoteroTagCommand::List { search, qmode, sort, direction, limit, start, top, trash, json } => {
-                        let params = TagListParams { q: search, qmode, sort, direction, limit: Some(limit), start };
+                    ZoteroTagCommand::List { search, sort, direction, limit, start, top, trash, json } => {
+                        let params = TagListParams { q: search, qmode: Some("contains".to_string()), sort, direction, limit: Some(limit), start };
                         let result = if trash {
                             zotero.list_trash_tags(&params).await
                         } else if top {

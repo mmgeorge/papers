@@ -729,8 +729,9 @@ where
 pub struct ZoteroWorkListToolParams {
     /// Quick text search (title, creator, year).
     pub search: Option<String>,
-    /// Search scope: `"titleCreatorYear"` (default) or `"everything"`.
-    pub qmode: Option<String>,
+    /// When true, expand search to all fields instead of title/creator/year only.
+    #[serde(default)]
+    pub everything: bool,
     /// Filter by tag name. `||` for OR, `-` prefix for NOT.
     pub tag: Option<String>,
     /// Narrow to a specific bibliographic type (e.g. `"journalArticle"`, `"book"`).
@@ -770,10 +771,8 @@ pub struct ZoteroWorkChildrenToolParams {
 pub struct ZoteroWorkTagsToolParams {
     /// Item key (e.g. `LF4MJWZK`) or a title/creator search string.
     pub key: String,
-    /// Filter tags by name.
+    /// Filter tags by name (substring match).
     pub search: Option<String>,
-    /// Search mode: `"startsWith"` (default) or `"contains"`.
-    pub qmode: Option<String>,
     /// Results per page (1–100).
     #[serde(default, deserialize_with = "lax_optional_u32")]
     pub limit: Option<u32>,
@@ -847,8 +846,9 @@ pub struct ZoteroCollectionWorksToolParams {
     pub key: String,
     /// Text search (title, creator, year).
     pub search: Option<String>,
-    /// Search scope: `"titleCreatorYear"` or `"everything"`.
-    pub qmode: Option<String>,
+    /// When true, expand search to all fields instead of title/creator/year only.
+    #[serde(default)]
+    pub everything: bool,
     /// Tag filter.
     pub tag: Option<String>,
     /// Narrow to a specific bibliographic type (e.g. `"journalArticle"`).
@@ -902,10 +902,8 @@ pub struct ZoteroCollectionSubcollectionsToolParams {
 pub struct ZoteroCollectionTagsToolParams {
     /// Collection key (e.g. `AB12CDEF`) or a name search string.
     pub key: String,
-    /// Filter tags by name.
+    /// Filter tags by name (substring match).
     pub search: Option<String>,
-    /// Search mode: `"startsWith"` or `"contains"`.
-    pub qmode: Option<String>,
     /// Results per page (1–100, default 25).
     #[serde(default, deserialize_with = "lax_optional_u32")]
     pub limit: Option<u32>,
@@ -919,10 +917,8 @@ pub struct ZoteroCollectionTagsToolParams {
 /// Parameters for the `zotero_tag_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ZoteroTagListToolParams {
-    /// Filter tag names.
+    /// Filter tag names (substring match).
     pub search: Option<String>,
-    /// Search mode: `"startsWith"` (default) or `"contains"`.
-    pub qmode: Option<String>,
     /// Sort field.
     pub sort: Option<String>,
     /// Sort direction: `"asc"` or `"desc"`.

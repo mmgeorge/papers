@@ -297,7 +297,7 @@ impl PapersMcp {
         let params = papers_zotero::ItemListParams {
             item_type: p.item_type,
             q: p.search,
-            qmode: p.qmode,
+            qmode: p.everything.then(|| "everything".to_string()),
             tag: p.tag,
             item_key: p.item_key,
             since: p.since,
@@ -378,7 +378,7 @@ impl PapersMcp {
     pub async fn zotero_work_tags(&self, Parameters(p): Parameters<ZoteroWorkTagsToolParams>) -> Result<String, String> {
         let z = self.zotero.as_ref().ok_or_else(|| "Zotero not configured. Set ZOTERO_USER_ID and ZOTERO_API_KEY.".to_string())?;
         let key = zotero_resolve::resolve_item_key(z, &p.key).await.map_err(|e| e.to_string())?;
-        let params = papers_zotero::TagListParams { q: p.search, qmode: p.qmode, limit: p.limit, start: p.start, ..Default::default() };
+        let params = papers_zotero::TagListParams { q: p.search, qmode: Some("contains".to_string()), limit: p.limit, start: p.start, ..Default::default() };
         json_result(z.list_item_tags(&key, &params).await)
     }
 
@@ -464,7 +464,7 @@ impl PapersMcp {
         let params = papers_zotero::ItemListParams {
             item_type: p.item_type,
             q: p.search,
-            qmode: p.qmode,
+            qmode: p.everything.then(|| "everything".to_string()),
             tag: p.tag,
             sort: p.sort,
             direction: p.direction,
@@ -526,7 +526,7 @@ impl PapersMcp {
     pub async fn zotero_collection_tags(&self, Parameters(p): Parameters<ZoteroCollectionTagsToolParams>) -> Result<String, String> {
         let z = self.zotero.as_ref().ok_or_else(|| "Zotero not configured. Set ZOTERO_USER_ID and ZOTERO_API_KEY.".to_string())?;
         let key = zotero_resolve::resolve_collection_key(z, &p.key).await.map_err(|e| e.to_string())?;
-        let params = papers_zotero::TagListParams { q: p.search, qmode: p.qmode, limit: p.limit, start: p.start, ..Default::default() };
+        let params = papers_zotero::TagListParams { q: p.search, qmode: Some("contains".to_string()), limit: p.limit, start: p.start, ..Default::default() };
         let result = if p.top == Some(true) {
             z.list_collection_top_items_tags(&key, &params).await
         } else {
@@ -541,7 +541,7 @@ impl PapersMcp {
     #[tool]
     pub async fn zotero_tag_list(&self, Parameters(p): Parameters<ZoteroTagListToolParams>) -> Result<String, String> {
         let z = self.zotero.as_ref().ok_or_else(|| "Zotero not configured. Set ZOTERO_USER_ID and ZOTERO_API_KEY.".to_string())?;
-        let params = papers_zotero::TagListParams { q: p.search, qmode: p.qmode, sort: p.sort, direction: p.direction, limit: p.limit, start: p.start };
+        let params = papers_zotero::TagListParams { q: p.search, qmode: Some("contains".to_string()), sort: p.sort, direction: p.direction, limit: p.limit, start: p.start };
         let result = match p.scope.as_deref() {
             Some("trash") => z.list_trash_tags(&params).await,
             Some("top") => z.list_top_items_tags(&params).await,

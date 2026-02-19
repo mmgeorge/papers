@@ -1719,6 +1719,70 @@ async fn test_zotero_work_list() {
 }
 
 #[tokio::test]
+async fn test_zotero_work_list_everything_flag() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/top"))
+        .and(query_param("qmode", "everything"))
+        .respond_with(zotero_array_response(&zotero_items_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"everything": true})).unwrap();
+    let result = server.zotero_work_list(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_zotero_work_list_no_qmode_by_default() {
+    let mock = MockServer::start().await;
+    // Strict matcher: request must NOT have qmode param
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/top"))
+        .respond_with(zotero_array_response(&zotero_items_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    server.zotero_work_list(Parameters(params)).await.unwrap();
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].url.query().unwrap_or("").contains("qmode"));
+}
+
+#[tokio::test]
+async fn test_zotero_tag_list_always_uses_contains() {
+    // qmode=contains is always sent, even without a search string
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/tags"))
+        .and(query_param("qmode", "contains"))
+        .respond_with(zotero_array_response(&zotero_tags_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({})).unwrap();
+    let result = server.zotero_tag_list(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_zotero_tag_list_search_with_contains() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/tags"))
+        .and(query_param("q", "Star"))
+        .and(query_param("qmode", "contains"))
+        .respond_with(zotero_array_response(&zotero_tags_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"search": "Star"})).unwrap();
+    let result = server.zotero_tag_list(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
 async fn test_zotero_work_get() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
