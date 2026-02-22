@@ -5,6 +5,7 @@
 
 use std::fs;
 use tempfile::TempDir;
+use serial_test::serial;
 
 use crate::ingest::{IngestParams, ingest_paper, is_ingested, list_cached_item_keys};
 use crate::query::{
@@ -12,6 +13,34 @@ use crate::query::{
 };
 use crate::store::RagStore;
 use crate::types::{ListPapersParams, ListTagsParams};
+
+// ── Test isolation ────────────────────────────────────────────────────────────
+
+/// RAII guard that redirects the embed cache to an isolated TempDir for one
+/// test, then clears the env var on drop.  Use together with `#[serial]` to
+/// prevent parallel tests from clobbering each other's `PAPERS_EMBED_CACHE_DIR`
+/// and from writing into the real platform cache.
+struct EmbedCacheGuard {
+    _dir: TempDir,
+}
+
+impl EmbedCacheGuard {
+    fn new() -> Self {
+        let dir = TempDir::new().expect("create temp embed cache dir");
+        unsafe {
+            std::env::set_var("PAPERS_EMBED_CACHE_DIR", dir.path());
+        }
+        Self { _dir: dir }
+    }
+}
+
+impl Drop for EmbedCacheGuard {
+    fn drop(&mut self) {
+        unsafe {
+            std::env::remove_var("PAPERS_EMBED_CACHE_DIR");
+        }
+    }
+}
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -157,8 +186,10 @@ async fn open_test_store(dir: &TempDir) -> RagStore {
 
 // ── Ingest tests ──────────────────────────────────────────────────────────────
 
+#[serial]
 #[tokio::test]
 async fn test_ingest_basic_counts() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -172,8 +203,10 @@ async fn test_ingest_basic_counts() {
     assert_eq!(stats.figures_added, 2, "expected 2 figures");
 }
 
+#[serial]
 #[tokio::test]
 async fn test_ingest_chapter_section_assignment() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -196,8 +229,10 @@ async fn test_ingest_chapter_section_assignment() {
     assert_eq!(ch2.sections.len(), 1, "ch2 should have 1 section");
 }
 
+#[serial]
 #[tokio::test]
 async fn test_ingest_skips_caption_and_pageheader() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -212,8 +247,10 @@ async fn test_ingest_skips_caption_and_pageheader() {
     );
 }
 
+#[serial]
 #[tokio::test]
 async fn test_ingest_chunk_ids_have_correct_format() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -229,8 +266,10 @@ async fn test_ingest_chunk_ids_have_correct_format() {
     assert_eq!(chunk.chunk.chunk_idx, 0);
 }
 
+#[serial]
 #[tokio::test]
 async fn test_ingest_text_content_stripped() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -244,8 +283,10 @@ async fn test_ingest_text_content_stripped() {
     assert!(!chunk.chunk.text.contains('<'));
 }
 
+#[serial]
 #[tokio::test]
 async fn test_ingest_reingest_deduplicates() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -287,8 +328,10 @@ async fn test_is_ingested_false_before_ingest() {
     assert!(!is_ingested(&store, "NOTINGESTED").await);
 }
 
+#[serial]
 #[tokio::test]
 async fn test_is_ingested_true_after_ingest() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -323,8 +366,10 @@ async fn test_list_papers_empty_db() {
     assert!(papers.is_empty());
 }
 
+#[serial]
 #[tokio::test]
 async fn test_list_papers_returns_ingested_paper() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -359,8 +404,10 @@ async fn test_list_papers_returns_ingested_paper() {
     assert_eq!(p.figure_count, 2);
 }
 
+#[serial]
 #[tokio::test]
 async fn test_list_papers_year_filter() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -394,8 +441,10 @@ async fn test_list_papers_year_filter() {
     assert_eq!(papers[0].paper_id, "YR2023");
 }
 
+#[serial]
 #[tokio::test]
 async fn test_list_papers_author_filter() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -440,8 +489,10 @@ async fn test_list_tags_empty_db() {
     assert!(tags.is_empty());
 }
 
+#[serial]
 #[tokio::test]
 async fn test_list_tags_returns_tag_counts() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -477,8 +528,10 @@ async fn test_get_paper_outline_not_found() {
     assert!(result.unwrap_err().to_string().contains("NOEXIST"));
 }
 
+#[serial]
 #[tokio::test]
 async fn test_get_paper_outline_structure() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -518,8 +571,10 @@ async fn test_get_chunk_not_found() {
     assert!(result.is_err());
 }
 
+#[serial]
 #[tokio::test]
 async fn test_get_chunk_returns_prev_and_next() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -535,8 +590,10 @@ async fn test_get_chunk_returns_prev_and_next() {
     assert!(result.next.is_none(), "p1 should have no next in s0");
 }
 
+#[serial]
 #[tokio::test]
 async fn test_get_chunk_position_context() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -553,8 +610,10 @@ async fn test_get_chunk_position_context() {
 
 // ── get_section ───────────────────────────────────────────────────────────────
 
+#[serial]
 #[tokio::test]
 async fn test_get_section_returns_chunks_in_order() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -573,8 +632,10 @@ async fn test_get_section_returns_chunks_in_order() {
     assert_eq!(section.chunks[0].text, "Method description text.");
 }
 
+#[serial]
 #[tokio::test]
 async fn test_get_section_empty_returns_zero_chunks() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -589,8 +650,10 @@ async fn test_get_section_empty_returns_zero_chunks() {
 
 // ── get_chapter ───────────────────────────────────────────────────────────────
 
+#[serial]
 #[tokio::test]
 async fn test_get_chapter_groups_by_section() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -605,8 +668,10 @@ async fn test_get_chapter_groups_by_section() {
     assert_eq!(chapter.total_chunks, 3); // t0, t1 in s0 + t2 in s1
 }
 
+#[serial]
 #[tokio::test]
 async fn test_get_chapter_section_titles() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -627,6 +692,7 @@ async fn test_get_chapter_section_titles() {
 
 // ── list_cached_item_keys (filesystem test) ───────────────────────────────────
 
+#[serial]
 #[test]
 fn test_list_cached_keys_multiple_papers() {
     let dir = TempDir::new().unwrap();
@@ -660,8 +726,10 @@ fn test_list_cached_keys_multiple_papers() {
 
 // ── figure ID format ──────────────────────────────────────────────────────────
 
+#[serial]
 #[tokio::test]
 async fn test_figure_ids_have_correct_format() {
+    let _ecg = EmbedCacheGuard::new();
     use crate::query::get_figure;
 
     let cache_dir = TempDir::new().unwrap();
@@ -685,8 +753,10 @@ async fn test_figure_ids_have_correct_format() {
 
 // ── paper metadata roundtrip ──────────────────────────────────────────────────
 
+#[serial]
 #[tokio::test]
 async fn test_paper_metadata_preserved_in_chunks() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -744,8 +814,10 @@ fn make_cache_from_json(dir: &TempDir, item_key: &str, json: &str) -> IngestPara
 }
 
 // 1. h1 is treated as paper title and skipped — no chapter is created.
+#[serial]
 #[tokio::test]
 async fn test_h1_skipped_as_paper_title() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -763,8 +835,10 @@ async fn test_h1_skipped_as_paper_title() {
 }
 
 // 2. h2 creates a chapter.
+#[serial]
 #[tokio::test]
 async fn test_h2_creates_chapter() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -782,8 +856,10 @@ async fn test_h2_creates_chapter() {
 }
 
 // 3. h3 creates a section within the current chapter.
+#[serial]
 #[tokio::test]
 async fn test_h3_creates_section() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -802,8 +878,10 @@ async fn test_h3_creates_section() {
 }
 
 // 4. h4 also creates a section (treated same as h3).
+#[serial]
 #[tokio::test]
 async fn test_h4_creates_section() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -821,8 +899,10 @@ async fn test_h4_creates_section() {
 }
 
 // 5. h5 is skipped — does not create a chapter or section.
+#[serial]
 #[tokio::test]
 async fn test_h5_is_skipped() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -840,8 +920,10 @@ async fn test_h5_is_skipped() {
 }
 
 // 6. h6 is skipped — matches ACM reference format and algorithm labels.
+#[serial]
 #[tokio::test]
 async fn test_h6_is_skipped() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -860,8 +942,10 @@ async fn test_h6_is_skipped() {
 }
 
 // 7. Multiple h2 headings produce sequentially-numbered chapters.
+#[serial]
 #[tokio::test]
 async fn test_multiple_h2_chapters_sequential() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -885,8 +969,10 @@ async fn test_multiple_h2_chapters_sequential() {
 }
 
 // 8. Multiple h3 sections within one chapter are numbered sequentially.
+#[serial]
 #[tokio::test]
 async fn test_multiple_h3_sections_sequential() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -911,8 +997,10 @@ async fn test_multiple_h3_sections_sequential() {
 }
 
 // 9. Section counter resets when a new h2 chapter starts.
+#[serial]
 #[tokio::test]
 async fn test_section_counter_resets_on_new_chapter() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -935,8 +1023,10 @@ async fn test_section_counter_resets_on_new_chapter() {
 }
 
 // 10. chunk_idx resets to 0 when a new h3 section starts.
+#[serial]
 #[tokio::test]
 async fn test_chunk_idx_resets_on_new_section() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -957,8 +1047,10 @@ async fn test_chunk_idx_resets_on_new_section() {
 }
 
 // 11. chunk_idx resets to 0 when a new h2 chapter starts.
+#[serial]
 #[tokio::test]
 async fn test_chunk_idx_resets_on_new_chapter() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -978,8 +1070,10 @@ async fn test_chunk_idx_resets_on_new_chapter() {
 }
 
 // 12. Text before any h2 lands in chapter 0 (implicit preamble).
+#[serial]
 #[tokio::test]
 async fn test_text_before_h2_lands_in_chapter_0() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1001,8 +1095,10 @@ async fn test_text_before_h2_lands_in_chapter_0() {
 }
 
 // 13. Chapter title is correctly extracted from h2 HTML (tags stripped).
+#[serial]
 #[tokio::test]
 async fn test_chapter_title_from_h2_html() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1021,8 +1117,10 @@ async fn test_chapter_title_from_h2_html() {
 }
 
 // 14. Section title is correctly extracted from h3 HTML (tags stripped).
+#[serial]
 #[tokio::test]
 async fn test_section_title_from_h3_html() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1039,8 +1137,10 @@ async fn test_section_title_from_h3_html() {
 }
 
 // 15. Section title is cleared (empty) when a new h2 chapter starts.
+#[serial]
 #[tokio::test]
 async fn test_section_title_cleared_on_new_chapter() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1060,8 +1160,10 @@ async fn test_section_title_cleared_on_new_chapter() {
 }
 
 // 16. h6 between h3 sections does not advance the section counter.
+#[serial]
 #[tokio::test]
 async fn test_h6_between_sections_does_not_advance_section() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1080,8 +1182,10 @@ async fn test_h6_between_sections_does_not_advance_section() {
 }
 
 // 17. h1 appearing after an h2 does not start a new chapter.
+#[serial]
 #[tokio::test]
 async fn test_h1_after_h2_does_not_start_new_chapter() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1102,8 +1206,10 @@ async fn test_h1_after_h2_does_not_start_new_chapter() {
 }
 
 // 18. h2 after h3 correctly starts a new chapter (not a section).
+#[serial]
 #[tokio::test]
 async fn test_h2_after_h3_starts_new_chapter() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1124,8 +1230,10 @@ async fn test_h2_after_h3_starts_new_chapter() {
 }
 
 // 19. Equation blocks are ingested as chunks.
+#[serial]
 #[tokio::test]
 async fn test_equation_block_ingested_as_chunk() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1143,8 +1251,10 @@ async fn test_equation_block_ingested_as_chunk() {
 }
 
 // 20. Realistic YFACFA8C-style structure: h1 title, h6 ACM ref, h2/h3 sections.
+#[serial]
 #[tokio::test]
 async fn test_realistic_yfacfa8c_structure() {
+    let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;

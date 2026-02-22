@@ -13,8 +13,7 @@ doctest = false
 [dependencies]
 papers-core.workspace = true
 lancedb = "0.26"
-fastembed = { version = "5", features = ["nomic-v2-moe", "cuda"] }
-candle-core = "0.9"
+fastembed = "5"
 arrow-array = { version = "57", default-features = false }
 arrow-schema = { version = "57", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
@@ -26,3 +25,4 @@ dirs.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+serial_test.workspace = true

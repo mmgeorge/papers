@@ -1,7 +1,7 @@
 use std::io;
 use std::path::PathBuf;
 
-pub const VALID_MODELS: &[&str] = &["nomic-embed-text-v2-moe"];
+pub const VALID_MODELS: &[&str] = &["embedding-gemma-300m"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -21,7 +21,7 @@ pub struct PapersConfig {
 impl Default for PapersConfig {
     fn default() -> Self {
         Self {
-            embedding_model: "nomic-embed-text-v2-moe".to_string(),
+            embedding_model: "embedding-gemma-300m".to_string(),
         }
     }
 }
@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn test_config_default() {
         let cfg = PapersConfig::default();
-        assert_eq!(cfg.embedding_model, "nomic-embed-text-v2-moe");
+        assert_eq!(cfg.embedding_model, "embedding-gemma-300m");
     }
 
     #[test]
@@ -83,7 +83,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.json");
         let cfg = PapersConfig {
-            embedding_model: "nomic-embed-text-v2-moe".to_string(),
+            embedding_model: "embedding-gemma-300m".to_string(),
         };
         let json = serde_json::to_vec_pretty(&cfg).unwrap();
         std::fs::write(&path, &json).unwrap();
@@ -105,7 +105,7 @@ mod tests {
         } else {
             PapersConfig::default()
         };
-        assert_eq!(cfg.embedding_model, "nomic-embed-text-v2-moe");
+        assert_eq!(cfg.embedding_model, "embedding-gemma-300m");
     }
 
     #[test]
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_valid_model_accepted() {
-        assert!(PapersConfig::validate_model("nomic-embed-text-v2-moe").is_ok());
+        assert!(PapersConfig::validate_model("embedding-gemma-300m").is_ok());
     }
 
     #[test]

@@ -1,26 +1,19 @@
-use candle_core::{DType, Device};
-use fastembed::NomicV2MoeTextEmbedding;
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use crate::error::RagError;
 #[cfg(test)]
 use crate::schema::EMBED_DIM;
 
 pub struct Embedder {
-    model: Option<NomicV2MoeTextEmbedding>,
+    model: Option<TextEmbedding>,
 }
 
 impl Embedder {
     /// Blocking constructor — call from spawn_blocking.
     /// Downloads model weights on first run from the HF Hub cache.
     pub fn new() -> Result<Self, RagError> {
-        let device = Device::new_cuda(0).unwrap();
-        let model = NomicV2MoeTextEmbedding::from_hf(
-            "nomic-ai/nomic-embed-text-v2-moe",
-            &device,
-            DType::F32,
-            512,
-        )
-        .map_err(|e| RagError::Embed(e.to_string()))?;
+        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::EmbeddingGemma300M))
+            .map_err(|e| RagError::Embed(e.to_string()))?;
         Ok(Self { model: Some(model) })
     }
 
@@ -30,12 +23,12 @@ impl Embedder {
         Self { model: None }
     }
 
-    /// Embed documents at ingest time. Prepends "search_document: " prefix.
-    pub fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
+    /// Embed documents at ingest time.
+    pub fn embed_documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        let model = match &self.model {
+        let model = match &mut self.model {
             Some(m) => m,
             None => {
                 #[cfg(test)]
@@ -47,19 +40,15 @@ impl Embedder {
                 unreachable!("Embedder has no model; Embedder::fake() is test-only");
             }
         };
-        let prefixed: Vec<String> = texts
-            .iter()
-            .map(|t| format!("search_document: {t}"))
-            .collect();
-        let refs: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         model
-            .embed(&refs)
+            .embed(refs, None)
             .map_err(|e| RagError::Embed(e.to_string()))
     }
 
-    /// Embed a query at search time. Prepends "search_query: " prefix.
-    pub fn embed_query(&self, query: &str) -> Result<Vec<f32>, RagError> {
-        let model = match &self.model {
+    /// Embed a query at search time.
+    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>, RagError> {
+        let model = match &mut self.model {
             Some(m) => m,
             None => {
                 #[cfg(test)]
@@ -68,10 +57,8 @@ impl Embedder {
                 unreachable!("Embedder has no model; Embedder::fake() is test-only");
             }
         };
-        let text = format!("search_query: {query}");
-        let refs: &[&str] = &[text.as_str()];
         let result = model
-            .embed(refs)
+            .embed(vec![query], None)
             .map_err(|e| RagError::Embed(e.to_string()))?;
         result
             .into_iter()

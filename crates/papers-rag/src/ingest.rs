@@ -159,7 +159,7 @@ pub fn embed_cache_base() -> PathBuf {
 fn default_embed_model() -> String {
     papers_core::config::PapersConfig::load()
         .map(|c| c.embedding_model)
-        .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_string())
+        .unwrap_or_else(|_| "embedding-gemma-300m".to_string())
 }
 
 /// Convenience helper: convert an `EmbedCacheError` to `RagError::Cache`.
@@ -776,6 +776,7 @@ pub fn list_cached_item_keys() -> Vec<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     // ── strip_html ───────────────────────────────────────────────────────────
@@ -874,6 +875,7 @@ mod tests {
 
     // ── list_cached_item_keys ─────────────────────────────────────────────────
 
+    #[serial]
     #[test]
     fn list_cached_keys_finds_dirs_with_json() {
         let dir = TempDir::new().unwrap();
@@ -914,6 +916,7 @@ mod tests {
         assert_eq!(keys, vec!["ABCD1234"]);
     }
 
+    #[serial]
     #[test]
     fn list_cached_keys_nonexistent_cache_dir_returns_empty() {
         let old = std::env::var("PAPERS_DATALAB_CACHE_DIR").ok();
@@ -972,6 +975,7 @@ mod tests {
         .unwrap();
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_ingest_writes_embed_cache() {
         let datalab_dir = TempDir::new().unwrap();
@@ -1012,12 +1016,13 @@ mod tests {
         }
 
         let embed_cache = crate::embed_cache::EmbedCache::new(embed_dir.path().to_path_buf());
-        let model = "nomic-embed-text-v2-moe";
+        let model = "embedding-gemma-300m";
         assert!(embed_cache.exists(model, key), "manifest.json + embeddings.bin should exist");
         let manifest = embed_cache.load_manifest(model, key).unwrap().unwrap();
         assert_eq!(manifest.chunks.len(), 2, "should have 2 text chunks");
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_ingest_cache_hit_skips_embedder() {
         let datalab_dir = TempDir::new().unwrap();
@@ -1054,7 +1059,7 @@ mod tests {
         ingest_paper(&rag, make_params()).await.unwrap();
 
         let embed_cache = crate::embed_cache::EmbedCache::new(embed_dir.path().to_path_buf());
-        let model = "nomic-embed-text-v2-moe";
+        let model = "embedding-gemma-300m";
         assert!(embed_cache.exists(model, key));
         let mtime_after_first = embed_dir
             .path()
@@ -1095,6 +1100,7 @@ mod tests {
         }
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_ingest_cache_miss_on_force() {
         let datalab_dir = TempDir::new().unwrap();
@@ -1134,7 +1140,7 @@ mod tests {
         .unwrap();
 
         let embed_cache = crate::embed_cache::EmbedCache::new(embed_dir.path().to_path_buf());
-        let model = "nomic-embed-text-v2-moe";
+        let model = "embedding-gemma-300m";
         assert!(embed_cache.exists(model, key));
 
         let mtime_first = embed_dir
