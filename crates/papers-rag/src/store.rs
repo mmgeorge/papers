@@ -23,11 +23,12 @@ impl RagStore {
         ensure_table(&db, "papers_figures", figures_schema()).await?;
 
         eprintln!("  loading embedding model (downloads on first run)...");
+        let t = std::time::Instant::now();
         let embedder = tokio::task::spawn_blocking(Embedder::new)
             .await
             .map_err(|e| RagError::Embed(format!("spawn_blocking join error: {e}")))?
             .map_err(|e| RagError::Embed(e.to_string()))?;
-        eprintln!("  embedding model ready");
+        eprintln!("  embedding model ready ({:.1}s)", t.elapsed().as_secs_f64());
 
         Ok(Self {
             db,

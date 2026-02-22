@@ -406,9 +406,10 @@ pub async fn cache_paper_embeddings(
         vec![]
     } else {
         eprintln!("  [{}] embedding {} chunks (model={})...", params.item_key, n, model);
+        let t = std::time::Instant::now();
         let texts: Vec<String> = chunk_records.iter().map(|c| c.text.clone()).collect();
         let result = store.embed_documents(texts).await?;
-        eprintln!("  [{}] chunk embeddings done", params.item_key);
+        eprintln!("  [{}] chunk embeddings done ({:.1}s)", params.item_key, t.elapsed().as_secs_f64());
         result
     };
 
@@ -448,6 +449,7 @@ pub async fn cache_paper_embeddings(
 
 /// Ingest a paper from the DataLab Marker JSON cache into LanceDB.
 pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<IngestStats, RagError> {
+    let t_total = std::time::Instant::now();
     let (chunk_records, figure_records) = parse_paper_blocks(&params)?;
 
     let chunks_added = chunk_records.len();
@@ -500,10 +502,11 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
                     params.item_key,
                     chunk_records.len()
                 );
+                let t = std::time::Instant::now();
                 let texts: Vec<String> =
                     chunk_records.iter().map(|c| c.text.clone()).collect();
                 let result = store.embed_documents(texts).await?;
-                eprintln!("  [{}] chunk embeddings done", params.item_key);
+                eprintln!("  [{}] chunk embeddings done ({:.1}s)", params.item_key, t.elapsed().as_secs_f64());
 
                 // Save to cache for future re-ingests
                 let dim = result
@@ -554,14 +557,16 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             params.item_key,
             fig_texts.len()
         );
+        let t = std::time::Instant::now();
         let result = store.embed_documents(fig_texts).await?;
-        eprintln!("  [{}] figure embeddings done", params.item_key);
+        eprintln!("  [{}] figure embeddings done ({:.1}s)", params.item_key, t.elapsed().as_secs_f64());
         result
     };
 
     // ── Insert chunks ───────────────────────────────────────────────────────
     if chunks_added > 0 {
         eprintln!("  [{}] inserting {} chunks...", params.item_key, chunks_added);
+        let t = std::time::Instant::now();
         let batch = build_chunks_batch(&params, &chunk_records, &embeddings)?;
         let schema = chunks_schema();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
@@ -570,6 +575,7 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             .add(Box::new(reader))
             .execute()
             .await?;
+        eprintln!("  [{}] chunks inserted ({:.1}s)", params.item_key, t.elapsed().as_secs_f64());
     }
 
     // ── Insert figures ──────────────────────────────────────────────────────
@@ -579,6 +585,7 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             params.item_key,
             figures_added
         );
+        let t = std::time::Instant::now();
         let batch = build_figures_batch(&params, &figure_records, &fig_embeddings)?;
         let schema = figures_schema();
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
@@ -587,9 +594,10 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             .add(Box::new(reader))
             .execute()
             .await?;
+        eprintln!("  [{}] figures inserted ({:.1}s)", params.item_key, t.elapsed().as_secs_f64());
     }
 
-    eprintln!("  [{}] done.", params.item_key);
+    eprintln!("  [{}] done (total {:.1}s)", params.item_key, t_total.elapsed().as_secs_f64());
     Ok(IngestStats {
         chunks_added,
         figures_added,
