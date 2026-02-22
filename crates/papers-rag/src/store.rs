@@ -2,6 +2,7 @@ use arrow_array::RecordBatchIterator;
 use arrow_schema::Schema;
 use lancedb::{Connection, Table};
 use std::sync::{Arc, Mutex};
+use tokio::sync::OnceCell;
 
 use crate::embed::Embedder;
 use crate::error::RagError;
@@ -9,12 +10,13 @@ use crate::schema::{chunks_schema, figures_schema};
 
 pub struct RagStore {
     pub(crate) db: Connection,
-    pub(crate) embedder: Arc<Mutex<Embedder>>,
+    pub(crate) embedder: OnceCell<Arc<Mutex<Embedder>>>,
 }
 
 impl RagStore {
     /// Open (or create) the RAG database at the given path.
     /// Creates both tables with correct schemas if they don't exist yet.
+    /// The embedding model is loaded lazily on first use.
     pub async fn open(path: &str) -> Result<Self, RagError> {
         let db = lancedb::connect(path).execute().await?;
 
@@ -22,18 +24,31 @@ impl RagStore {
         ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         ensure_table(&db, "papers_figures", figures_schema()).await?;
 
-        eprintln!("  loading {} [{}] (downloads on first run)...", crate::embed::MODEL_NAME, crate::embed::ep_name());
-        let t = std::time::Instant::now();
-        let embedder = tokio::task::spawn_blocking(Embedder::new)
-            .await
-            .map_err(|e| RagError::Embed(format!("spawn_blocking join error: {e}")))?
-            .map_err(|e| RagError::Embed(e.to_string()))?;
-        eprintln!("  embedding model ready ({:.1}s)", t.elapsed().as_secs_f64());
-
         Ok(Self {
             db,
-            embedder: Arc::new(Mutex::new(embedder)),
+            embedder: OnceCell::new(),
         })
+    }
+
+    /// Get or initialize the embedder (lazy loading).
+    async fn embedder(&self) -> Result<Arc<Mutex<Embedder>>, RagError> {
+        self.embedder
+            .get_or_try_init(|| async {
+                eprintln!(
+                    "    loading {} [{}] (downloads on first run)...",
+                    crate::embed::MODEL_NAME,
+                    crate::embed::ep_name()
+                );
+                let t = std::time::Instant::now();
+                let embedder = tokio::task::spawn_blocking(Embedder::new)
+                    .await
+                    .map_err(|e| RagError::Embed(format!("spawn_blocking join error: {e}")))?
+                    .map_err(|e| RagError::Embed(e.to_string()))?;
+                eprintln!("    embedding model ready ({:.1}s)", t.elapsed().as_secs_f64());
+                Ok(Arc::new(Mutex::new(embedder)))
+            })
+            .await
+            .cloned()
     }
 
     /// Default path: $PAPERS_RAG_DB or {PAPERS_DATA_DIR}/rag or platform data dir.
@@ -56,10 +71,11 @@ impl RagStore {
         let db = lancedb::connect(path).execute().await?;
         ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         ensure_table(&db, "papers_figures", figures_schema()).await?;
-        Ok(Self {
-            db,
-            embedder: Arc::new(Mutex::new(Embedder::fake())),
-        })
+        let embedder = OnceCell::new();
+        embedder
+            .set(Arc::new(Mutex::new(Embedder::fake())))
+            .unwrap();
+        Ok(Self { db, embedder })
     }
 
     pub async fn chunks_table(&self) -> Result<Table, RagError> {
@@ -80,7 +96,7 @@ impl RagStore {
 
     /// Embed a query string asynchronously.
     pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>, RagError> {
-        let embedder = self.embedder.clone();
+        let embedder = self.embedder().await?;
         let query = query.to_string();
         tokio::task::spawn_blocking(move || {
             embedder
@@ -94,7 +110,7 @@ impl RagStore {
 
     /// Embed document texts asynchronously.
     pub async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RagError> {
-        let embedder = self.embedder.clone();
+        let embedder = self.embedder().await?;
         tokio::task::spawn_blocking(move || {
             embedder
                 .lock()
