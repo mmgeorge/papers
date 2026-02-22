@@ -1,0 +1,28 @@
+[package]
+name = "papers-rag"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Local vector RAG system for academic papers using LanceDB and Nomic Embed"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+papers-core.workspace = true
+lancedb = "0.26"
+fastembed = { version = "5", features = ["nomic-v2-moe", "cuda"] }
+candle-core = "0.9"
+arrow-array = { version = "57", default-features = false }
+arrow-schema = { version = "57", default-features = false }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
