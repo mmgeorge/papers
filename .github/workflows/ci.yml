@@ -15,10 +15,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
+        id: setup-protoc
         uses: arduino/setup-protoc@v3
         with:
           version: "28.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify protoc
+        run: |
+          echo "PROTOC=${{ steps.setup-protoc.outputs.path }}/bin/protoc" >> $GITHUB_ENV
+          "${{ steps.setup-protoc.outputs.path }}/bin/protoc" --version
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
