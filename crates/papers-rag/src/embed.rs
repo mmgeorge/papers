@@ -1,4 +1,5 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use ort::ep::directml::DirectML;
 
 use crate::error::RagError;
 #[cfg(test)]
@@ -12,8 +13,11 @@ impl Embedder {
     /// Blocking constructor — call from spawn_blocking.
     /// Downloads model weights on first run from the HF Hub cache.
     pub fn new() -> Result<Self, RagError> {
-        let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::EmbeddingGemma300M))
-            .map_err(|e| RagError::Embed(e.to_string()))?;
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::EmbeddingGemma300M)
+                .with_execution_providers(vec![DirectML::default().build()]),
+        )
+        .map_err(|e| RagError::Embed(e.to_string()))?;
         Ok(Self { model: Some(model) })
     }
 

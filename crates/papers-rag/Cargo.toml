@@ -14,6 +14,7 @@ doctest = false
 papers-core.workspace = true
 lancedb = "0.26"
 fastembed = "5"
+ort = { version = "=2.0.0-rc.11", features = ["directml"] }
 arrow-array = { version = "57", default-features = false }
 arrow-schema = { version = "57", default-features = false }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

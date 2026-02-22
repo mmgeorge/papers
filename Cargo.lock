@@ -4877,6 +4877,7 @@ dependencies = [
  "fastembed",
  "futures",
  "lancedb",
+ "ort",
  "papers-core",
  "serde",
  "serde_json",
