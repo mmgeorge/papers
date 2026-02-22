@@ -22,7 +22,7 @@ impl RagStore {
         ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         ensure_table(&db, "papers_figures", figures_schema()).await?;
 
-        eprintln!("  loading embedding model (downloads on first run)...");
+        eprintln!("  loading {} [{}] (downloads on first run)...", crate::embed::MODEL_NAME, crate::embed::ep_name());
         let t = std::time::Instant::now();
         let embedder = tokio::task::spawn_blocking(Embedder::new)
             .await

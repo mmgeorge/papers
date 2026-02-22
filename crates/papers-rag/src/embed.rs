@@ -1,9 +1,21 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use ort::ep::directml::DirectML;
 
 use crate::error::RagError;
 #[cfg(test)]
 use crate::schema::EMBED_DIM;
+
+/// Human-readable name of the embedding model.
+pub const MODEL_NAME: &str = "embedding-gemma-300m";
+
+/// Name of the execution provider selected at compile time.
+pub fn ep_name() -> &'static str {
+    #[cfg(target_os = "windows")]
+    { "DirectML" }
+    #[cfg(target_os = "macos")]
+    { "CoreML" }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    { "CPU" }
+}
 
 pub struct Embedder {
     model: Option<TextEmbedding>,
@@ -13,11 +25,23 @@ impl Embedder {
     /// Blocking constructor — call from spawn_blocking.
     /// Downloads model weights on first run from the HF Hub cache.
     pub fn new() -> Result<Self, RagError> {
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::EmbeddingGemma300M)
-                .with_execution_providers(vec![DirectML::default().build()]),
-        )
-        .map_err(|e| RagError::Embed(e.to_string()))?;
+        let mut opts = InitOptions::new(EmbeddingModel::EmbeddingGemma300M);
+
+        #[cfg(target_os = "windows")]
+        {
+            opts = opts.with_execution_providers(vec![
+                ort::ep::directml::DirectML::default().build(),
+            ]);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            opts = opts.with_execution_providers(vec![
+                ort::ep::coreml::CoreML::default().build(),
+            ]);
+        }
+
+        let model = TextEmbedding::try_new(opts)
+            .map_err(|e| RagError::Embed(e.to_string()))?;
         Ok(Self { model: Some(model) })
     }
 
