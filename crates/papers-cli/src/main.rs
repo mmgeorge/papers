@@ -6,7 +6,7 @@ use cli::{
     AdvancedMode, AuthorCommand, AuthorFilterArgs, Cli, DomainCommand, DomainFilterArgs,
     EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand, FunderFilterArgs,
     InstitutionCommand, InstitutionFilterArgs, PublisherCommand, PublisherFilterArgs,
-    SelectionCommand, SourceCommand, SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs,
+    RagCommand, SelectionCommand, SourceCommand, SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs,
     TopicCommand, TopicFilterArgs, WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand,
     ZoteroAttachmentCommand, ZoteroCollectionCommand, ZoteroCommand, ZoteroDeletedCommand,
     ZoteroExtractCommand, ZoteroGroupCommand, ZoteroNoteCommand, ZoteroPermissionCommand,
@@ -1617,6 +1617,493 @@ async fn papers_main() {
         EntityCommand::Selection { cmd } => {
             handle_selection_command(cmd, &client).await;
         }
+        EntityCommand::Rag { cmd } => {
+            handle_rag_command(cmd).await;
+        }
+    }
+}
+
+async fn open_rag_store() -> papers_rag::RagStore {
+    let path = papers_rag::RagStore::default_path();
+    match papers_rag::RagStore::open(&path).await {
+        Ok(store) => store,
+        Err(e) => exit_err(&format!("Failed to open RAG database: {e}")),
+    }
+}
+
+async fn handle_rag_command(cmd: RagCommand) {
+    match cmd {
+        RagCommand::Search {
+            query,
+            selection,
+            paper_id,
+            chapter_idx,
+            section_idx,
+            year_min,
+            year_max,
+            venue,
+            tag,
+            depth,
+            limit,
+            json,
+        } => {
+            let rag = open_rag_store().await;
+            let paper_ids = match selection.as_deref() {
+                Some(sel) => {
+                    match papers_core::selection::load_selection(sel) {
+                        Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                            e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                        }).collect()),
+                        Err(e) => exit_err(&e.to_string()),
+                    }
+                }
+                None => paper_id.map(|id| vec![id]),
+            };
+            let params = papers_rag::SearchParams {
+                query,
+                paper_ids,
+                chapter_idx,
+                section_idx,
+                filter_year_min: year_min,
+                filter_year_max: year_max,
+                filter_venue: venue,
+                filter_tags: tag,
+                filter_depth: depth,
+                limit,
+            };
+            match papers_rag::query::search(&rag, params).await {
+                Ok(results) => {
+                    if json {
+                        print_json(&results);
+                    } else {
+                        format_rag_search(&results);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::SearchFigures {
+            query,
+            selection,
+            paper_id,
+            figure_type,
+            limit,
+            json,
+        } => {
+            let rag = open_rag_store().await;
+            let paper_ids = match selection.as_deref() {
+                Some(sel) => match papers_core::selection::load_selection(sel) {
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => paper_id.map(|id| vec![id]),
+            };
+            let params = papers_rag::SearchFiguresParams {
+                query,
+                paper_ids,
+                filter_figure_type: figure_type,
+                limit,
+            };
+            match papers_rag::query::search_figures(&rag, params).await {
+                Ok(results) => {
+                    if json {
+                        print_json(&results);
+                    } else {
+                        format_rag_figures(&results);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::GetChunk { chunk_id, json } => {
+            let rag = open_rag_store().await;
+            match papers_rag::query::get_chunk(&rag, &chunk_id).await {
+                Ok(result) => {
+                    if json {
+                        print_json(&result);
+                    } else {
+                        format_rag_chunk_result(&result);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::GetSection { paper_id, chapter_idx, section_idx, json } => {
+            let rag = open_rag_store().await;
+            match papers_rag::query::get_section(&rag, &paper_id, chapter_idx, section_idx).await {
+                Ok(result) => {
+                    if json {
+                        print_json(&result);
+                    } else {
+                        format_rag_section(&result);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::GetChapter { paper_id, chapter_idx, json } => {
+            let rag = open_rag_store().await;
+            match papers_rag::query::get_chapter(&rag, &paper_id, chapter_idx).await {
+                Ok(result) => {
+                    if json {
+                        print_json(&result);
+                    } else {
+                        format_rag_chapter(&result);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::GetFigure { figure_id, json } => {
+            let rag = open_rag_store().await;
+            match papers_rag::query::get_figure(&rag, &figure_id).await {
+                Ok(result) => {
+                    if json {
+                        print_json(&result);
+                    } else {
+                        format_rag_figure(&result);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::Outline { paper_id, json } => {
+            let rag = open_rag_store().await;
+            match papers_rag::query::get_paper_outline(&rag, &paper_id).await {
+                Ok(result) => {
+                    if json {
+                        print_json(&result);
+                    } else {
+                        format_rag_outline(&result);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::ListPapers {
+            selection,
+            year_min,
+            year_max,
+            venue,
+            tag,
+            author,
+            sort,
+            limit,
+            json,
+        } => {
+            let rag = open_rag_store().await;
+            let paper_ids = match selection.as_deref() {
+                Some(sel) => match papers_core::selection::load_selection(sel) {
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => None,
+            };
+            let params = papers_rag::ListPapersParams {
+                paper_ids,
+                filter_year_min: year_min,
+                filter_year_max: year_max,
+                filter_venue: venue,
+                filter_tags: tag,
+                filter_authors: author,
+                sort_by: sort,
+                limit,
+            };
+            match papers_rag::query::list_papers(&rag, params).await {
+                Ok(results) => {
+                    if json {
+                        print_json(&results);
+                    } else {
+                        format_rag_papers(&results);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::ListTags { selection, json } => {
+            let rag = open_rag_store().await;
+            let paper_ids = match selection.as_deref() {
+                Some(sel) => match papers_core::selection::load_selection(sel) {
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => None,
+            };
+            let params = papers_rag::ListTagsParams { paper_ids };
+            match papers_rag::query::list_tags(&rag, params).await {
+                Ok(results) => {
+                    if json {
+                        print_json(&results);
+                    } else {
+                        format_rag_tags(&results);
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::Ingest { item_key, paper_id, tag, force, json } => {
+            let rag = open_rag_store().await;
+            let mut params = match papers_rag::ingest_params_from_cache(&item_key) {
+                Ok(p) => p,
+                Err(e) => exit_err(&format!("Failed to read cache for {item_key}: {e}")),
+            };
+            if let Some(pid) = paper_id {
+                params.paper_id = pid;
+            }
+            if let Some(tags) = tag {
+                params.tags.extend(tags);
+            }
+            // Check if already indexed (unless --force)
+            if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
+                if json {
+                    print_json(&serde_json::json!({
+                        "skipped": true,
+                        "paper_id": params.paper_id,
+                        "message": "already indexed; use --force to re-index"
+                    }));
+                } else {
+                    println!("Already indexed: {} (use --force to re-index)", params.paper_id);
+                }
+                return;
+            }
+            match papers_rag::ingest_paper(&rag, params).await {
+                Ok(stats) => {
+                    if json {
+                        print_json(&serde_json::json!({
+                            "chunks_added": stats.chunks_added,
+                            "figures_added": stats.figures_added,
+                            "item_key": item_key,
+                        }));
+                    } else {
+                        println!(
+                            "Ingested {} chunks and {} figures for {}",
+                            stats.chunks_added, stats.figures_added, item_key
+                        );
+                    }
+                }
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+
+        RagCommand::IngestAll { force, json } => {
+            let rag = open_rag_store().await;
+            let keys = papers_rag::list_cached_item_keys();
+            if keys.is_empty() {
+                if json {
+                    print_json(&serde_json::json!({ "ingested": 0, "message": "no cached papers found" }));
+                } else {
+                    println!("No cached papers found in DataLab cache.");
+                }
+                return;
+            }
+            let mut total_chunks = 0usize;
+            let mut total_figures = 0usize;
+            let mut ingested = 0usize;
+            let mut failed = 0usize;
+            for key in &keys {
+                let params = match papers_rag::ingest_params_from_cache(key) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("  [skip] {key}: {e}");
+                        failed += 1;
+                        continue;
+                    }
+                };
+                if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
+                    if !json {
+                        println!("  [skip] {key}: already indexed");
+                    }
+                    continue;
+                }
+                if !json {
+                    print!("  [ingest] {key}... ");
+                }
+                match papers_rag::ingest_paper(&rag, params).await {
+                    Ok(stats) => {
+                        total_chunks += stats.chunks_added;
+                        total_figures += stats.figures_added;
+                        ingested += 1;
+                        if !json {
+                            println!("{} chunks, {} figures", stats.chunks_added, stats.figures_added);
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        if !json {
+                            println!("FAILED: {e}");
+                        } else {
+                            eprintln!("  [fail] {key}: {e}");
+                        }
+                    }
+                }
+            }
+            if json {
+                print_json(&serde_json::json!({
+                    "ingested": ingested,
+                    "failed": failed,
+                    "total_chunks": total_chunks,
+                    "total_figures": total_figures,
+                }));
+            } else {
+                println!(
+                    "Ingested {} papers: {} chunks, {} figures ({} failed)",
+                    ingested, total_chunks, total_figures, failed
+                );
+            }
+        }
+    }
+}
+
+// ── RAG human-readable formatters ────────────────────────────────────────────
+
+fn format_rag_search(results: &[papers_rag::SearchResult]) {
+    if results.is_empty() {
+        println!("No results found.");
+        return;
+    }
+    for r in results {
+        let c = &r.chunk;
+        println!(
+            "{:.2}  {}  |  {}. {} › {} {}",
+            r.score,
+            c.paper_id,
+            c.chapter_idx,
+            c.chapter_title,
+            c.section_idx,
+            c.section_title,
+        );
+        let preview: String = c.text.chars().take(200).collect();
+        println!("      {}", preview);
+        let prev = r.prev.as_ref().map(|p| p.chunk_id.as_str()).unwrap_or("(none)");
+        let next = r.next.as_ref().map(|n| n.chunk_id.as_str()).unwrap_or("(none)");
+        println!("      ← {}  /  {} →", prev, next);
+        println!();
+    }
+}
+
+fn format_rag_figures(results: &[papers_rag::FigureResult]) {
+    if results.is_empty() {
+        println!("No figures found.");
+        return;
+    }
+    for f in results {
+        println!(
+            "{}  {}  [{}]  (page {})",
+            f.figure_id,
+            f.paper_id,
+            f.figure_type,
+            f.page.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+        );
+        println!("  Caption: {}", f.caption);
+        if let Some(img) = &f.image_path {
+            println!("  Image: {img}");
+        }
+        println!();
+    }
+}
+
+fn format_rag_chunk_result(r: &papers_rag::ChunkResult) {
+    let c = &r.chunk;
+    println!("[{}]  {} — Ch.{} {} / Sec.{} {}", c.chunk_id, c.paper_id, c.chapter_idx, c.chapter_title, c.section_idx, c.section_title);
+    println!();
+    println!("{}", c.text);
+    println!();
+    let prev = r.prev.as_ref().map(|p| p.chunk_id.as_str()).unwrap_or("(none)");
+    let next = r.next.as_ref().map(|n| n.chunk_id.as_str()).unwrap_or("(none)");
+    println!("← {}  /  {} →", prev, next);
+}
+
+fn format_rag_section(r: &papers_rag::SectionResult) {
+    println!("[{}] Ch.{} {} / Sec.{} {} ({} chunks)", r.paper_id, 0, r.chapter_title, 0, r.section_title, r.total_chunks);
+    println!();
+    for chunk in &r.chunks {
+        println!("{}", chunk.text);
+        println!("---");
+    }
+}
+
+fn format_rag_chapter(r: &papers_rag::ChapterResult) {
+    println!("[{}] Ch.{} {} ({} chunks)", r.paper_id, r.chapter_idx, r.chapter_title, r.total_chunks);
+    println!();
+    for sec in &r.sections {
+        println!("  § {} {}", sec.section_idx, sec.section_title);
+        for chunk in &sec.chunks {
+            let preview: String = chunk.text.chars().take(120).collect();
+            println!("    {}", preview);
+        }
+        println!();
+    }
+}
+
+fn format_rag_figure(f: &papers_rag::FigureResult) {
+    println!("{} [{}]", f.figure_id, f.figure_type);
+    println!("  Paper: {}", f.paper_id);
+    println!("  Caption: {}", f.caption);
+    if let Some(img) = &f.image_path {
+        println!("  Image: {img}");
+    }
+    if let Some(p) = f.page {
+        println!("  Page: {p}");
+    }
+}
+
+fn format_rag_outline(r: &papers_rag::PaperOutline) {
+    println!(
+        "{}  {:?}  ({}{})",
+        r.paper_id,
+        r.title,
+        r.year.map(|y| y.to_string()).unwrap_or_else(|| "?".into()),
+        r.venue.as_ref().map(|v| format!(", {v}")).unwrap_or_default()
+    );
+    for ch in &r.chapters {
+        let ch_chunk_count: usize = ch.sections.iter().map(|s| s.chunk_count).sum();
+        println!("  {}. {}  [{} chunks]", ch.chapter_idx, ch.chapter_title, ch_chunk_count);
+        for sec in &ch.sections {
+            println!("     {}.{} {}  [{} chunks]", ch.chapter_idx, sec.section_idx, sec.section_title, sec.chunk_count);
+        }
+    }
+    println!("Total: {} chunks, {} figures", r.total_chunks, r.total_figures);
+}
+
+fn format_rag_papers(papers: &[papers_rag::PaperSummary]) {
+    if papers.is_empty() {
+        println!("No indexed papers found.");
+        return;
+    }
+    println!("{:<6}  {:<12}  {:<6}  {}", "YEAR", "VENUE", "CHUNKS", "TITLE");
+    for p in papers {
+        println!(
+            "{:<6}  {:<12}  {:<6}  {}",
+            p.year.map(|y| y.to_string()).unwrap_or_else(|| "?".into()),
+            p.venue.as_deref().unwrap_or(""),
+            p.chunk_count,
+            p.title,
+        );
+    }
+}
+
+fn format_rag_tags(tags: &[papers_rag::TagSummary]) {
+    if tags.is_empty() {
+        println!("No tags found.");
+        return;
+    }
+    for t in tags {
+        println!("{:<30}  ({} papers)", t.tag, t.paper_count);
     }
 }
 

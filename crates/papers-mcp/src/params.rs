@@ -1178,3 +1178,116 @@ pub struct SelectionRemoveToolParams {
     /// Target selection name or 1-based index. Defaults to the active selection.
     pub selection: Option<String>,
 }
+
+// ── RAG tool params ──────────────────────────────────────────────────────────
+
+/// Parameters for the `rag_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SearchToolParams {
+    /// Natural language search query.
+    pub query: String,
+    /// Scope to papers in this named selection.
+    pub selection: Option<String>,
+    /// Scope to a single paper by paper_id (DOI or item key).
+    pub paper_id: Option<String>,
+    /// Scope to a chapter (requires paper_id).
+    pub chapter_idx: Option<u16>,
+    /// Scope to a section (requires paper_id and chapter_idx).
+    pub section_idx: Option<u16>,
+    /// Minimum publication year filter.
+    pub filter_year_min: Option<u16>,
+    /// Maximum publication year filter.
+    pub filter_year_max: Option<u16>,
+    /// Filter by venue name.
+    pub filter_venue: Option<String>,
+    /// Filter by tags (any match).
+    pub filter_tags: Option<Vec<String>>,
+    /// Granularity filter: "chapter", "section", or "paragraph".
+    pub filter_depth: Option<String>,
+    /// Maximum number of results (default 5).
+    pub limit: Option<u16>,
+}
+
+/// Parameters for the `rag_search_figures` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SearchFiguresToolParams {
+    /// Natural language description of the figure, table, or diagram to find.
+    pub query: String,
+    /// Scope to papers in this named selection.
+    pub selection: Option<String>,
+    /// Scope to a single paper by paper_id.
+    pub paper_id: Option<String>,
+    /// Filter by figure type: "figure" or "table".
+    pub filter_figure_type: Option<String>,
+    /// Maximum number of results (default 5).
+    pub limit: Option<u16>,
+}
+
+/// Parameters for the `rag_get_chunk` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetChunkToolParams {
+    /// Chunk ID (e.g. "10.1145/abc/ch1/s2/p3" or "YFACFA8C/ch1/s0/p0").
+    pub chunk_id: String,
+}
+
+/// Parameters for the `rag_get_section` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetSectionToolParams {
+    /// Paper ID (DOI or item key).
+    pub paper_id: String,
+    /// Chapter index (1-based).
+    pub chapter_idx: u16,
+    /// Section index (1-based).
+    pub section_idx: u16,
+}
+
+/// Parameters for the `rag_get_chapter` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetChapterToolParams {
+    /// Paper ID (DOI or item key).
+    pub paper_id: String,
+    /// Chapter index (1-based).
+    pub chapter_idx: u16,
+}
+
+/// Parameters for the `rag_get_figure` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetFigureToolParams {
+    /// Figure ID (e.g. "YFACFA8C/fig3").
+    pub figure_id: String,
+}
+
+/// Parameters for the `rag_get_paper_outline` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GetPaperOutlineToolParams {
+    /// Paper ID (DOI or item key).
+    pub paper_id: String,
+}
+
+/// Parameters for the `rag_list_papers` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ListPapersToolParams {
+    /// Scope to papers in this named selection.
+    pub selection: Option<String>,
+    /// Minimum publication year.
+    pub filter_year_min: Option<u16>,
+    /// Maximum publication year.
+    pub filter_year_max: Option<u16>,
+    /// Filter by venue name.
+    pub filter_venue: Option<String>,
+    /// Filter by tags (any match).
+    pub filter_tags: Option<Vec<String>>,
+    /// Filter by author name (substring match, any author).
+    pub filter_authors: Option<Vec<String>>,
+    /// Sort field: "year" (default) or "title".
+    pub sort_by: Option<String>,
+    /// Maximum number of results (default 50).
+    pub limit: Option<u16>,
+}
+
+/// Parameters for the `rag_list_tags` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ListTagsToolParams {
+    /// Scope to papers in this named selection.
+    pub selection: Option<String>,
+}

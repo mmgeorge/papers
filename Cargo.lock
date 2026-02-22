@@ -5240,6 +5240,7 @@ dependencies = [
  "dirs",
  "papers-core",
  "papers-datalab",
+ "papers-rag",
  "papers-zotero",
  "serde",
  "serde_json",

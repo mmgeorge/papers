@@ -16,6 +16,7 @@ base64 = "0.22"
 papers-openalex = { path = "crates/papers-openalex", version = "0.2.0" }
 papers-zotero = { path = "crates/papers-zotero", version = "0.2.0" }
 papers-core = { path = "crates/papers-core", version = "0.2.0" }
+papers-rag = { path = "crates/papers-rag", version = "0.2.0" }
 dirs = "6"
 bon = "3"
 clap = { version = "4", features = ["derive", "wrap_help"] }

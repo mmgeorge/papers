@@ -82,6 +82,153 @@ pub enum EntityCommand {
         #[command(subcommand)]
         cmd: SelectionCommand,
     },
+    /// Local RAG index: semantic search over your indexed papers
+    Rag {
+        #[command(subcommand)]
+        cmd: RagCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RagCommand {
+    /// Semantic search over indexed paper chunks
+    Search {
+        /// Natural language search query
+        query: String,
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long)]
+        paper_id: Option<String>,
+        #[arg(long)]
+        chapter_idx: Option<u16>,
+        #[arg(long)]
+        section_idx: Option<u16>,
+        #[arg(long)]
+        year_min: Option<u16>,
+        #[arg(long)]
+        year_max: Option<u16>,
+        #[arg(long)]
+        venue: Option<String>,
+        #[arg(long)]
+        tag: Option<Vec<String>>,
+        /// Granularity: chapter | section | paragraph
+        #[arg(long)]
+        depth: Option<String>,
+        #[arg(long, short = 'n', default_value = "5")]
+        limit: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search for figures, tables, and diagrams
+    SearchFigures {
+        /// Natural language description of the figure to find
+        query: String,
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long)]
+        paper_id: Option<String>,
+        /// Filter: "figure" or "table"
+        #[arg(long)]
+        figure_type: Option<String>,
+        #[arg(long, short = 'n', default_value = "5")]
+        limit: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retrieve a specific chunk by ID
+    GetChunk {
+        /// Chunk ID (e.g. YFACFA8C/ch1/s2/p3)
+        chunk_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch all chunks in a section in reading order
+    GetSection {
+        /// Paper ID (DOI or item key)
+        paper_id: String,
+        #[arg(long)]
+        chapter_idx: u16,
+        #[arg(long)]
+        section_idx: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch all content of a chapter
+    GetChapter {
+        /// Paper ID (DOI or item key)
+        paper_id: String,
+        #[arg(long)]
+        chapter_idx: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get figure details by ID
+    GetFigure {
+        /// Figure ID (e.g. YFACFA8C/fig3)
+        figure_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the table of contents for a paper
+    Outline {
+        /// Paper ID (DOI or item key)
+        paper_id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List indexed papers with optional filters
+    ListPapers {
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long)]
+        year_min: Option<u16>,
+        #[arg(long)]
+        year_max: Option<u16>,
+        #[arg(long)]
+        venue: Option<String>,
+        #[arg(long)]
+        tag: Option<Vec<String>>,
+        #[arg(long)]
+        author: Option<Vec<String>>,
+        /// Sort by: "year" (default) or "title"
+        #[arg(long)]
+        sort: Option<String>,
+        #[arg(long, short = 'n', default_value = "50")]
+        limit: u16,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all tags and counts
+    ListTags {
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Index a paper from local DataLab cache into the RAG database
+    Ingest {
+        /// Zotero item key (directory name under the DataLab cache)
+        item_key: String,
+        /// Override paper_id (default: DOI from meta.json, else item_key)
+        #[arg(long)]
+        paper_id: Option<String>,
+        /// Add tags to this paper (repeatable)
+        #[arg(long)]
+        tag: Option<Vec<String>>,
+        /// Force re-index even if already indexed
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Index all papers in the DataLab cache
+    IngestAll {
+        /// Force re-index all papers
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

@@ -12,8 +12,11 @@ use serde::Serialize;
 
 use crate::params::{
     AutocompleteToolParams, AuthorListToolParams, DomainListToolParams, FieldListToolParams,
-    FindWorksToolParams, FunderListToolParams, GetToolParams, InstitutionListToolParams,
-    PublisherListToolParams, SelectionAddToolParams, SelectionCreateToolParams,
+    FindWorksToolParams, FunderListToolParams, GetToolParams, GetChapterToolParams,
+    GetChunkToolParams, GetFigureToolParams, GetPaperOutlineToolParams, GetSectionToolParams,
+    InstitutionListToolParams, ListPapersToolParams, ListTagsToolParams,
+    PublisherListToolParams, SearchFiguresToolParams, SearchToolParams,
+    SelectionAddToolParams, SelectionCreateToolParams,
     SelectionDeleteToolParams, SelectionGetToolParams, SelectionListToolParams,
     SelectionRemoveToolParams, SourceListToolParams, SubfieldListToolParams, TopicListToolParams,
     WorkListToolParams, WorkTextToolParams,
@@ -30,6 +33,7 @@ pub struct PapersMcp {
     client: OpenAlexClient,
     zotero: Arc<tokio::sync::Mutex<Option<ZoteroClient>>>,
     datalab: Option<DatalabClient>,
+    rag: Option<Arc<papers_rag::RagStore>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -40,19 +44,23 @@ impl PapersMcp {
             client = client.with_cache(cache);
         }
         let datalab = DatalabClient::from_env().ok();
+        let rag = Self::open_rag_store().await;
         Self {
             client,
             zotero: Arc::new(tokio::sync::Mutex::new(None)),
             datalab,
+            rag,
             tool_router: Self::tool_router(),
         }
     }
 
     pub async fn with_client(client: OpenAlexClient) -> Self {
+        let rag = Self::open_rag_store().await;
         Self {
             client,
             zotero: Arc::new(tokio::sync::Mutex::new(None)),
             datalab: DatalabClient::from_env().ok(),
+            rag,
             tool_router: Self::tool_router(),
         }
     }
@@ -63,8 +71,33 @@ impl PapersMcp {
             client: OpenAlexClient::new(),
             zotero: Arc::new(tokio::sync::Mutex::new(Some(zotero))),
             datalab: None,
+            rag: None,
             tool_router: Self::tool_router(),
         }
+    }
+
+    async fn open_rag_store() -> Option<Arc<papers_rag::RagStore>> {
+        let path = papers_rag::RagStore::default_path();
+        match papers_rag::RagStore::open(&path).await {
+            Ok(store) => Some(Arc::new(store)),
+            Err(e) => {
+                eprintln!("RAG store unavailable: {e}");
+                None
+            }
+        }
+    }
+
+    fn resolve_selection_paper_ids(selection: &str) -> Result<Vec<String>, String> {
+        let sel = papers_core::selection::load_selection(selection)
+            .map_err(|e| e.to_string())?;
+        let ids: Vec<String> = sel
+            .entries
+            .iter()
+            .flat_map(|e| {
+                e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+            })
+            .collect();
+        Ok(ids)
     }
 
     /// Try to get the Zotero client, probing if not yet connected.
@@ -872,6 +905,125 @@ impl PapersMcp {
             save_selection(&sel).map_err(|e| e.to_string())?;
         }
         json_result::<_, String>(Ok(entry))
+    }
+
+    // ── RAG tools ─────────────────────────────────────────────────────────────
+
+    /// Semantic search across indexed paper chunks. Scope with selection, paper, chapter, or section.
+    /// Returns matched chunks with immediate neighbors (prev/next) for reading context.
+    /// Requires papers to be indexed first via `papers rag ingest`.
+    #[tool]
+    pub async fn rag_search(&self, Parameters(p): Parameters<SearchToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured. Run: papers rag ingest <ITEM_KEY>".to_string())?;
+        let paper_ids = match p.selection.as_deref() {
+            Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
+            None => p.paper_id.map(|id| vec![id]),
+        };
+        let params = papers_rag::SearchParams {
+            query: p.query,
+            paper_ids,
+            chapter_idx: p.chapter_idx,
+            section_idx: p.section_idx,
+            filter_year_min: p.filter_year_min,
+            filter_year_max: p.filter_year_max,
+            filter_venue: p.filter_venue,
+            filter_tags: p.filter_tags,
+            filter_depth: p.filter_depth,
+            limit: p.limit.unwrap_or(5),
+        };
+        json_result(papers_rag::query::search(rag, params).await)
+    }
+
+    /// Search for figures, tables, and diagrams by description.
+    /// Use when the user asks about a specific visualization, comparison table, or diagram.
+    #[tool]
+    pub async fn rag_search_figures(&self, Parameters(p): Parameters<SearchFiguresToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured. Run: papers rag ingest <ITEM_KEY>".to_string())?;
+        let paper_ids = match p.selection.as_deref() {
+            Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
+            None => p.paper_id.map(|id| vec![id]),
+        };
+        let params = papers_rag::SearchFiguresParams {
+            query: p.query,
+            paper_ids,
+            filter_figure_type: p.filter_figure_type,
+            limit: p.limit.unwrap_or(5),
+        };
+        json_result(papers_rag::query::search_figures(rag, params).await)
+    }
+
+    /// Retrieve a specific chunk by ID with its prev/next neighbors for sequential reading.
+    /// Use after rag_search to follow prev/next chunk references.
+    #[tool]
+    pub async fn rag_get_chunk(&self, Parameters(p): Parameters<GetChunkToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        json_result(papers_rag::query::get_chunk(rag, &p.chunk_id).await)
+    }
+
+    /// Fetch all chunks in a specific section in reading order.
+    /// Use when you need complete section content after finding a relevant chunk.
+    #[tool]
+    pub async fn rag_get_section(&self, Parameters(p): Parameters<GetSectionToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        json_result(papers_rag::query::get_section(rag, &p.paper_id, p.chapter_idx, p.section_idx).await)
+    }
+
+    /// Fetch the full content of an entire chapter, grouped by section.
+    /// Use when the user asks about a broad topic within a paper.
+    #[tool]
+    pub async fn rag_get_chapter(&self, Parameters(p): Parameters<GetChapterToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        json_result(papers_rag::query::get_chapter(rag, &p.paper_id, p.chapter_idx).await)
+    }
+
+    /// Retrieve full details for a figure by ID, including the image file path.
+    /// Use when you need the image path to display it, or to see cross-references.
+    #[tool]
+    pub async fn rag_get_figure(&self, Parameters(p): Parameters<GetFigureToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        json_result(papers_rag::query::get_figure(rag, &p.figure_id).await)
+    }
+
+    /// Get the table of contents for a paper (all chapters and sections with chunk counts).
+    /// Use to understand paper structure before searching within it.
+    #[tool]
+    pub async fn rag_get_paper_outline(&self, Parameters(p): Parameters<GetPaperOutlineToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        json_result(papers_rag::query::get_paper_outline(rag, &p.paper_id).await)
+    }
+
+    /// Browse indexed papers with optional metadata filters.
+    /// Use when the user asks what papers are available, or to find a paper by metadata.
+    #[tool]
+    pub async fn rag_list_papers(&self, Parameters(p): Parameters<ListPapersToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_ids = match p.selection.as_deref() {
+            Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
+            None => None,
+        };
+        let params = papers_rag::ListPapersParams {
+            paper_ids,
+            filter_year_min: p.filter_year_min,
+            filter_year_max: p.filter_year_max,
+            filter_venue: p.filter_venue,
+            filter_tags: p.filter_tags,
+            filter_authors: p.filter_authors,
+            sort_by: p.sort_by,
+            limit: p.limit.unwrap_or(50),
+        };
+        json_result(papers_rag::query::list_papers(rag, params).await)
+    }
+
+    /// List all tags and per-tag paper counts. Use to discover available filter categories.
+    #[tool]
+    pub async fn rag_list_tags(&self, Parameters(p): Parameters<ListTagsToolParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_ids = match p.selection.as_deref() {
+            Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
+            None => None,
+        };
+        let params = papers_rag::ListTagsParams { paper_ids };
+        json_result(papers_rag::query::list_tags(rag, params).await)
     }
 
     /// Remove a paper from a selection.
