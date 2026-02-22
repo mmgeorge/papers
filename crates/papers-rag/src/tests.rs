@@ -143,6 +143,7 @@ fn make_test_cache(dir: &TempDir, item_key: &str) -> IngestParams {
         venue: Some("SIGGRAPH".to_string()),
         tags: vec!["rendering".to_string(), "GPU".to_string()],
         cache_dir,
+        force: false,
     }
 }
 
@@ -738,6 +739,7 @@ fn make_cache_from_json(dir: &TempDir, item_key: &str, json: &str) -> IngestPara
         venue: None,
         tags: vec![],
         cache_dir,
+        force: false,
     }
 }
 

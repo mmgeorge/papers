@@ -1,4 +1,5 @@
 pub mod api;
+pub mod config;
 pub mod filter;
 pub mod selection;
 pub mod summary;

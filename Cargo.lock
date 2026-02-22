@@ -5288,6 +5288,7 @@ version = "0.2.0"
 dependencies = [
  "papers-core",
  "papers-datalab",
+ "papers-rag",
  "papers-zotero",
  "reqwest 0.13.2",
  "rmcp",

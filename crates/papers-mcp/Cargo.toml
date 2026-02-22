@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 papers-core.workspace = true
+papers-rag.workspace = true
 papers-zotero.workspace = true
 papers-datalab.workspace = true
 reqwest.workspace = true

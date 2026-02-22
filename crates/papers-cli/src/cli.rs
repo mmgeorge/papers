@@ -87,6 +87,11 @@ pub enum EntityCommand {
         #[command(subcommand)]
         cmd: RagCommand,
     },
+    /// Manage papers CLI configuration
+    Config {
+        #[command(subcommand)]
+        cmd: ConfigCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -228,6 +233,11 @@ pub enum RagCommand {
         force: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Manage the on-disk embedding cache
+    Embed {
+        #[command(subcommand)]
+        cmd: RagEmbedCommand,
     },
 }
 
@@ -1442,4 +1452,190 @@ pub enum ZoteroPermissionCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum RagEmbedCommand {
+    /// List cached embeddings for a paper (or all papers when work is omitted)
+    List {
+        /// Paper identifier (Zotero key)
+        work: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compute and cache embeddings for a paper (or all papers)
+    Add {
+        /// Paper identifier (Zotero key)
+        work: Option<String>,
+        /// Embedding model (defaults to configured model)
+        #[arg(long)]
+        model: Option<String>,
+        /// Re-embed even if the cache already exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove cached embeddings for a paper (or all papers)
+    Delete {
+        /// Paper identifier (Zotero key)
+        work: Option<String>,
+        /// Embedding model (defaults to configured model)
+        #[arg(long)]
+        model: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Set a configuration value
+    Set {
+        #[command(subcommand)]
+        cmd: ConfigSetCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ConfigSetCommand {
+    /// Set the default embedding model
+    Model {
+        /// Model name (e.g. nomic-embed-text-v2-moe)
+        name: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("parse failed")
+    }
+
+    #[test]
+    fn test_parse_config_set_model_valid() {
+        let cli = parse(&["papers", "config", "set", "model", "nomic-embed-text-v2-moe"]);
+        match cli.entity {
+            EntityCommand::Config {
+                cmd: ConfigCommand::Set {
+                    cmd: ConfigSetCommand::Model { name },
+                },
+            } => assert_eq!(name, "nomic-embed-text-v2-moe"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_embed_list_no_args() {
+        let cli = parse(&["papers", "rag", "embed", "list"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Embed {
+                    cmd: RagEmbedCommand::List { work, json: _ },
+                },
+            } => assert!(work.is_none()),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_embed_list_with_work() {
+        let cli = parse(&["papers", "rag", "embed", "list", "ABC123"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Embed {
+                    cmd: RagEmbedCommand::List { work, json: _ },
+                },
+            } => assert_eq!(work.as_deref(), Some("ABC123")),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_embed_add_no_model() {
+        let cli = parse(&["papers", "rag", "embed", "add", "KEY1"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Embed {
+                    cmd: RagEmbedCommand::Add { work, model, force },
+                },
+            } => {
+                assert_eq!(work.as_deref(), Some("KEY1"));
+                assert!(model.is_none());
+                assert!(!force);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_embed_add_explicit_model() {
+        let cli = parse(&[
+            "papers",
+            "rag",
+            "embed",
+            "add",
+            "KEY1",
+            "--model",
+            "nomic-embed-text-v2-moe",
+        ]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Embed {
+                    cmd: RagEmbedCommand::Add { model, .. },
+                },
+            } => assert_eq!(model.as_deref(), Some("nomic-embed-text-v2-moe")),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_embed_add_force_flag() {
+        let cli = parse(&["papers", "rag", "embed", "add", "KEY1", "--force"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Embed {
+                    cmd: RagEmbedCommand::Add { force, .. },
+                },
+            } => assert!(force),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_embed_delete() {
+        let cli = parse(&["papers", "rag", "embed", "delete", "KEY1"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Embed {
+                    cmd: RagEmbedCommand::Delete { work, model },
+                },
+            } => {
+                assert_eq!(work.as_deref(), Some("KEY1"));
+                assert!(model.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_embed_delete_with_model() {
+        let cli = parse(&[
+            "papers",
+            "rag",
+            "embed",
+            "delete",
+            "KEY1",
+            "--model",
+            "nomic-embed-text-v2-moe",
+        ]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Embed {
+                    cmd: RagEmbedCommand::Delete { model, .. },
+                },
+            } => assert_eq!(model.as_deref(), Some("nomic-embed-text-v2-moe")),
+            _ => panic!("wrong variant"),
+        }
+    }
 }

@@ -3,14 +3,15 @@ mod format;
 
 use clap::Parser;
 use cli::{
-    AdvancedMode, AuthorCommand, AuthorFilterArgs, Cli, DomainCommand, DomainFilterArgs,
-    EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand, FunderFilterArgs,
-    InstitutionCommand, InstitutionFilterArgs, PublisherCommand, PublisherFilterArgs,
-    RagCommand, SelectionCommand, SourceCommand, SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs,
-    TopicCommand, TopicFilterArgs, WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand,
-    ZoteroAttachmentCommand, ZoteroCollectionCommand, ZoteroCommand, ZoteroDeletedCommand,
-    ZoteroExtractCommand, ZoteroGroupCommand, ZoteroNoteCommand, ZoteroPermissionCommand,
-    ZoteroSearchCommand, ZoteroSettingCommand, ZoteroTagCommand, ZoteroWorkCommand,
+    AdvancedMode, AuthorCommand, AuthorFilterArgs, Cli, ConfigCommand, ConfigSetCommand,
+    DomainCommand, DomainFilterArgs, EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand,
+    FunderFilterArgs, InstitutionCommand, InstitutionFilterArgs, PublisherCommand,
+    PublisherFilterArgs, RagCommand, RagEmbedCommand, SelectionCommand, SourceCommand,
+    SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand, TopicFilterArgs,
+    WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand, ZoteroAttachmentCommand,
+    ZoteroCollectionCommand, ZoteroCommand, ZoteroDeletedCommand, ZoteroExtractCommand,
+    ZoteroGroupCommand, ZoteroNoteCommand, ZoteroPermissionCommand, ZoteroSearchCommand,
+    ZoteroSettingCommand, ZoteroTagCommand, ZoteroWorkCommand,
 };
 use papers_core::{
     filter::FilterError,
@@ -1620,6 +1621,9 @@ async fn papers_main() {
         EntityCommand::Rag { cmd } => {
             handle_rag_command(cmd).await;
         }
+        EntityCommand::Config { cmd } => {
+            handle_config_command(cmd);
+        }
     }
 }
 
@@ -1868,6 +1872,7 @@ async fn handle_rag_command(cmd: RagCommand) {
             if let Some(tags) = tag {
                 params.tags.extend(tags);
             }
+            params.force = force;
             // Check if already indexed (unless --force)
             if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
                 if json {
@@ -1916,7 +1921,7 @@ async fn handle_rag_command(cmd: RagCommand) {
             let mut ingested = 0usize;
             let mut failed = 0usize;
             for key in &keys {
-                let params = match papers_rag::ingest_params_from_cache(key) {
+                let mut params = match papers_rag::ingest_params_from_cache(key) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("  [skip] {key}: {e}");
@@ -1924,6 +1929,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                         continue;
                     }
                 };
+                params.force = force;
                 if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
                     if !json {
                         println!("  [skip] {key}: already indexed");
@@ -1964,6 +1970,151 @@ async fn handle_rag_command(cmd: RagCommand) {
                     "Ingested {} papers: {} chunks, {} figures ({} failed)",
                     ingested, total_chunks, total_figures, failed
                 );
+            }
+        }
+
+        RagCommand::Embed { cmd } => {
+            handle_rag_embed_command(cmd).await;
+        }
+    }
+}
+
+fn handle_config_command(cmd: ConfigCommand) {
+    match cmd {
+        ConfigCommand::Set {
+            cmd: ConfigSetCommand::Model { name },
+        } => {
+            if let Err(e) = papers_core::config::PapersConfig::validate_model(&name) {
+                exit_err(&e.to_string());
+            }
+            let mut cfg = match papers_core::config::PapersConfig::load() {
+                Ok(c) => c,
+                Err(e) => exit_err(&format!("Failed to load config: {e}")),
+            };
+            cfg.embedding_model = name;
+            match cfg.save() {
+                Ok(()) => println!(
+                    "Config saved: {}",
+                    papers_core::config::PapersConfig::config_path().display()
+                ),
+                Err(e) => exit_err(&e.to_string()),
+            }
+        }
+    }
+}
+
+async fn handle_rag_embed_command(cmd: RagEmbedCommand) {
+    let cache = papers_rag::default_embed_cache();
+    let default_model = || {
+        papers_core::config::PapersConfig::load()
+            .map(|c| c.embedding_model)
+            .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_string())
+    };
+
+    match cmd {
+        RagEmbedCommand::List { work, json } => {
+            if let Some(key) = work {
+                match cache.list_models(&key) {
+                    Ok(models) => {
+                        if json {
+                            print_json(&serde_json::json!({ "item_key": key, "models": models }));
+                        } else if models.is_empty() {
+                            println!("No cached embeddings for {key}.");
+                        } else {
+                            for model in &models {
+                                let chunk_count = cache
+                                    .load_manifest(model, &key)
+                                    .ok()
+                                    .flatten()
+                                    .map(|m| m.chunks.len());
+                                if let Some(n) = chunk_count {
+                                    println!("{key}  {model}  ({n} chunks)");
+                                } else {
+                                    println!("{key}  {model}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            } else {
+                match cache.list_all() {
+                    Ok(pairs) => {
+                        if json {
+                            let out: Vec<_> = pairs
+                                .iter()
+                                .map(|(k, m)| serde_json::json!({ "item_key": k, "model": m }))
+                                .collect();
+                            print_json(&out);
+                        } else if pairs.is_empty() {
+                            println!("No cached embeddings.");
+                        } else {
+                            for (key, model) in &pairs {
+                                let chunk_count = cache
+                                    .load_manifest(model, key)
+                                    .ok()
+                                    .flatten()
+                                    .map(|m| m.chunks.len());
+                                if let Some(n) = chunk_count {
+                                    println!("{key}  {model}  ({n} chunks)");
+                                } else {
+                                    println!("{key}  {model}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+        }
+
+        RagEmbedCommand::Add { work, model, force } => {
+            let model_name = model.unwrap_or_else(default_model);
+            if let Err(e) = papers_core::config::PapersConfig::validate_model(&model_name) {
+                exit_err(&e.to_string());
+            }
+
+            let keys = if let Some(key) = work {
+                vec![key]
+            } else {
+                papers_rag::list_cached_item_keys()
+            };
+
+            if keys.is_empty() {
+                println!("No cached papers found.");
+                return;
+            }
+
+            let rag = open_rag_store().await;
+            for key in &keys {
+                let params = match papers_rag::ingest_params_from_cache(key) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("  [skip] {key}: {e}");
+                        continue;
+                    }
+                };
+                match papers_rag::cache_paper_embeddings(&rag, &params, &model_name, force).await {
+                    Ok(n) => println!("Cached {n} chunks for {key} [{model_name}]"),
+                    Err(e) => eprintln!("  [fail] {key}: {e}"),
+                }
+            }
+        }
+
+        RagEmbedCommand::Delete { work, model } => {
+            let model_name = model.unwrap_or_else(default_model);
+
+            let keys = if let Some(key) = work {
+                vec![key]
+            } else {
+                papers_rag::list_cached_item_keys()
+            };
+
+            for key in &keys {
+                match cache.delete(&model_name, key) {
+                    Ok(()) => println!("Deleted embeddings for {key} [{model_name}]"),
+                    Err(e) => exit_err(&e.to_string()),
+                }
             }
         }
     }

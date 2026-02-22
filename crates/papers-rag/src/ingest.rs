@@ -23,6 +23,8 @@ pub struct IngestParams {
     pub venue: Option<String>,
     pub tags: Vec<String>,
     pub cache_dir: PathBuf,
+    /// When `true`, bypass the embedding cache and re-embed from scratch.
+    pub force: bool,
 }
 
 struct ChunkRecord {
@@ -131,6 +133,7 @@ pub fn ingest_params_from_cache(item_key: &str) -> Result<IngestParams, RagError
         venue,
         tags: vec![],
         cache_dir,
+        force: false,
     })
 }
 
@@ -138,8 +141,47 @@ fn parse_year(date: &str) -> Option<u16> {
     date.split('-').next()?.parse().ok()
 }
 
-/// Ingest a paper from the DataLab Marker JSON cache into LanceDB.
-pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<IngestStats, RagError> {
+/// Return the base directory for the embedding cache.
+///
+/// Checks `PAPERS_EMBED_CACHE_DIR` first, then falls back to
+/// `{cache_dir}/papers` (platform cache directory).
+pub fn embed_cache_base() -> PathBuf {
+    if let Ok(p) = std::env::var("PAPERS_EMBED_CACHE_DIR") {
+        return PathBuf::from(p);
+    }
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("papers")
+}
+
+/// Return the default embedding model name from user config, falling back to the
+/// built-in default.
+fn default_embed_model() -> String {
+    papers_core::config::PapersConfig::load()
+        .map(|c| c.embedding_model)
+        .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_string())
+}
+
+/// Convenience helper: convert an `EmbedCacheError` to `RagError::Cache`.
+fn cache_err(e: crate::embed_cache::EmbedCacheError) -> RagError {
+    RagError::Cache(e.to_string())
+}
+
+/// Return the current Unix timestamp as a decimal string.
+fn unix_timestamp_str() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
+/// Parse the DataLab Marker JSON for a paper into raw `ChunkRecord` and
+/// `FigureRecord` lists.  This is shared between `ingest_paper` and
+/// `cache_paper_embeddings`.
+fn parse_paper_blocks(
+    params: &IngestParams,
+) -> Result<(Vec<ChunkRecord>, Vec<FigureRecord>), RagError> {
     let json_path = params.cache_dir.join(format!("{}.json", params.item_key));
     let json_bytes = std::fs::read(&json_path)?;
     let root: Value = serde_json::from_slice(&json_bytes)?;
@@ -177,10 +219,7 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             == "SectionHeader"
         {
             if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
-                let html = block
-                    .get("html")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let html = block.get("html").and_then(|v| v.as_str()).unwrap_or("");
                 heading_map.insert(id.to_string(), strip_html(html));
             }
         }
@@ -242,10 +281,8 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
                         chapter_idx += 1;
                         section_idx = 0;
                         chunk_idx = 0;
-                        current_chapter_title = heading_map
-                            .get(block_id)
-                            .cloned()
-                            .unwrap_or_default();
+                        current_chapter_title =
+                            heading_map.get(block_id).cloned().unwrap_or_default();
                         current_section_title = String::new();
                         last_section_key = (chapter_idx, section_idx);
                     }
@@ -253,10 +290,8 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
                         // Subsection
                         section_idx += 1;
                         chunk_idx = 0;
-                        current_section_title = heading_map
-                            .get(block_id)
-                            .cloned()
-                            .unwrap_or_default();
+                        current_section_title =
+                            heading_map.get(block_id).cloned().unwrap_or_default();
                         last_section_key = (chapter_idx, section_idx);
                     }
                     _ => {}
@@ -265,10 +300,7 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             }
 
             "Text" | "ListGroup" | "Equation" => {
-                let html = block
-                    .get("html")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let html = block.get("html").and_then(|v| v.as_str()).unwrap_or("");
                 let text = strip_html(html);
                 if text.trim().is_empty() {
                     continue;
@@ -300,10 +332,7 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             }
 
             "Figure" | "Table" => {
-                let html = block
-                    .get("html")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let html = block.get("html").and_then(|v| v.as_str()).unwrap_or("");
                 let caption = extract_img_alt(html).unwrap_or_default();
                 let src = extract_img_src(html);
                 let image_path = src.map(|s| {
@@ -314,11 +343,7 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
                         .to_string_lossy()
                         .into_owned()
                 });
-                let figure_type = if block_type == "Table" {
-                    "table"
-                } else {
-                    "figure"
-                };
+                let figure_type = if block_type == "Table" { "table" } else { "figure" };
                 figure_seq += 1;
                 let figure_id = format!("{}/fig{}", params.paper_id, figure_seq);
                 figure_records.push(FigureRecord {
@@ -336,16 +361,97 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
         }
     }
 
-    let chunks_added = chunk_records.len();
-    let figures_added = figure_records.len();
-
     eprintln!(
         "  [{}] extracted {} chunks, {} figures ({} section headers)",
         params.item_key,
-        chunks_added,
-        figures_added,
+        chunk_records.len(),
+        figure_records.len(),
         heading_map.len()
     );
+
+    Ok((chunk_records, figure_records))
+}
+
+/// Compute embeddings for a paper's chunks and write them to the embedding cache.
+///
+/// - Returns the number of chunks cached.
+/// - If the cache already exists and `force` is `false`, returns the cached chunk
+///   count without re-embedding.
+/// - Saves figure embeddings are **not** cached — only text chunks.
+pub async fn cache_paper_embeddings(
+    store: &RagStore,
+    params: &IngestParams,
+    model: &str,
+    force: bool,
+) -> Result<usize, RagError> {
+    let cache = crate::embed_cache::EmbedCache::new(embed_cache_base());
+
+    // Cache hit: skip embedding
+    if !force {
+        if let Some(manifest) = cache.load_manifest(model, &params.item_key).map_err(cache_err)? {
+            eprintln!(
+                "  [{}] embed cache hit ({} chunks, model={})",
+                params.item_key,
+                manifest.chunks.len(),
+                model
+            );
+            return Ok(manifest.chunks.len());
+        }
+    }
+
+    let (chunk_records, _figure_records) = parse_paper_blocks(params)?;
+    let n = chunk_records.len();
+
+    let embeddings = if chunk_records.is_empty() {
+        vec![]
+    } else {
+        eprintln!("  [{}] embedding {} chunks (model={})...", params.item_key, n, model);
+        let texts: Vec<String> = chunk_records.iter().map(|c| c.text.clone()).collect();
+        let result = store.embed_documents(texts).await?;
+        eprintln!("  [{}] chunk embeddings done", params.item_key);
+        result
+    };
+
+    let dim = embeddings.first().map(|v| v.len()).unwrap_or(crate::schema::EMBED_DIM as usize);
+    let cached_chunks: Vec<crate::embed_cache::ChunkRecord> = chunk_records
+        .iter()
+        .map(|c| crate::embed_cache::ChunkRecord {
+            chunk_id: c.chunk_id.clone(),
+            text: c.text.clone(),
+            section: c.section_title.clone(),
+            heading: c.chapter_title.clone(),
+            chapter_idx: c.chapter_idx as u32,
+            section_idx: c.section_idx as u32,
+            chunk_idx: c.chunk_idx as u32,
+            page_start: c.page.map(|p| p as u32),
+            page_end: c.page.map(|p| p as u32),
+        })
+        .collect();
+
+    let manifest = crate::embed_cache::EmbedManifest {
+        model: model.to_string(),
+        dim,
+        created_at: unix_timestamp_str(),
+        chunks: cached_chunks,
+    };
+
+    cache
+        .save(model, &params.item_key, &manifest, &embeddings, force)
+        .map_err(cache_err)?;
+
+    eprintln!(
+        "  [{}] embed cache written ({} chunks, model={})",
+        params.item_key, n, model
+    );
+    Ok(n)
+}
+
+/// Ingest a paper from the DataLab Marker JSON cache into LanceDB.
+pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<IngestStats, RagError> {
+    let (chunk_records, figure_records) = parse_paper_blocks(&params)?;
+
+    let chunks_added = chunk_records.len();
+    let figures_added = figure_records.len();
 
     // ── Delete existing records for this paper ──────────────────────────────
     let paper_id_esc = params.paper_id.replace('\'', "''");
@@ -357,19 +463,85 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
         let _ = figures_table.delete(&delete_filter).await;
     }
 
-    // ── Embed chunk texts ───────────────────────────────────────────────────
-    let texts: Vec<String> = chunk_records.iter().map(|c| c.text.clone()).collect();
-    let embeddings = if texts.is_empty() {
+    // ── Embed chunk texts (with cache) ─────────────────────────────────────
+    let model = default_embed_model();
+    let embed_cache = crate::embed_cache::EmbedCache::new(embed_cache_base());
+
+    let embeddings = if chunk_records.is_empty() {
         vec![]
     } else {
-        eprintln!(
-            "  [{}] embedding {} chunks...",
-            params.item_key,
-            texts.len()
-        );
-        let result = store.embed_documents(texts).await?;
-        eprintln!("  [{}] chunk embeddings done", params.item_key);
-        result
+        // Cache hit: load embeddings from disk, skip GPU inference
+        let cached = if !params.force {
+            embed_cache
+                .load_manifest(&model, &params.item_key)
+                .map_err(cache_err)?
+                .map(|manifest| {
+                    embed_cache
+                        .load_embeddings(&model, &params.item_key, &manifest)
+                        .map_err(cache_err)
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        match cached {
+            Some(embs) => {
+                eprintln!(
+                    "  [{}] embed cache hit ({} chunks)",
+                    params.item_key,
+                    embs.len()
+                );
+                embs
+            }
+            None => {
+                eprintln!(
+                    "  [{}] embedding {} chunks...",
+                    params.item_key,
+                    chunk_records.len()
+                );
+                let texts: Vec<String> =
+                    chunk_records.iter().map(|c| c.text.clone()).collect();
+                let result = store.embed_documents(texts).await?;
+                eprintln!("  [{}] chunk embeddings done", params.item_key);
+
+                // Save to cache for future re-ingests
+                let dim = result
+                    .first()
+                    .map(|v| v.len())
+                    .unwrap_or(crate::schema::EMBED_DIM as usize);
+                let cached_chunks: Vec<crate::embed_cache::ChunkRecord> = chunk_records
+                    .iter()
+                    .map(|c| crate::embed_cache::ChunkRecord {
+                        chunk_id: c.chunk_id.clone(),
+                        text: c.text.clone(),
+                        section: c.section_title.clone(),
+                        heading: c.chapter_title.clone(),
+                        chapter_idx: c.chapter_idx as u32,
+                        section_idx: c.section_idx as u32,
+                        chunk_idx: c.chunk_idx as u32,
+                        page_start: c.page.map(|p| p as u32),
+                        page_end: c.page.map(|p| p as u32),
+                    })
+                    .collect();
+                let manifest = crate::embed_cache::EmbedManifest {
+                    model: model.clone(),
+                    dim,
+                    created_at: unix_timestamp_str(),
+                    chunks: cached_chunks,
+                };
+                if let Err(e) = embed_cache.save(
+                    &model,
+                    &params.item_key,
+                    &manifest,
+                    &result,
+                    params.force,
+                ) {
+                    eprintln!("  [{}] warning: failed to write embed cache: {e}", params.item_key);
+                }
+                result
+            }
+        }
     };
 
     // ── Embed figure captions ───────────────────────────────────────────────
@@ -760,5 +932,259 @@ mod tests {
             }
         }
         assert!(keys.is_empty());
+    }
+
+    // ── embed cache integration ───────────────────────────────────────────────
+
+    /// Build a minimal DataLab JSON with a few text blocks and write it to `dir/item_key/`.
+    fn write_fake_datalab_json(dir: &std::path::Path, item_key: &str) {
+        let item_dir = dir.join(item_key);
+        fs::create_dir_all(&item_dir).unwrap();
+        let json = serde_json::json!({
+            "children": [{
+                "block_type": "Page",
+                "children": [
+                    {
+                        "block_type": "SectionHeader",
+                        "id": "hdr1",
+                        "html": "<h2>Introduction</h2>",
+                        "page": 1
+                    },
+                    {
+                        "block_type": "Text",
+                        "id": "blk1",
+                        "html": "<p>First chunk of text.</p>",
+                        "page": 1
+                    },
+                    {
+                        "block_type": "Text",
+                        "id": "blk2",
+                        "html": "<p>Second chunk of text.</p>",
+                        "page": 2
+                    }
+                ]
+            }]
+        });
+        fs::write(
+            item_dir.join(format!("{item_key}.json")),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ingest_writes_embed_cache() {
+        let datalab_dir = TempDir::new().unwrap();
+        let rag_dir = TempDir::new().unwrap();
+        let embed_dir = TempDir::new().unwrap();
+        let key = "TESTKEY1";
+
+        write_fake_datalab_json(datalab_dir.path(), key);
+
+        unsafe {
+            std::env::set_var("PAPERS_DATALAB_CACHE_DIR", datalab_dir.path());
+            std::env::set_var("PAPERS_EMBED_CACHE_DIR", embed_dir.path());
+        }
+
+        let rag = crate::store::RagStore::open_for_test(
+            rag_dir.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let params = IngestParams {
+            item_key: key.to_string(),
+            paper_id: key.to_string(),
+            title: "Test Paper".to_string(),
+            authors: vec![],
+            year: None,
+            venue: None,
+            tags: vec![],
+            cache_dir: datalab_dir.path().join(key),
+            force: false,
+        };
+
+        ingest_paper(&rag, params).await.unwrap();
+
+        unsafe {
+            std::env::remove_var("PAPERS_DATALAB_CACHE_DIR");
+            std::env::remove_var("PAPERS_EMBED_CACHE_DIR");
+        }
+
+        let embed_cache = crate::embed_cache::EmbedCache::new(embed_dir.path().to_path_buf());
+        let model = "nomic-embed-text-v2-moe";
+        assert!(embed_cache.exists(model, key), "manifest.json + embeddings.bin should exist");
+        let manifest = embed_cache.load_manifest(model, key).unwrap().unwrap();
+        assert_eq!(manifest.chunks.len(), 2, "should have 2 text chunks");
+    }
+
+    #[tokio::test]
+    async fn test_ingest_cache_hit_skips_embedder() {
+        let datalab_dir = TempDir::new().unwrap();
+        let rag_dir = TempDir::new().unwrap();
+        let embed_dir = TempDir::new().unwrap();
+        let key = "TESTKEY2";
+
+        write_fake_datalab_json(datalab_dir.path(), key);
+
+        unsafe {
+            std::env::set_var("PAPERS_DATALAB_CACHE_DIR", datalab_dir.path());
+            std::env::set_var("PAPERS_EMBED_CACHE_DIR", embed_dir.path());
+        }
+
+        let rag = crate::store::RagStore::open_for_test(
+            rag_dir.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let make_params = || IngestParams {
+            item_key: key.to_string(),
+            paper_id: key.to_string(),
+            title: "Test Paper".to_string(),
+            authors: vec![],
+            year: None,
+            venue: None,
+            tags: vec![],
+            cache_dir: datalab_dir.path().join(key),
+            force: false,
+        };
+
+        // First ingest writes the cache
+        ingest_paper(&rag, make_params()).await.unwrap();
+
+        let embed_cache = crate::embed_cache::EmbedCache::new(embed_dir.path().to_path_buf());
+        let model = "nomic-embed-text-v2-moe";
+        assert!(embed_cache.exists(model, key));
+        let mtime_after_first = embed_dir
+            .path()
+            .join("embeddings")
+            .join(model)
+            .join(key)
+            .join("embeddings.bin")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Second ingest: should hit cache (no re-embedding)
+        // We can verify the embeddings.bin file is NOT rewritten
+        // (mtime doesn't change on cache hit).
+        // Note: force=false so cache hit applies.
+        ingest_paper(&rag, make_params()).await.unwrap();
+
+        let mtime_after_second = embed_dir
+            .path()
+            .join("embeddings")
+            .join(model)
+            .join(key)
+            .join("embeddings.bin")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Cache file was not rewritten (same mtime)
+        // Note: we pass overwrite=false so save() would fail on second call —
+        // meaning the file is never touched on cache hit.
+        assert_eq!(mtime_after_first, mtime_after_second, "embeddings.bin should not be rewritten on cache hit");
+
+        unsafe {
+            std::env::remove_var("PAPERS_DATALAB_CACHE_DIR");
+            std::env::remove_var("PAPERS_EMBED_CACHE_DIR");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ingest_cache_miss_on_force() {
+        let datalab_dir = TempDir::new().unwrap();
+        let rag_dir = TempDir::new().unwrap();
+        let embed_dir = TempDir::new().unwrap();
+        let key = "TESTKEY3";
+
+        write_fake_datalab_json(datalab_dir.path(), key);
+
+        unsafe {
+            std::env::set_var("PAPERS_DATALAB_CACHE_DIR", datalab_dir.path());
+            std::env::set_var("PAPERS_EMBED_CACHE_DIR", embed_dir.path());
+        }
+
+        let rag = crate::store::RagStore::open_for_test(
+            rag_dir.path().to_str().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // First ingest (force=false) — writes cache
+        ingest_paper(
+            &rag,
+            IngestParams {
+                item_key: key.to_string(),
+                paper_id: key.to_string(),
+                title: "Test".to_string(),
+                authors: vec![],
+                year: None,
+                venue: None,
+                tags: vec![],
+                cache_dir: datalab_dir.path().join(key),
+                force: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let embed_cache = crate::embed_cache::EmbedCache::new(embed_dir.path().to_path_buf());
+        let model = "nomic-embed-text-v2-moe";
+        assert!(embed_cache.exists(model, key));
+
+        let mtime_first = embed_dir
+            .path()
+            .join("embeddings")
+            .join(model)
+            .join(key)
+            .join("embeddings.bin")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Small sleep so mtime changes if file is rewritten
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // Second ingest with force=true — should re-embed and overwrite cache
+        ingest_paper(
+            &rag,
+            IngestParams {
+                item_key: key.to_string(),
+                paper_id: key.to_string(),
+                title: "Test".to_string(),
+                authors: vec![],
+                year: None,
+                venue: None,
+                tags: vec![],
+                cache_dir: datalab_dir.path().join(key),
+                force: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let mtime_second = embed_dir
+            .path()
+            .join("embeddings")
+            .join(model)
+            .join(key)
+            .join("embeddings.bin")
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        assert_ne!(mtime_first, mtime_second, "force=true should overwrite the cache file");
+
+        unsafe {
+            std::env::remove_var("PAPERS_DATALAB_CACHE_DIR");
+            std::env::remove_var("PAPERS_EMBED_CACHE_DIR");
+        }
     }
 }

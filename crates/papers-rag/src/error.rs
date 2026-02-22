@@ -14,4 +14,6 @@ pub enum RagError {
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("Embed cache error: {0}")]
+    Cache(String),
 }
