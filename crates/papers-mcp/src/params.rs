@@ -1133,3 +1133,48 @@ mod tests {
         assert_eq!(params.works.as_deref(), Some(">1000000"));
     }
 }
+
+// ── Selection params ───────────────────────────────────────────────────────
+
+/// Parameters for `selection_list`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SelectionListToolParams {}
+
+/// Parameters for `selection_get`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SelectionGetToolParams {
+    /// Selection name or 1-based index. Omit to use the active selection.
+    pub name: Option<String>,
+}
+
+/// Parameters for `selection_create`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SelectionCreateToolParams {
+    /// Selection name (alphanumeric, hyphens, and underscores only).
+    pub name: String,
+}
+
+/// Parameters for `selection_delete`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SelectionDeleteToolParams {
+    /// Selection name or 1-based index.
+    pub name: String,
+}
+
+/// Parameters for `selection_add`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SelectionAddToolParams {
+    /// Paper identifier: Zotero key, DOI, OpenAlex Work ID (e.g. W2741809807), or title.
+    pub paper: String,
+    /// Target selection name or 1-based index. Defaults to the active selection.
+    pub selection: Option<String>,
+}
+
+/// Parameters for `selection_remove`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SelectionRemoveToolParams {
+    /// Paper identifier: Zotero key, DOI, OpenAlex ID, or title substring.
+    pub paper: String,
+    /// Target selection name or 1-based index. Defaults to the active selection.
+    pub selection: Option<String>,
+}

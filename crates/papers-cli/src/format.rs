@@ -1284,3 +1284,89 @@ pub fn format_zotero_permission_list(info: &serde_json::Value) -> String {
     out
 }
 
+// ── Selection ──────────────────────────────────────────────────────────────
+
+pub struct SelectionListItem {
+    pub name: String,
+    pub item_count: usize,
+    pub is_active: bool,
+}
+
+pub fn format_selection_list(items: &[SelectionListItem]) -> String {
+    if items.is_empty() {
+        return "No selections. Create one with: papers selection create <name>\n".to_string();
+    }
+    let mut out = String::new();
+    for (i, item) in items.iter().enumerate() {
+        let active = if item.is_active { "* " } else { "  " };
+        out.push_str(&format!(
+            "{}{:>2}  {} ({} item{})\n",
+            active,
+            i + 1,
+            item.name,
+            item.item_count,
+            if item.item_count == 1 { "" } else { "s" }
+        ));
+    }
+    out
+}
+
+pub fn format_selection_get(sel: &papers_core::selection::Selection, is_active: bool) -> String {
+    let active = if is_active { " (active)" } else { "" };
+    let mut out = format!("Selection: {}{}\n", sel.name, active);
+    out.push_str(&format!("Items: {}\n", sel.entries.len()));
+    if sel.entries.is_empty() {
+        out.push_str("\n(empty — add papers with: papers selection add <paper>)\n");
+        return out;
+    }
+    out.push('\n');
+    for (i, entry) in sel.entries.iter().enumerate() {
+        let title = entry.title.as_deref().unwrap_or("(untitled)");
+        let year = entry.year.map_or(String::new(), |y| format!(" ({y})"));
+        out.push_str(&format!("  {:>2}  {}{}\n", i + 1, title, year));
+        if let Some(authors) = &entry.authors {
+            if !authors.is_empty() {
+                out.push_str(&format!("       {}\n", authors.join(" · ")));
+            }
+        }
+        let mut ids = Vec::new();
+        if let Some(k) = &entry.zotero_key {
+            ids.push(format!("Zotero: {k}"));
+        }
+        if let Some(oa) = &entry.openalex_id {
+            ids.push(format!("OA: {oa}"));
+        }
+        if let Some(doi) = &entry.doi {
+            ids.push(format!("DOI: {doi}"));
+        }
+        if !ids.is_empty() {
+            out.push_str(&format!("       {}\n", ids.join("  ")));
+        }
+    }
+    out
+}
+
+pub fn format_selection_create(name: &str) -> String {
+    format!("Created selection {name:?} (now active)\n")
+}
+
+pub fn format_selection_delete(name: &str, was_active: bool) -> String {
+    if was_active {
+        format!("Deleted selection {name:?} (was active; no selection now active)\n")
+    } else {
+        format!("Deleted selection {name:?}\n")
+    }
+}
+
+pub fn format_selection_add(
+    entry: &papers_core::selection::SelectionEntry,
+    selection_name: &str,
+) -> String {
+    let title = entry.title.as_deref().unwrap_or("(unknown)");
+    format!("Added {title:?} to selection {selection_name:?}\n")
+}
+
+pub fn format_selection_remove(title: &str, selection_name: &str) -> String {
+    format!("Removed {title:?} from selection {selection_name:?}\n")
+}
+

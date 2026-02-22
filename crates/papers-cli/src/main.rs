@@ -6,11 +6,11 @@ use cli::{
     AdvancedMode, AuthorCommand, AuthorFilterArgs, Cli, DomainCommand, DomainFilterArgs,
     EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand, FunderFilterArgs,
     InstitutionCommand, InstitutionFilterArgs, PublisherCommand, PublisherFilterArgs,
-    SourceCommand, SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand,
-    TopicFilterArgs, WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand, ZoteroAttachmentCommand,
-    ZoteroCollectionCommand, ZoteroCommand, ZoteroDeletedCommand, ZoteroExtractCommand,
-    ZoteroGroupCommand, ZoteroNoteCommand, ZoteroPermissionCommand, ZoteroSearchCommand,
-    ZoteroSettingCommand, ZoteroTagCommand, ZoteroWorkCommand,
+    SelectionCommand, SourceCommand, SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs,
+    TopicCommand, TopicFilterArgs, WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand,
+    ZoteroAttachmentCommand, ZoteroCollectionCommand, ZoteroCommand, ZoteroDeletedCommand,
+    ZoteroExtractCommand, ZoteroGroupCommand, ZoteroNoteCommand, ZoteroPermissionCommand,
+    ZoteroSearchCommand, ZoteroSettingCommand, ZoteroTagCommand, ZoteroWorkCommand,
 };
 use papers_core::{
     filter::FilterError,
@@ -1614,5 +1614,199 @@ async fn papers_main() {
             }
         },
 
+        EntityCommand::Selection { cmd } => {
+            handle_selection_command(cmd, &client).await;
+        }
+    }
+}
+
+async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient) {
+    use papers_core::selection::{
+        active_selection_name, delete_selection, entry_matches_remove_input,
+        list_selection_names, load_selection, load_state, resolve_paper,
+        resolve_selection, save_selection, save_state, validate_name, Selection,
+    };
+
+    match cmd {
+        SelectionCommand::List { json } => {
+            let names = list_selection_names();
+            let state = load_state();
+            let active = state.active.as_deref();
+            let items: Vec<format::SelectionListItem> = names
+                .iter()
+                .map(|name| {
+                    let count = load_selection(name)
+                        .map(|s| s.entries.len())
+                        .unwrap_or(0);
+                    format::SelectionListItem {
+                        name: name.clone(),
+                        item_count: count,
+                        is_active: Some(name.as_str()) == active,
+                    }
+                })
+                .collect();
+            if json {
+                let v: Vec<_> = items
+                    .iter()
+                    .map(|i| {
+                        serde_json::json!({
+                            "name": i.name,
+                            "item_count": i.item_count,
+                            "is_active": i.is_active,
+                        })
+                    })
+                    .collect();
+                print_json(&v);
+            } else {
+                print!("{}", format::format_selection_list(&items));
+            }
+        }
+
+        SelectionCommand::Get { name, json } => {
+            let sel_name = match name {
+                Some(n) => match resolve_selection(&n) {
+                    Ok(n) => n,
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => match active_selection_name() {
+                    Some(n) => n,
+                    None => exit_err("no active selection; run: papers selection list"),
+                },
+            };
+            let sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+            // Activate it
+            let mut state = load_state();
+            state.active = Some(sel_name.clone());
+            let _ = save_state(&state);
+            let is_active = true;
+            if json {
+                print_json(&serde_json::json!({
+                    "name": sel.name,
+                    "is_active": is_active,
+                    "entries": sel.entries,
+                }));
+            } else {
+                print!("{}", format::format_selection_get(&sel, is_active));
+            }
+        }
+
+        SelectionCommand::Create { name, json } => {
+            if let Err(e) = validate_name(&name) {
+                exit_err(&e.to_string());
+            }
+            // Check if already exists
+            if load_selection(&name).is_ok() {
+                exit_err(&format!("selection {name:?} already exists"));
+            }
+            let sel = Selection {
+                name: name.clone(),
+                entries: Vec::new(),
+            };
+            if let Err(e) = save_selection(&sel) {
+                exit_err(&e.to_string());
+            }
+            let mut state = load_state();
+            state.active = Some(name.clone());
+            if let Err(e) = save_state(&state) {
+                exit_err(&e.to_string());
+            }
+            if json {
+                print_json(&serde_json::json!({ "name": name, "is_active": true, "entries": [] }));
+            } else {
+                print!("{}", format::format_selection_create(&name));
+            }
+        }
+
+        SelectionCommand::Delete { name, json } => {
+            let sel_name = match resolve_selection(&name) {
+                Ok(n) => n,
+                Err(e) => exit_err(&e.to_string()),
+            };
+            let mut state = load_state();
+            let was_active = state.active.as_deref() == Some(&sel_name);
+            if let Err(e) = delete_selection(&sel_name) {
+                exit_err(&e.to_string());
+            }
+            if was_active {
+                state.active = None;
+                let _ = save_state(&state);
+            }
+            if json {
+                print_json(&serde_json::json!({ "name": sel_name, "was_active": was_active }));
+            } else {
+                print!("{}", format::format_selection_delete(&sel_name, was_active));
+            }
+        }
+
+        SelectionCommand::Add { paper, selection, json } => {
+            let sel_name = match selection {
+                Some(s) => match resolve_selection(&s) {
+                    Ok(n) => n,
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => match active_selection_name() {
+                    Some(n) => n,
+                    None => exit_err("no active selection; use --selection or create one first"),
+                },
+            };
+            // For selection add, Zotero is optional — treat all errors as "not available"
+            let zotero = optional_zotero().await.unwrap_or(None);
+            let entry = match resolve_paper(&paper, client, zotero.as_ref()).await {
+                Ok(e) => e,
+                Err(e) => exit_err(&e.to_string()),
+            };
+            let mut sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+            // Deduplication check
+            let is_dup = sel.entries.iter().any(|e| {
+                entry.zotero_key.as_deref().map(|k| papers_core::selection::entry_matches_key(e, k)).unwrap_or(false)
+                    || entry.openalex_id.as_deref().map(|id| papers_core::selection::entry_matches_openalex(e, id)).unwrap_or(false)
+                    || entry.doi.as_deref().map(|d| papers_core::selection::entry_matches_doi(e, d)).unwrap_or(false)
+            });
+            if !is_dup {
+                sel.entries.push(entry.clone());
+                if let Err(e) = save_selection(&sel) {
+                    exit_err(&e.to_string());
+                }
+            }
+            if json {
+                print_json(&serde_json::json!({ "entry": entry, "added": !is_dup }));
+            } else if is_dup {
+                let title = entry.title.as_deref().unwrap_or("(unknown)");
+                println!("Already in selection: {title:?}");
+            } else {
+                print!("{}", format::format_selection_add(&entry, &sel_name));
+            }
+        }
+
+        SelectionCommand::Remove { paper, selection, json } => {
+            let sel_name = match selection {
+                Some(s) => match resolve_selection(&s) {
+                    Ok(n) => n,
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => match active_selection_name() {
+                    Some(n) => n,
+                    None => exit_err("no active selection; use --selection or create one first"),
+                },
+            };
+            let mut sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let before = sel.entries.len();
+            let removed_entry = sel.entries.iter().find(|e| entry_matches_remove_input(e, &paper)).cloned();
+            sel.entries.retain(|e| !entry_matches_remove_input(e, &paper));
+            if sel.entries.len() == before {
+                exit_err("item not found in selection");
+            }
+            if let Err(e) = save_selection(&sel) {
+                exit_err(&e.to_string());
+            }
+            let title = removed_entry
+                .and_then(|e| e.title)
+                .unwrap_or_else(|| paper.clone());
+            if json {
+                print_json(&serde_json::json!({ "removed": title, "selection": sel_name }));
+            } else {
+                print!("{}", format::format_selection_remove(&title, &sel_name));
+            }
+        }
     }
 }

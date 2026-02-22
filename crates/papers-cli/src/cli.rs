@@ -77,6 +77,67 @@ pub enum EntityCommand {
         #[command(subcommand)]
         cmd: ZoteroCommand,
     },
+    /// Named groups of papers for focused work sessions
+    Selection {
+        #[command(subcommand)]
+        cmd: SelectionCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SelectionCommand {
+    /// List all selections (marks active with *)
+    List {
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show selection info and items; activate it (defaults to active selection)
+    Get {
+        /// Selection name or 1-based index (omit to use active selection)
+        name: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a new selection and activate it
+    Create {
+        /// Selection name (alphanumeric, - and _ only)
+        name: String,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a selection (deactivates if currently active)
+    Delete {
+        /// Selection name or 1-based index
+        name: String,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a paper to a selection (Zotero optional; stores rich metadata)
+    Add {
+        /// Paper identifier: Zotero key, DOI, OpenAlex ID, or title
+        paper: String,
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a paper from a selection
+    Remove {
+        /// Paper identifier: Zotero key, DOI, OpenAlex ID, or title
+        paper: String,
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Shared args for all list commands

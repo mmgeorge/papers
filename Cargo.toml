@@ -33,6 +33,7 @@ md-5 = "0.10"
 papers-datalab = { path = "crates/papers-datalab", version = "0.2.0" }
 wiremock = "0.6"
 serial_test = "3"
+tempfile = "3"
 
 # The profile that 'dist' will build with
 [profile.dist]

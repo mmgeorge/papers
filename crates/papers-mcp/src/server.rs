@@ -13,7 +13,9 @@ use serde::Serialize;
 use crate::params::{
     AutocompleteToolParams, AuthorListToolParams, DomainListToolParams, FieldListToolParams,
     FindWorksToolParams, FunderListToolParams, GetToolParams, InstitutionListToolParams,
-    PublisherListToolParams, SourceListToolParams, SubfieldListToolParams, TopicListToolParams,
+    PublisherListToolParams, SelectionAddToolParams, SelectionCreateToolParams,
+    SelectionDeleteToolParams, SelectionGetToolParams, SelectionListToolParams,
+    SelectionRemoveToolParams, SourceListToolParams, SubfieldListToolParams, TopicListToolParams,
     WorkListToolParams, WorkTextToolParams,
     ZoteroAnnotationListToolParams, ZoteroAttachmentListToolParams, ZoteroCollectionListToolParams,
     ZoteroCollectionNotesToolParams, ZoteroCollectionSubcollectionsToolParams,
@@ -765,6 +767,136 @@ impl PapersMcp {
             }
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    // ── Selection tools ───────────────────────────────────────────────────
+
+    /// List all named paper selections with item counts.
+    /// Marks the currently active selection.
+    #[tool]
+    pub async fn selection_list(&self, Parameters(_p): Parameters<SelectionListToolParams>) -> Result<String, String> {
+        use papers_core::selection::{list_selection_names, load_selection, load_state};
+        let names = list_selection_names();
+        let state = load_state();
+        let active = state.active.as_deref();
+        let items: Vec<_> = names
+            .iter()
+            .map(|name| {
+                let count = load_selection(name).map(|s| s.entries.len()).unwrap_or(0);
+                serde_json::json!({
+                    "name": name,
+                    "item_count": count,
+                    "is_active": Some(name.as_str()) == active,
+                })
+            })
+            .collect();
+        serde_json::to_string_pretty(&items).map_err(|e| e.to_string())
+    }
+
+    /// Get a selection's info and all its entries; activates the selection.
+    /// Defaults to the active selection if name is omitted.
+    #[tool]
+    pub async fn selection_get(&self, Parameters(p): Parameters<SelectionGetToolParams>) -> Result<String, String> {
+        use papers_core::selection::{active_selection_name, load_selection, load_state, resolve_selection, save_state};
+        let name = match p.name {
+            Some(n) => resolve_selection(&n).map_err(|e| e.to_string())?,
+            None => active_selection_name().ok_or_else(|| "no active selection; run selection_list".to_string())?,
+        };
+        let sel = load_selection(&name).map_err(|e| e.to_string())?;
+        let mut state = load_state();
+        state.active = Some(name.clone());
+        let _ = save_state(&state);
+        json_result::<_, String>(Ok(serde_json::json!({
+            "name": sel.name,
+            "is_active": true,
+            "entries": sel.entries,
+        })))
+    }
+
+    /// Create a new named selection and activate it.
+    /// Returns an error if a selection with that name already exists.
+    #[tool]
+    pub async fn selection_create(&self, Parameters(p): Parameters<SelectionCreateToolParams>) -> Result<String, String> {
+        use papers_core::selection::{load_selection, load_state, save_selection, save_state, validate_name, Selection};
+        validate_name(&p.name).map_err(|e| e.to_string())?;
+        if load_selection(&p.name).is_ok() {
+            return Err(format!("selection {:?} already exists", p.name));
+        }
+        let sel = Selection { name: p.name.clone(), entries: Vec::new() };
+        save_selection(&sel).map_err(|e| e.to_string())?;
+        let mut state = load_state();
+        state.active = Some(p.name.clone());
+        save_state(&state).map_err(|e| e.to_string())?;
+        json_result::<_, String>(Ok(serde_json::json!({ "name": p.name, "is_active": true, "entries": [] })))
+    }
+
+    /// Delete a named selection. Deactivates it if it was the active selection.
+    #[tool]
+    pub async fn selection_delete(&self, Parameters(p): Parameters<SelectionDeleteToolParams>) -> Result<String, String> {
+        use papers_core::selection::{delete_selection, load_state, resolve_selection, save_state};
+        let name = resolve_selection(&p.name).map_err(|e| e.to_string())?;
+        let mut state = load_state();
+        let was_active = state.active.as_deref() == Some(&name);
+        delete_selection(&name).map_err(|e| e.to_string())?;
+        if was_active {
+            state.active = None;
+            let _ = save_state(&state);
+        }
+        json_result::<_, String>(Ok(serde_json::json!({ "name": name, "was_active": was_active })))
+    }
+
+    /// Add a paper to a selection using smart resolution.
+    /// Input can be a Zotero key, DOI, OpenAlex Work ID (e.g. W2741809807), or title text.
+    /// Zotero is optional; falls back to OpenAlex-only metadata if not configured.
+    /// Skips duplicates silently. Defaults to the active selection.
+    #[tool]
+    pub async fn selection_add(&self, Parameters(p): Parameters<SelectionAddToolParams>) -> Result<String, String> {
+        use papers_core::selection::{
+            active_selection_name, entry_matches_doi, entry_matches_key, entry_matches_openalex,
+            load_selection, resolve_paper, resolve_selection, save_selection,
+        };
+        let sel_name = match p.selection {
+            Some(s) => resolve_selection(&s).map_err(|e| e.to_string())?,
+            None => active_selection_name().ok_or_else(|| "no active selection; use selection param or create one first".to_string())?,
+        };
+        let zotero = self.get_optional_zotero().await?;
+        let entry = resolve_paper(&p.paper, &self.client, zotero.as_ref()).await.map_err(|e| e.to_string())?;
+        let mut sel = load_selection(&sel_name).map_err(|e| e.to_string())?;
+        let is_dup = sel.entries.iter().any(|e| {
+            entry.zotero_key.as_deref().map(|k| entry_matches_key(e, k)).unwrap_or(false)
+                || entry.openalex_id.as_deref().map(|id| entry_matches_openalex(e, id)).unwrap_or(false)
+                || entry.doi.as_deref().map(|d| entry_matches_doi(e, d)).unwrap_or(false)
+        });
+        if !is_dup {
+            sel.entries.push(entry.clone());
+            save_selection(&sel).map_err(|e| e.to_string())?;
+        }
+        json_result::<_, String>(Ok(entry))
+    }
+
+    /// Remove a paper from a selection.
+    /// Matches by Zotero key, DOI, OpenAlex ID, or title substring.
+    /// Defaults to the active selection.
+    #[tool]
+    pub async fn selection_remove(&self, Parameters(p): Parameters<SelectionRemoveToolParams>) -> Result<String, String> {
+        use papers_core::selection::{
+            active_selection_name, entry_matches_remove_input,
+            load_selection, resolve_selection, save_selection, SelectionError,
+        };
+        let sel_name = match p.selection {
+            Some(s) => resolve_selection(&s).map_err(|e| e.to_string())?,
+            None => active_selection_name().ok_or_else(|| "no active selection".to_string())?,
+        };
+        let mut sel = load_selection(&sel_name).map_err(|e| e.to_string())?;
+        let removed = sel.entries.iter().find(|e| entry_matches_remove_input(e, &p.paper)).cloned();
+        let before = sel.entries.len();
+        sel.entries.retain(|e| !entry_matches_remove_input(e, &p.paper));
+        if sel.entries.len() == before {
+            return Err(SelectionError::ItemNotFound.to_string());
+        }
+        save_selection(&sel).map_err(|e| e.to_string())?;
+        let title = removed.and_then(|e| e.title).unwrap_or_else(|| p.paper.clone());
+        json_result::<_, String>(Ok(serde_json::json!({ "removed": title, "selection": sel_name })))
     }
 }
 
