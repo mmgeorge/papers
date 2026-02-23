@@ -102,33 +102,104 @@ fn strip_html_preserve_math(html: &str) -> String {
     strip_html(&buf)
 }
 
-/// Convert DataLab `<table>` HTML to pipe-delimited markdown.
-///
-/// Returns `None` if the html doesn't contain a `<table` tag (i.e. it's an
-/// `<img>` reference, not a real table).
-fn html_table_to_markdown(html: &str) -> Option<String> {
-    if !html.contains("<table") && !html.contains("<TABLE") {
-        return None;
+/// Parsed cell from an HTML table row.
+struct ParsedCell {
+    text: String,
+    colspan: usize,
+    rowspan: usize,
+}
+
+/// Parse a `colspan` or `rowspan` attribute from an opening tag string.
+/// Returns 1 if the attribute is missing or unparseable.
+fn parse_span_attr(tag_html: &str, attr: &str) -> usize {
+    let needle = format!("{}=\"", attr);
+    let start = match tag_html.find(&needle) {
+        Some(s) => s + needle.len(),
+        None => return 1,
+    };
+    let rest = &tag_html[start..];
+    let end = rest.find('"').unwrap_or(0);
+    rest[..end].parse::<usize>().unwrap_or(1).max(1)
+}
+
+/// Extract cells from a `<tr>` block, including span attributes.
+fn extract_row_cells(tr_html: &str) -> Vec<ParsedCell> {
+    let mut cells = Vec::new();
+    let mut search = 0;
+    let lower = tr_html.to_ascii_lowercase();
+
+    while search < lower.len() {
+        let th_pos = lower[search..].find("<th");
+        let td_pos = lower[search..].find("<td");
+
+        let cell_start = match (th_pos, td_pos) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        let cell_abs = search + cell_start;
+
+        // Find the > that closes the opening tag
+        let tag_close = match lower[cell_abs..].find('>') {
+            Some(p) => cell_abs + p + 1,
+            None => break,
+        };
+
+        let opening_tag_lower = &lower[cell_abs..tag_close];
+
+        let colspan = parse_span_attr(opening_tag_lower, "colspan");
+        let rowspan = parse_span_attr(opening_tag_lower, "rowspan");
+
+        // Find closing </th> or </td>
+        let close_tag = lower[tag_close..]
+            .find("</th>")
+            .or_else(|| lower[tag_close..].find("</td>"));
+
+        let cell_content_end = match close_tag {
+            Some(p) => tag_close + p,
+            None => {
+                search = tag_close;
+                continue;
+            }
+        };
+
+        let cell_html = &tr_html[tag_close..cell_content_end];
+        let text = strip_html_preserve_math(cell_html);
+
+        cells.push(ParsedCell {
+            text,
+            colspan,
+            rowspan,
+        });
+
+        // Skip past the closing tag (</th> or </td> = 5 chars)
+        search = cell_content_end + 5;
     }
 
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut thead_row_count = 0usize;
+    cells
+}
 
-    // Normalize <br/> and <br> to space before processing
-    let html = html.replace("<br/>", " ").replace("<br>", " ").replace("<br />", " ");
+/// Build a 2D grid from parsed rows, filling colspan/rowspan blocks.
+///
+/// Returns `(grid, thead_row_count)` where each grid cell is `Some(text)` if
+/// filled by a cell or `None` if unfilled (shouldn't happen with valid HTML).
+fn build_table_grid(
+    html: &str,
+) -> (Vec<Vec<Option<String>>>, usize) {
+    let lower = html.to_ascii_lowercase();
 
-    // Determine thead boundary
-    let thead_end = html.find("</thead>").or_else(|| html.find("</THEAD>"));
-    let thead_html = thead_end.map(|end| {
-        let start = html.find("<thead").or_else(|| html.find("<THEAD")).unwrap_or(0);
-        &html[start..end]
+    // Determine thead boundary (on original html, using lowercase for searching)
+    let thead_range = lower.find("<thead").and_then(|start| {
+        lower.find("</thead>").map(|end| (start, end))
     });
 
-    // Extract all <tr> blocks
+    // Extract all <tr> blocks with their in-thead status
+    let mut raw_rows: Vec<(Vec<ParsedCell>, bool)> = Vec::new();
     let mut search_from = 0;
-    while let Some(tr_start) = html[search_from..].find("<tr").or_else(|| html[search_from..].find("<TR")) {
+    while let Some(tr_start) = lower[search_from..].find("<tr") {
         let tr_abs = search_from + tr_start;
-        let tr_end_tag = html[tr_abs..].find("</tr>").or_else(|| html[tr_abs..].find("</TR>"));
+        let tr_end_tag = lower[tr_abs..].find("</tr>");
         let tr_end = match tr_end_tag {
             Some(e) => tr_abs + e,
             None => {
@@ -138,80 +209,183 @@ fn html_table_to_markdown(html: &str) -> Option<String> {
         };
         let tr_html = &html[tr_abs..tr_end];
 
-        // Check if this row is inside thead
-        let in_thead = thead_html.map_or(false, |th| {
-            let th_ptr = th.as_ptr() as usize;
-            let tr_ptr = tr_html.as_ptr() as usize;
-            tr_ptr >= th_ptr && tr_ptr < th_ptr + th.len()
+        let in_thead = thead_range.map_or(false, |(ts, te)| {
+            tr_abs >= ts && tr_abs < te
         });
 
-        // Extract cells: <th> or <td>
-        let mut cells: Vec<String> = Vec::new();
-        let mut cell_search = 0;
-        while cell_search < tr_html.len() {
-            // Find next <th or <td
-            let th_pos = tr_html[cell_search..].find("<th").or_else(|| tr_html[cell_search..].find("<TH"));
-            let td_pos = tr_html[cell_search..].find("<td").or_else(|| tr_html[cell_search..].find("<TD"));
-
-            let cell_start = match (th_pos, td_pos) {
-                (Some(a), Some(b)) => a.min(b),
-                (Some(a), None) => a,
-                (None, Some(b)) => b,
-                (None, None) => break,
-            };
-            let cell_abs = cell_search + cell_start;
-
-            // Find the > that closes the opening tag
-            let tag_close = match tr_html[cell_abs..].find('>') {
-                Some(p) => cell_abs + p + 1,
-                None => break,
-            };
-
-            // Find the closing </th> or </td>
-            let close_tag = tr_html[tag_close..].find("</th>")
-                .or_else(|| tr_html[tag_close..].find("</TH>"))
-                .or_else(|| tr_html[tag_close..].find("</td>"))
-                .or_else(|| tr_html[tag_close..].find("</TD>"));
-
-            let cell_content_end = match close_tag {
-                Some(p) => tag_close + p,
-                None => {
-                    cell_search = tag_close;
-                    continue;
-                }
-            };
-
-            let cell_html = &tr_html[tag_close..cell_content_end];
-            let cell_text = strip_html_preserve_math(cell_html);
-            cells.push(cell_text);
-
-            cell_search = cell_content_end + 5; // skip past </t?>
-        }
-
+        let cells = extract_row_cells(tr_html);
         if !cells.is_empty() {
-            if in_thead {
-                thead_row_count += 1;
-            }
-            rows.push(cells);
+            raw_rows.push((cells, in_thead));
         }
 
         search_from = tr_end + 5;
     }
 
-    if rows.is_empty() {
+    if raw_rows.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    // First pass: determine grid dimensions
+    let num_rows = raw_rows.len();
+    // We'll build the grid incrementally to determine width
+    let mut grid: Vec<Vec<Option<String>>> = vec![Vec::new(); num_rows];
+    let mut thead_row_count = 0usize;
+
+    for (row_idx, (cells, in_thead)) in raw_rows.iter().enumerate() {
+        if *in_thead {
+            thead_row_count = row_idx + 1;
+        }
+
+        let mut col = 0;
+        for cell in cells {
+            // Skip columns already occupied by rowspan from previous rows
+            while col < grid[row_idx].len() && grid[row_idx][col].is_some() {
+                col += 1;
+            }
+
+            // Fill the R×C block
+            for dr in 0..cell.rowspan {
+                let r = row_idx + dr;
+                if r >= num_rows {
+                    break;
+                }
+                for dc in 0..cell.colspan {
+                    let c = col + dc;
+                    // Ensure the grid row is wide enough
+                    while grid[r].len() <= c {
+                        grid[r].push(None);
+                    }
+                    grid[r][c] = Some(cell.text.clone());
+                }
+            }
+
+            col += cell.colspan;
+        }
+    }
+
+    // Normalize all rows to the same width
+    let max_cols = grid.iter().map(|r| r.len()).max().unwrap_or(0);
+    for row in &mut grid {
+        row.resize(max_cols, None);
+    }
+
+    (grid, thead_row_count)
+}
+
+/// Flatten multi-row header into a single row.
+///
+/// For each column, if the header rows have different values, join them with
+/// a space. If they repeat (from rowspan), keep one copy.
+fn flatten_header(grid: &[Vec<Option<String>>], thead_rows: usize) -> Vec<String> {
+    if thead_rows == 0 || grid.is_empty() {
+        return Vec::new();
+    }
+
+    let ncols = grid[0].len();
+    let mut header = Vec::with_capacity(ncols);
+
+    for col in 0..ncols {
+        let mut parts: Vec<String> = Vec::new();
+        for row in grid.iter().take(thead_rows) {
+            let val = row.get(col).and_then(|v| v.clone()).unwrap_or_default();
+            // Skip duplicates (from rowspan filling the same value)
+            if parts.last().map_or(true, |last| last != &val) {
+                parts.push(val);
+            }
+        }
+        // Join non-empty parts
+        let label = parts
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        header.push(label);
+    }
+
+    header
+}
+
+/// Convert DataLab `<table>` HTML to pipe-delimited markdown.
+///
+/// Returns `None` if the html doesn't contain a `<table` tag (i.e. it's an
+/// `<img>` reference, not a real table).
+fn html_table_to_markdown(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    if !lower.contains("<table") {
         return None;
     }
 
-    // Build markdown lines
-    let mut lines: Vec<String> = Vec::new();
-    for (i, row) in rows.iter().enumerate() {
-        let line = format!("| {} |", row.join(" | "));
-        lines.push(line);
+    // Normalize <br> variants to space before processing
+    let html = html
+        .replace("<br/>", " ")
+        .replace("<br>", " ")
+        .replace("<br />", " ")
+        .replace("<BR/>", " ")
+        .replace("<BR>", " ")
+        .replace("<BR />", " ");
 
-        // Add separator after the last thead row
-        if thead_row_count > 0 && i + 1 == thead_row_count {
-            let sep = format!("| {} |", row.iter().map(|_| "---").collect::<Vec<_>>().join(" | "));
-            lines.push(sep);
+    let (grid, thead_row_count) = build_table_grid(&html);
+    if grid.is_empty() {
+        return None;
+    }
+
+    let ncols = grid[0].len();
+    let mut lines: Vec<String> = Vec::new();
+
+    if thead_row_count > 1 {
+        // Flatten multi-row header into one row
+        let header = flatten_header(&grid, thead_row_count);
+        let header_line = format!(
+            "| {} |",
+            header
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+        lines.push(header_line);
+        let sep = format!(
+            "| {} |",
+            (0..ncols).map(|_| "---").collect::<Vec<_>>().join(" | ")
+        );
+        lines.push(sep);
+
+        // Body rows (everything after thead)
+        for row in &grid[thead_row_count..] {
+            let cells: Vec<&str> = row
+                .iter()
+                .map(|c| c.as_deref().unwrap_or(""))
+                .collect();
+            lines.push(format!("| {} |", cells.join(" | ")));
+        }
+    } else if thead_row_count == 1 {
+        // Single header row
+        let cells: Vec<&str> = grid[0]
+            .iter()
+            .map(|c| c.as_deref().unwrap_or(""))
+            .collect();
+        lines.push(format!("| {} |", cells.join(" | ")));
+        let sep = format!(
+            "| {} |",
+            (0..ncols).map(|_| "---").collect::<Vec<_>>().join(" | ")
+        );
+        lines.push(sep);
+
+        for row in &grid[1..] {
+            let cells: Vec<&str> = row
+                .iter()
+                .map(|c| c.as_deref().unwrap_or(""))
+                .collect();
+            lines.push(format!("| {} |", cells.join(" | ")));
+        }
+    } else {
+        // No thead — all rows as body
+        for row in &grid {
+            let cells: Vec<&str> = row
+                .iter()
+                .map(|c| c.as_deref().unwrap_or(""))
+                .collect();
+            lines.push(format!("| {} |", cells.join(" | ")));
         }
     }
 
@@ -2050,8 +2224,13 @@ mod tests {
     #[test]
     fn test_table_to_md_rowspan_doesnt_crash() {
         let html = r#"<table><thead><tr><th rowspan="2">Name</th><th>Col1</th></tr><tr><th>Sub</th></tr></thead><tbody><tr><td>A</td><td>1</td></tr></tbody></table>"#;
-        let md = html_table_to_markdown(html);
-        assert!(md.is_some(), "should not crash on rowspan");
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        // Flattened header + separator + 1 data row = 3 lines
+        assert_eq!(lines.len(), 3, "expected 3 lines: {}", md);
+        assert!(lines[0].contains("Name"), "header should contain Name: {}", md);
+        assert!(lines[0].contains("Col1 Sub"), "header should merge sub-column: {}", md);
+        assert!(lines[1].contains("---"), "second line should be separator");
     }
 
     #[test]
@@ -2059,9 +2238,11 @@ mod tests {
         let html = r#"<table><thead><tr><th>Name</th><th>Value</th></tr><tr><th>Sub1</th><th>Sub2</th></tr></thead><tbody><tr><td>A</td><td>1</td></tr></tbody></table>"#;
         let md = html_table_to_markdown(html).unwrap();
         let lines: Vec<&str> = md.lines().collect();
-        // Two header rows, then separator, then data
-        assert_eq!(lines.len(), 4, "expected 4 lines: {}", md);
-        assert!(lines[2].contains("---"), "separator should be after second header row");
+        // Flattened header + separator + 1 data row = 3 lines
+        assert_eq!(lines.len(), 3, "expected 3 lines: {}", md);
+        assert!(lines[0].contains("Name Sub1"), "header should merge: {}", md);
+        assert!(lines[0].contains("Value Sub2"), "header should merge: {}", md);
+        assert!(lines[1].contains("---"), "separator should be after header");
     }
 
     #[test]
@@ -2083,6 +2264,396 @@ mod tests {
         // Count data rows (lines after separator)
         let lines: Vec<&str> = md.lines().collect();
         assert_eq!(lines.len(), 4, "header + separator + 2 data rows: {}", md);
+    }
+
+    // ── html_table_to_markdown: new tests ──────────────────────────────────
+
+    // Basic structure tests
+
+    #[test]
+    fn test_table_to_md_3x3_with_thead() {
+        let html = "<table><thead><tr><th>A</th><th>B</th><th>C</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>3</td></tr><tr><td>4</td><td>5</td><td>6</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 4); // header + sep + 2 data rows
+        assert_eq!(lines[0], "| A | B | C |");
+    }
+
+    #[test]
+    fn test_table_to_md_single_column() {
+        let html = "<table><thead><tr><th>Only</th></tr></thead><tbody><tr><td>val</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert_eq!(md, "| Only |\n| --- |\n| val |");
+    }
+
+    #[test]
+    fn test_table_to_md_header_only_no_tbody() {
+        let html = "<table><thead><tr><th>A</th><th>B</th></tr></thead></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 2); // header + separator
+        assert_eq!(lines[0], "| A | B |");
+        assert!(lines[1].contains("---"));
+    }
+
+    #[test]
+    fn test_table_to_md_large_table() {
+        let header = "<tr><th>C1</th><th>C2</th><th>C3</th><th>C4</th><th>C5</th></tr>";
+        let row = "<tr><td>a</td><td>b</td><td>c</td><td>d</td><td>e</td></tr>";
+        let html = format!(
+            "<table><thead>{}</thead><tbody>{}{}{}{}{}</tbody></table>",
+            header, row, row, row, row, row
+        );
+        let md = html_table_to_markdown(&html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 7); // 1 header + 1 sep + 5 data
+    }
+
+    #[test]
+    fn test_table_to_md_empty_tr_tags() {
+        let html = "<table><tbody><tr></tr><tr></tr></tbody></table>";
+        assert!(html_table_to_markdown(html).is_none(), "empty rows should produce None");
+    }
+
+    // Colspan tests
+
+    #[test]
+    fn test_table_to_md_header_colspan_2() {
+        let html = r#"<table><thead><tr><th colspan="2">Group</th></tr></thead><tbody><tr><td>a</td><td>b</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Group | Group |");
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn test_table_to_md_colspan_entire_row() {
+        let html = r#"<table><thead><tr><th colspan="3">All</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>3</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.starts_with("| All | All | All |"));
+    }
+
+    #[test]
+    fn test_table_to_md_colspan_in_body() {
+        let html = r#"<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody><tr><td colspan="2">merged</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[2], "| merged | merged |");
+    }
+
+    #[test]
+    fn test_table_to_md_multiple_colspans_one_row() {
+        let html = r#"<table><thead><tr><th colspan="2">Left</th><th colspan="2">Right</th></tr></thead><tbody><tr><td>a</td><td>b</td><td>c</td><td>d</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Left | Left | Right | Right |");
+    }
+
+    #[test]
+    fn test_table_to_md_colspan_3_header() {
+        let html = r#"<table><thead><tr><th>ID</th><th colspan="3">Metrics</th></tr></thead><tbody><tr><td>1</td><td>a</td><td>b</td><td>c</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| ID | Metrics | Metrics | Metrics |");
+    }
+
+    // Rowspan tests
+
+    #[test]
+    fn test_table_to_md_rowspan_2_first_header_col() {
+        // Classic: first column spans 2 header rows, second column has sub-headers
+        let html = r#"<table><thead><tr><th rowspan="2">Method</th><th>Score</th></tr><tr><th>Mean</th></tr></thead><tbody><tr><td>Ours</td><td>95</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("Method"), "should have Method: {}", md);
+        assert!(lines[0].contains("Score Mean"), "should merge Score+Mean: {}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_rowspan_in_body() {
+        let html = r#"<table><thead><tr><th>Cat</th><th>Val</th></tr></thead><tbody><tr><td rowspan="2">Group</td><td>1</td></tr><tr><td>2</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 4); // header + sep + 2 data
+        assert_eq!(lines[2], "| Group | 1 |");
+        assert_eq!(lines[3], "| Group | 2 |");
+    }
+
+    #[test]
+    fn test_table_to_md_rowspan_3_body() {
+        let html = r#"<table><thead><tr><th>Cat</th><th>Val</th></tr></thead><tbody><tr><td rowspan="3">X</td><td>1</td></tr><tr><td>2</td></tr><tr><td>3</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 5); // header + sep + 3 data
+        assert_eq!(lines[2], "| X | 1 |");
+        assert_eq!(lines[3], "| X | 2 |");
+        assert_eq!(lines[4], "| X | 3 |");
+    }
+
+    #[test]
+    fn test_table_to_md_rowspan_middle_column() {
+        let html = r#"<table><thead><tr><th>A</th><th>B</th><th>C</th></tr></thead><tbody><tr><td>1</td><td rowspan="2">mid</td><td>x</td></tr><tr><td>2</td><td>y</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[2], "| 1 | mid | x |");
+        assert_eq!(lines[3], "| 2 | mid | y |");
+    }
+
+    // Combined span tests
+
+    #[test]
+    fn test_table_to_md_vbd_style_rowspan_colspan_header() {
+        // VBD Table 1 pattern: first col rowspan=2, next cols have colspan groups
+        let html = r#"<table><thead><tr><th rowspan="2">Experiment</th><th colspan="2">Our Method</th><th colspan="2">Baseline</th></tr><tr><th>Time</th><th>Error</th><th>Time</th><th>Error</th></tr></thead><tbody><tr><td>Beam</td><td>1.2</td><td>0.01</td><td>3.4</td><td>0.05</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3, "flattened header + sep + 1 data: {}", md);
+        // Header should have: Experiment | Our Method Time | Our Method Error | Baseline Time | Baseline Error
+        assert!(lines[0].contains("Experiment"), "{}", md);
+        assert!(lines[0].contains("Our Method Time"), "{}", md);
+        assert!(lines[0].contains("Baseline Error"), "{}", md);
+        // Data row
+        assert!(lines[2].contains("Beam"), "{}", md);
+        assert!(lines[2].contains("1.2"), "{}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_two_level_header() {
+        // Top row with colspans, bottom row with individual columns
+        let html = r#"<table><thead><tr><th colspan="2">Group A</th><th colspan="2">Group B</th></tr><tr><th>X</th><th>Y</th><th>X</th><th>Y</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>3</td><td>4</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("Group A X"), "{}", md);
+        assert!(lines[0].contains("Group A Y"), "{}", md);
+        assert!(lines[0].contains("Group B X"), "{}", md);
+        assert!(lines[0].contains("Group B Y"), "{}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_three_level_header() {
+        let html = r#"<table><thead><tr><th colspan="4">All</th></tr><tr><th colspan="2">Left</th><th colspan="2">Right</th></tr><tr><th>A</th><th>B</th><th>C</th><th>D</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>3</td><td>4</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("All Left A"), "{}", md);
+        assert!(lines[0].contains("All Right D"), "{}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_body_cell_colspan_and_rowspan() {
+        let html = r#"<table><thead><tr><th>A</th><th>B</th><th>C</th></tr></thead><tbody><tr><td colspan="2" rowspan="2">big</td><td>x</td></tr><tr><td>y</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[2], "| big | big | x |");
+        assert_eq!(lines[3], "| big | big | y |");
+    }
+
+    // Multi-row header flattening tests
+
+    #[test]
+    fn test_table_to_md_flatten_two_header_rows() {
+        let html = r#"<table><thead><tr><th>Top1</th><th>Top2</th></tr><tr><th>Bot1</th><th>Bot2</th></tr></thead><tbody><tr><td>a</td><td>b</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("Top1 Bot1"), "{}", md);
+        assert!(lines[0].contains("Top2 Bot2"), "{}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_rowspan_parent_with_sub_columns() {
+        // "Parent" rowspan stays, sub-columns get their own labels
+        let html = r#"<table><thead><tr><th rowspan="2">Parent</th><th colspan="2">Children</th></tr><tr><th>C1</th><th>C2</th></tr></thead><tbody><tr><td>p</td><td>a</td><td>b</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("Parent"), "{}", md);
+        assert!(lines[0].contains("Children C1"), "{}", md);
+        assert!(lines[0].contains("Children C2"), "{}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_three_header_rows_cascading() {
+        let html = r#"<table><thead><tr><th colspan="4">Root</th></tr><tr><th colspan="2">L</th><th colspan="2">R</th></tr><tr><th>a</th><th>b</th><th>c</th><th>d</th></tr></thead><tbody><tr><td>1</td><td>2</td><td>3</td><td>4</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Root L a, Root L b, Root R c, Root R d
+        assert!(lines[0].contains("Root L a"), "{}", md);
+        assert!(lines[0].contains("Root R d"), "{}", md);
+    }
+
+    // Edge cases
+
+    #[test]
+    fn test_table_to_md_mixed_case_tags() {
+        let html = "<TABLE><THEAD><TR><TH>A</TH><TH>B</TH></TR></THEAD><TBODY><TR><TD>1</TD><TD>2</TD></TR></TBODY></TABLE>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert_eq!(md, "| A | B |\n| --- | --- |\n| 1 | 2 |");
+    }
+
+    #[test]
+    fn test_table_to_md_extra_attributes() {
+        let html = r#"<table border="1" class="results"><thead><tr><th style="color:red">A</th></tr></thead><tbody><tr><td class="val">1</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.contains("| A |"), "{}", md);
+        assert!(md.contains("| 1 |"), "{}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_pipe_in_cell() {
+        // Pipe chars in cell content — they'll appear in the output as-is (this is a known limitation)
+        let html = "<table><thead><tr><th>A</th></tr></thead><tbody><tr><td>x|y</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        // We just verify it doesn't crash and the content is there
+        assert!(md.contains("x|y") || md.contains("x"), "{}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_whitespace_only_cells() {
+        let html = "<table><thead><tr><th>A</th></tr></thead><tbody><tr><td>   </td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        // Whitespace-only cells should normalize to empty
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[2], "|  |");
+    }
+
+    #[test]
+    fn test_table_to_md_uneven_body_rows() {
+        // Body row with fewer cells than header — grid pads with None
+        let html = "<table><thead><tr><th>A</th><th>B</th><th>C</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| A | B | C |");
+        // Data row should be padded
+        assert_eq!(lines[2], "| 1 |  |  |");
+    }
+
+    #[test]
+    fn test_table_to_md_nested_html_in_cells() {
+        let html = "<table><thead><tr><th><b>Bold</b></th></tr></thead><tbody><tr><td><i>italic</i> and <span>span</span></td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.contains("| Bold |"), "should strip <b>: {}", md);
+        assert!(md.contains("italic and span"), "should strip inline tags: {}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_br_variants() {
+        let html = "<table><thead><tr><th>A<br>B<br/>C<br />D</th></tr></thead><tbody><tr><td>x</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.contains("A B C D"), "all br variants should become space: {}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_uppercase_table_thead_tbody() {
+        let html = "<TABLE><THEAD><TR><TH>X</TH></TR></THEAD><TBODY><TR><TD>1</TD></TR></TBODY></TABLE>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert_eq!(md, "| X |\n| --- |\n| 1 |");
+    }
+
+    // Real-world patterns
+
+    #[test]
+    fn test_table_to_md_vbd_table1_reproduction() {
+        // Reproduces the VBD paper Table 1 structure
+        let html = r#"<table border="1">
+            <thead>
+                <tr>
+                    <th rowspan="2">Experiment Name</th>
+                    <th rowspan="2">Number of Vert.</th>
+                    <th rowspan="2">Material</th>
+                    <th colspan="2">VBD (Ours)</th>
+                    <th colspan="2">Newton</th>
+                </tr>
+                <tr>
+                    <th>Time(s)</th>
+                    <th>Iter</th>
+                    <th>Time(s)</th>
+                    <th>Iter</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Twisting Beams</td>
+                    <td>97K</td>
+                    <td>NeoHookean</td>
+                    <td>1.2</td>
+                    <td>5</td>
+                    <td>3.4</td>
+                    <td>12</td>
+                </tr>
+                <tr>
+                    <td>Armadillo</td>
+                    <td>15K</td>
+                    <td>StVK</td>
+                    <td>0.8</td>
+                    <td>3</td>
+                    <td>2.1</td>
+                    <td>8</td>
+                </tr>
+            </tbody>
+        </table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+
+        // Should have: 1 flattened header + 1 separator + 2 data rows = 4 lines
+        assert_eq!(lines.len(), 4, "wrong line count: {}", md);
+
+        // Header should have 7 columns
+        let header_pipes = lines[0].matches('|').count();
+        assert_eq!(header_pipes, 8, "header should have 7 cols (8 pipes): {}", lines[0]);
+
+        // Verify flattened header labels
+        assert!(lines[0].contains("Experiment Name"), "{}", lines[0]);
+        assert!(lines[0].contains("Number of Vert."), "{}", lines[0]);
+        assert!(lines[0].contains("Material"), "{}", lines[0]);
+        assert!(lines[0].contains("VBD (Ours) Time(s)"), "{}", lines[0]);
+        assert!(lines[0].contains("Newton Iter"), "{}", lines[0]);
+
+        // Verify separator
+        assert!(lines[1].contains("---"));
+        let sep_pipes = lines[1].matches('|').count();
+        assert_eq!(sep_pipes, 8, "separator should match header width");
+
+        // Verify data
+        assert!(lines[2].contains("Twisting Beams"), "{}", lines[2]);
+        assert!(lines[2].contains("97K"), "{}", lines[2]);
+        assert!(lines[3].contains("Armadillo"), "{}", lines[3]);
+    }
+
+    #[test]
+    fn test_table_to_md_statistical_results() {
+        // Statistical results table with grouped header columns
+        let html = r#"<table>
+            <thead>
+                <tr>
+                    <th rowspan="2">Method</th>
+                    <th colspan="2">Accuracy</th>
+                    <th colspan="2">F1-Score</th>
+                </tr>
+                <tr>
+                    <th>Mean</th>
+                    <th>CI</th>
+                    <th>Mean</th>
+                    <th>CI</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>Ours</td><td>0.95</td><td>[0.93,0.97]</td><td>0.91</td><td>[0.88,0.94]</td></tr>
+                <tr><td>Baseline</td><td>0.82</td><td>[0.79,0.85]</td><td>0.78</td><td>[0.74,0.82]</td></tr>
+            </tbody>
+        </table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+
+        assert_eq!(lines.len(), 4, "header + sep + 2 data: {}", md);
+        assert!(lines[0].contains("Method"), "{}", lines[0]);
+        assert!(lines[0].contains("Accuracy Mean"), "{}", lines[0]);
+        assert!(lines[0].contains("F1-Score CI"), "{}", lines[0]);
+        assert!(lines[2].contains("0.95"), "{}", lines[2]);
+        assert!(lines[3].contains("Baseline"), "{}", lines[3]);
     }
 
     // ── table content in FigureRecord ────────────────────────────────────
