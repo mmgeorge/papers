@@ -2,6 +2,9 @@
 
 [![crates.io](https://img.shields.io/crates/v/papers-cli.svg)](https://crates.io/crates/papers-cli)
 
+> [!WARNING]
+> Under active development. Expect bugs and breaking changes.
+
 Search, manage, and explore academic papers from the terminal or LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers embeddings (using DirectML and CoreML) with [LanceDB](https://lancedb.com) so you can semantically search across sections, figures, and chunks locally.
 
 Also runs as an [MCP](https://modelcontextprotocol.io) server, exposing all functionality as tools for LLMs.
@@ -42,7 +45,7 @@ papers work list --topic "deep learning" --citations ">100" --sort cited_by_coun
 papers author list --institution harvard --country US --h-index ">50"
 ```
 
-Filter aliases (`--author`, `--year`, `--topic`, `--citations`, etc.) resolve names to OpenAlex IDs automatically. You can also use raw [OpenAlex filter syntax](https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists) via `--filter`.
+[Filter aliases](#filter-aliases) (`--author`, `--year`, `--topic`, `--citations`, etc.) resolve names to OpenAlex IDs automatically. You can also use raw [OpenAlex filter syntax](https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists) via `--filter`.
 
 ### Get by ID or search
 
