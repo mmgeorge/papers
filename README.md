@@ -29,6 +29,29 @@ cargo install --path crates/papers-cli
 
 Commands accepts `--json` for machine-readable output.
 
+## MCP server
+
+Exposes CLI commands as MCP tools for LLMs. Currently only --stdio is supported.
+
+**Claude Code:**
+
+```sh
+claude mcp add papers -- papers mcp start --stdio
+```
+
+**`.mcp.json` (Claude Desktop, Cursor, etc.):**
+
+```json
+{
+  "mcpServers": {
+    "papers": {
+      "command": "papers",
+      "args": ["mcp", "start", "--stdio"]
+    }
+  }
+}
+```
+
 ## OpenAlex
 
 OpenAlex works without authentication but is rate-limited. Set `OPENALEX_KEY` for higher rate limits ([openalex.org/pricing](https://openalex.org/pricing)).
@@ -120,29 +143,6 @@ papers rag search "differentiable rendering" -n 5
 papers rag search-figures "neural radiance field architecture"
 papers rag get-section <paper> <section>
 papers rag outline <paper>
-```
-
-## MCP server
-
-Exposes CLI commands as MCP tools for LLMs. Currently only --stdio is supported.
-
-**Claude Code:**
-
-```sh
-claude mcp add papers -- papers mcp start --stdio
-```
-
-**`.mcp.json` (Claude Desktop, Cursor, etc.):**
-
-```json
-{
-  "mcpServers": {
-    "papers": {
-      "command": "papers",
-      "args": ["mcp", "start", "--stdio"]
-    }
-  }
-}
 ```
 
 ## Filter aliases
