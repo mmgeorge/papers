@@ -16,7 +16,7 @@ pub enum AdvancedMode {
 #[derive(Parser)]
 #[command(
     name = "papers",
-    about = "Query the OpenAlex academic research database",
+    about = "Search, manage, and explore academic papers from the terminal",
     term_width = 100
 )]
 pub struct Cli {
@@ -119,27 +119,37 @@ pub enum RagCommand {
     Search {
         /// Natural language search query
         query: String,
+        /// Scope to papers in a named selection
         #[arg(long)]
         selection: Option<String>,
+        /// Scope to a specific paper (DOI or item key)
         #[arg(long)]
         paper_id: Option<String>,
+        /// Scope to a specific chapter (1-based; requires --paper-id)
         #[arg(long)]
         chapter_idx: Option<u16>,
+        /// Scope to a specific section (1-based; requires --paper-id and --chapter-idx)
         #[arg(long)]
         section_idx: Option<u16>,
+        /// Minimum publication year
         #[arg(long)]
         year_min: Option<u16>,
+        /// Maximum publication year
         #[arg(long)]
         year_max: Option<u16>,
+        /// Filter by venue name
         #[arg(long)]
         venue: Option<String>,
+        /// Filter by tag (repeatable)
         #[arg(long)]
         tag: Option<Vec<String>>,
         /// Granularity: chapter | section | paragraph
         #[arg(long)]
         depth: Option<String>,
+        /// Maximum number of results
         #[arg(long, short = 'n', default_value = "5")]
         limit: u16,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
@@ -147,22 +157,27 @@ pub enum RagCommand {
     SearchFigures {
         /// Natural language description of the figure to find
         query: String,
+        /// Scope to papers in a named selection
         #[arg(long)]
         selection: Option<String>,
+        /// Scope to a specific paper (DOI or item key)
         #[arg(long)]
         paper_id: Option<String>,
-        /// Filter: "figure" or "table"
+        /// Filter by type: "figure" or "table"
         #[arg(long)]
         figure_type: Option<String>,
+        /// Maximum number of results
         #[arg(long, short = 'n', default_value = "5")]
         limit: u16,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// Retrieve a specific chunk by ID
+    /// Retrieve a specific chunk by ID with neighboring context
     GetChunk {
         /// Chunk ID (e.g. YFACFA8C/ch1/s2/p3)
         chunk_id: String,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
@@ -170,62 +185,79 @@ pub enum RagCommand {
     GetSection {
         /// Paper ID (DOI or item key)
         paper_id: String,
+        /// Chapter index (1-based)
         #[arg(long)]
         chapter_idx: u16,
+        /// Section index (1-based within chapter)
         #[arg(long)]
         section_idx: u16,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// Fetch all content of a chapter
+    /// Fetch all chunks in a chapter in reading order
     GetChapter {
         /// Paper ID (DOI or item key)
         paper_id: String,
+        /// Chapter index (1-based)
         #[arg(long)]
         chapter_idx: u16,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// Get figure details by ID
+    /// Get figure or table details by ID
     GetFigure {
         /// Figure ID (e.g. YFACFA8C/fig3)
         figure_id: String,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// Show the table of contents for a paper
+    /// Show the table of contents for an indexed paper
     Outline {
         /// Paper ID (DOI or item key)
         paper_id: String,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
     /// List indexed papers with optional filters
     ListPapers {
+        /// Scope to papers in a named selection
         #[arg(long)]
         selection: Option<String>,
+        /// Minimum publication year
         #[arg(long)]
         year_min: Option<u16>,
+        /// Maximum publication year
         #[arg(long)]
         year_max: Option<u16>,
+        /// Filter by venue name
         #[arg(long)]
         venue: Option<String>,
+        /// Filter by tag (repeatable)
         #[arg(long)]
         tag: Option<Vec<String>>,
+        /// Filter by author name (repeatable, post-filter)
         #[arg(long)]
         author: Option<Vec<String>>,
         /// Sort by: "year" (default) or "title"
         #[arg(long)]
         sort: Option<String>,
+        /// Maximum number of results
         #[arg(long, short = 'n', default_value = "50")]
         limit: u16,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// List all tags and counts
+    /// List all tags across indexed papers with counts
     ListTags {
+        /// Scope to papers in a named selection
         #[arg(long)]
         selection: Option<String>,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
@@ -242,6 +274,7 @@ pub enum RagCommand {
         /// Force re-index even if already indexed
         #[arg(long)]
         force: bool,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
@@ -250,6 +283,7 @@ pub enum RagCommand {
         /// Force re-index all papers
         #[arg(long)]
         force: bool,
+        /// Output raw JSON
         #[arg(long)]
         json: bool,
     },

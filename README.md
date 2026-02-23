@@ -25,6 +25,7 @@ cargo install --path crates/papers-cli
 | `zotero` | Access your Zotero library |
 | `rag` | Semantic search over locally indexed papers |
 | `selection` | Manage named groups of papers |
+| `config` | Configure settings (e.g. embedding model) |
 | `mcp` | MCP server integration |
 
 Commands accepts `--json` for machine-readable output.
@@ -90,7 +91,7 @@ papers zotero attachment file <work> --output paper.pdf
 papers zotero collection list --top
 ```
 
-Entities: `work`, `attachment`, `annotation`, `note`, `collection`, `tag`, `search`, `group`.
+Entities: `work`, `extract`, `attachment`, `annotation`, `note`, `collection`, `tag`, `search`, `group`, `setting`, `deleted`, `permission`.
 
 ## Extraction
 
@@ -109,6 +110,8 @@ Processing modes: `fast`, `balanced` (default), `accurate`.
 ```sh
 papers zotero extract list                               # List items with cached extractions
 papers zotero extract text <work>                        # Get markdown
+papers zotero extract json <work>                        # Get structured JSON
+papers zotero extract get <work>                         # Get extraction metadata
 papers zotero extract upload [--dry-run]                 # Upload local cache to Zotero
 papers zotero extract download [--dry-run]               # Download Zotero cache to local
 ```
@@ -149,13 +152,17 @@ Local semantic search over your papers using [LanceDB](https://github.com/lanced
 PDFs are sent to [Datalab Marker](https://www.datalab.to/) for vision-model OCR, which returns a structured JSON block tree alongside markdown. Each block (paragraph, equation, list, table, figure) becomes one chunk — no fixed-size splitting or overlap. Chunks and figure captions are embedded into 768-d vectors and stored in LanceDB. At query time, the query is embedded with the same model and matched via approximate nearest neighbor (ANN) search. Each result includes truncated previews of its neighboring chunks for surrounding context.
 
 ```sh
-papers rag ingest <work>                 # Index a single paper
-papers rag ingest-all                    # Index all cached extractions
+papers rag ingest <work>                                 # Index a single paper
+papers rag ingest-all                                    # Index all cached extractions
 papers rag search "differentiable rendering" -n 5
 papers rag search-figures "neural radiance field architecture"
 papers rag get-chunk <chunk_id>
-papers rag get-section <work> <chapter> <section>
-papers rag outline <work>
+papers rag get-section <paper_id> --chapter-idx 1 --section-idx 2
+papers rag get-chapter <paper_id> --chapter-idx 1
+papers rag get-figure <figure_id>
+papers rag outline <paper_id>
+papers rag list-papers [--selection <name>]
+papers rag list-tags
 ```
 
 ## Filter aliases
