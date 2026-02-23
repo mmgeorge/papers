@@ -2,12 +2,13 @@
 
 [![crates.io](https://img.shields.io/crates/v/papers-cli.svg)](https://crates.io/crates/papers-cli)
 [![CI](https://github.com/mmgeorge/papers/actions/workflows/ci.yml/badge.svg)](https://github.com/mmgeorge/papers/actions/workflows/ci.yml)[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Search, manage, and explore academic papers from the terminal or LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers embeddings (using DirectML and CoreML) with [LanceDB](https://github.com/lancedb/lancedb) so you can semantically search across sections, figures, and chunks locally.
 
 Also runs as an [MCP](https://modelcontextprotocol.io) server, exposing all functionality as tools for LLMs.
 
 > [!NOTE]
-> Producing a high quality OCR for technical papers is complex. Even the best PDF-extraction mangle LaTeX and tables. This project uses vision-model-based OCR via [Datalab](https://www.datalab.to/) (requires API key) to produce clean markdown with math and tables preserved. Extracted results (JSON, markdown, images) sync back to your Zotero library.
+> Even the best analytical PDF-extraction methods mangle LaTeX and tables for technical papers. This project uses vision-model-based OCR via [Datalab](https://www.datalab.to/) (requires API key) to produce clean markdown with math and tables preserved. Extracted results (JSON, markdown, images) sync back to your Zotero library.
 >
 > You can also run [marker](https://github.com/datalab-to/marker) locally if you meet its [license requirements](https://github.com/datalab-to/marker?tab=readme-ov-file#commercial-usage) — just place the output in the cache directory.
 
