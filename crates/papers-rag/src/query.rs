@@ -382,7 +382,7 @@ async fn resolve_figures(
                 figure_id: col_str(batch, "figure_id", row)?,
                 figure_type: col_str(batch, "figure_type", row)?,
                 caption: col_str(batch, "caption", row)?,
-                description: col_str(batch, "description", row)?,
+                description: col_str_opt(batch, "description", row)?,
             });
         }
     }
@@ -769,7 +769,7 @@ async fn search_figures_with_embedding_inner(
                 paper_id: col_str(batch, "paper_id", row)?,
                 figure_type: col_str(batch, "figure_type", row)?,
                 caption: col_str(batch, "caption", row)?,
-                description: col_str(batch, "description", row)?,
+                description: col_str_opt(batch, "description", row)?,
                 image_path: col_str_opt(batch, "image_path", row)?,
                 content: col_str_opt(batch, "content", row)?,
                 page: col_u16_opt(batch, "page", row)?,
@@ -971,7 +971,7 @@ pub async fn get_figure(store: &RagStore, figure_id: &str) -> Result<FigureResul
         paper_id: col_str(batch, "paper_id", 0)?,
         figure_type: col_str(batch, "figure_type", 0)?,
         caption: col_str(batch, "caption", 0)?,
-        description: col_str(batch, "description", 0)?,
+        description: col_str_opt(batch, "description", 0)?,
         image_path: col_str_opt(batch, "image_path", 0)?,
         content: col_str_opt(batch, "content", 0)?,
         page: col_u16_opt(batch, "page", 0)?,

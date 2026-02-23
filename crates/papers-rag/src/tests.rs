@@ -745,7 +745,7 @@ async fn test_figure_ids_have_correct_format() {
     assert_eq!(fig.figure_type, "figure");
     // Caption comes from the adjacent Caption block, not from alt text
     assert_eq!(fig.caption, "Caption for figure 1.");
-    assert_eq!(fig.description, "Figure 1: A diagram");
+    assert_eq!(fig.description.as_deref(), Some("Figure 1: A diagram"));
 
     let tbl = get_figure(&store, "FIGID/fig2").await.unwrap();
     assert_eq!(tbl.figure_id, "FIGID/fig2");

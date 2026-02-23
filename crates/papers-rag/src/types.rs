@@ -11,7 +11,7 @@ pub struct ReferencedFigure {
     pub figure_id: String,
     pub figure_type: String,
     pub caption: String,
-    pub description: String,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +71,7 @@ pub struct FigureSearchResult {
     pub paper_id: String,
     pub figure_type: String,
     pub caption: String,
-    pub description: String,
+    pub description: Option<String>,
     pub image_path: Option<String>,
     pub content: Option<String>,
     pub page: Option<u16>,
@@ -117,7 +117,7 @@ pub struct FigureResult {
     pub paper_id: String,
     pub figure_type: String,
     pub caption: String,
-    pub description: String,
+    pub description: Option<String>,
     pub image_path: Option<String>,
     pub content: Option<String>,
     pub page: Option<u16>,

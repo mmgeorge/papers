@@ -45,7 +45,7 @@ struct FigureRecord {
     figure_id: String,
     figure_type: String,
     caption: String,
-    description: String,
+    description: Option<String>,
     image_path: Option<String>,
     content: Option<String>,
     page: Option<u16>,
@@ -749,7 +749,7 @@ fn parse_paper_blocks(
                 let caption = adjacent_caption
                     .clone()
                     .unwrap_or_else(|| alt_text.clone());
-                let description = alt_text;
+                let description = if alt_text.is_empty() { None } else { Some(alt_text) };
 
                 // Extract table content as markdown for Table blocks
                 let content = if block_type == "Table" {
@@ -1030,11 +1030,11 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
     let fig_texts: Vec<String> = figure_records
         .iter()
         .map(|f| {
-            match (f.caption.is_empty(), f.description.is_empty()) {
-                (false, false) => format!("{}\n{}", f.caption, f.description),
-                (false, true) => f.caption.clone(),
-                (true, false) => f.description.clone(),
-                (true, true) => String::new(),
+            match (f.caption.is_empty(), &f.description) {
+                (false, Some(desc)) => format!("{}\n{}", f.caption, desc),
+                (false, None) => f.caption.clone(),
+                (true, Some(desc)) => desc.clone(),
+                (true, None) => String::new(),
             }
         })
         .collect();
@@ -1201,7 +1201,7 @@ fn build_figures_batch(
     let vectors = build_vector_array(embeddings);
     let figure_types: Vec<&str> = records.iter().map(|r| r.figure_type.as_str()).collect();
     let captions: Vec<&str> = records.iter().map(|r| r.caption.as_str()).collect();
-    let descriptions: Vec<&str> = records.iter().map(|r| r.description.as_str()).collect();
+    let descriptions: Vec<Option<&str>> = records.iter().map(|r| r.description.as_deref()).collect();
     let image_paths: Vec<Option<&str>> = records
         .iter()
         .map(|r| r.image_path.as_deref())
@@ -1625,7 +1625,7 @@ mod tests {
         assert_eq!(figures[0].figure_type, "figure");
         assert!(figures[0].caption.contains("Fig. 1."));
         assert!(figures[0].caption.contains("Convergence results"));
-        assert!(figures[0].description.contains("stress test result"));
+        assert!(figures[0].description.as_deref().unwrap().contains("stress test result"));
         assert!(figures[0].image_path.is_some());
         assert_eq!(chunks.len(), 2); // two Text blocks
     }
@@ -1668,7 +1668,7 @@ mod tests {
         let (_chunks, figures) = parse_paper_blocks(&params).unwrap();
         assert_eq!(figures.len(), 1);
         assert!(figures[0].caption.contains("Fig. 6."));
-        assert!(figures[0].description.contains("AI description"));
+        assert!(figures[0].description.as_deref().unwrap().contains("AI description"));
     }
 
     #[test]
@@ -1948,7 +1948,7 @@ mod tests {
 
         // Figure captions vs descriptions
         assert!(figures[0].caption.contains("Fig. 1."));
-        assert!(figures[0].description.contains("AI description"));
+        assert!(figures[0].description.as_deref().unwrap().contains("AI description"));
         assert_eq!(figures[0].figure_type, "figure");
 
         assert!(figures[1].caption.contains("Table 1."));
@@ -2724,7 +2724,7 @@ mod tests {
             figure_id: "test/fig1".to_string(),
             figure_type: "table".to_string(),
             caption: "Table 1. Results".to_string(),
-            description: "Table alt text".to_string(),
+            description: Some("Table alt text".to_string()),
             image_path: None,
             content: Some("| A | B |\n| --- | --- |\n| 1 | 2 |".to_string()),
             page: None,
@@ -2734,11 +2734,11 @@ mod tests {
         let records = vec![rec];
         let text: Vec<String> = records
             .iter()
-            .map(|f| match (f.caption.is_empty(), f.description.is_empty()) {
-                (false, false) => format!("{}\n{}", f.caption, f.description),
-                (false, true) => f.caption.clone(),
-                (true, false) => f.description.clone(),
-                (true, true) => String::new(),
+            .map(|f| match (f.caption.is_empty(), &f.description) {
+                (false, Some(desc)) => format!("{}\n{}", f.caption, desc),
+                (false, None) => f.caption.clone(),
+                (true, Some(desc)) => desc.clone(),
+                (true, None) => String::new(),
             })
             .collect();
         assert_eq!(text[0], "Table 1. Results\nTable alt text");
@@ -2750,7 +2750,7 @@ mod tests {
             figure_id: "test/fig1".to_string(),
             figure_type: "table".to_string(),
             caption: "Table 1. Results".to_string(),
-            description: String::new(),
+            description: None,
             image_path: None,
             content: Some("| A | B |\n| --- | --- |\n| 1 | 2 |".to_string()),
             page: None,
@@ -2760,11 +2760,11 @@ mod tests {
         let records = vec![rec];
         let text: Vec<String> = records
             .iter()
-            .map(|f| match (f.caption.is_empty(), f.description.is_empty()) {
-                (false, false) => format!("{}\n{}", f.caption, f.description),
-                (false, true) => f.caption.clone(),
-                (true, false) => f.description.clone(),
-                (true, true) => String::new(),
+            .map(|f| match (f.caption.is_empty(), &f.description) {
+                (false, Some(desc)) => format!("{}\n{}", f.caption, desc),
+                (false, None) => f.caption.clone(),
+                (true, Some(desc)) => desc.clone(),
+                (true, None) => String::new(),
             })
             .collect();
         assert_eq!(text[0], "Table 1. Results");
@@ -2776,7 +2776,7 @@ mod tests {
             figure_id: "test/fig1".to_string(),
             figure_type: "figure".to_string(),
             caption: String::new(),
-            description: "Alt text description".to_string(),
+            description: Some("Alt text description".to_string()),
             image_path: None,
             content: None,
             page: None,
@@ -2786,11 +2786,11 @@ mod tests {
         let records = vec![rec];
         let text: Vec<String> = records
             .iter()
-            .map(|f| match (f.caption.is_empty(), f.description.is_empty()) {
-                (false, false) => format!("{}\n{}", f.caption, f.description),
-                (false, true) => f.caption.clone(),
-                (true, false) => f.description.clone(),
-                (true, true) => String::new(),
+            .map(|f| match (f.caption.is_empty(), &f.description) {
+                (false, Some(desc)) => format!("{}\n{}", f.caption, desc),
+                (false, None) => f.caption.clone(),
+                (true, Some(desc)) => desc.clone(),
+                (true, None) => String::new(),
             })
             .collect();
         assert_eq!(text[0], "Alt text description");
@@ -2802,7 +2802,7 @@ mod tests {
             figure_id: "test/fig1".to_string(),
             figure_type: "figure".to_string(),
             caption: "Fig. 1. A caption".to_string(),
-            description: "Alt text description".to_string(),
+            description: Some("Alt text description".to_string()),
             image_path: None,
             content: None,
             page: None,
@@ -2812,11 +2812,11 @@ mod tests {
         let records = vec![rec];
         let text: Vec<String> = records
             .iter()
-            .map(|f| match (f.caption.is_empty(), f.description.is_empty()) {
-                (false, false) => format!("{}\n{}", f.caption, f.description),
-                (false, true) => f.caption.clone(),
-                (true, false) => f.description.clone(),
-                (true, true) => String::new(),
+            .map(|f| match (f.caption.is_empty(), &f.description) {
+                (false, Some(desc)) => format!("{}\n{}", f.caption, desc),
+                (false, None) => f.caption.clone(),
+                (true, Some(desc)) => desc.clone(),
+                (true, None) => String::new(),
             })
             .collect();
         assert_eq!(text[0], "Fig. 1. A caption\nAlt text description");

@@ -189,6 +189,21 @@ does a brute-force scan over all rows.
 
 ---
 
+## Database path
+
+Default LanceDB path: `{dirs::data_dir()}/papers/rag`
+
+| Platform | Default path |
+|----------|-------------|
+| Linux | `~/.local/share/papers/rag` |
+| macOS | `~/Library/Application Support/papers/rag` |
+| Windows | `C:\Users\<user>\AppData\Roaming\papers\rag` |
+
+Override with `PAPERS_RAG_DB` env var, or set `PAPERS_DATA_DIR` to relocate
+the entire `papers/` data root.
+
+---
+
 ## Test infrastructure
 
 - `RagStore::open_for_test(path)` — no GPU; uses `Embedder::fake()` (zero vectors)
