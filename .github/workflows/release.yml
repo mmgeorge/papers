@@ -128,9 +128,15 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: "Install protoc"
+        id: "setup-protoc"
         uses: "arduino/setup-protoc@v3"
         with:
           "repo-token": "${{ secrets.GITHUB_TOKEN }}"
+          "version": "28.x"
+      - name: "Set PROTOC env var"
+        run: |
+          "echo \"PROTOC=${{ steps.setup-protoc.outputs.path }}/bin/protoc\" >> $GITHUB_ENV"
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

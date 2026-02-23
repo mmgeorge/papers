@@ -1,4 +1,10 @@
 - name: Install protoc
+  id: setup-protoc
   uses: arduino/setup-protoc@v3
   with:
+    version: "28.x"
     repo-token: ${{ secrets.GITHUB_TOKEN }}
+- name: Set PROTOC env var
+  shell: bash
+  run: |
+    echo "PROTOC=${{ steps.setup-protoc.outputs.path }}/bin/protoc" >> $GITHUB_ENV
