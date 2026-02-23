@@ -1,4 +1,4 @@
-## [0.2.1] - 2026-02-23
+## [0.3.0] - 2026-02-23
 
 ### Features
 
@@ -59,6 +59,7 @@
 - Install protoc in ci workflow
 - Specify protoc version in ci workflow
 - Verify protoc installation and set environment variable
+- Release v0.2.1
 ## [0.2.0] - 2026-02-20
 
 ### Features

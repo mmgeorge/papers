@@ -4787,7 +4787,7 @@ dependencies = [
 
 [[package]]
 name = "papers-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "clap",
  "dirs",
@@ -4805,7 +4805,7 @@ dependencies = [
 
 [[package]]
 name = "papers-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -4827,7 +4827,7 @@ dependencies = [
 
 [[package]]
 name = "papers-datalab"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "reqwest 0.13.2",
  "serde",
@@ -4838,7 +4838,7 @@ dependencies = [
 
 [[package]]
 name = "papers-mcp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "papers-core",
  "papers-datalab",
@@ -4856,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "papers-openalex"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bon",
  "dirs",
@@ -4870,7 +4870,7 @@ dependencies = [
 
 [[package]]
 name = "papers-rag"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
@@ -4890,7 +4890,7 @@ dependencies = [
 
 [[package]]
 name = "papers-zotero"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "bon",
  "dirs",
