@@ -15,13 +15,6 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# Custom steps injected into build-local-artifacts before building
+github-build-setup = "../build-setup.yml"
 
-# System dependencies needed for building (protoc required by lance-encoding)
-[dist.dependencies.apt]
-protobuf-compiler = '*'
-
-[dist.dependencies.homebrew]
-protobuf = '*'
-
-[dist.dependencies.chocolatey]
-protoc = '*'
