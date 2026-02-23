@@ -2,9 +2,6 @@
 
 [![crates.io](https://img.shields.io/crates/v/papers-cli.svg)](https://crates.io/crates/papers-cli)
 [![CI](https://github.com/mmgeorge/papers/actions/workflows/ci.yml/badge.svg)](https://github.com/mmgeorge/papers/actions/workflows/ci.yml)[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-> [!WARNING]
-> Under active development. Expect bugs and breaking changes.
-
 Search, manage, and explore academic papers from the terminal or LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers embeddings (using DirectML and CoreML) with [LanceDB](https://github.com/lancedb/lancedb) so you can semantically search across sections, figures, and chunks locally.
 
 Also runs as an [MCP](https://modelcontextprotocol.io) server, exposing all functionality as tools for LLMs.
