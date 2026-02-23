@@ -2108,7 +2108,16 @@ async fn handle_rag_command(cmd: RagCommand) {
                     ),
                     Err(e) => exit_err(&e.to_string()),
                 },
-                None => paper_id.map(|id| vec![id]),
+                None => match paper_id {
+                    Some(id) => {
+                        let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
+                            Ok(r) => r,
+                            Err(e) => exit_err(&e.to_string()),
+                        };
+                        Some(vec![resolved])
+                    }
+                    None => None,
+                },
             };
             let params = papers_rag::SearchParams {
                 query,
@@ -2159,7 +2168,16 @@ async fn handle_rag_command(cmd: RagCommand) {
                     ),
                     Err(e) => exit_err(&e.to_string()),
                 },
-                None => paper_id.map(|id| vec![id]),
+                None => match paper_id {
+                    Some(id) => {
+                        let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
+                            Ok(r) => r,
+                            Err(e) => exit_err(&e.to_string()),
+                        };
+                        Some(vec![resolved])
+                    }
+                    None => None,
+                },
             };
             let params = papers_rag::SearchFiguresParams {
                 query,
@@ -2200,6 +2218,10 @@ async fn handle_rag_command(cmd: RagCommand) {
             json,
         } => {
             let rag = open_rag_store().await;
+            let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                Ok(r) => r,
+                Err(e) => exit_err(&e.to_string()),
+            };
             match papers_rag::query::get_section(&rag, &paper_id, chapter_idx, section_idx).await {
                 Ok(result) => {
                     if json {
@@ -2218,6 +2240,10 @@ async fn handle_rag_command(cmd: RagCommand) {
             json,
         } => {
             let rag = open_rag_store().await;
+            let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                Ok(r) => r,
+                Err(e) => exit_err(&e.to_string()),
+            };
             match papers_rag::query::get_chapter(&rag, &paper_id, chapter_idx).await {
                 Ok(result) => {
                     if json {
@@ -2246,6 +2272,10 @@ async fn handle_rag_command(cmd: RagCommand) {
 
         RagCommand::Outline { paper_id, json } => {
             let rag = open_rag_store().await;
+            let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                Ok(r) => r,
+                Err(e) => exit_err(&e.to_string()),
+            };
             match papers_rag::query::get_paper_outline(&rag, &paper_id).await {
                 Ok(result) => {
                     if json {

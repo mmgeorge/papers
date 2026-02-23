@@ -122,7 +122,7 @@ pub enum RagCommand {
         /// Scope to papers in a named selection
         #[arg(long)]
         selection: Option<String>,
-        /// Scope to a specific paper (DOI or item key)
+        /// Scope to a specific paper (DOI, item key, or title search)
         #[arg(long)]
         paper_id: Option<String>,
         /// Scope to a specific chapter (1-based; requires --paper-id)
@@ -160,7 +160,7 @@ pub enum RagCommand {
         /// Scope to papers in a named selection
         #[arg(long)]
         selection: Option<String>,
-        /// Scope to a specific paper (DOI or item key)
+        /// Scope to a specific paper (DOI, item key, or title search)
         #[arg(long)]
         paper_id: Option<String>,
         /// Filter by type: "figure" or "table"
@@ -183,7 +183,7 @@ pub enum RagCommand {
     },
     /// Fetch all chunks in a section in reading order
     GetSection {
-        /// Paper ID (DOI or item key)
+        /// Paper: DOI, item key, or title search
         paper_id: String,
         /// Chapter index (1-based)
         #[arg(long)]
@@ -197,7 +197,7 @@ pub enum RagCommand {
     },
     /// Fetch all chunks in a chapter in reading order
     GetChapter {
-        /// Paper ID (DOI or item key)
+        /// Paper: DOI, item key, or title search
         paper_id: String,
         /// Chapter index (1-based)
         #[arg(long)]
@@ -216,7 +216,7 @@ pub enum RagCommand {
     },
     /// Show the table of contents for an indexed paper
     Outline {
-        /// Paper ID (DOI or item key)
+        /// Paper: DOI, item key, or title search
         paper_id: String,
         /// Output raw JSON
         #[arg(long)]

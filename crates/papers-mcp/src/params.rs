@@ -1188,7 +1188,7 @@ pub struct SearchToolParams {
     pub query: String,
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
-    /// Scope to a single paper by paper_id (DOI or item key).
+    /// Scope to a single paper by DOI, item key, or title search.
     pub paper_id: Option<String>,
     /// Scope to a chapter (requires paper_id).
     pub chapter_idx: Option<u16>,
@@ -1215,7 +1215,7 @@ pub struct SearchFiguresToolParams {
     pub query: String,
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
-    /// Scope to a single paper by paper_id.
+    /// Scope to a single paper by DOI, item key, or title search.
     pub paper_id: Option<String>,
     /// Filter by figure type: "figure" or "table".
     pub filter_figure_type: Option<String>,
@@ -1233,7 +1233,7 @@ pub struct GetChunkToolParams {
 /// Parameters for the `rag_get_section` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetSectionToolParams {
-    /// Paper ID (DOI or item key).
+    /// Paper: DOI, item key, or title search.
     pub paper_id: String,
     /// Chapter index (1-based).
     pub chapter_idx: u16,
@@ -1244,7 +1244,7 @@ pub struct GetSectionToolParams {
 /// Parameters for the `rag_get_chapter` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetChapterToolParams {
-    /// Paper ID (DOI or item key).
+    /// Paper: DOI, item key, or title search.
     pub paper_id: String,
     /// Chapter index (1-based).
     pub chapter_idx: u16,
@@ -1260,7 +1260,7 @@ pub struct GetFigureToolParams {
 /// Parameters for the `rag_get_paper_outline` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetPaperOutlineToolParams {
-    /// Paper ID (DOI or item key).
+    /// Paper: DOI, item key, or title search.
     pub paper_id: String,
 }
 

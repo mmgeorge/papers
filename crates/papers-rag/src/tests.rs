@@ -1777,3 +1777,258 @@ async fn test_search_figures_has_score() {
     assert!(!results[0].paper_id.is_empty());
     assert!(!results[0].figure_type.is_empty());
 }
+
+// ── resolve_paper_id ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_resolve_paper_id_empty_db() {
+    use crate::query::resolve_paper_id;
+
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let result = resolve_paper_id(&store, "anything").await;
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("no paper matching"), "error should describe the problem: {}", msg);
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_exact_match() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+    let params = make_test_cache(&cache_dir, "RESOLVE1");
+    ingest_paper(&store, params).await.unwrap();
+
+    let result = resolve_paper_id(&store, "RESOLVE1").await.unwrap();
+    assert_eq!(result, "RESOLVE1");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_exact_doi() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // Ingest with a DOI-style paper_id
+    let mut params = make_test_cache(&cache_dir, "DOIDIR");
+    params.paper_id = "10.1145/3528223.3530168".to_string();
+    ingest_paper(&store, params).await.unwrap();
+
+    let result = resolve_paper_id(&store, "10.1145/3528223.3530168").await.unwrap();
+    assert_eq!(result, "10.1145/3528223.3530168");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_title_substring() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut params = make_test_cache(&cache_dir, "TITLESUB");
+    params.title = "Vertex Block Descent".to_string();
+    ingest_paper(&store, params).await.unwrap();
+
+    // Substring match
+    let result = resolve_paper_id(&store, "vertex block").await.unwrap();
+    assert_eq!(result, "TITLESUB");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_case_insensitive() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut params = make_test_cache(&cache_dir, "CASETEST");
+    params.title = "Neural Radiance Fields".to_string();
+    ingest_paper(&store, params).await.unwrap();
+
+    // All-caps search should still match
+    let result = resolve_paper_id(&store, "NEURAL RADIANCE").await.unwrap();
+    assert_eq!(result, "CASETEST");
+
+    // Mixed case
+    let result = resolve_paper_id(&store, "neural Radiance").await.unwrap();
+    assert_eq!(result, "CASETEST");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_exact_match_preferred_over_title() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // Paper 1: paper_id matches a title substring of paper 2
+    let mut params1 = make_test_cache(&cache_dir, "ABC");
+    params1.title = "Some Paper".to_string();
+    ingest_paper(&store, params1).await.unwrap();
+
+    let mut params2 = make_test_cache(&cache_dir, "OTHER");
+    params2.title = "About ABC Protocol".to_string();
+    ingest_paper(&store, params2).await.unwrap();
+
+    // "ABC" should match paper_id exactly, not title
+    let result = resolve_paper_id(&store, "ABC").await.unwrap();
+    assert_eq!(result, "ABC");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_no_match_lists_available() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut params = make_test_cache(&cache_dir, "AVAIL1");
+    params.title = "First Available Paper".to_string();
+    ingest_paper(&store, params).await.unwrap();
+
+    let mut params2 = make_test_cache(&cache_dir, "AVAIL2");
+    params2.title = "Second Available Paper".to_string();
+    ingest_paper(&store, params2).await.unwrap();
+
+    let result = resolve_paper_id(&store, "nonexistent query").await;
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("AVAIL1"), "should list available papers: {}", msg);
+    assert!(msg.contains("AVAIL2"), "should list available papers: {}", msg);
+    assert!(msg.contains("First Available Paper"), "should list titles: {}", msg);
+    assert!(msg.contains("Second Available Paper"), "should list titles: {}", msg);
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_multiple_title_matches_returns_first() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut params1 = make_test_cache(&cache_dir, "MULTI1");
+    params1.title = "Gaussian Splatting for Real-Time Rendering".to_string();
+    ingest_paper(&store, params1).await.unwrap();
+
+    let mut params2 = make_test_cache(&cache_dir, "MULTI2");
+    params2.title = "Gaussian Splatting in the Wild".to_string();
+    ingest_paper(&store, params2).await.unwrap();
+
+    // "Gaussian Splatting" matches both; should return one (first found)
+    let result = resolve_paper_id(&store, "gaussian splatting").await.unwrap();
+    assert!(
+        result == "MULTI1" || result == "MULTI2",
+        "should return one of the matching papers: {}",
+        result
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_full_title_match() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut params = make_test_cache(&cache_dir, "FULLTITLE");
+    params.title = "3D Gaussian Splatting for Real-Time Radiance Field Rendering".to_string();
+    ingest_paper(&store, params).await.unwrap();
+
+    // Full title as search
+    let result = resolve_paper_id(
+        &store,
+        "3D Gaussian Splatting for Real-Time Radiance Field Rendering",
+    )
+    .await
+    .unwrap();
+    assert_eq!(result, "FULLTITLE");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_single_word_title_match() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut params = make_test_cache(&cache_dir, "ONEWORD");
+    params.title = "Differentiable Rendering: A Survey".to_string();
+    ingest_paper(&store, params).await.unwrap();
+
+    // Single keyword match
+    let result = resolve_paper_id(&store, "differentiable").await.unwrap();
+    assert_eq!(result, "ONEWORD");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_special_chars_in_title() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut params = make_test_cache(&cache_dir, "SPECIAL");
+    params.title = "C++ Templates: The Complete Guide (2nd Ed.)".to_string();
+    ingest_paper(&store, params).await.unwrap();
+
+    let result = resolve_paper_id(&store, "c++ templates").await.unwrap();
+    assert_eq!(result, "SPECIAL");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_resolve_paper_id_with_doi_containing_slash() {
+    use crate::query::resolve_paper_id;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut params = make_test_cache(&cache_dir, "DOISLASH");
+    params.paper_id = "10.1145/3592433".to_string();
+    params.title = "Some Conference Paper".to_string();
+    ingest_paper(&store, params).await.unwrap();
+
+    // Exact DOI match with slashes
+    let result = resolve_paper_id(&store, "10.1145/3592433").await.unwrap();
+    assert_eq!(result, "10.1145/3592433");
+
+    // Title fallback still works
+    let result = resolve_paper_id(&store, "conference paper").await.unwrap();
+    assert_eq!(result, "10.1145/3592433");
+}

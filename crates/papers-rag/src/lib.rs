@@ -15,6 +15,7 @@ pub use ingest::{
     cache_paper_embeddings, embed_cache_base, IngestParams, ingest_paper, ingest_params_from_cache,
     is_ingested, list_cached_item_keys,
 };
+pub use query::resolve_paper_id;
 pub use store::RagStore;
 pub use types::*;
 

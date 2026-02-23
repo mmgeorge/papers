@@ -917,7 +917,13 @@ impl PapersMcp {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured. Run: papers rag ingest <ITEM_KEY>".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
-            None => p.paper_id.map(|id| vec![id]),
+            None => match p.paper_id {
+                Some(id) => {
+                    let resolved = papers_rag::resolve_paper_id(rag, &id).await.map_err(|e| e.to_string())?;
+                    Some(vec![resolved])
+                }
+                None => None,
+            },
         };
         let params = papers_rag::SearchParams {
             query: p.query,
@@ -941,7 +947,13 @@ impl PapersMcp {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured. Run: papers rag ingest <ITEM_KEY>".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
-            None => p.paper_id.map(|id| vec![id]),
+            None => match p.paper_id {
+                Some(id) => {
+                    let resolved = papers_rag::resolve_paper_id(rag, &id).await.map_err(|e| e.to_string())?;
+                    Some(vec![resolved])
+                }
+                None => None,
+            },
         };
         let params = papers_rag::SearchFiguresParams {
             query: p.query,
@@ -965,7 +977,8 @@ impl PapersMcp {
     #[tool]
     pub async fn rag_get_section(&self, Parameters(p): Parameters<GetSectionToolParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
-        json_result(papers_rag::query::get_section(rag, &p.paper_id, p.chapter_idx, p.section_idx).await)
+        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        json_result(papers_rag::query::get_section(rag, &paper_id, p.chapter_idx, p.section_idx).await)
     }
 
     /// Fetch the full content of an entire chapter, grouped by section.
@@ -973,7 +986,8 @@ impl PapersMcp {
     #[tool]
     pub async fn rag_get_chapter(&self, Parameters(p): Parameters<GetChapterToolParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
-        json_result(papers_rag::query::get_chapter(rag, &p.paper_id, p.chapter_idx).await)
+        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        json_result(papers_rag::query::get_chapter(rag, &paper_id, p.chapter_idx).await)
     }
 
     /// Retrieve full details for a figure by ID, including the image file path.
@@ -989,7 +1003,8 @@ impl PapersMcp {
     #[tool]
     pub async fn rag_get_paper_outline(&self, Parameters(p): Parameters<GetPaperOutlineToolParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
-        json_result(papers_rag::query::get_paper_outline(rag, &p.paper_id).await)
+        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        json_result(papers_rag::query::get_paper_outline(rag, &paper_id).await)
     }
 
     /// Browse indexed papers with optional metadata filters.

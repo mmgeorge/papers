@@ -435,6 +435,70 @@ async fn build_chunk_with_position(
 
 // ── Public query functions ──────────────────────────────────────────────────
 
+/// Resolve flexible user input to an exact `paper_id` in the RAG database.
+///
+/// Resolution order:
+/// 1. **Exact match** — if `input` matches an existing `paper_id`, return it immediately.
+/// 2. **Title search** — case-insensitive substring match on the `title` column;
+///    returns the first match's `paper_id`.
+///
+/// Returns a `NotFound` error with a list of available papers when no match is found.
+pub async fn resolve_paper_id(store: &RagStore, input: &str) -> Result<String, RagError> {
+    let table = store.chunks_table().await?;
+
+    // Fetch all distinct (paper_id, title) pairs
+    let batches = table
+        .query()
+        .select(Select::columns(&["paper_id", "title"]))
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+
+    // Deduplicate into (paper_id, title) pairs
+    let mut seen = std::collections::HashSet::new();
+    let mut papers: Vec<(String, String)> = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.num_rows() {
+            let pid = col_str(batch, "paper_id", row);
+            if seen.insert(pid.clone()) {
+                let title = col_str(batch, "title", row);
+                papers.push((pid, title));
+            }
+        }
+    }
+
+    // 1. Exact paper_id match
+    for (pid, _) in &papers {
+        if pid == input {
+            return Ok(pid.clone());
+        }
+    }
+
+    // 2. Case-insensitive title substring match
+    let input_lower = input.to_lowercase();
+    let matches: Vec<&(String, String)> = papers
+        .iter()
+        .filter(|(_, title)| title.to_lowercase().contains(&input_lower))
+        .collect();
+
+    match matches.len() {
+        0 => {
+            let available: Vec<String> = papers
+                .iter()
+                .map(|(pid, title)| format!("  {pid} — {title}"))
+                .collect();
+            Err(RagError::NotFound(format!(
+                "no paper matching '{}'. Available papers:\n{}",
+                input,
+                available.join("\n")
+            )))
+        }
+        _ => Ok(matches[0].0.clone()),
+    }
+}
+
 /// Semantic search across indexed paper chunks.
 pub async fn search(
     store: &RagStore,
