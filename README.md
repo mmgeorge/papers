@@ -69,18 +69,6 @@ papers zotero collection list --top
 
 Entities: `work`, `attachment`, `annotation`, `note`, `collection`, `tag`, `search`, `group`.
 
-## RAG
-
-Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Runs locally with hardware acceleration via DirectML on Windows and CoreML on macOS.
-
-```sh
-papers rag ingest                        # Index papers from marker cache
-papers rag search "differentiable rendering" -n 5
-papers rag search-figures "neural radiance field architecture"
-papers rag get-section <paper> <section>
-papers rag outline <paper>
-```
-
 ## Extraction
 
 PDF extraction uses vision-model-based OCR via marker to produce clean markdown with LaTeX math and tables preserved. Extracted results (markdown, JSON, images) are cached locally and synced back to your Zotero library as attachments.
@@ -121,6 +109,18 @@ You can run [marker](https://github.com/datalab-to/marker) locally instead of us
 ```
 
 The extraction will be picked up automatically from the local cache.
+
+## RAG
+
+Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Runs locally with hardware acceleration via DirectML on Windows and CoreML on macOS.
+
+```sh
+papers rag ingest                        # Index papers from marker cache
+papers rag search "differentiable rendering" -n 5
+papers rag search-figures "neural radiance field architecture"
+papers rag get-section <paper> <section>
+papers rag outline <paper>
+```
 
 ## MCP server
 
