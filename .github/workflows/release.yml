@@ -133,10 +133,10 @@ jobs:
         with:
           "repo-token": "${{ secrets.GITHUB_TOKEN }}"
           "version": "28.x"
-      - name: "Set PROTOC env var"
+      - name: Set PROTOC env var
+        shell: bash
         run: |
-          "echo \"PROTOC=${{ steps.setup-protoc.outputs.path }}/bin/protoc\" >> $GITHUB_ENV"
-        shell: "bash"
+          echo PROTOC=${{ steps.setup-protoc.outputs.path }}/bin/protoc >> $GITHUB_ENV
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

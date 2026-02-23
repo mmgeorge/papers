@@ -7,4 +7,4 @@
 - name: Set PROTOC env var
   shell: bash
   run: |
-    echo "PROTOC=${{ steps.setup-protoc.outputs.path }}/bin/protoc" >> $GITHUB_ENV
+    echo PROTOC=${{ steps.setup-protoc.outputs.path }}/bin/protoc >> $GITHUB_ENV
