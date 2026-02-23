@@ -130,13 +130,33 @@ The extraction will be picked up automatically from the local cache.
 
 ## RAG
 
-Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Runs locally with hardware acceleration via DirectML on Windows and CoreML on macOS.
+Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Hardware-accelerated with DirectML (Windows) and CoreML (macOS).
+
+```
+ Marker OCR              Structural              Embed
+ (Datalab API)           Chunking                (Gemma 300M)
+                                                                  ┌─────────┐
+ ┌──────────┐      ┌──────────────────┐      ┌───────────┐       │         │
+ │  marker  │ ──►  │ JSON block tree  │ ──►  │ 768-d f32 │ ──►   │ LanceDB │
+ │  OCR     │  .md │ per paragraph    │ vec  │ vectors   │       │         │
+ │          │ .json│ equation, table,  │      └───────────┘       │ chunks  │
+ └──────────┘      │ figure, list      │        ▲                 │ figures │
+                   └──────────────────┘        │                 │         │
+                                                │  Query          └────┬────┘
+                                         ┌──────┴──────┐              │
+                                         │ embed query │ ── ANN ──────┘
+                                         └─────────────┘
+```
+
+PDFs are sent to [Datalab Marker](https://www.datalab.to/) for vision-model OCR, which returns a structured JSON block tree alongside markdown. Each block (paragraph, equation, list, table, figure) becomes one chunk — no fixed-size splitting or overlap. Chunks and figure captions are embedded into 768-d vectors and stored in LanceDB. At query time, the query is embedded with the same model and matched via ANN search.
 
 ```sh
-papers rag ingest                        # Index papers from marker cache
+papers rag ingest <work>                 # Index a single paper
+papers rag ingest-all                    # Index all cached extractions
 papers rag search "differentiable rendering" -n 5
 papers rag search-figures "neural radiance field architecture"
-papers rag get-section <work> <section>
+papers rag get-chunk <chunk_id>
+papers rag get-section <work> <chapter> <section>
 papers rag outline <work>
 ```
 
