@@ -24,4 +24,4 @@ protobuf-compiler = '*'
 protobuf = '*'
 
 [dist.dependencies.chocolatey]
-protobuf = '*'
+protoc = '*'
