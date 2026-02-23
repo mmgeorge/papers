@@ -1282,7 +1282,18 @@ impl ServerHandler for PapersMcp {
                  authors, sources, institutions, topics, publishers, and funders. \
                  Also supports full-text extraction from PDFs via the work_text tool, \
                  which can download papers from Zotero, open-access repositories, \
-                 or the OpenAlex content API."
+                 or the OpenAlex content API.\n\n\
+                 ## RAG workflow (indexed papers)\n\
+                 Papers ingested via `papers rag ingest` are searchable locally:\n\
+                 1. `rag_list_papers` — see what's indexed\n\
+                 2. `rag_get_paper_outline` — get structure (chapters/sections) before diving in\n\
+                 3. `rag_search` — semantic search across chunks; scope by paper, chapter, or section\n\
+                 4. `rag_search_figures` — find figures, tables, and diagrams by description. \
+                    Always use alongside `rag_search` when exploring a topic, \
+                    as text search won't surface visual content.\n\
+                 5. `rag_get_section` / `rag_get_chapter` — read full content after finding relevant chunks\n\
+                 6. `rag_get_figure` — get full details and local image path for a specific figure\n\
+                 7. `rag_get_chunk` — follow prev/next references for sequential reading"
                     .into(),
             ),
         }
