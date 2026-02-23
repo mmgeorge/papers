@@ -4,7 +4,7 @@
 [![CI](https://github.com/mmgeorge/papers/actions/workflows/ci.yml/badge.svg)](https://github.com/mmgeorge/papers/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Search, manage, and explore academic papers from the terminal. Or run as an [MCP](https://github.com/mmgeorge/papers/tree/main?tab=readme-ov-file#mcp-server) to query your papers with an LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers with [LanceDB](https://github.com/lancedb/lancedb) so you can semantically search across sections, figures, and chunks locally. Embedding accelerated with DirectML and CoreML.
+Search, manage, and explore academic papers from the terminal. Or run as an [MCP](https://github.com/mmgeorge/papers/tree/main?tab=readme-ov-file#mcp-server) to query your papers with an LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers with [LanceDB](https://github.com/lancedb/lancedb) so you can semantically search across sections, figures, and chunks locally. Embedding accelerated with DirectML and CoreML on Windows and macOS.
 
 > [!NOTE]
 > Even the best analytical PDF-extraction methods mangle LaTeX and tables for technical papers. This project uses vision-model-based OCR via [Datalab](https://www.datalab.to/) (requires API key) to produce clean markdown with math and tables preserved. Extracted results (JSON, markdown, images) sync back to your Zotero library.
@@ -69,7 +69,7 @@ Entities: `work`, `attachment`, `annotation`, `note`, `collection`, `tag`, `sear
 
 ## RAG
 
-Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Inference runs on-device with hardware acceleration via DirectML on Windows and CoreML on macOS.
+Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Runs locally with hardware acceleration via DirectML on Windows and CoreML on macOS.
 
 ```sh
 papers rag ingest                        # Index papers from marker cache
