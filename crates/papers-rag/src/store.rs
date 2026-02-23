@@ -1,5 +1,6 @@
 use arrow_array::RecordBatchIterator;
 use arrow_schema::Schema;
+use lancedb::index::Index;
 use lancedb::{Connection, Table};
 use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
@@ -26,10 +27,12 @@ impl RagStore {
         let figures = ensure_table(&db, "papers_figures", figures_schema()).await?;
         migrate_figures_table(&figures).await?;
 
-        Ok(Self {
+        let store = Self {
             db,
             embedder: OnceCell::new(),
-        })
+        };
+        store.ensure_indexes().await;
+        Ok(store)
     }
 
     /// Get or initialize the embedder (lazy loading).
@@ -66,10 +69,10 @@ impl RagStore {
         base.join("rag").to_string_lossy().into_owned()
     }
 
-    /// Test-only: open (or create) the RAG database without loading the embedding model.
+    /// Test/bench-only: open (or create) the RAG database without loading the embedding model.
     /// All embed calls return zero vectors via `Embedder::fake()`.
-    #[cfg(test)]
-    pub(crate) async fn open_for_test(path: &str) -> Result<Self, RagError> {
+    #[cfg(any(test, feature = "bench"))]
+    pub async fn open_for_test(path: &str) -> Result<Self, RagError> {
         let db = lancedb::connect(path).execute().await?;
         let chunks = ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         migrate_chunks_table(&chunks).await?;
@@ -96,6 +99,38 @@ impl RagStore {
             .execute()
             .await
             .map_err(Into::into)
+    }
+
+    /// Create vector indexes on both tables if they don't exist.
+    /// Uses `Index::Auto` which selects IVF-PQ for vector columns.
+    /// Logs and continues on failure (e.g. empty tables or < 256 rows).
+    pub async fn ensure_indexes(&self) {
+        for table_name in &["papers_chunks", "papers_figures"] {
+            let table = match self.db.open_table(*table_name).execute().await {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            match table
+                .create_index(&["vector"], Index::Auto)
+                .execute()
+                .await
+            {
+                Ok(_) => {
+                    eprintln!("  vector index created for {table_name}");
+                }
+                Err(e) => {
+                    // Expected for empty tables or tables with few rows
+                    eprintln!("  vector index skipped for {table_name}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Eagerly initialize the embedding model so the first search call is fast.
+    /// Safe to call multiple times — subsequent calls are no-ops.
+    pub async fn warm_up(&self) -> Result<(), RagError> {
+        self.embedder().await?;
+        Ok(())
     }
 
     /// Embed a query string asynchronously.

@@ -31,6 +31,16 @@ ort = { version = "=2.0.0-rc.11", features = ["directml"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 ort = { version = "=2.0.0-rc.11", features = ["coreml"] }
 
+[features]
+bench = []
+
 [dev-dependencies]
 tempfile.workspace = true
 serial_test.workspace = true
+criterion = { version = "0.5", features = ["async_tokio"] }
+rand = "0.8"
+
+[[bench]]
+name = "search"
+harness = false
+required-features = ["bench"]

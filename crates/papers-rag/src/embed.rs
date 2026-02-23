@@ -1,7 +1,7 @@
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use crate::error::RagError;
-#[cfg(test)]
+#[cfg(any(test, feature = "bench"))]
 use crate::schema::EMBED_DIM;
 
 /// Human-readable name of the embedding model.
@@ -54,8 +54,8 @@ impl Embedder {
     }
 
     /// Test-only: create an embedder that returns zero vectors without loading any model.
-    #[cfg(test)]
-    pub(crate) fn fake() -> Self {
+    #[cfg(any(test, feature = "bench"))]
+    pub fn fake() -> Self {
         Self { model: None }
     }
 
@@ -67,12 +67,12 @@ impl Embedder {
         let model = match &mut self.model {
             Some(m) => m,
             None => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "bench"))]
                 return Ok(texts
                     .iter()
                     .map(|_| vec![0.0f32; EMBED_DIM as usize])
                     .collect());
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "bench")))]
                 unreachable!("Embedder has no model; Embedder::fake() is test-only");
             }
         };
@@ -87,9 +87,9 @@ impl Embedder {
         let model = match &mut self.model {
             Some(m) => m,
             None => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "bench"))]
                 return Ok(vec![0.0f32; EMBED_DIM as usize]);
-                #[cfg(not(test))]
+                #[cfg(not(any(test, feature = "bench")))]
                 unreachable!("Embedder has no model; Embedder::fake() is test-only");
             }
         };

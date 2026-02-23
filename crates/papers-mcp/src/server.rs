@@ -79,7 +79,14 @@ impl PapersMcp {
     async fn open_rag_store() -> Option<Arc<papers_rag::RagStore>> {
         let path = papers_rag::RagStore::default_path();
         match papers_rag::RagStore::open(&path).await {
-            Ok(store) => Some(Arc::new(store)),
+            Ok(store) => {
+                let store = Arc::new(store);
+                // Eagerly load the embedding model so first search is fast
+                if let Err(e) = store.warm_up().await {
+                    eprintln!("warning: embedding model warm-up failed: {e}");
+                }
+                Some(store)
+            }
             Err(e) => {
                 eprintln!("RAG store unavailable: {e}");
                 None

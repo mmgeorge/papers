@@ -13,6 +13,7 @@ use crate::error::RagError;
 use crate::schema::{EMBED_DIM, chunks_schema, figures_schema};
 use crate::store::RagStore;
 use crate::types::IngestStats;
+use lancedb::index::Index;
 
 pub struct IngestParams {
     pub item_key: String,
@@ -884,6 +885,14 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             .add(Box::new(reader))
             .execute()
             .await?;
+        // Rebuild vector index after inserting new data
+        if let Err(e) = table
+            .create_index(&["vector"], Index::Auto)
+            .execute()
+            .await
+        {
+            eprintln!("  [{}] chunks index rebuild skipped: {e}", params.item_key);
+        }
         eprintln!("  [{}] chunks inserted ({:.1}s)", params.item_key, t.elapsed().as_secs_f64());
     }
 
@@ -903,6 +912,14 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
             .add(Box::new(reader))
             .execute()
             .await?;
+        // Rebuild vector index after inserting new data
+        if let Err(e) = table
+            .create_index(&["vector"], Index::Auto)
+            .execute()
+            .await
+        {
+            eprintln!("  [{}] figures index rebuild skipped: {e}", params.item_key);
+        }
         eprintln!("  [{}] figures inserted ({:.1}s)", params.item_key, t.elapsed().as_secs_f64());
     }
 

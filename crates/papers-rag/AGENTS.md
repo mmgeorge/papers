@@ -116,9 +116,13 @@ The manifest chunk list and binary rows are always in sync (written atomically).
 
 ## `RagStore` and embedding
 
-`RagStore::open` loads the GPU model via `Embedder::new` (blocking, runs on
-`spawn_blocking`). In tests, `RagStore::open_for_test` uses `Embedder::fake()`
-which returns zero vectors without loading any model weights.
+The embedding model (`EmbeddingGemma300M`) is loaded eagerly at MCP server
+startup via `store.warm_up()`, which triggers the `OnceCell` init. This avoids
+a 30-60s delay on the first search call. The `warm_up()` call is in
+`PapersMcp::open_rag_store()` — failure is logged but doesn't block the server.
+
+In tests, `RagStore::open_for_test` uses `Embedder::fake()` which returns zero
+vectors without loading any model weights.
 
 `store.embed_documents(texts)` and `store.embed_query(query)` both delegate to
 `spawn_blocking` to avoid blocking the async runtime.
@@ -170,12 +174,44 @@ which returns zero vectors without loading any model weights.
 
 ---
 
+## Vector indexes
+
+LanceDB does not auto-create vector indexes. Without an index, `nearest_to()`
+does a brute-force scan over all rows.
+
+- `RagStore::ensure_indexes()` runs on startup (end of `open()`) and creates
+  `Index::Auto` indexes on the `vector` column of both tables.
+- After each ingestion (`ingest_paper`), the index is rebuilt for the affected
+  table via `create_index`. This replaces any existing index.
+- `Index::Auto` selects IVF-PQ for vector columns.
+- Tables with fewer than ~256 rows may fail index creation — this is expected
+  and logged. At that scale brute-force is already fast.
+
+---
+
 ## Test infrastructure
 
 - `RagStore::open_for_test(path)` — no GPU; uses `Embedder::fake()` (zero vectors)
 - `PAPERS_DATALAB_CACHE_DIR` — redirect DataLab cache in tests
 - `PAPERS_EMBED_CACHE_DIR` — redirect embed cache in tests
 - `tempfile::TempDir` — all test state is isolated
+
+---
+
+## Benchmarks
+
+Run with: `cargo bench -p papers-rag --features bench`
+
+Uses `criterion` with `async_tokio` support. Benchmarks measure the LanceDB
+query path only — no real embedding model is loaded (uses `open_for_test` with
+`Embedder::fake()`). Pre-computed random vectors bypass `embed_query`.
+
+| Benchmark | What it measures |
+|-----------|-----------------|
+| `search/chunks/{N}` | Vector search + batched neighbor fetching, N rows |
+| `search_figures/figures/{N}` | Vector search on figures table, N rows |
+
+Parameterized over table sizes: 100, 500, 1000 rows.
 
 ---
 

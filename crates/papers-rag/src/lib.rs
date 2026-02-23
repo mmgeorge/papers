@@ -16,6 +16,8 @@ pub use ingest::{
     is_ingested, list_cached_item_keys,
 };
 pub use query::resolve_paper_id;
+#[cfg(any(test, feature = "bench"))]
+pub use query::{search_figures_with_embedding, search_with_embedding};
 pub use store::RagStore;
 pub use types::*;
 

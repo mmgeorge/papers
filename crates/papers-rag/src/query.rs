@@ -167,69 +167,99 @@ fn truncate_at_sentence(text: &str, min_chars: usize) -> String {
     result
 }
 
+/// Key for neighbor lookups: (paper_id, chapter_idx, section_idx, chunk_idx).
+type NeighborKey = (String, u16, u16, u16);
+
 struct NeighborRow {
     chunk_id: String,
     text: String,
     block_type: String,
 }
 
-async fn fetch_neighbor_row(
+/// Batch-fetch neighbor rows for multiple search results in a single query.
+/// Returns a map from (paper_id, chapter_idx, section_idx, chunk_idx) to NeighborRow.
+async fn batch_fetch_neighbor_rows(
     table: &lancedb::Table,
-    paper_id: &str,
-    chapter_idx: u16,
-    section_idx: u16,
-    chunk_idx: u16,
-) -> Result<Option<NeighborRow>, RagError> {
-    let filter = format!(
-        "paper_id = '{}' AND chapter_idx = {} AND section_idx = {} AND chunk_idx = {}",
-        paper_id.replace('\'', "''"),
-        chapter_idx,
-        section_idx,
-        chunk_idx
-    );
+    keys: &[NeighborKey],
+) -> Result<HashMap<NeighborKey, NeighborRow>, RagError> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let clauses: Vec<String> = keys
+        .iter()
+        .map(|(pid, ch, sec, ci)| {
+            format!(
+                "(paper_id = '{}' AND chapter_idx = {} AND section_idx = {} AND chunk_idx = {})",
+                pid.replace('\'', "''"),
+                ch,
+                sec,
+                ci
+            )
+        })
+        .collect();
+    let filter = clauses.join(" OR ");
+
     let batches = table
         .query()
         .only_if(&filter)
-        .select(Select::columns(&["chunk_id", "text", "block_type"]))
-        .limit(1)
+        .select(Select::columns(&[
+            "paper_id",
+            "chapter_idx",
+            "section_idx",
+            "chunk_idx",
+            "chunk_id",
+            "text",
+            "block_type",
+        ]))
         .execute()
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
-    if total_rows(&batches) > 0 {
-        let b = &batches[0];
-        Ok(Some(NeighborRow {
-            chunk_id: col_str(b, "chunk_id", 0),
-            text: col_str(b, "text", 0),
-            block_type: col_str(b, "block_type", 0),
-        }))
-    } else {
-        Ok(None)
+        .map_err(RagError::LanceDb)?;
+
+    let mut map = HashMap::new();
+    for batch in &batches {
+        for row in 0..batch.num_rows() {
+            let key = (
+                col_str(batch, "paper_id", row),
+                col_u16(batch, "chapter_idx", row),
+                col_u16(batch, "section_idx", row),
+                col_u16(batch, "chunk_idx", row),
+            );
+            map.insert(
+                key,
+                NeighborRow {
+                    chunk_id: col_str(batch, "chunk_id", row),
+                    text: col_str(batch, "text", row),
+                    block_type: col_str(batch, "block_type", row),
+                },
+            );
+        }
     }
+    Ok(map)
 }
 
-async fn fetch_neighbors(
-    table: &lancedb::Table,
+/// Resolve prev/next neighbors for a single result from a pre-fetched neighbor map.
+/// If the immediate neighbor is an equation, looks through to the "far" neighbor
+/// (which must also be in the map).
+fn resolve_neighbors_from_map(
+    map: &HashMap<NeighborKey, NeighborRow>,
     paper_id: &str,
     chapter_idx: u16,
     section_idx: u16,
     chunk_idx: u16,
-) -> Result<(Option<ChunkSummary>, Option<ChunkSummary>), RagError> {
-    // Fetch prev neighbor (with formula look-through)
+) -> (Option<ChunkSummary>, Option<ChunkSummary>) {
+    // Prev
     let prev = if chunk_idx > 0 {
-        let prev_idx = chunk_idx - 1;
-        match fetch_neighbor_row(table, paper_id, chapter_idx, section_idx, prev_idx).await? {
+        let prev_key = (paper_id.to_string(), chapter_idx, section_idx, chunk_idx - 1);
+        match map.get(&prev_key) {
             Some(row) if row.block_type == "equation" => {
-                // Equation neighbor: include full equation text and look one further back
-                let far_preview = if prev_idx > 0 {
-                    if let Some(far) = fetch_neighbor_row(
-                        table, paper_id, chapter_idx, section_idx, prev_idx - 1,
-                    ).await? {
-                        truncate_at_sentence(&far.text, PREVIEW_MIN_CHARS)
-                    } else {
-                        String::new()
-                    }
+                let far_preview = if chunk_idx >= 2 {
+                    let far_key = (paper_id.to_string(), chapter_idx, section_idx, chunk_idx - 2);
+                    map.get(&far_key)
+                        .map(|far| truncate_at_sentence(&far.text, PREVIEW_MIN_CHARS))
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -239,12 +269,12 @@ async fn fetch_neighbors(
                     format!("{} {}", far_preview, row.text)
                 };
                 Some(ChunkSummary {
-                    chunk_id: row.chunk_id,
+                    chunk_id: row.chunk_id.clone(),
                     text_preview: preview,
                 })
             }
             Some(row) => Some(ChunkSummary {
-                chunk_id: row.chunk_id,
+                chunk_id: row.chunk_id.clone(),
                 text_preview: truncate_at_sentence(&row.text, PREVIEW_MIN_CHARS),
             }),
             None => None,
@@ -253,35 +283,63 @@ async fn fetch_neighbors(
         None
     };
 
-    // Fetch next neighbor (with formula look-through)
+    // Next
     let next_idx = chunk_idx + 1;
-    let next = match fetch_neighbor_row(table, paper_id, chapter_idx, section_idx, next_idx).await? {
+    let next_key = (paper_id.to_string(), chapter_idx, section_idx, next_idx);
+    let next = match map.get(&next_key) {
         Some(row) if row.block_type == "equation" => {
-            let far_preview = if let Some(far) = fetch_neighbor_row(
-                table, paper_id, chapter_idx, section_idx, next_idx + 1,
-            ).await? {
-                truncate_at_sentence(&far.text, PREVIEW_MIN_CHARS)
-            } else {
-                String::new()
-            };
+            let far_key = (paper_id.to_string(), chapter_idx, section_idx, next_idx + 1);
+            let far_preview = map
+                .get(&far_key)
+                .map(|far| truncate_at_sentence(&far.text, PREVIEW_MIN_CHARS))
+                .unwrap_or_default();
             let preview = if far_preview.is_empty() {
                 row.text.clone()
             } else {
                 format!("{} {}", row.text, far_preview)
             };
             Some(ChunkSummary {
-                chunk_id: row.chunk_id,
+                chunk_id: row.chunk_id.clone(),
                 text_preview: preview,
             })
         }
         Some(row) => Some(ChunkSummary {
-            chunk_id: row.chunk_id,
+            chunk_id: row.chunk_id.clone(),
             text_preview: truncate_at_sentence(&row.text, PREVIEW_MIN_CHARS),
         }),
         None => None,
     };
 
-    Ok((prev, next))
+    (prev, next)
+}
+
+/// Single-result fetch_neighbors for use outside of search (get_chunk, etc.).
+async fn fetch_neighbors(
+    table: &lancedb::Table,
+    paper_id: &str,
+    chapter_idx: u16,
+    section_idx: u16,
+    chunk_idx: u16,
+) -> Result<(Option<ChunkSummary>, Option<ChunkSummary>), RagError> {
+    // Collect all candidate keys (prev, prev-1, next, next+1)
+    let mut keys: Vec<NeighborKey> = Vec::with_capacity(4);
+    if chunk_idx > 0 {
+        keys.push((paper_id.to_string(), chapter_idx, section_idx, chunk_idx - 1));
+        if chunk_idx >= 2 {
+            keys.push((paper_id.to_string(), chapter_idx, section_idx, chunk_idx - 2));
+        }
+    }
+    keys.push((paper_id.to_string(), chapter_idx, section_idx, chunk_idx + 1));
+    keys.push((paper_id.to_string(), chapter_idx, section_idx, chunk_idx + 2));
+
+    let map = batch_fetch_neighbor_rows(table, &keys).await?;
+    Ok(resolve_neighbors_from_map(
+        &map,
+        paper_id,
+        chapter_idx,
+        section_idx,
+        chunk_idx,
+    ))
 }
 
 async fn resolve_figures(
@@ -504,6 +562,34 @@ pub async fn search(
     store: &RagStore,
     params: SearchParams,
 ) -> Result<Vec<SearchResult>, RagError> {
+    let embedding = store.embed_query(&params.query).await?;
+    search_with_embedding(store, params, &embedding).await
+}
+
+/// Search with a pre-computed embedding vector (used by benchmarks to bypass the embedder).
+#[cfg(any(test, feature = "bench"))]
+pub async fn search_with_embedding(
+    store: &RagStore,
+    params: SearchParams,
+    embedding: &[f32],
+) -> Result<Vec<SearchResult>, RagError> {
+    search_with_embedding_inner(store, params, embedding).await
+}
+
+#[cfg(not(any(test, feature = "bench")))]
+async fn search_with_embedding(
+    store: &RagStore,
+    params: SearchParams,
+    embedding: &[f32],
+) -> Result<Vec<SearchResult>, RagError> {
+    search_with_embedding_inner(store, params, embedding).await
+}
+
+async fn search_with_embedding_inner(
+    store: &RagStore,
+    params: SearchParams,
+    embedding: &[f32],
+) -> Result<Vec<SearchResult>, RagError> {
     validate_scope(
         params.chapter_idx,
         params.section_idx,
@@ -512,8 +598,6 @@ pub async fn search(
             .and_then(|ids| ids.first())
             .map(|s| s.as_str()),
     )?;
-
-    let embedding = store.embed_query(&params.query).await?;
     let table = store.chunks_table().await?;
 
     let mut fb = FilterBuilder::new();
@@ -537,7 +621,7 @@ pub async fn search(
         fb = fb.tags_any(tags);
     }
 
-    let mut query_builder = table.query().nearest_to(embedding.as_slice())?;
+    let mut query_builder = table.query().nearest_to(embedding)?;
     query_builder = query_builder.limit(params.limit as usize);
     if let Some(filter) = fb.build() {
         query_builder = query_builder.only_if(filter);
@@ -550,8 +634,8 @@ pub async fn search(
         .await
         .map_err(|e| RagError::LanceDb(e))?;
 
-    let chunks_table = store.chunks_table().await?;
-    let mut results = Vec::new();
+    // Collect all chunk data and scores first
+    let mut chunk_data_list: Vec<(ChunkData, f32)> = Vec::new();
     for batch in &batches {
         let has_distance = batch.column_by_name("_distance").is_some();
         for row in 0..batch.num_rows() {
@@ -560,33 +644,61 @@ pub async fn search(
             } else {
                 0.0
             };
-            let data = chunk_from_row(batch, row);
-            let chunk = SearchChunkResult {
-                chunk_id: data.chunk_id,
-                paper_id: data.paper_id.clone(),
-                paper_title: data.title,
-                block_type: data.block_type,
-                text: data.text,
-                chapter_title: data.chapter_title,
-                section_title: data.section_title,
-                chunk_idx: data.chunk_idx,
-                figure_ids: data.figure_ids,
-            };
-            let (prev, next) = fetch_neighbors(
-                &chunks_table,
-                &data.paper_id,
-                data.chapter_idx,
-                data.section_idx,
-                data.chunk_idx,
-            )
-            .await?;
-            results.push(SearchResult {
-                chunk,
-                prev,
-                next,
-                score,
-            });
+            chunk_data_list.push((chunk_from_row(batch, row), score));
         }
+    }
+
+    // Collect all neighbor keys across all results in one pass
+    let mut neighbor_keys: Vec<NeighborKey> = Vec::new();
+    for (data, _) in &chunk_data_list {
+        let pid = &data.paper_id;
+        let ch = data.chapter_idx;
+        let sec = data.section_idx;
+        let ci = data.chunk_idx;
+        if ci > 0 {
+            neighbor_keys.push((pid.clone(), ch, sec, ci - 1));
+            if ci >= 2 {
+                neighbor_keys.push((pid.clone(), ch, sec, ci - 2));
+            }
+        }
+        neighbor_keys.push((pid.clone(), ch, sec, ci + 1));
+        neighbor_keys.push((pid.clone(), ch, sec, ci + 2));
+    }
+    // Deduplicate keys
+    neighbor_keys.sort();
+    neighbor_keys.dedup();
+
+    // Single batch query for all neighbors
+    let chunks_table = store.chunks_table().await?;
+    let neighbor_map = batch_fetch_neighbor_rows(&chunks_table, &neighbor_keys).await?;
+
+    // Build results using the pre-fetched map
+    let mut results = Vec::new();
+    for (data, score) in chunk_data_list {
+        let (prev, next) = resolve_neighbors_from_map(
+            &neighbor_map,
+            &data.paper_id,
+            data.chapter_idx,
+            data.section_idx,
+            data.chunk_idx,
+        );
+        let chunk = SearchChunkResult {
+            chunk_id: data.chunk_id,
+            paper_id: data.paper_id,
+            paper_title: data.title,
+            block_type: data.block_type,
+            text: data.text,
+            chapter_title: data.chapter_title,
+            section_title: data.section_title,
+            chunk_idx: data.chunk_idx,
+            figure_ids: data.figure_ids,
+        };
+        results.push(SearchResult {
+            chunk,
+            prev,
+            next,
+            score,
+        });
     }
     Ok(results)
 }
@@ -597,6 +709,24 @@ pub async fn search_figures(
     params: SearchFiguresParams,
 ) -> Result<Vec<FigureSearchResult>, RagError> {
     let embedding = store.embed_query(&params.query).await?;
+    search_figures_with_embedding_inner(store, params, &embedding).await
+}
+
+/// Search figures with a pre-computed embedding vector (for benchmarks).
+#[cfg(any(test, feature = "bench"))]
+pub async fn search_figures_with_embedding(
+    store: &RagStore,
+    params: SearchFiguresParams,
+    embedding: &[f32],
+) -> Result<Vec<FigureSearchResult>, RagError> {
+    search_figures_with_embedding_inner(store, params, embedding).await
+}
+
+async fn search_figures_with_embedding_inner(
+    store: &RagStore,
+    params: SearchFiguresParams,
+    embedding: &[f32],
+) -> Result<Vec<FigureSearchResult>, RagError> {
     let table = store.figures_table().await?;
 
     let mut fb = FilterBuilder::new();
@@ -607,7 +737,7 @@ pub async fn search_figures(
         fb = fb.eq_str("figure_type", ft);
     }
 
-    let mut query_builder = table.query().nearest_to(embedding.as_slice())?;
+    let mut query_builder = table.query().nearest_to(embedding)?;
     query_builder = query_builder.limit(params.limit as usize);
     if let Some(filter) = fb.build() {
         query_builder = query_builder.only_if(filter);
