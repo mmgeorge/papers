@@ -749,11 +749,7 @@ fn parse_paper_blocks(
                 let caption = adjacent_caption
                     .clone()
                     .unwrap_or_else(|| alt_text.clone());
-                let description = if alt_text.is_empty() {
-                    caption.clone()
-                } else {
-                    alt_text
-                };
+                let description = alt_text;
 
                 // Extract table content as markdown for Table blocks
                 let content = if block_type == "Table" {
