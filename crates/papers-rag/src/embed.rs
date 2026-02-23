@@ -10,15 +10,27 @@ pub const MODEL_NAME: &str = "embedding-gemma-300m";
 /// Name of the execution provider selected at compile time.
 pub fn ep_name() -> &'static str {
     #[cfg(target_os = "windows")]
-    { "DirectML" }
+    {
+        "DirectML"
+    }
     #[cfg(target_os = "macos")]
-    { "CoreML" }
+    {
+        "CoreML"
+    }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    { "CPU" }
+    {
+        "CPU"
+    }
 }
 
 pub struct Embedder {
     model: Option<TextEmbedding>,
+}
+
+impl std::fmt::Debug for Embedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Embedder").finish()
+    }
 }
 
 impl Embedder {
@@ -29,19 +41,15 @@ impl Embedder {
 
         #[cfg(target_os = "windows")]
         {
-            opts = opts.with_execution_providers(vec![
-                ort::ep::directml::DirectML::default().build(),
-            ]);
+            opts =
+                opts.with_execution_providers(vec![ort::ep::directml::DirectML::default().build()]);
         }
         #[cfg(target_os = "macos")]
         {
-            opts = opts.with_execution_providers(vec![
-                ort::ep::coreml::CoreML::default().build(),
-            ]);
+            opts = opts.with_execution_providers(vec![ort::ep::coreml::CoreML::default().build()]);
         }
 
-        let model = TextEmbedding::try_new(opts)
-            .map_err(|e| RagError::Embed(e.to_string()))?;
+        let model = TextEmbedding::try_new(opts).map_err(|e| RagError::Embed(e.to_string()))?;
         Ok(Self { model: Some(model) })
     }
 

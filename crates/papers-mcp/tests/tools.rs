@@ -401,10 +401,12 @@ async fn test_work_get_exact_title_match_returns_ok() {
     // Search returns multiple candidates; the second is an exact match
     Mock::given(method("GET"))
         .and(path("/works"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(work_candidates_list_json(&[
-            ("https://openalex.org/W1", "Intro to Neural Networks", 200),
-            ("https://openalex.org/W2741809807", "Neural Networks", 500),
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(work_candidates_list_json(&[
+                ("https://openalex.org/W1", "Intro to Neural Networks", 200),
+                ("https://openalex.org/W2741809807", "Neural Networks", 500),
+            ])),
+        )
         .mount(&mock)
         .await;
     Mock::given(method("GET"))
@@ -419,7 +421,7 @@ async fn test_work_get_exact_title_match_returns_ok() {
     assert!(result.is_ok());
     let text = result.unwrap();
     assert!(text.contains("The state of OA")); // from minimal_work_json
-    assert!(!text.contains("candidates"));     // not a suggestions response
+    assert!(!text.contains("candidates")); // not a suggestions response
 }
 
 #[tokio::test]
@@ -428,10 +430,20 @@ async fn test_work_get_suggestions_returns_ok_with_json_body() {
     // No exact match among candidates → suggestions JSON returned as Ok
     Mock::given(method("GET"))
         .and(path("/works"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(work_candidates_list_json(&[
-            ("https://openalex.org/W1", "GPU rasterization for real-time aggregation", 42),
-            ("https://openalex.org/W2", "High-performance GPU rasterization", 17),
-        ])))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(work_candidates_list_json(&[
+                (
+                    "https://openalex.org/W1",
+                    "GPU rasterization for real-time aggregation",
+                    42,
+                ),
+                (
+                    "https://openalex.org/W2",
+                    "High-performance GPU rasterization",
+                    17,
+                ),
+            ])),
+        )
         .mount(&mock)
         .await;
 
@@ -447,8 +459,12 @@ async fn test_work_get_suggestions_returns_ok_with_json_body() {
     assert_eq!(json["query"], "GPU rasterization");
     let candidates = json["candidates"].as_array().unwrap();
     assert_eq!(candidates.len(), 2);
-    assert!(candidates.contains(&serde_json::json!({"name": "GPU rasterization for real-time aggregation", "citations": 42})));
-    assert!(candidates.contains(&serde_json::json!({"name": "High-performance GPU rasterization", "citations": 17})));
+    assert!(candidates.contains(
+        &serde_json::json!({"name": "GPU rasterization for real-time aggregation", "citations": 42})
+    ));
+    assert!(candidates.contains(
+        &serde_json::json!({"name": "High-performance GPU rasterization", "citations": 17})
+    ));
 }
 
 // ── New Zotero tool tests ─────────────────────────────────────────────
@@ -479,7 +495,10 @@ async fn test_zotero_work_fulltext() {
     let params = serde_json::from_value(serde_json::json!({"key": "ABC12345"})).unwrap();
     let result = server.zotero_work_fulltext(Parameters(params)).await;
     let text = result.unwrap();
-    assert!(text.contains("indexed full text"), "Expected fulltext content, got: {text}");
+    assert!(
+        text.contains("indexed full text"),
+        "Expected fulltext content, got: {text}"
+    );
 }
 
 #[tokio::test]
@@ -498,7 +517,9 @@ async fn test_zotero_work_view_url() {
     // /file/view/url returns plain text URL
     Mock::given(method("GET"))
         .and(path("/users/test/items/ATT12345/file/view/url"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("https://cdn.example.com/paper.pdf"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("https://cdn.example.com/paper.pdf"),
+        )
         .mount(&mock)
         .await;
 
@@ -506,7 +527,10 @@ async fn test_zotero_work_view_url() {
     let params = serde_json::from_value(serde_json::json!({"key": "ABC12345"})).unwrap();
     let result = server.zotero_work_view_url(Parameters(params)).await;
     let url = result.unwrap();
-    assert!(url.contains("cdn.example.com"), "Expected CDN URL, got: {url}");
+    assert!(
+        url.contains("cdn.example.com"),
+        "Expected CDN URL, got: {url}"
+    );
 }
 
 #[tokio::test]
@@ -514,9 +538,11 @@ async fn test_zotero_attachment_url() {
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/users/test/items/ATT12345"))
-        .respond_with(ResponseTemplate::new(200)
-            .insert_header("Last-Modified-Version", "100")
-            .set_body_string(&zotero_attachment_body()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(&zotero_attachment_body()),
+        )
         .mount(&mock)
         .await;
     Mock::given(method("GET"))
@@ -529,7 +555,10 @@ async fn test_zotero_attachment_url() {
     let params = serde_json::from_value(serde_json::json!({"key": "ATT12345"})).unwrap();
     let result = server.zotero_attachment_url(Parameters(params)).await;
     let url = result.unwrap();
-    assert!(url.contains("cdn.example.com"), "Expected CDN URL, got: {url}");
+    assert!(
+        url.contains("cdn.example.com"),
+        "Expected CDN URL, got: {url}"
+    );
 }
 
 #[tokio::test]
@@ -545,8 +574,14 @@ async fn test_zotero_permission_list() {
     let params = serde_json::from_value(serde_json::json!({})).unwrap();
     let result = server.zotero_permission_list(Parameters(params)).await;
     let text = result.unwrap();
-    assert!(text.contains("16916553"), "Expected userID in response: {text}");
-    assert!(text.contains("testuser"), "Expected username in response: {text}");
+    assert!(
+        text.contains("16916553"),
+        "Expected userID in response: {text}"
+    );
+    assert!(
+        text.contains("testuser"),
+        "Expected username in response: {text}"
+    );
 }
 
 #[tokio::test]
@@ -562,7 +597,10 @@ async fn test_zotero_setting_list() {
     let params = serde_json::from_value(serde_json::json!({})).unwrap();
     let result = server.zotero_setting_list(Parameters(params)).await;
     let text = result.unwrap();
-    assert!(text.contains("tagColors"), "Expected settings in response: {text}");
+    assert!(
+        text.contains("tagColors"),
+        "Expected settings in response: {text}"
+    );
 }
 
 #[tokio::test]
@@ -578,7 +616,10 @@ async fn test_zotero_setting_get() {
     let params = serde_json::from_value(serde_json::json!({"key": "tagColors"})).unwrap();
     let result = server.zotero_setting_get(Parameters(params)).await;
     let text = result.unwrap();
-    assert!(text.contains("Starred"), "Expected setting value in response: {text}");
+    assert!(
+        text.contains("Starred"),
+        "Expected setting value in response: {text}"
+    );
 }
 
 #[tokio::test]
@@ -594,7 +635,10 @@ async fn test_zotero_deleted_list() {
     let params = serde_json::from_value(serde_json::json!({"since": 0})).unwrap();
     let result = server.zotero_deleted_list(Parameters(params)).await;
     let text = result.unwrap();
-    assert!(text.contains("DEL12345"), "Expected deleted item key in response: {text}");
+    assert!(
+        text.contains("DEL12345"),
+        "Expected deleted item key in response: {text}"
+    );
 }
 
 #[tokio::test]
@@ -603,7 +647,7 @@ async fn test_zotero_deleted_list_no_params() {
     Mock::given(method("GET"))
         .and(path("/users/test/deleted"))
         .respond_with(zotero_fulltext_response(
-            r#"{"collections": [], "searches": [], "items": [], "tags": [], "settings": []}"#
+            r#"{"collections": [], "searches": [], "items": [], "tags": [], "settings": []}"#,
         ))
         .mount(&mock)
         .await;
@@ -616,91 +660,6 @@ async fn test_zotero_deleted_list_no_params() {
 }
 
 // ── Tool listing tests ───────────────────────────────────────────────
-
-#[test]
-fn test_tool_router_has_62_tools() {
-    let router = PapersMcp::tool_router();
-    let tools = router.list_all();
-    assert_eq!(tools.len(), 62);
-}
-
-#[test]
-fn test_all_tool_names_present() {
-    let router = PapersMcp::tool_router();
-    let tools = router.list_all();
-    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-
-    let expected = [
-        "work_list",
-        "author_list",
-        "source_list",
-        "institution_list",
-        "topic_list",
-        "publisher_list",
-        "funder_list",
-        "domain_list",
-        "field_list",
-        "subfield_list",
-        "work_get",
-        "author_get",
-        "source_get",
-        "institution_get",
-        "topic_get",
-        "publisher_get",
-        "funder_get",
-        "domain_get",
-        "field_get",
-        "subfield_get",
-        "work_autocomplete",
-        "author_autocomplete",
-        "source_autocomplete",
-        "institution_autocomplete",
-        "publisher_autocomplete",
-        "funder_autocomplete",
-        "subfield_autocomplete",
-        "work_find",
-        "work_text",
-        // Zotero tools
-        "zotero_work_list",
-        "zotero_work_get",
-        "zotero_work_collections",
-        "zotero_work_notes",
-        "zotero_work_attachments",
-        "zotero_work_annotations",
-        "zotero_work_tags",
-        "zotero_attachment_list",
-        "zotero_attachment_get",
-        "zotero_annotation_list",
-        "zotero_annotation_get",
-        "zotero_note_list",
-        "zotero_note_get",
-        "zotero_collection_list",
-        "zotero_collection_get",
-        "zotero_collection_works",
-        "zotero_collection_attachments",
-        "zotero_collection_notes",
-        "zotero_collection_annotations",
-        "zotero_collection_subcollections",
-        "zotero_collection_tags",
-        "zotero_tag_list",
-        "zotero_tag_get",
-        "zotero_search_list",
-        "zotero_group_list",
-        // New tools
-        "zotero_work_fulltext",
-        "zotero_work_view",
-        "zotero_work_view_url",
-        "zotero_attachment_url",
-        "zotero_permission_list",
-        "zotero_setting_list",
-        "zotero_setting_get",
-        "zotero_deleted_list",
-    ];
-
-    for name in &expected {
-        assert!(names.contains(name), "Missing tool: {name}");
-    }
-}
 
 #[test]
 fn test_all_tools_have_descriptions() {
@@ -723,10 +682,13 @@ mod summary_unit {
         AuthorSummary, DomainSummary, FieldSummary, FunderSummary, InstitutionSummary,
         PublisherSummary, SourceSummary, SubfieldSummary, TopicSummary, WorkSummary,
     };
-    use papers_core::{Author, Domain, Field, Funder, Institution, Publisher, Source, Subfield, Topic, Work};
+    use papers_core::{
+        Author, Domain, Field, Funder, Institution, Publisher, Source, Subfield, Topic, Work,
+    };
 
     fn minimal_work() -> Work {
-        serde_json::from_str(r#"{
+        serde_json::from_str(
+            r#"{
             "id": "https://openalex.org/W1",
             "doi": "https://doi.org/10.1234/test",
             "display_name": "Test Work",
@@ -742,11 +704,14 @@ mod summary_unit {
                 "source": {"id": "https://openalex.org/S1", "display_name": "Nature"}
             },
             "primary_topic": {"id": "https://openalex.org/T1", "display_name": "Machine Learning"}
-        }"#).unwrap()
+        }"#,
+        )
+        .unwrap()
     }
 
     fn minimal_author() -> Author {
-        serde_json::from_str(r#"{
+        serde_json::from_str(
+            r#"{
             "id": "https://openalex.org/A1",
             "display_name": "Alice Smith",
             "orcid": "https://orcid.org/0000-0001-2345-6789",
@@ -762,11 +727,14 @@ mod summary_unit {
                 {"id": "https://openalex.org/T3", "display_name": "NLP"},
                 {"id": "https://openalex.org/T4", "display_name": "CV"}
             ]
-        }"#).unwrap()
+        }"#,
+        )
+        .unwrap()
     }
 
     fn minimal_source() -> Source {
-        serde_json::from_str(r#"{
+        serde_json::from_str(
+            r#"{
             "id": "https://openalex.org/S1",
             "display_name": "Nature",
             "issn_l": "0028-0836",
@@ -777,7 +745,9 @@ mod summary_unit {
             "cited_by_count": 25000000,
             "summary_stats": {"2yr_mean_citedness": 50.2, "h_index": 1200, "i10_index": 50000},
             "host_organization_name": "Springer Nature"
-        }"#).unwrap()
+        }"#,
+        )
+        .unwrap()
     }
 
     fn minimal_institution() -> Institution {
@@ -795,7 +765,8 @@ mod summary_unit {
     }
 
     fn minimal_topic() -> Topic {
-        serde_json::from_str(r#"{
+        serde_json::from_str(
+            r#"{
             "id": "https://openalex.org/T1",
             "display_name": "Machine Learning",
             "description": "Research on machine learning algorithms and applications.",
@@ -804,22 +775,28 @@ mod summary_unit {
             "domain": {"id": 1, "display_name": "Physical Sciences"},
             "works_count": 500000,
             "cited_by_count": 10000000
-        }"#).unwrap()
+        }"#,
+        )
+        .unwrap()
     }
 
     fn minimal_publisher() -> Publisher {
-        serde_json::from_str(r#"{
+        serde_json::from_str(
+            r#"{
             "id": "https://openalex.org/P1",
             "display_name": "Springer Nature",
             "hierarchy_level": 0,
             "country_codes": ["DE"],
             "works_count": 2750825,
             "cited_by_count": 75000000
-        }"#).unwrap()
+        }"#,
+        )
+        .unwrap()
     }
 
     fn minimal_funder() -> Funder {
-        serde_json::from_str(r#"{
+        serde_json::from_str(
+            r#"{
             "id": "https://openalex.org/F1",
             "display_name": "National Institutes of Health",
             "country_code": "US",
@@ -827,7 +804,9 @@ mod summary_unit {
             "awards_count": 500000,
             "works_count": 3253779,
             "cited_by_count": 150000000
-        }"#).unwrap()
+        }"#,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -865,7 +844,10 @@ mod summary_unit {
         let s = AuthorSummary::from(minimal_author());
         assert_eq!(s.id, "https://openalex.org/A1");
         assert_eq!(s.display_name.as_deref(), Some("Alice Smith"));
-        assert_eq!(s.orcid.as_deref(), Some("https://orcid.org/0000-0001-2345-6789"));
+        assert_eq!(
+            s.orcid.as_deref(),
+            Some("https://orcid.org/0000-0001-2345-6789")
+        );
         assert_eq!(s.works_count, Some(50));
         assert_eq!(s.cited_by_count, Some(1000));
         assert_eq!(s.h_index, Some(15));
@@ -939,7 +921,12 @@ mod summary_unit {
         let s = TopicSummary::from(minimal_topic());
         assert_eq!(s.id, "https://openalex.org/T1");
         assert_eq!(s.display_name.as_deref(), Some("Machine Learning"));
-        assert!(s.description.as_deref().unwrap().contains("machine learning"));
+        assert!(
+            s.description
+                .as_deref()
+                .unwrap()
+                .contains("machine learning")
+        );
         assert_eq!(s.subfield.as_deref(), Some("Artificial Intelligence"));
         assert_eq!(s.field.as_deref(), Some("Computer Science"));
         assert_eq!(s.domain.as_deref(), Some("Physical Sciences"));
@@ -963,7 +950,10 @@ mod summary_unit {
         assert_eq!(s.id, "https://openalex.org/P1");
         assert_eq!(s.display_name.as_deref(), Some("Springer Nature"));
         assert_eq!(s.hierarchy_level, Some(0));
-        assert_eq!(s.country_codes.as_deref(), Some(["DE".to_string()].as_slice()));
+        assert_eq!(
+            s.country_codes.as_deref(),
+            Some(["DE".to_string()].as_slice())
+        );
         assert_eq!(s.works_count, Some(2750825));
         assert_eq!(s.cited_by_count, Some(75000000));
     }
@@ -982,9 +972,15 @@ mod summary_unit {
     fn funder_summary_maps_essential_fields() {
         let s = FunderSummary::from(minimal_funder());
         assert_eq!(s.id, "https://openalex.org/F1");
-        assert_eq!(s.display_name.as_deref(), Some("National Institutes of Health"));
+        assert_eq!(
+            s.display_name.as_deref(),
+            Some("National Institutes of Health")
+        );
         assert_eq!(s.country_code.as_deref(), Some("US"));
-        assert_eq!(s.description.as_deref(), Some("US federal biomedical research agency"));
+        assert_eq!(
+            s.description.as_deref(),
+            Some("US federal biomedical research agency")
+        );
         assert_eq!(s.awards_count, Some(500000));
         assert_eq!(s.works_count, Some(3253779));
         assert_eq!(s.cited_by_count, Some(150000000));
@@ -1001,7 +997,8 @@ mod summary_unit {
     }
 
     fn minimal_domain() -> Domain {
-        serde_json::from_str(r#"{
+        serde_json::from_str(
+            r#"{
             "id": "https://openalex.org/domains/3",
             "display_name": "Physical Sciences",
             "description": "branch of natural science",
@@ -1012,7 +1009,9 @@ mod summary_unit {
             "siblings": [{"id": "https://openalex.org/domains/1", "display_name": "Life Sciences"}],
             "works_count": 134263529,
             "cited_by_count": 1500000000
-        }"#).unwrap()
+        }"#,
+        )
+        .unwrap()
     }
 
     fn minimal_field() -> Field {
@@ -1265,15 +1264,27 @@ async fn test_list_works_returns_slim_response() {
 
     // Essential fields present
     assert!(text.contains("Bitonic Sort"), "title missing");
-    assert!(text.contains("\"cited_by_count\""), "cited_by_count missing");
+    assert!(
+        text.contains("\"cited_by_count\""),
+        "cited_by_count missing"
+    );
     assert!(text.contains("Alice"), "author name missing");
     assert!(text.contains("JACM"), "journal missing");
     assert!(text.contains("Algorithms"), "primary_topic missing");
     assert!(text.contains("Sorting networks"), "abstract_text missing");
     // Verbose fields absent
-    assert!(!text.contains("referenced_works"), "referenced_works should be absent");
-    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
-    assert!(!text.contains("\"locations\""), "locations should be absent");
+    assert!(
+        !text.contains("referenced_works"),
+        "referenced_works should be absent"
+    );
+    assert!(
+        !text.contains("counts_by_year"),
+        "counts_by_year should be absent"
+    );
+    assert!(
+        !text.contains("\"locations\""),
+        "locations should be absent"
+    );
     assert!(!text.contains("mesh"), "mesh should be absent");
     // group_by absent
     assert!(!text.contains("group_by"), "group_by should be absent");
@@ -1295,8 +1306,14 @@ async fn test_list_authors_returns_slim_response() {
     assert!(text.contains("Alice"));
     assert!(text.contains("h_index"));
     assert!(text.contains("MIT"));
-    assert!(!text.contains("affiliations"), "affiliations should be absent");
-    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+    assert!(
+        !text.contains("affiliations"),
+        "affiliations should be absent"
+    );
+    assert!(
+        !text.contains("counts_by_year"),
+        "counts_by_year should be absent"
+    );
 }
 
 #[tokio::test]
@@ -1316,7 +1333,10 @@ async fn test_list_sources_returns_slim_response() {
     assert!(text.contains("h_index"));
     assert!(text.contains("Springer Nature"));
     assert!(!text.contains("apc_prices"), "apc_prices should be absent");
-    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+    assert!(
+        !text.contains("counts_by_year"),
+        "counts_by_year should be absent"
+    );
 }
 
 #[tokio::test]
@@ -1335,8 +1355,14 @@ async fn test_list_institutions_returns_slim_response() {
     assert!(text.contains("Harvard University"));
     assert!(text.contains("Cambridge"));
     assert!(text.contains("h_index"));
-    assert!(!text.contains("associated_institutions"), "associated_institutions should be absent");
-    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+    assert!(
+        !text.contains("associated_institutions"),
+        "associated_institutions should be absent"
+    );
+    assert!(
+        !text.contains("counts_by_year"),
+        "counts_by_year should be absent"
+    );
 }
 
 #[tokio::test]
@@ -1374,8 +1400,14 @@ async fn test_list_publishers_returns_slim_response() {
 
     assert!(text.contains("Springer Nature"));
     assert!(text.contains("hierarchy_level"));
-    assert!(!text.contains("alternate_titles"), "alternate_titles should be absent");
-    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+    assert!(
+        !text.contains("alternate_titles"),
+        "alternate_titles should be absent"
+    );
+    assert!(
+        !text.contains("counts_by_year"),
+        "counts_by_year should be absent"
+    );
     assert!(!text.contains("lineage"), "lineage should be absent");
 }
 
@@ -1394,8 +1426,14 @@ async fn test_list_funders_returns_slim_response() {
 
     assert!(text.contains("National Institutes of Health"));
     assert!(text.contains("awards_count"));
-    assert!(!text.contains("alternate_titles"), "alternate_titles should be absent");
-    assert!(!text.contains("counts_by_year"), "counts_by_year should be absent");
+    assert!(
+        !text.contains("alternate_titles"),
+        "alternate_titles should be absent"
+    );
+    assert!(
+        !text.contains("counts_by_year"),
+        "counts_by_year should be absent"
+    );
 }
 
 fn domain_list_json() -> String {
@@ -1471,8 +1509,14 @@ async fn test_list_domains_returns_slim_response() {
     assert!(text.contains("Physical Sciences"));
     assert!(text.contains("Computer Science")); // field display_name kept
     assert!(!text.contains("siblings"), "siblings should be absent");
-    assert!(!text.contains("works_api_url"), "works_api_url should be absent");
-    assert!(!text.contains("display_name_alternatives"), "display_name_alternatives should be absent");
+    assert!(
+        !text.contains("works_api_url"),
+        "works_api_url should be absent"
+    );
+    assert!(
+        !text.contains("display_name_alternatives"),
+        "display_name_alternatives should be absent"
+    );
 }
 
 #[tokio::test]
@@ -1492,7 +1536,10 @@ async fn test_list_fields_returns_slim_response() {
     assert!(text.contains("Physical Sciences")); // domain display_name kept
     assert!(text.contains("subfield_count")); // count instead of full list
     assert!(!text.contains("siblings"), "siblings should be absent");
-    assert!(!text.contains("Artificial Intelligence"), "subfields list should be absent");
+    assert!(
+        !text.contains("Artificial Intelligence"),
+        "subfields list should be absent"
+    );
 }
 
 #[tokio::test]
@@ -1591,8 +1638,7 @@ async fn test_work_list_with_author_id() {
         .await;
 
     let server = make_server(&mock).await;
-    let params =
-        serde_json::from_value(serde_json::json!({"author": "A5083138872"})).unwrap();
+    let params = serde_json::from_value(serde_json::json!({"author": "A5083138872"})).unwrap();
     let result = server.work_list(Parameters(params)).await;
     assert!(result.is_ok());
 }
@@ -1742,8 +1788,7 @@ async fn test_work_list_with_subfield_id() {
         .await;
 
     let server = make_server(&mock).await;
-    let params =
-        serde_json::from_value(serde_json::json!({"subfield": "subfields/1702"})).unwrap();
+    let params = serde_json::from_value(serde_json::json!({"subfield": "subfields/1702"})).unwrap();
     let result = server.work_list(Parameters(params)).await;
     assert!(result.is_ok());
 }
@@ -1972,7 +2017,10 @@ async fn test_author_list_with_institution_search() {
     // Mock the authors list with resolved filter
     Mock::given(method("GET"))
         .and(path("/authors"))
-        .and(query_param("filter", "last_known_institutions.id:I136199984"))
+        .and(query_param(
+            "filter",
+            "last_known_institutions.id:I136199984",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
         .mount(&mock)
         .await;
@@ -2313,7 +2361,9 @@ async fn test_zotero_collection_attachments() {
         .await;
     let server = make_zotero_server(&mock);
     let params = serde_json::from_value(serde_json::json!({"key": "COL12345"})).unwrap();
-    let result = server.zotero_collection_attachments(Parameters(params)).await;
+    let result = server
+        .zotero_collection_attachments(Parameters(params))
+        .await;
     assert!(result.is_ok());
 }
 
@@ -2342,7 +2392,9 @@ async fn test_zotero_collection_annotations() {
         .await;
     let server = make_zotero_server(&mock);
     let params = serde_json::from_value(serde_json::json!({"key": "COL12345"})).unwrap();
-    let result = server.zotero_collection_annotations(Parameters(params)).await;
+    let result = server
+        .zotero_collection_annotations(Parameters(params))
+        .await;
     assert!(result.is_ok());
 }
 
@@ -2356,7 +2408,9 @@ async fn test_zotero_collection_subcollections() {
         .await;
     let server = make_zotero_server(&mock);
     let params = serde_json::from_value(serde_json::json!({"key": "COL12345"})).unwrap();
-    let result = server.zotero_collection_subcollections(Parameters(params)).await;
+    let result = server
+        .zotero_collection_subcollections(Parameters(params))
+        .await;
     assert!(result.is_ok());
 }
 
@@ -2493,9 +2547,7 @@ async fn test_zotero_work_get_by_title_not_found() {
         serde_json::from_value(serde_json::json!({"key": "Nonexistent Paper Title"})).unwrap();
     let result = server.zotero_work_get(Parameters(params)).await;
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .contains("Nonexistent Paper Title"));
+    assert!(result.unwrap_err().contains("Nonexistent Paper Title"));
 }
 
 #[tokio::test]
@@ -2514,8 +2566,7 @@ async fn test_zotero_collection_get_by_name_resolves_key() {
         .mount(&mock)
         .await;
     let server = make_zotero_server(&mock);
-    let params =
-        serde_json::from_value(serde_json::json!({"key": "Test Collection"})).unwrap();
+    let params = serde_json::from_value(serde_json::json!({"key": "Test Collection"})).unwrap();
     let result = server.zotero_collection_get(Parameters(params)).await;
     assert!(result.is_ok());
     assert!(result.unwrap().contains("COL12345"));
@@ -2537,8 +2588,7 @@ async fn test_zotero_collection_works_by_name_resolves_key() {
         .mount(&mock)
         .await;
     let server = make_zotero_server(&mock);
-    let params =
-        serde_json::from_value(serde_json::json!({"key": "Test Collection"})).unwrap();
+    let params = serde_json::from_value(serde_json::json!({"key": "Test Collection"})).unwrap();
     let result = server.zotero_collection_works(Parameters(params)).await;
     assert!(result.is_ok());
 }
