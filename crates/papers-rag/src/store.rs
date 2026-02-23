@@ -267,7 +267,7 @@ const CURRENT_FIGURES_VERSION: u32 = 1;
 
 /// Versioned schema migrations for the figures table.
 const FIGURE_MIGRATIONS: &[(u32, &str, &str)] = &[
-    (1, "content", "NULL"),
+    (1, "content", "CAST(NULL AS string)"),
 ];
 
 /// Apply pending schema migrations to the figures table.

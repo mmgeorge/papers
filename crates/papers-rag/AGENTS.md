@@ -235,6 +235,12 @@ via `table.add_columns()`. If the column already exists (e.g. the table was
 created with the latest schema but the version metadata was missing), the
 `add_columns` call fails silently.
 
+**Important:** When adding a nullable column, always use an explicitly typed
+default expression like `CAST(NULL AS string)`, never bare `NULL`. LanceDB's
+`add_columns` infers Arrow `Null` type from an untyped `NULL`, which is not
+the same as a nullable `Utf8` column and will cause runtime panics when
+reading rows.
+
 Each table tracks its own version independently via Arrow schema metadata:
 - `CURRENT_CHUNKS_VERSION` must equal the highest version in `CHUNK_MIGRATIONS`
 - `CURRENT_FIGURES_VERSION` must equal the highest version in `FIGURE_MIGRATIONS`
@@ -246,7 +252,8 @@ every `RagStore::open()` call.
 
 1. Bump `CURRENT_CHUNKS_VERSION` or `CURRENT_FIGURES_VERSION` in `store.rs`
 2. Add a `(new_version, column_name, default_expr)` entry to `CHUNK_MIGRATIONS`
-   or `FIGURE_MIGRATIONS`
+   or `FIGURE_MIGRATIONS` — use `CAST(NULL AS string)` for nullable strings,
+   never bare `NULL`
 3. Add the column to `schema.rs` (`chunks_schema()` or `figures_schema()`)
 4. Add the column to the ingest path (`ChunkRecord`, `build_chunks_batch()`, etc.)
 5. Update `ChunkData` / `chunk_from_row()` in `query.rs` to read the new column

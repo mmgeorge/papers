@@ -1,6 +1,7 @@
 use arrow_array::{
-    Array, Float32Array, ListArray, RecordBatch, StringArray, UInt16Array,
+    Array, Float32Array, LargeStringArray, ListArray, RecordBatch, StringArray, UInt16Array,
 };
+use arrow_schema::DataType;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use std::collections::HashMap;
@@ -19,21 +20,27 @@ use crate::types::{
 
 fn col_str(batch: &RecordBatch, name: &str, row: usize) -> String {
     let col = batch.column_by_name(name).expect("column exists");
-    let arr = col.as_any().downcast_ref::<StringArray>().expect("StringArray");
-    if arr.is_null(row) {
-        String::new()
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+        if arr.is_null(row) { String::new() } else { arr.value(row).to_string() }
+    } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+        if arr.is_null(row) { String::new() } else { arr.value(row).to_string() }
     } else {
-        arr.value(row).to_string()
+        panic!("column '{name}' has unexpected type {:?}", col.data_type());
     }
 }
 
 fn col_str_opt(batch: &RecordBatch, name: &str, row: usize) -> Option<String> {
     let col = batch.column_by_name(name).expect("column exists");
-    let arr = col.as_any().downcast_ref::<StringArray>().expect("StringArray");
-    if arr.is_null(row) {
-        None
+    // Migrated columns with bare NULL default produce Arrow Null type
+    if *col.data_type() == DataType::Null {
+        return None;
+    }
+    if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+        if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) }
+    } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
+        if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) }
     } else {
-        Some(arr.value(row).to_string())
+        panic!("column '{name}' has unexpected type {:?}", col.data_type());
     }
 }
 
