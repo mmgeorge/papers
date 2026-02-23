@@ -1,3 +1,16 @@
+## [0.3.1] - 2026-02-23
+
+### Other
+
+- Add protoc installation to github workflow
+
+### Documentation
+
+- Update ci badge to release badge in readme
+
+### Miscellaneous Tasks
+
+- Update chocolatey dependency name from protobuf to protoc
 ## [0.3.0] - 2026-02-23
 
 ### Features
@@ -60,6 +73,7 @@
 - Specify protoc version in ci workflow
 - Verify protoc installation and set environment variable
 - Release v0.2.1
+- Release v0.3.0
 ## [0.2.0] - 2026-02-20
 
 ### Features
