@@ -13,14 +13,15 @@ use cli::{
     ZoteroGroupCommand, ZoteroNoteCommand, ZoteroPermissionCommand, ZoteroSearchCommand,
     ZoteroSettingCommand, ZoteroTagCommand, ZoteroWorkCommand,
 };
+use papers_core::zotero::{resolve_collection_key, resolve_item_key, resolve_search_key};
 use papers_core::{
-    filter::FilterError,
     AuthorListParams, DiskCache, DomainListParams, FieldListParams, FindWorksParams,
     FunderListParams, GetParams, InstitutionListParams, OpenAlexClient, PublisherListParams,
-    SourceListParams, SubfieldListParams, TopicListParams, WorkListParams,
+    SourceListParams, SubfieldListParams, TopicListParams, WorkListParams, filter::FilterError,
 };
-use papers_core::zotero::{resolve_collection_key, resolve_item_key, resolve_search_key};
-use papers_zotero::{CollectionListParams, DeletedParams, Item, ItemListParams, TagListParams, ZoteroClient};
+use papers_zotero::{
+    CollectionListParams, DeletedParams, Item, ItemListParams, TagListParams, ZoteroClient,
+};
 use std::time::Duration;
 
 async fn zotero_client() -> Result<ZoteroClient, papers_zotero::ZoteroError> {
@@ -110,7 +111,10 @@ fn source_list_params(args: &cli::ListArgs, sf: &SourceFilterArgs) -> SourceList
     }
 }
 
-fn institution_list_params(args: &cli::ListArgs, inf: &InstitutionFilterArgs) -> InstitutionListParams {
+fn institution_list_params(
+    args: &cli::ListArgs,
+    inf: &InstitutionFilterArgs,
+) -> InstitutionListParams {
     InstitutionListParams {
         search: args.search.clone(),
         filter: args.filter.clone(),
@@ -240,7 +244,10 @@ fn subfield_list_params(args: &cli::ListArgs, sf: &SubfieldFilterArgs) -> Subfie
 }
 
 fn print_json<T: serde::Serialize>(val: &T) {
-    println!("{}", serde_json::to_string_pretty(val).expect("JSON serialization failed"));
+    println!(
+        "{}",
+        serde_json::to_string_pretty(val).expect("JSON serialization failed")
+    );
 }
 
 /// Returns true if this attachment can have annotation children (PDF, EPUB, or HTML snapshot).
@@ -262,10 +269,17 @@ async fn find_pdf_attachment_key(zotero: &ZoteroClient, item_key: &str) -> Resul
 }
 
 async fn find_pdf_attachment(zotero: &ZoteroClient, item_key: &str) -> Result<Item, String> {
-    let att_params = ItemListParams { item_type: Some("attachment".into()), ..Default::default() };
-    let children = zotero.list_item_children(item_key, &att_params).await
+    let att_params = ItemListParams {
+        item_type: Some("attachment".into()),
+        ..Default::default()
+    };
+    let children = zotero
+        .list_item_children(item_key, &att_params)
+        .await
         .map_err(|e| e.to_string())?;
-    children.items.into_iter()
+    children
+        .items
+        .into_iter()
         .find(|a| a.data.content_type.as_deref() == Some("application/pdf"))
         .ok_or_else(|| format!("No PDF attachment found for item {item_key}"))
 }
@@ -296,14 +310,16 @@ async fn smart_resolve_item_key(zotero: &ZoteroClient, input: &str) -> Result<St
     } else {
         ItemListParams::builder().q(input).limit(1).build()
     };
-    let resp = zotero.list_top_items(&params).await.map_err(|e| e.to_string())?;
+    let resp = zotero
+        .list_top_items(&params)
+        .await
+        .map_err(|e| e.to_string())?;
     resp.items
         .into_iter()
         .next()
         .map(|i| i.key)
         .ok_or_else(|| format!("No item found matching {:?}", input))
 }
-
 
 /// The entry point spawns the Tokio runtime on a thread with an explicit
 /// 8 MB stack.  Windows' default main-thread stack is only 1 MB, which is
@@ -349,14 +365,26 @@ async fn papers_main() {
                 }
             }
             WorkCommand::Get { id, json } => {
-                let zotero = optional_zotero().await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                let zotero = optional_zotero()
+                    .await
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
                 let zotero_configured = zotero.is_some();
-                match papers_core::api::work_get_response(&client, zotero.as_ref(), &id, &GetParams::default()).await {
+                match papers_core::api::work_get_response(
+                    &client,
+                    zotero.as_ref(),
+                    &id,
+                    &GetParams::default(),
+                )
+                .await
+                {
                     Ok(response) => {
                         if json {
                             print_json(&response);
                         } else {
-                            print!("{}", format::format_work_get_response(&response, zotero_configured));
+                            print!(
+                                "{}",
+                                format::format_work_get_response(&response, zotero_configured)
+                            );
                         }
                     }
                     Err(FilterError::Suggestions { query, suggestions }) if json => {
@@ -406,78 +434,6 @@ async fn papers_main() {
                             print_json(&resp);
                         } else {
                             print!("{}", format::format_find_works(&resp));
-                        }
-                    }
-                    Err(e) => exit_err(&e.to_string()),
-                }
-            }
-            WorkCommand::Text { id, json, no_prompt, advanced } => {
-                let zotero = optional_zotero().await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                let dl_client = if advanced.is_some() {
-                    papers_datalab::DatalabClient::from_env().ok()
-                } else {
-                    None
-                };
-                let datalab = dl_client.as_ref().map(|dl| {
-                    let mode = match advanced.as_ref().unwrap() {
-                        AdvancedMode::Fast     => papers_core::text::ProcessingMode::Fast,
-                        AdvancedMode::Balanced => papers_core::text::ProcessingMode::Balanced,
-                        AdvancedMode::Accurate => papers_core::text::ProcessingMode::Accurate,
-                    };
-                    (dl, mode)
-                });
-                match papers_core::text::work_text(&client, zotero.as_ref(), datalab, &id).await {
-                    Ok(result) => {
-                        if json {
-                            print_json(&result);
-                        } else {
-                            print!("{}", format::format_work_text(&result));
-                        }
-                    }
-                    Err(papers_core::text::WorkTextError::NoPdfFound { ref work_id, ref title, ref doi }) => {
-                        let display_title = title.as_deref().unwrap_or(work_id);
-
-                        if no_prompt || doi.is_none() || zotero.is_none() {
-                            exit_err(&format!("No PDF found for {display_title}"));
-                        }
-
-                        let doi = doi.as_ref().unwrap();
-                        let bare = doi.strip_prefix("https://doi.org/").unwrap_or(doi);
-                        eprintln!("No PDF found for \"{display_title}\".");
-                        eprintln!("Open https://doi.org/{bare} to save this paper to Zotero? [Y/n] ");
-
-                        let mut input = String::new();
-                        std::io::stdin().read_line(&mut input).unwrap_or(0);
-                        let input = input.trim().to_lowercase();
-
-                        if !input.is_empty() && input != "y" && input != "yes" {
-                            exit_err(&format!("No PDF found for {display_title}"));
-                        }
-
-                        // Open DOI URL in browser
-                        let url = format!("https://doi.org/{bare}");
-                        #[cfg(target_os = "windows")]
-                        let _ = std::process::Command::new("cmd").args(["/c", "start", &url]).spawn();
-                        #[cfg(target_os = "macos")]
-                        let _ = std::process::Command::new("open").arg(&url).spawn();
-                        #[cfg(target_os = "linux")]
-                        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
-
-                        eprintln!("Waiting for paper to appear in Zotero...");
-                        match papers_core::text::poll_zotero_for_work(
-                            zotero.as_ref().unwrap(),
-                            work_id,
-                            title.as_deref(),
-                            bare,
-                        ).await {
-                            Ok(result) => {
-                                if json {
-                                    print_json(&result);
-                                } else {
-                                    print!("{}", format::format_work_text(&result));
-                                }
-                            }
-                            Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     Err(e) => exit_err(&e.to_string()),
@@ -821,7 +777,16 @@ async fn papers_main() {
             match cmd {
                 ZoteroCommand::Work { cmd } => match cmd {
                     ZoteroWorkCommand::List {
-                        search, everything, tag, type_, sort, direction, limit, start, since, json,
+                        search,
+                        everything,
+                        tag,
+                        type_,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        since,
+                        json,
                     } => {
                         let params = ItemListParams {
                             item_type: type_,
@@ -837,23 +802,38 @@ async fn papers_main() {
                         };
                         match zotero.list_top_items(&params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_work_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_work_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroWorkCommand::Get { key, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         match zotero.get_item(&key).await {
                             Ok(item) => {
-                                if json { print_json(&item); } else { print!("{}", format::format_zotero_item_get(&item)); }
+                                if json {
+                                    print_json(&item);
+                                } else {
+                                    print!("{}", format::format_zotero_item_get(&item));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroWorkCommand::Collections { key, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let item = zotero.get_item(&key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let item = zotero
+                            .get_item(&key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         let col_keys = item.data.collections.clone();
                         let mut collections = Vec::new();
                         for ck in &col_keys {
@@ -862,50 +842,126 @@ async fn papers_main() {
                                 Err(e) => exit_err(&e.to_string()),
                             }
                         }
-                        if json { print_json(&collections); } else { print!("{}", format::format_zotero_collection_list_vec(&collections)); }
+                        if json {
+                            print_json(&collections);
+                        } else {
+                            print!(
+                                "{}",
+                                format::format_zotero_collection_list_vec(&collections)
+                            );
+                        }
                     }
-                    ZoteroWorkCommand::Notes { key, limit, start, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = ItemListParams { item_type: Some("note".into()), limit, start, ..Default::default() };
+                    ZoteroWorkCommand::Notes {
+                        key,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let params = ItemListParams {
+                            item_type: Some("note".into()),
+                            limit,
+                            start,
+                            ..Default::default()
+                        };
                         match zotero.list_item_children(&key, &params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_note_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_note_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
-                    ZoteroWorkCommand::Attachments { key, limit, start, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = ItemListParams { item_type: Some("attachment".into()), limit, start, ..Default::default() };
+                    ZoteroWorkCommand::Attachments {
+                        key,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let params = ItemListParams {
+                            item_type: Some("attachment".into()),
+                            limit,
+                            start,
+                            ..Default::default()
+                        };
                         match zotero.list_item_children(&key, &params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_attachment_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_attachment_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroWorkCommand::Annotations { key, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let att_params = ItemListParams { item_type: Some("attachment".into()), ..Default::default() };
-                        let attachments = zotero.list_item_children(&key, &att_params).await
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
                             .unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let ann_params = ItemListParams { item_type: Some("annotation".into()), ..Default::default() };
+                        let att_params = ItemListParams {
+                            item_type: Some("attachment".into()),
+                            ..Default::default()
+                        };
+                        let attachments = zotero
+                            .list_item_children(&key, &att_params)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let ann_params = ItemListParams {
+                            item_type: Some("annotation".into()),
+                            ..Default::default()
+                        };
                         let mut all_annotations = Vec::new();
                         for att in &attachments.items {
-                            if !is_annotatable_attachment(att) { continue; }
+                            if !is_annotatable_attachment(att) {
+                                continue;
+                            }
                             match zotero.list_item_children(&att.key, &ann_params).await {
                                 Ok(r) => all_annotations.extend(r.items),
-                                Err(_) => {},
+                                Err(_) => {}
                             }
                         }
-                        if json { print_json(&all_annotations); } else { print!("{}", format::format_zotero_annotation_list_vec(&all_annotations)); }
+                        if json {
+                            print_json(&all_annotations);
+                        } else {
+                            print!(
+                                "{}",
+                                format::format_zotero_annotation_list_vec(&all_annotations)
+                            );
+                        }
                     }
-                    ZoteroWorkCommand::Tags { key, search, limit, start, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = TagListParams { q: search, qmode: Some("contains".to_string()), limit, start, ..Default::default() };
+                    ZoteroWorkCommand::Tags {
+                        key,
+                        search,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let params = TagListParams {
+                            q: search,
+                            qmode: Some("contains".to_string()),
+                            limit,
+                            start,
+                            ..Default::default()
+                        };
                         match zotero.list_item_tags(&key, &params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_tag_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_tag_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
@@ -914,7 +970,9 @@ async fn papers_main() {
                         let is_exact_key = papers_core::zotero::looks_like_zotero_key(&input);
 
                         // Resolve to a concrete item key.
-                        let key = resolve_item_key(&zotero, &input).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_item_key(&zotero, &input)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
 
                         // Cache hit: return immediately regardless of how the key was specified.
                         if let Some(markdown) = papers_core::text::datalab_cached_markdown(&key) {
@@ -925,7 +983,9 @@ async fn papers_main() {
                             // on the wrong paper.
                             if !is_exact_key {
                                 let matched = zotero
-                                    .list_top_items(&ItemListParams::builder().q(&input).limit(5).build())
+                                    .list_top_items(
+                                        &ItemListParams::builder().q(&input).limit(5).build(),
+                                    )
                                     .await
                                     .unwrap_or_else(|e| exit_err(&e.to_string()));
                                 let mut msg = format!(
@@ -934,59 +994,103 @@ async fn papers_main() {
                                 );
                                 for item in &matched.items {
                                     let title = item.data.title.as_deref().unwrap_or("(no title)");
-                                    msg.push_str(&format!("  papers zotero work extract {}: {}\n", item.key, title));
+                                    msg.push_str(&format!(
+                                        "  papers zotero work extract {}: {}\n",
+                                        item.key, title
+                                    ));
                                 }
                                 exit_err(&msg);
                             }
 
                             // Cache miss: read the PDF from local Zotero storage (no HTTP download).
-                            let att = find_pdf_attachment(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e));
-                            let filename = att.data.filename.unwrap_or_else(|| exit_err("attachment has no filename"));
+                            let att = find_pdf_attachment(&zotero, &key)
+                                .await
+                                .unwrap_or_else(|e| exit_err(&e));
+                            let filename = att
+                                .data
+                                .filename
+                                .unwrap_or_else(|| exit_err("attachment has no filename"));
                             let local_path = dirs::home_dir()
                                 .unwrap_or_else(|| exit_err("cannot determine home dir"))
-                                .join("Zotero").join("storage").join(&att.key).join(&filename);
-                            let pdf_bytes = std::fs::read(&local_path)
-                                .unwrap_or_else(|e| exit_err(&format!("failed to read {}: {e}", local_path.display())));
+                                .join("Zotero")
+                                .join("storage")
+                                .join(&att.key)
+                                .join(&filename);
+                            let pdf_bytes = std::fs::read(&local_path).unwrap_or_else(|e| {
+                                exit_err(&format!("failed to read {}: {e}", local_path.display()))
+                            });
 
-                            let dl = papers_datalab::DatalabClient::from_env().unwrap_or_else(|e| exit_err(&e.to_string()));
+                            let dl = papers_datalab::DatalabClient::from_env()
+                                .unwrap_or_else(|e| exit_err(&e.to_string()));
                             let processing_mode = match mode {
-                                AdvancedMode::Fast     => papers_core::text::ProcessingMode::Fast,
-                                AdvancedMode::Balanced => papers_core::text::ProcessingMode::Balanced,
-                                AdvancedMode::Accurate => papers_core::text::ProcessingMode::Accurate,
+                                AdvancedMode::Fast => papers_core::text::ProcessingMode::Fast,
+                                AdvancedMode::Balanced => {
+                                    papers_core::text::ProcessingMode::Balanced
+                                }
+                                AdvancedMode::Accurate => {
+                                    papers_core::text::ProcessingMode::Accurate
+                                }
                             };
-                            let mut source = papers_core::text::PdfSource::ZoteroLocal { path: local_path.to_string_lossy().into_owned() };
-                            match papers_core::text::do_extract(pdf_bytes, &key, Some(&zotero), Some((&dl, processing_mode)), &mut source).await {
+                            let mut source = papers_core::text::PdfSource::ZoteroLocal {
+                                path: local_path.to_string_lossy().into_owned(),
+                            };
+                            match papers_core::text::do_extract(
+                                pdf_bytes,
+                                &key,
+                                Some(&zotero),
+                                Some((&dl, processing_mode)),
+                                &mut source,
+                            )
+                            .await
+                            {
                                 Ok(markdown) => print!("{markdown}"),
                                 Err(e) => exit_err(&e.to_string()),
                             }
                         }
                     }
                     ZoteroWorkCommand::Text { key, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let att_key = find_pdf_attachment_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let att_key = find_pdf_attachment_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e));
                         match zotero.get_item_fulltext(&att_key).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_work_fulltext(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_work_fulltext(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroWorkCommand::ViewUrl { key } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let att_key = find_pdf_attachment_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let att_key = find_pdf_attachment_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e));
                         match zotero.get_item_file_view_url(&att_key).await {
                             Ok(url) => println!("{url}"),
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroWorkCommand::View { key, output } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let att_key = find_pdf_attachment_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let att_key = find_pdf_attachment_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e));
                         match zotero.get_item_file_view(&att_key).await {
                             Ok(bytes) => {
                                 if output == "-" {
                                     use std::io::Write;
-                                    std::io::stdout().write_all(&bytes)
+                                    std::io::stdout()
+                                        .write_all(&bytes)
                                         .unwrap_or_else(|e| exit_err(&e.to_string()));
                                 } else {
                                     std::fs::write(&output, &bytes)
@@ -1000,12 +1104,18 @@ async fn papers_main() {
                 },
 
                 ZoteroCommand::Extract { cmd } => match cmd {
-                    ZoteroExtractCommand::List { search, limit, json } => {
+                    ZoteroExtractCommand::List {
+                        search,
+                        limit,
+                        json,
+                    } => {
                         use std::collections::{HashMap, HashSet};
 
                         // 1. Local cache keys (filesystem scan)
                         let local_keys: HashSet<String> =
-                            papers_core::text::datalab_cached_item_keys().into_iter().collect();
+                            papers_core::text::datalab_cached_item_keys()
+                                .into_iter()
+                                .collect();
 
                         // 2. Zotero-backed keys: find all `papers_extract_*.zip` attachments
                         //    with a single targeted query — the embedded key in the filename
@@ -1042,11 +1152,16 @@ async fn papers_main() {
                                 limit: Some(limit),
                                 ..Default::default()
                             };
-                            let search_resp = zotero.list_top_items(&search_params).await
+                            let search_resp = zotero
+                                .list_top_items(&search_params)
+                                .await
                                 .unwrap_or_else(|e| exit_err(&e.to_string()));
                             let search_set: HashSet<String> =
                                 search_resp.items.into_iter().map(|i| i.key).collect();
-                            all_keys.into_iter().filter(|k| search_set.contains(k)).collect()
+                            all_keys
+                                .into_iter()
+                                .filter(|k| search_set.contains(k))
+                                .collect()
                         } else {
                             all_keys.into_iter().take(limit as usize).collect()
                         };
@@ -1105,26 +1220,33 @@ async fn papers_main() {
                         };
 
                         if json {
-                            let items: Vec<_> = filtered_keys.iter().map(|k| {
-                                let remote_status = if backed_up_keys.contains(k) {
-                                    "ok"
-                                } else if title_map.contains_key(k) {
-                                    "no_backup"
-                                } else {
-                                    "no_item"
-                                };
-                                serde_json::json!({
-                                    "key": k,
-                                    "title": resolve_title(k),
-                                    "local":  local_keys.contains(k),
-                                    "remote": backed_up_keys.contains(k),
-                                    "remote_status": remote_status,
+                            let items: Vec<_> = filtered_keys
+                                .iter()
+                                .map(|k| {
+                                    let remote_status = if backed_up_keys.contains(k) {
+                                        "ok"
+                                    } else if title_map.contains_key(k) {
+                                        "no_backup"
+                                    } else {
+                                        "no_item"
+                                    };
+                                    serde_json::json!({
+                                        "key": k,
+                                        "title": resolve_title(k),
+                                        "local":  local_keys.contains(k),
+                                        "remote": backed_up_keys.contains(k),
+                                        "remote_status": remote_status,
+                                    })
                                 })
-                            }).collect();
+                                .collect();
                             print_json(&items);
                         } else {
                             for key in &filtered_keys {
-                                let lmark = if local_keys.contains(key) { "✓" } else { "✗" };
+                                let lmark = if local_keys.contains(key) {
+                                    "✓"
+                                } else {
+                                    "✗"
+                                };
                                 let remote_col = if backed_up_keys.contains(key) {
                                     "[✓ remote]"
                                 } else if title_map.contains_key(key) {
@@ -1132,14 +1254,19 @@ async fn papers_main() {
                                 } else {
                                     "[✗ remote *no item*]"
                                 };
-                                println!("{key}  [{lmark} local]  {remote_col}  {}", resolve_title(key));
+                                println!(
+                                    "{key}  [{lmark} local]  {remote_col}  {}",
+                                    resolve_title(key)
+                                );
                             }
                         }
                     }
                     ZoteroExtractCommand::Upload { dry_run } => {
                         use std::collections::HashSet;
                         let local_keys: HashSet<String> =
-                            papers_core::text::datalab_cached_item_keys().into_iter().collect();
+                            papers_core::text::datalab_cached_item_keys()
+                                .into_iter()
+                                .collect();
 
                         // Keys already backed up in Zotero
                         let backed_up_keys: HashSet<String> = {
@@ -1150,19 +1277,23 @@ async fn papers_main() {
                                 ..Default::default()
                             };
                             match zotero.list_items(&p).await {
-                                Ok(r) => r.items.iter().filter_map(|i| {
-                                    let f = i.data.filename.as_deref()?;
-                                    let k = f.strip_prefix("papers_extract_")?.strip_suffix(".zip")?;
-                                    Some(k.to_string())
-                                }).collect(),
+                                Ok(r) => r
+                                    .items
+                                    .iter()
+                                    .filter_map(|i| {
+                                        let f = i.data.filename.as_deref()?;
+                                        let k = f
+                                            .strip_prefix("papers_extract_")?
+                                            .strip_suffix(".zip")?;
+                                        Some(k.to_string())
+                                    })
+                                    .collect(),
                                 Err(e) => exit_err(&e.to_string()),
                             }
                         };
 
-                        let mut to_upload: Vec<String> = local_keys
-                            .difference(&backed_up_keys)
-                            .cloned()
-                            .collect();
+                        let mut to_upload: Vec<String> =
+                            local_keys.difference(&backed_up_keys).cloned().collect();
                         to_upload.sort();
 
                         if to_upload.is_empty() {
@@ -1174,9 +1305,14 @@ async fn papers_main() {
                             let mut item_exists: HashSet<String> = HashSet::new();
                             for chunk in to_upload.chunks(50) {
                                 let keys_str = chunk.join(",");
-                                let p = ItemListParams { item_key: Some(keys_str), ..Default::default() };
+                                let p = ItemListParams {
+                                    item_key: Some(keys_str),
+                                    ..Default::default()
+                                };
                                 if let Ok(resp) = zotero.list_top_items(&p).await {
-                                    for item in resp.items { item_exists.insert(item.key); }
+                                    for item in resp.items {
+                                        item_exists.insert(item.key);
+                                    }
                                 }
                             }
 
@@ -1194,8 +1330,15 @@ async fn papers_main() {
                                     println!("would upload: {key}");
                                 } else {
                                     eprint!("Uploading backup {key}... ");
-                                    match papers_core::text::upload_extraction_to_zotero(&zotero, key).await {
-                                        Ok(()) => { eprintln!("ok"); uploaded += 1; }
+                                    match papers_core::text::upload_extraction_to_zotero(
+                                        &zotero, key,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            eprintln!("ok");
+                                            uploaded += 1;
+                                        }
                                         Err(e) => eprintln!("error: {e}"),
                                     }
                                 }
@@ -1209,7 +1352,9 @@ async fn papers_main() {
                     ZoteroExtractCommand::Download { dry_run } => {
                         use std::collections::HashSet;
                         let local_keys: HashSet<String> =
-                            papers_core::text::datalab_cached_item_keys().into_iter().collect();
+                            papers_core::text::datalab_cached_item_keys()
+                                .into_iter()
+                                .collect();
 
                         // Collect (att_key, item_key) for all Zotero-backed extractions
                         let p = ItemListParams {
@@ -1218,14 +1363,21 @@ async fn papers_main() {
                             limit: Some(100),
                             ..Default::default()
                         };
-                        let att_resp = zotero.list_items(&p).await
+                        let att_resp = zotero
+                            .list_items(&p)
+                            .await
                             .unwrap_or_else(|e| exit_err(&e.to_string()));
 
-                        let mut to_download: Vec<(String, String)> = att_resp.items.iter()
+                        let mut to_download: Vec<(String, String)> = att_resp
+                            .items
+                            .iter()
                             .filter_map(|i| {
                                 let f = i.data.filename.as_deref()?;
-                                let item_key = f.strip_prefix("papers_extract_")?.strip_suffix(".zip")?;
-                                if local_keys.contains(item_key) { return None; }
+                                let item_key =
+                                    f.strip_prefix("papers_extract_")?.strip_suffix(".zip")?;
+                                if local_keys.contains(item_key) {
+                                    return None;
+                                }
                                 Some((i.key.clone(), item_key.to_string()))
                             })
                             .collect();
@@ -1239,7 +1391,11 @@ async fn papers_main() {
                                     println!("would download: {item_key}");
                                 } else {
                                     eprint!("Downloading {item_key}... ");
-                                    match papers_core::text::download_extraction_from_zotero(&zotero, att_key, item_key).await {
+                                    match papers_core::text::download_extraction_from_zotero(
+                                        &zotero, att_key, item_key,
+                                    )
+                                    .await
+                                    {
                                         Ok(()) => eprintln!("ok"),
                                         Err(e) => eprintln!("error: {e}"),
                                     }
@@ -1253,11 +1409,15 @@ async fn papers_main() {
 
                     other => {
                         #[derive(PartialEq)]
-                        enum OutputKind { Text, Json, Get }
+                        enum OutputKind {
+                            Text,
+                            Json,
+                            Get,
+                        }
                         let (query, output_kind) = match other {
                             ZoteroExtractCommand::Text { query } => (query, OutputKind::Text),
                             ZoteroExtractCommand::Json { query } => (query, OutputKind::Json),
-                            ZoteroExtractCommand::Get  { query } => (query, OutputKind::Get),
+                            ZoteroExtractCommand::Get { query } => (query, OutputKind::Get),
                             ZoteroExtractCommand::List { .. } => unreachable!(),
                             ZoteroExtractCommand::Upload { .. } => unreachable!(),
                             ZoteroExtractCommand::Download { .. } => unreachable!(),
@@ -1268,30 +1428,46 @@ async fn papers_main() {
                             .unwrap_or_else(|e| exit_err(&e));
 
                         match output_kind {
-                            OutputKind::Text => match papers_core::text::datalab_cached_markdown(&key) {
-                                Some(md) => print!("{md}"),
-                                None => exit_err(&format!("No cached extraction for {key}. Run: papers zotero work extract {key}")),
-                            },
-                            OutputKind::Json => match papers_core::text::datalab_cached_json(&key) {
-                                Some(json_str) => print!("{json_str}"),
-                                None => exit_err(&format!("No cached extraction for {key}. Run: papers zotero work extract {key}")),
-                            },
+                            OutputKind::Text => {
+                                match papers_core::text::datalab_cached_markdown(&key) {
+                                    Some(md) => print!("{md}"),
+                                    None => exit_err(&format!(
+                                        "No cached extraction for {key}. Run: papers zotero work extract {key}"
+                                    )),
+                                }
+                            }
+                            OutputKind::Json => {
+                                match papers_core::text::datalab_cached_json(&key) {
+                                    Some(json_str) => print!("{json_str}"),
+                                    None => exit_err(&format!(
+                                        "No cached extraction for {key}. Run: papers zotero work extract {key}"
+                                    )),
+                                }
+                            }
                             OutputKind::Get => {
                                 let local_dir = papers_core::text::datalab_cache_dir_path(&key);
-                                let local_ok = local_dir.as_ref()
+                                let local_ok = local_dir
+                                    .as_ref()
                                     .map(|d| d.join(format!("{key}.md")).exists())
                                     .unwrap_or(false);
                                 let item_exists = zotero.get_item(&key).await.is_ok();
                                 // Only check for backup ZIP when the item exists
                                 let remote_col = if item_exists {
                                     let expected_zip = format!("papers_extract_{key}.zip");
-                                    let backup_ok = match zotero.list_item_children(
-                                        &key,
-                                        &ItemListParams { item_type: Some("attachment".into()), ..Default::default() },
-                                    ).await {
+                                    let backup_ok = match zotero
+                                        .list_item_children(
+                                            &key,
+                                            &ItemListParams {
+                                                item_type: Some("attachment".into()),
+                                                ..Default::default()
+                                            },
+                                        )
+                                        .await
+                                    {
                                         Ok(children) => children.items.iter().any(|c| {
                                             c.data.filename.as_deref() == Some(&expected_zip)
-                                                && c.data.link_mode.as_deref() == Some("imported_file")
+                                                && c.data.link_mode.as_deref()
+                                                    == Some("imported_file")
                                         }),
                                         Err(_) => false,
                                     };
@@ -1301,18 +1477,30 @@ async fn papers_main() {
                                 };
                                 println!("{key}");
                                 match &local_dir {
-                                    Some(dir) if local_ok => println!("  local:✓  {}", dir.display()),
+                                    Some(dir) if local_ok => {
+                                        println!("  local:✓  {}", dir.display())
+                                    }
                                     _ => println!("  local:✗"),
                                 }
                                 println!("  remote:{remote_col}");
                                 if let Some(meta) = papers_core::text::read_extraction_meta(&key) {
-                                    if let Some(t) = meta.title { println!("  title: {t}"); }
-                                    if let Some(authors) = meta.authors { println!("  authors: {}", authors.join(", ")); }
-                                    if let Some(et) = meta.extracted_at { println!("  extracted: {et}"); }
-                                    if let Some(mode) = meta.processing_mode { println!("  mode: {mode}"); }
+                                    if let Some(t) = meta.title {
+                                        println!("  title: {t}");
+                                    }
+                                    if let Some(authors) = meta.authors {
+                                        println!("  authors: {}", authors.join(", "));
+                                    }
+                                    if let Some(et) = meta.extracted_at {
+                                        println!("  extracted: {et}");
+                                    }
+                                    if let Some(mode) = meta.processing_mode {
+                                        println!("  mode: {mode}");
+                                    }
                                 }
                                 if !local_ok && remote_col == "✗" {
-                                    eprintln!("No extraction found. Run: papers zotero work extract {key}");
+                                    eprintln!(
+                                        "No extraction found. Run: papers zotero work extract {key}"
+                                    );
                                 }
                             }
                         }
@@ -1320,31 +1508,59 @@ async fn papers_main() {
                 },
 
                 ZoteroCommand::Attachment { cmd } => match cmd {
-                    ZoteroAttachmentCommand::List { search, sort, direction, limit, start, json } => {
-                        let params = ItemListParams { item_type: Some("attachment".into()), q: search, sort, direction, limit: Some(limit), start, ..Default::default() };
+                    ZoteroAttachmentCommand::List {
+                        search,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let params = ItemListParams {
+                            item_type: Some("attachment".into()),
+                            q: search,
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
+                            ..Default::default()
+                        };
                         match zotero.list_items(&params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_attachment_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_attachment_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroAttachmentCommand::Get { key, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         match zotero.get_item(&key).await {
                             Ok(item) => {
-                                if json { print_json(&item); } else { print!("{}", format::format_zotero_item_get(&item)); }
+                                if json {
+                                    print_json(&item);
+                                } else {
+                                    print!("{}", format::format_zotero_item_get(&item));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroAttachmentCommand::File { key, output } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         match zotero.download_item_file(&key).await {
                             Ok(bytes) => {
                                 if output == "-" {
                                     use std::io::Write;
-                                    std::io::stdout().write_all(&bytes)
+                                    std::io::stdout()
+                                        .write_all(&bytes)
                                         .unwrap_or_else(|e| exit_err(&e.to_string()));
                                 } else {
                                     std::fs::write(&output, &bytes)
@@ -1356,7 +1572,9 @@ async fn papers_main() {
                         }
                     }
                     ZoteroAttachmentCommand::Url { key } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         match zotero.get_item_file_view_url(&key).await {
                             Ok(url) => println!("{url}"),
                             Err(e) => exit_err(&e.to_string()),
@@ -1366,19 +1584,34 @@ async fn papers_main() {
 
                 ZoteroCommand::Annotation { cmd } => match cmd {
                     ZoteroAnnotationCommand::List { limit, start, json } => {
-                        let params = ItemListParams { item_type: Some("annotation".into()), limit: Some(limit), start, ..Default::default() };
+                        let params = ItemListParams {
+                            item_type: Some("annotation".into()),
+                            limit: Some(limit),
+                            start,
+                            ..Default::default()
+                        };
                         match zotero.list_items(&params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_annotation_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_annotation_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroAnnotationCommand::Get { key, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         match zotero.get_item(&key).await {
                             Ok(item) => {
-                                if json { print_json(&item); } else { print!("{}", format::format_zotero_item_get(&item)); }
+                                if json {
+                                    print_json(&item);
+                                } else {
+                                    print!("{}", format::format_zotero_item_get(&item));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
@@ -1386,20 +1619,41 @@ async fn papers_main() {
                 },
 
                 ZoteroCommand::Note { cmd } => match cmd {
-                    ZoteroNoteCommand::List { search, limit, start, json } => {
-                        let params = ItemListParams { item_type: Some("note".into()), q: search, limit: Some(limit), start, ..Default::default() };
+                    ZoteroNoteCommand::List {
+                        search,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let params = ItemListParams {
+                            item_type: Some("note".into()),
+                            q: search,
+                            limit: Some(limit),
+                            start,
+                            ..Default::default()
+                        };
                         match zotero.list_items(&params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_note_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_note_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroNoteCommand::Get { key, json } => {
-                        let key = resolve_item_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_item_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         match zotero.get_item(&key).await {
                             Ok(item) => {
-                                if json { print_json(&item); } else { print!("{}", format::format_zotero_item_get(&item)); }
+                                if json {
+                                    print_json(&item);
+                                } else {
+                                    print!("{}", format::format_zotero_item_get(&item));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
@@ -1407,8 +1661,20 @@ async fn papers_main() {
                 },
 
                 ZoteroCommand::Collection { cmd } => match cmd {
-                    ZoteroCollectionCommand::List { sort, direction, limit, start, top, json } => {
-                        let params = CollectionListParams { sort, direction, limit: Some(limit), start };
+                    ZoteroCollectionCommand::List {
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        top,
+                        json,
+                    } => {
+                        let params = CollectionListParams {
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
+                        };
                         let result = if top {
                             zotero.list_top_collections(&params).await
                         } else {
@@ -1416,22 +1682,45 @@ async fn papers_main() {
                         };
                         match result {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_collection_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_collection_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroCollectionCommand::Get { key, json } => {
-                        let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_collection_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         match zotero.get_collection(&key).await {
                             Ok(coll) => {
-                                if json { print_json(&coll); } else { print!("{}", format::format_zotero_collection_get(&coll)); }
+                                if json {
+                                    print_json(&coll);
+                                } else {
+                                    print!("{}", format::format_zotero_collection_get(&coll));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
-                    ZoteroCollectionCommand::Works { key, search, everything, tag, type_, sort, direction, limit, start, json } => {
-                        let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                    ZoteroCollectionCommand::Works {
+                        key,
+                        search,
+                        everything,
+                        tag,
+                        type_,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let key = resolve_collection_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         let params = ItemListParams {
                             item_type: type_,
                             q: search,
@@ -1445,60 +1734,158 @@ async fn papers_main() {
                         };
                         match zotero.list_collection_top_items(&key, &params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_work_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_work_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
-                    ZoteroCollectionCommand::Attachments { key, sort, direction, limit, start, json } => {
-                        let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = ItemListParams { item_type: Some("attachment".into()), sort, direction, limit: Some(limit), start, ..Default::default() };
+                    ZoteroCollectionCommand::Attachments {
+                        key,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let key = resolve_collection_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let params = ItemListParams {
+                            item_type: Some("attachment".into()),
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
+                            ..Default::default()
+                        };
                         match zotero.list_collection_items(&key, &params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_attachment_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_attachment_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
-                    ZoteroCollectionCommand::Notes { key, search, sort, direction, limit, start, json } => {
-                        let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = ItemListParams { item_type: Some("note".into()), q: search, sort, direction, limit: Some(limit), start, ..Default::default() };
+                    ZoteroCollectionCommand::Notes {
+                        key,
+                        search,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let key = resolve_collection_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let params = ItemListParams {
+                            item_type: Some("note".into()),
+                            q: search,
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
+                            ..Default::default()
+                        };
                         match zotero.list_collection_items(&key, &params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_note_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_note_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                     ZoteroCollectionCommand::Annotations { key, json } => {
-                        let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let att_params = ItemListParams { item_type: Some("attachment".into()), ..Default::default() };
-                        let attachments = zotero.list_collection_items(&key, &att_params).await
+                        let key = resolve_collection_key(&zotero, &key)
+                            .await
                             .unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let ann_params = ItemListParams { item_type: Some("annotation".into()), ..Default::default() };
+                        let att_params = ItemListParams {
+                            item_type: Some("attachment".into()),
+                            ..Default::default()
+                        };
+                        let attachments = zotero
+                            .list_collection_items(&key, &att_params)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let ann_params = ItemListParams {
+                            item_type: Some("annotation".into()),
+                            ..Default::default()
+                        };
                         let mut all_annotations = Vec::new();
                         for att in &attachments.items {
-                            if !is_annotatable_attachment(att) { continue; }
+                            if !is_annotatable_attachment(att) {
+                                continue;
+                            }
                             match zotero.list_item_children(&att.key, &ann_params).await {
                                 Ok(r) => all_annotations.extend(r.items),
-                                Err(_) => {},
+                                Err(_) => {}
                             }
                         }
-                        if json { print_json(&all_annotations); } else { print!("{}", format::format_zotero_annotation_list_vec(&all_annotations)); }
+                        if json {
+                            print_json(&all_annotations);
+                        } else {
+                            print!(
+                                "{}",
+                                format::format_zotero_annotation_list_vec(&all_annotations)
+                            );
+                        }
                     }
-                    ZoteroCollectionCommand::Subcollections { key, sort, direction, limit, start, json } => {
-                        let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = CollectionListParams { sort, direction, limit: Some(limit), start };
+                    ZoteroCollectionCommand::Subcollections {
+                        key,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let key = resolve_collection_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let params = CollectionListParams {
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
+                        };
                         match zotero.list_subcollections(&key, &params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_collection_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_collection_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
-                    ZoteroCollectionCommand::Tags { key, search, limit, start, top, json } => {
-                        let key = resolve_collection_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
-                        let params = TagListParams { q: search, qmode: Some("contains".to_string()), limit, start, ..Default::default() };
+                    ZoteroCollectionCommand::Tags {
+                        key,
+                        search,
+                        limit,
+                        start,
+                        top,
+                        json,
+                    } => {
+                        let key = resolve_collection_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let params = TagListParams {
+                            q: search,
+                            qmode: Some("contains".to_string()),
+                            limit,
+                            start,
+                            ..Default::default()
+                        };
                         let result = if top {
                             zotero.list_collection_top_items_tags(&key, &params).await
                         } else {
@@ -1506,7 +1893,11 @@ async fn papers_main() {
                         };
                         match result {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_tag_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_tag_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
@@ -1514,8 +1905,24 @@ async fn papers_main() {
                 },
 
                 ZoteroCommand::Tag { cmd } => match cmd {
-                    ZoteroTagCommand::List { search, sort, direction, limit, start, top, trash, json } => {
-                        let params = TagListParams { q: search, qmode: Some("contains".to_string()), sort, direction, limit: Some(limit), start };
+                    ZoteroTagCommand::List {
+                        search,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        top,
+                        trash,
+                        json,
+                    } => {
+                        let params = TagListParams {
+                            q: search,
+                            qmode: Some("contains".to_string()),
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
+                        };
                         let result = if trash {
                             zotero.list_trash_tags(&params).await
                         } else if top {
@@ -1525,35 +1932,49 @@ async fn papers_main() {
                         };
                         match result {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_tag_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_tag_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
-                    ZoteroTagCommand::Get { name, json } => {
-                        match zotero.get_tag(&name).await {
-                            Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_tag_list(&resp)); }
+                    ZoteroTagCommand::Get { name, json } => match zotero.get_tag(&name).await {
+                        Ok(resp) => {
+                            if json {
+                                print_json(&resp);
+                            } else {
+                                print!("{}", format::format_zotero_tag_list(&resp));
                             }
-                            Err(e) => exit_err(&e.to_string()),
                         }
-                    }
+                        Err(e) => exit_err(&e.to_string()),
+                    },
                 },
 
                 ZoteroCommand::Search { cmd } => match cmd {
-                    ZoteroSearchCommand::List { json } => {
-                        match zotero.list_searches().await {
-                            Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_search_list(&resp)); }
+                    ZoteroSearchCommand::List { json } => match zotero.list_searches().await {
+                        Ok(resp) => {
+                            if json {
+                                print_json(&resp);
+                            } else {
+                                print!("{}", format::format_zotero_search_list(&resp));
                             }
-                            Err(e) => exit_err(&e.to_string()),
                         }
-                    }
+                        Err(e) => exit_err(&e.to_string()),
+                    },
                     ZoteroSearchCommand::Get { key, json } => {
-                        let key = resolve_search_key(&zotero, &key).await.unwrap_or_else(|e| exit_err(&e.to_string()));
+                        let key = resolve_search_key(&zotero, &key)
+                            .await
+                            .unwrap_or_else(|e| exit_err(&e.to_string()));
                         match zotero.get_search(&key).await {
                             Ok(search) => {
-                                if json { print_json(&search); } else { print!("{}", format::format_zotero_search_get(&search)); }
+                                if json {
+                                    print_json(&search);
+                                } else {
+                                    print!("{}", format::format_zotero_search_get(&search));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
@@ -1561,29 +1982,37 @@ async fn papers_main() {
                 },
 
                 ZoteroCommand::Group { cmd } => match cmd {
-                    ZoteroGroupCommand::List { json } => {
-                        match zotero.list_groups().await {
-                            Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_group_list(&resp)); }
+                    ZoteroGroupCommand::List { json } => match zotero.list_groups().await {
+                        Ok(resp) => {
+                            if json {
+                                print_json(&resp);
+                            } else {
+                                print!("{}", format::format_zotero_group_list(&resp));
                             }
-                            Err(e) => exit_err(&e.to_string()),
                         }
-                    }
+                        Err(e) => exit_err(&e.to_string()),
+                    },
                 },
 
                 ZoteroCommand::Setting { cmd } => match cmd {
-                    ZoteroSettingCommand::List { json } => {
-                        match zotero.get_settings().await {
-                            Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_setting_list(&resp)); }
+                    ZoteroSettingCommand::List { json } => match zotero.get_settings().await {
+                        Ok(resp) => {
+                            if json {
+                                print_json(&resp);
+                            } else {
+                                print!("{}", format::format_zotero_setting_list(&resp));
                             }
-                            Err(e) => exit_err(&e.to_string()),
                         }
-                    }
+                        Err(e) => exit_err(&e.to_string()),
+                    },
                     ZoteroSettingCommand::Get { key, json } => {
                         match zotero.get_setting(&key).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_setting_get(&key, &resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_setting_get(&key, &resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
@@ -1595,7 +2024,11 @@ async fn papers_main() {
                         let params = DeletedParams { since };
                         match zotero.get_deleted(&params).await {
                             Ok(resp) => {
-                                if json { print_json(&resp); } else { print!("{}", format::format_zotero_deleted_list(&resp)); }
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_deleted_list(&resp));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
@@ -1606,14 +2039,18 @@ async fn papers_main() {
                     ZoteroPermissionCommand::List { json } => {
                         match zotero.get_current_key_info().await {
                             Ok(info) => {
-                                if json { print_json(&info); } else { print!("{}", format::format_zotero_permission_list(&info)); }
+                                if json {
+                                    print_json(&info);
+                                } else {
+                                    print!("{}", format::format_zotero_permission_list(&info));
+                                }
                             }
                             Err(e) => exit_err(&e.to_string()),
                         }
                     }
                 },
             }
-        },
+        }
 
         EntityCommand::Selection { cmd } => {
             handle_selection_command(cmd, &client).await;
@@ -1656,14 +2093,21 @@ async fn handle_rag_command(cmd: RagCommand) {
         } => {
             let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
-                Some(sel) => {
-                    match papers_core::selection::load_selection(sel) {
-                        Ok(s) => Some(s.entries.iter().flat_map(|e| {
-                            e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
-                        }).collect()),
-                        Err(e) => exit_err(&e.to_string()),
-                    }
-                }
+                Some(sel) => match papers_core::selection::load_selection(sel) {
+                    Ok(s) => Some(
+                        s.entries
+                            .iter()
+                            .flat_map(|e| {
+                                e.doi
+                                    .iter()
+                                    .chain(e.openalex_id.iter())
+                                    .chain(e.zotero_key.iter())
+                                    .cloned()
+                            })
+                            .collect(),
+                    ),
+                    Err(e) => exit_err(&e.to_string()),
+                },
                 None => paper_id.map(|id| vec![id]),
             };
             let params = papers_rag::SearchParams {
@@ -1701,9 +2145,18 @@ async fn handle_rag_command(cmd: RagCommand) {
             let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
-                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
-                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
-                    }).collect()),
+                    Ok(s) => Some(
+                        s.entries
+                            .iter()
+                            .flat_map(|e| {
+                                e.doi
+                                    .iter()
+                                    .chain(e.openalex_id.iter())
+                                    .chain(e.zotero_key.iter())
+                                    .cloned()
+                            })
+                            .collect(),
+                    ),
                     Err(e) => exit_err(&e.to_string()),
                 },
                 None => paper_id.map(|id| vec![id]),
@@ -1740,7 +2193,12 @@ async fn handle_rag_command(cmd: RagCommand) {
             }
         }
 
-        RagCommand::GetSection { paper_id, chapter_idx, section_idx, json } => {
+        RagCommand::GetSection {
+            paper_id,
+            chapter_idx,
+            section_idx,
+            json,
+        } => {
             let rag = open_rag_store().await;
             match papers_rag::query::get_section(&rag, &paper_id, chapter_idx, section_idx).await {
                 Ok(result) => {
@@ -1754,7 +2212,11 @@ async fn handle_rag_command(cmd: RagCommand) {
             }
         }
 
-        RagCommand::GetChapter { paper_id, chapter_idx, json } => {
+        RagCommand::GetChapter {
+            paper_id,
+            chapter_idx,
+            json,
+        } => {
             let rag = open_rag_store().await;
             match papers_rag::query::get_chapter(&rag, &paper_id, chapter_idx).await {
                 Ok(result) => {
@@ -1810,9 +2272,18 @@ async fn handle_rag_command(cmd: RagCommand) {
             let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
-                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
-                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
-                    }).collect()),
+                    Ok(s) => Some(
+                        s.entries
+                            .iter()
+                            .flat_map(|e| {
+                                e.doi
+                                    .iter()
+                                    .chain(e.openalex_id.iter())
+                                    .chain(e.zotero_key.iter())
+                                    .cloned()
+                            })
+                            .collect(),
+                    ),
                     Err(e) => exit_err(&e.to_string()),
                 },
                 None => None,
@@ -1843,9 +2314,18 @@ async fn handle_rag_command(cmd: RagCommand) {
             let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
-                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
-                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
-                    }).collect()),
+                    Ok(s) => Some(
+                        s.entries
+                            .iter()
+                            .flat_map(|e| {
+                                e.doi
+                                    .iter()
+                                    .chain(e.openalex_id.iter())
+                                    .chain(e.zotero_key.iter())
+                                    .cloned()
+                            })
+                            .collect(),
+                    ),
                     Err(e) => exit_err(&e.to_string()),
                 },
                 None => None,
@@ -1863,7 +2343,13 @@ async fn handle_rag_command(cmd: RagCommand) {
             }
         }
 
-        RagCommand::Ingest { item_key, paper_id, tag, force, json } => {
+        RagCommand::Ingest {
+            item_key,
+            paper_id,
+            tag,
+            force,
+            json,
+        } => {
             let rag = open_rag_store().await;
             let mut params = match papers_rag::ingest_params_from_cache(&item_key) {
                 Ok(p) => p,
@@ -1885,7 +2371,10 @@ async fn handle_rag_command(cmd: RagCommand) {
                         "message": "already indexed; use --force to re-index"
                     }));
                 } else {
-                    println!("Already indexed: {} (use --force to re-index)", params.paper_id);
+                    println!(
+                        "Already indexed: {} (use --force to re-index)",
+                        params.paper_id
+                    );
                 }
                 return;
             }
@@ -1913,7 +2402,9 @@ async fn handle_rag_command(cmd: RagCommand) {
             let keys = papers_rag::list_cached_item_keys();
             if keys.is_empty() {
                 if json {
-                    print_json(&serde_json::json!({ "ingested": 0, "message": "no cached papers found" }));
+                    print_json(
+                        &serde_json::json!({ "ingested": 0, "message": "no cached papers found" }),
+                    );
                 } else {
                     println!("No cached papers found in DataLab cache.");
                 }
@@ -1948,7 +2439,10 @@ async fn handle_rag_command(cmd: RagCommand) {
                         total_figures += stats.figures_added;
                         ingested += 1;
                         if !json {
-                            println!("{} chunks, {} figures", stats.chunks_added, stats.figures_added);
+                            println!(
+                                "{} chunks, {} figures",
+                                stats.chunks_added, stats.figures_added
+                            );
                         }
                     }
                     Err(e) => {
@@ -2144,15 +2638,20 @@ fn format_rag_search(results: &[papers_rag::SearchResult]) {
         let c = &r.chunk;
         println!(
             "{:.2}  {}  |  {} › {}",
-            r.score,
-            c.paper_id,
-            c.chapter_title,
-            c.section_title,
+            r.score, c.paper_id, c.chapter_title, c.section_title,
         );
         let preview: String = c.text.chars().take(200).collect();
         println!("      {}", preview);
-        let prev = r.prev.as_ref().map(|p| p.chunk_id.as_str()).unwrap_or("(none)");
-        let next = r.next.as_ref().map(|n| n.chunk_id.as_str()).unwrap_or("(none)");
+        let prev = r
+            .prev
+            .as_ref()
+            .map(|p| p.chunk_id.as_str())
+            .unwrap_or("(none)");
+        let next = r
+            .next
+            .as_ref()
+            .map(|n| n.chunk_id.as_str())
+            .unwrap_or("(none)");
         println!("      ← {}  /  {} →", prev, next);
         println!();
     }
@@ -2182,17 +2681,31 @@ fn format_rag_figures(results: &[papers_rag::FigureSearchResult]) {
 
 fn format_rag_chunk_result(r: &papers_rag::ChunkResult) {
     let c = &r.chunk;
-    println!("[{}]  {} — Ch.{} {} / Sec.{} {}", c.chunk_id, c.paper_id, c.chapter_idx, c.chapter_title, c.section_idx, c.section_title);
+    println!(
+        "[{}]  {} — Ch.{} {} / Sec.{} {}",
+        c.chunk_id, c.paper_id, c.chapter_idx, c.chapter_title, c.section_idx, c.section_title
+    );
     println!();
     println!("{}", c.text);
     println!();
-    let prev = r.prev.as_ref().map(|p| p.chunk_id.as_str()).unwrap_or("(none)");
-    let next = r.next.as_ref().map(|n| n.chunk_id.as_str()).unwrap_or("(none)");
+    let prev = r
+        .prev
+        .as_ref()
+        .map(|p| p.chunk_id.as_str())
+        .unwrap_or("(none)");
+    let next = r
+        .next
+        .as_ref()
+        .map(|n| n.chunk_id.as_str())
+        .unwrap_or("(none)");
     println!("← {}  /  {} →", prev, next);
 }
 
 fn format_rag_section(r: &papers_rag::SectionResult) {
-    println!("[{}] Ch.{} {} / Sec.{} {} ({} chunks)", r.paper_id, 0, r.chapter_title, 0, r.section_title, r.total_chunks);
+    println!(
+        "[{}] Ch.{} {} / Sec.{} {} ({} chunks)",
+        r.paper_id, 0, r.chapter_title, 0, r.section_title, r.total_chunks
+    );
     println!();
     for chunk in &r.chunks {
         println!("{}", chunk.text);
@@ -2201,7 +2714,10 @@ fn format_rag_section(r: &papers_rag::SectionResult) {
 }
 
 fn format_rag_chapter(r: &papers_rag::ChapterResult) {
-    println!("[{}] Ch.{} {} ({} chunks)", r.paper_id, r.chapter_idx, r.chapter_title, r.total_chunks);
+    println!(
+        "[{}] Ch.{} {} ({} chunks)",
+        r.paper_id, r.chapter_idx, r.chapter_title, r.total_chunks
+    );
     println!();
     for sec in &r.sections {
         println!("  § {} {}", sec.section_idx, sec.section_title);
@@ -2237,16 +2753,28 @@ fn format_rag_outline(r: &papers_rag::PaperOutline) {
         r.paper_id,
         r.title,
         r.year.map(|y| y.to_string()).unwrap_or_else(|| "?".into()),
-        r.venue.as_ref().map(|v| format!(", {v}")).unwrap_or_default()
+        r.venue
+            .as_ref()
+            .map(|v| format!(", {v}"))
+            .unwrap_or_default()
     );
     for ch in &r.chapters {
         let ch_chunk_count: usize = ch.sections.iter().map(|s| s.chunk_count).sum();
-        println!("  {}. {}  [{} chunks]", ch.chapter_idx, ch.chapter_title, ch_chunk_count);
+        println!(
+            "  {}. {}  [{} chunks]",
+            ch.chapter_idx, ch.chapter_title, ch_chunk_count
+        );
         for sec in &ch.sections {
-            println!("     {}.{} {}  [{} chunks]", ch.chapter_idx, sec.section_idx, sec.section_title, sec.chunk_count);
+            println!(
+                "     {}.{} {}  [{} chunks]",
+                ch.chapter_idx, sec.section_idx, sec.section_title, sec.chunk_count
+            );
         }
     }
-    println!("Total: {} chunks, {} figures", r.total_chunks, r.total_figures);
+    println!(
+        "Total: {} chunks, {} figures",
+        r.total_chunks, r.total_figures
+    );
 }
 
 fn format_rag_papers(papers: &[papers_rag::PaperSummary]) {
@@ -2254,7 +2782,10 @@ fn format_rag_papers(papers: &[papers_rag::PaperSummary]) {
         println!("No indexed papers found.");
         return;
     }
-    println!("{:<6}  {:<12}  {:<6}  {}", "YEAR", "VENUE", "CHUNKS", "TITLE");
+    println!(
+        "{:<6}  {:<12}  {:<6}  {}",
+        "YEAR", "VENUE", "CHUNKS", "TITLE"
+    );
     for p in papers {
         println!(
             "{:<6}  {:<12}  {:<6}  {}",
@@ -2278,9 +2809,9 @@ fn format_rag_tags(tags: &[papers_rag::TagSummary]) {
 
 async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient) {
     use papers_core::selection::{
-        active_selection_name, delete_selection, entry_matches_remove_input,
-        list_selection_names, load_selection, load_state, resolve_paper,
-        resolve_selection, save_selection, save_state, validate_name, Selection,
+        Selection, active_selection_name, delete_selection, entry_matches_remove_input,
+        list_selection_names, load_selection, load_state, resolve_paper, resolve_selection,
+        save_selection, save_state, validate_name,
     };
 
     match cmd {
@@ -2291,9 +2822,7 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             let items: Vec<format::SelectionListItem> = names
                 .iter()
                 .map(|name| {
-                    let count = load_selection(name)
-                        .map(|s| s.entries.len())
-                        .unwrap_or(0);
+                    let count = load_selection(name).map(|s| s.entries.len()).unwrap_or(0);
                     format::SelectionListItem {
                         name: name.clone(),
                         item_count: count,
@@ -2394,7 +2923,11 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             }
         }
 
-        SelectionCommand::Add { paper, selection, json } => {
+        SelectionCommand::Add {
+            paper,
+            selection,
+            json,
+        } => {
             let sel_name = match selection {
                 Some(s) => match resolve_selection(&s) {
                     Ok(n) => n,
@@ -2414,9 +2947,21 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             let mut sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
             // Deduplication check
             let is_dup = sel.entries.iter().any(|e| {
-                entry.zotero_key.as_deref().map(|k| papers_core::selection::entry_matches_key(e, k)).unwrap_or(false)
-                    || entry.openalex_id.as_deref().map(|id| papers_core::selection::entry_matches_openalex(e, id)).unwrap_or(false)
-                    || entry.doi.as_deref().map(|d| papers_core::selection::entry_matches_doi(e, d)).unwrap_or(false)
+                entry
+                    .zotero_key
+                    .as_deref()
+                    .map(|k| papers_core::selection::entry_matches_key(e, k))
+                    .unwrap_or(false)
+                    || entry
+                        .openalex_id
+                        .as_deref()
+                        .map(|id| papers_core::selection::entry_matches_openalex(e, id))
+                        .unwrap_or(false)
+                    || entry
+                        .doi
+                        .as_deref()
+                        .map(|d| papers_core::selection::entry_matches_doi(e, d))
+                        .unwrap_or(false)
             });
             if !is_dup {
                 sel.entries.push(entry.clone());
@@ -2434,7 +2979,11 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             }
         }
 
-        SelectionCommand::Remove { paper, selection, json } => {
+        SelectionCommand::Remove {
+            paper,
+            selection,
+            json,
+        } => {
             let sel_name = match selection {
                 Some(s) => match resolve_selection(&s) {
                     Ok(n) => n,
@@ -2447,8 +2996,13 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             };
             let mut sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
             let before = sel.entries.len();
-            let removed_entry = sel.entries.iter().find(|e| entry_matches_remove_input(e, &paper)).cloned();
-            sel.entries.retain(|e| !entry_matches_remove_input(e, &paper));
+            let removed_entry = sel
+                .entries
+                .iter()
+                .find(|e| entry_matches_remove_input(e, &paper))
+                .cloned();
+            sel.entries
+                .retain(|e| !entry_matches_remove_input(e, &paper));
             if sel.entries.len() == before {
                 exit_err("item not found in selection");
             }

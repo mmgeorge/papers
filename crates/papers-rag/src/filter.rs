@@ -7,7 +7,9 @@ pub struct FilterBuilder {
 
 impl FilterBuilder {
     pub fn new() -> Self {
-        Self { clauses: Vec::new() }
+        Self {
+            clauses: Vec::new(),
+        }
     }
 
     pub fn paper_ids(mut self, ids: &[String]) -> Self {
@@ -39,11 +41,6 @@ impl FilterBuilder {
         self
     }
 
-    pub fn eq_u16(mut self, col: &str, val: u16) -> Self {
-        self.clauses.push(format!("{col} = {val}"));
-        self
-    }
-
     pub fn year_range(mut self, min: Option<u16>, max: Option<u16>) -> Self {
         if let Some(min) = min {
             self.clauses.push(format!("year >= {min}"));
@@ -70,8 +67,7 @@ impl FilterBuilder {
         if conditions.len() == 1 {
             self.clauses.push(conditions.into_iter().next().unwrap());
         } else {
-            self.clauses
-                .push(format!("({})", conditions.join(" OR ")));
+            self.clauses.push(format!("({})", conditions.join(" OR ")));
         }
         self
     }
@@ -94,14 +90,10 @@ pub fn validate_scope(
     paper_id: Option<&str>,
 ) -> Result<(), RagError> {
     if section_idx.is_some() && chapter_idx.is_none() {
-        return Err(RagError::Scope(
-            "section_idx requires chapter_idx".into(),
-        ));
+        return Err(RagError::Scope("section_idx requires chapter_idx".into()));
     }
     if chapter_idx.is_some() && paper_id.is_none() {
-        return Err(RagError::Scope(
-            "chapter_idx requires paper_id".into(),
-        ));
+        return Err(RagError::Scope("chapter_idx requires paper_id".into()));
     }
     Ok(())
 }
@@ -200,7 +192,10 @@ mod tests {
     fn tags_any_multiple_tags_uses_or() {
         let tags = vec!["GPU".to_string(), "rendering".to_string()];
         let f = FilterBuilder::new().tags_any(&tags).build().unwrap();
-        assert_eq!(f, "(array_has(tags, 'GPU') OR array_has(tags, 'rendering'))");
+        assert_eq!(
+            f,
+            "(array_has(tags, 'GPU') OR array_has(tags, 'rendering'))"
+        );
     }
 
     #[test]
@@ -218,13 +213,19 @@ mod tests {
 
     #[test]
     fn eq_str_clause() {
-        let f = FilterBuilder::new().eq_str("venue", "SIGGRAPH").build().unwrap();
+        let f = FilterBuilder::new()
+            .eq_str("venue", "SIGGRAPH")
+            .build()
+            .unwrap();
         assert_eq!(f, "venue = 'SIGGRAPH'");
     }
 
     #[test]
     fn eq_str_escapes_single_quote() {
-        let f = FilterBuilder::new().eq_str("venue", "it's").build().unwrap();
+        let f = FilterBuilder::new()
+            .eq_str("venue", "it's")
+            .build()
+            .unwrap();
         assert_eq!(f, "venue = 'it''s'");
     }
 
@@ -237,7 +238,10 @@ mod tests {
             .eq_str("depth", "paragraph")
             .build()
             .unwrap();
-        assert_eq!(f, "paper_id IN ('p1') AND chapter_idx = 2 AND depth = 'paragraph'");
+        assert_eq!(
+            f,
+            "paper_id IN ('p1') AND chapter_idx = 2 AND depth = 'paragraph'"
+        );
     }
 
     // ── validate_scope ───────────────────────────────────────────────────────

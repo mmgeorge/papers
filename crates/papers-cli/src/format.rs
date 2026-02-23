@@ -3,13 +3,15 @@ use papers_core::summary::{
     AuthorSummary, DomainSummary, FieldSummary, FunderSummary, InstitutionSummary,
     PublisherSummary, SlimListResponse, SourceSummary, SubfieldSummary, TopicSummary, WorkSummary,
 };
-use papers_core::text::WorkTextResult;
 use papers_core::{
     Author, AutocompleteResponse, Domain, Field, FindWorksResponse, Funder, Institution, ListMeta,
     Publisher, Source, Subfield, Topic, Work,
 };
+use papers_zotero::{
+    Collection, Creator, DeletedObjects, Group, Item, ItemFulltext, PagedResponse, SavedSearch,
+    SettingEntry, Tag, VersionedResponse,
+};
 use std::collections::HashMap;
-use papers_zotero::{Collection, Creator, DeletedObjects, Group, Item, ItemFulltext, PagedResponse, SavedSearch, SettingEntry, Tag, VersionedResponse};
 
 // ── Meta line ─────────────────────────────────────────────────────────────
 
@@ -117,9 +119,15 @@ pub fn format_work_get(w: &Work) -> String {
         if let Some(name) = &topic.display_name {
             let mut topic_str = name.clone();
             let parts: Vec<_> = [
-                topic.subfield.as_ref().and_then(|s| s.display_name.as_deref()),
+                topic
+                    .subfield
+                    .as_ref()
+                    .and_then(|s| s.display_name.as_deref()),
                 topic.field.as_ref().and_then(|f| f.display_name.as_deref()),
-                topic.domain.as_ref().and_then(|d| d.display_name.as_deref()),
+                topic
+                    .domain
+                    .as_ref()
+                    .and_then(|d| d.display_name.as_deref()),
             ]
             .into_iter()
             .flatten()
@@ -168,7 +176,10 @@ pub fn format_work_get_response(response: &WorkGetResponse, zotero_configured: b
             out.push_str(&format!("  Key:   {}\n", z.key));
             out.push_str(&format!("  Open:  {}\n", z.uri));
             out.push_str(&format!("  Type:  {}\n", z.item_type));
-            out.push_str(&format!("  PDF:   {}\n", if z.has_pdf { "Yes" } else { "No" }));
+            out.push_str(&format!(
+                "  PDF:   {}\n",
+                if z.has_pdf { "Yes" } else { "No" }
+            ));
             if !z.tags.is_empty() {
                 out.push_str(&format!("  Tags:  {}\n", z.tags.join(", ")));
             }
@@ -205,10 +216,7 @@ pub fn format_author_list(resp: &SlimListResponse<AuthorSummary>) -> String {
         }
 
         if !a.last_known_institutions.is_empty() {
-            out.push_str(&format!(
-                "     {}\n",
-                a.last_known_institutions.join(", ")
-            ));
+            out.push_str(&format!("     {}\n", a.last_known_institutions.join(", ")));
         }
         if !a.top_topics.is_empty() {
             out.push_str(&format!("     Topics: {}\n", a.top_topics.join(", ")));
@@ -394,10 +402,14 @@ pub fn format_topic_list(resp: &SlimListResponse<TopicSummary>) -> String {
         let name = t.display_name.as_deref().unwrap_or("?");
         out.push_str(&format!("\n {:>2}  {name}\n", i + 1));
 
-        let hierarchy: Vec<_> = [t.subfield.as_deref(), t.field.as_deref(), t.domain.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect();
+        let hierarchy: Vec<_> = [
+            t.subfield.as_deref(),
+            t.field.as_deref(),
+            t.domain.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if !hierarchy.is_empty() {
             out.push_str(&format!("     {}\n", hierarchy.join(" → ")));
         }
@@ -715,7 +727,12 @@ pub fn format_subfield_get(s: &Subfield) -> String {
 pub fn format_autocomplete(resp: &AutocompleteResponse) -> String {
     let mut out = String::new();
     for (i, r) in resp.results.iter().enumerate() {
-        out.push_str(&format!("{:>2}  {} [{}]\n", i + 1, r.display_name, r.short_id.as_deref().unwrap_or("")));
+        out.push_str(&format!(
+            "{:>2}  {} [{}]\n",
+            i + 1,
+            r.display_name,
+            r.short_id.as_deref().unwrap_or("")
+        ));
         if let Some(hint) = &r.hint {
             if !hint.is_empty() {
                 out.push_str(&format!("    {hint}\n"));
@@ -799,10 +816,26 @@ pub fn format_zotero_work_list(resp: &PagedResponse<Item>) -> String {
                 }
             })
             .unwrap_or_default();
-        out.push_str(&format!("\n {:>2}  [{}] {}{}\n", i + 1, item.key, title, year));
+        out.push_str(&format!(
+            "\n {:>2}  [{}] {}{}\n",
+            i + 1,
+            item.key,
+            title,
+            year
+        ));
         if !item.data.creators.is_empty() {
-            let authors: Vec<String> = item.data.creators.iter().take(3).map(creator_display).collect();
-            let suffix = if item.data.creators.len() > 3 { " et al." } else { "" };
+            let authors: Vec<String> = item
+                .data
+                .creators
+                .iter()
+                .take(3)
+                .map(creator_display)
+                .collect();
+            let suffix = if item.data.creators.len() > 3 {
+                " et al."
+            } else {
+                ""
+            };
             out.push_str(&format!("     {}{suffix}\n", authors.join("; ")));
         }
         let mut meta_parts = Vec::new();
@@ -833,21 +866,34 @@ pub fn format_zotero_item_get(item: &Item) -> String {
     let title = item.data.title.as_deref().unwrap_or("(untitled)");
     out.push_str(&format!("{}: {}\n", item.data.item_type, title));
     out.push_str(&format!("Key:  {}\n", item.key));
-    out.push_str(&format!("Open: zotero://select/library/items/{}\n", item.key));
+    out.push_str(&format!(
+        "Open: zotero://select/library/items/{}\n",
+        item.key
+    ));
     if let Some(doi) = &item.data.doi {
-        if !doi.is_empty() { out.push_str(&format!("DOI:  {doi}\n")); }
+        if !doi.is_empty() {
+            out.push_str(&format!("DOI:  {doi}\n"));
+        }
     }
     if let Some(date) = &item.data.date {
-        if !date.is_empty() { out.push_str(&format!("Date: {date}\n")); }
+        if !date.is_empty() {
+            out.push_str(&format!("Date: {date}\n"));
+        }
     }
     if let Some(j) = &item.data.publication_title {
-        if !j.is_empty() { out.push_str(&format!("Publication: {j}\n")); }
+        if !j.is_empty() {
+            out.push_str(&format!("Publication: {j}\n"));
+        }
     }
     if let Some(p) = &item.data.publisher {
-        if !p.is_empty() { out.push_str(&format!("Publisher: {p}\n")); }
+        if !p.is_empty() {
+            out.push_str(&format!("Publisher: {p}\n"));
+        }
     }
     if let Some(url) = &item.data.url {
-        if !url.is_empty() { out.push_str(&format!("URL: {url}\n")); }
+        if !url.is_empty() {
+            out.push_str(&format!("URL: {url}\n"));
+        }
     }
     if !item.data.creators.is_empty() {
         out.push_str("\nCreators:\n");
@@ -857,7 +903,9 @@ pub fn format_zotero_item_get(item: &Item) -> String {
         }
     }
     if let Some(abs) = &item.data.abstract_note {
-        if !abs.is_empty() { out.push_str(&format!("\nAbstract:\n  {abs}\n")); }
+        if !abs.is_empty() {
+            out.push_str(&format!("\nAbstract:\n  {abs}\n"));
+        }
     }
     if !item.data.tags.is_empty() {
         let tag_names: Vec<&str> = item.data.tags.iter().map(|t| t.tag.as_str()).collect();
@@ -885,10 +933,20 @@ pub fn format_zotero_item_get(item: &Item) -> String {
         }
     }
     // Annotation fields
-    if let Some(ann_type) = item.data.extra_fields.get("annotationType").and_then(|v| v.as_str()) {
+    if let Some(ann_type) = item
+        .data
+        .extra_fields
+        .get("annotationType")
+        .and_then(|v| v.as_str())
+    {
         out.push_str(&format!("Annotation type: {ann_type}\n"));
     }
-    if let Some(text) = item.data.extra_fields.get("annotationText").and_then(|v| v.as_str()) {
+    if let Some(text) = item
+        .data
+        .extra_fields
+        .get("annotationText")
+        .and_then(|v| v.as_str())
+    {
         if !text.is_empty() {
             let snippet = if text.chars().count() > 500 {
                 format!("{}…", text.chars().take(500).collect::<String>())
@@ -898,15 +956,30 @@ pub fn format_zotero_item_get(item: &Item) -> String {
             out.push_str(&format!("Text: {snippet}\n"));
         }
     }
-    if let Some(comment) = item.data.extra_fields.get("annotationComment").and_then(|v| v.as_str()) {
+    if let Some(comment) = item
+        .data
+        .extra_fields
+        .get("annotationComment")
+        .and_then(|v| v.as_str())
+    {
         if !comment.is_empty() {
             out.push_str(&format!("Comment: {comment}\n"));
         }
     }
-    if let Some(page) = item.data.extra_fields.get("annotationPageLabel").and_then(|v| v.as_str()) {
+    if let Some(page) = item
+        .data
+        .extra_fields
+        .get("annotationPageLabel")
+        .and_then(|v| v.as_str())
+    {
         out.push_str(&format!("Page: {page}\n"));
     }
-    if let Some(color) = item.data.extra_fields.get("annotationColor").and_then(|v| v.as_str()) {
+    if let Some(color) = item
+        .data
+        .extra_fields
+        .get("annotationColor")
+        .and_then(|v| v.as_str())
+    {
         out.push_str(&format!("Color: {color}\n"));
     }
     out
@@ -996,7 +1069,12 @@ fn push_annotation_entry(out: &mut String, i: usize, item: &Item) {
     if !parent.is_empty() {
         out.push_str(&format!("     Parent: {parent}\n"));
     }
-    if let Some(text) = item.data.extra_fields.get("annotationText").and_then(|v| v.as_str()) {
+    if let Some(text) = item
+        .data
+        .extra_fields
+        .get("annotationText")
+        .and_then(|v| v.as_str())
+    {
         if !text.is_empty() {
             let snippet = if text.chars().count() > 120 {
                 format!("{}…", text.chars().take(120).collect::<String>())
@@ -1006,7 +1084,12 @@ fn push_annotation_entry(out: &mut String, i: usize, item: &Item) {
             out.push_str(&format!("     \"{snippet}\"\n"));
         }
     }
-    if let Some(comment) = item.data.extra_fields.get("annotationComment").and_then(|v| v.as_str()) {
+    if let Some(comment) = item
+        .data
+        .extra_fields
+        .get("annotationComment")
+        .and_then(|v| v.as_str())
+    {
         if !comment.is_empty() {
             out.push_str(&format!("     Note: {comment}\n"));
         }
@@ -1021,7 +1104,11 @@ pub fn format_zotero_note_list(resp: &PagedResponse<Item>) -> String {
     let mut out = header;
     for (i, item) in resp.items.iter().enumerate() {
         let parent = item.data.parent_item.as_deref().unwrap_or("(standalone)");
-        out.push_str(&format!("\n {:>2}  [{}] parent: {parent}\n", i + 1, item.key));
+        out.push_str(&format!(
+            "\n {:>2}  [{}] parent: {parent}\n",
+            i + 1,
+            item.key
+        ));
         if let Some(note) = &item.data.note {
             let stripped = strip_html(note);
             let trimmed = stripped.trim().to_string();
@@ -1054,9 +1141,22 @@ pub fn format_zotero_collection_list_vec(collections: &[Collection]) -> String {
 fn format_zotero_collection_list_inner(collections: &[Collection], header: String) -> String {
     let mut out = header;
     for (i, coll) in collections.iter().enumerate() {
-        let parent = coll.data.parent_key().map(|k| format!(" (sub of {k})")).unwrap_or_default();
-        let items = coll.meta.num_items.map(|n| format!(", {n} items")).unwrap_or_default();
-        out.push_str(&format!("\n {:>2}  [{}] {}{parent}{items}\n", i + 1, coll.key, coll.data.name));
+        let parent = coll
+            .data
+            .parent_key()
+            .map(|k| format!(" (sub of {k})"))
+            .unwrap_or_default();
+        let items = coll
+            .meta
+            .num_items
+            .map(|n| format!(", {n} items"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n {:>2}  [{}] {}{parent}{items}\n",
+            i + 1,
+            coll.key,
+            coll.data.name
+        ));
     }
     out
 }
@@ -1086,7 +1186,11 @@ pub fn format_zotero_tag_list(resp: &PagedResponse<Tag>) -> String {
     };
     let mut out = header;
     for (i, tag) in resp.items.iter().enumerate() {
-        let count = tag.meta.num_items.map(|n| format!(" ({n} items)")).unwrap_or_default();
+        let count = tag
+            .meta
+            .num_items
+            .map(|n| format!(" ({n} items)"))
+            .unwrap_or_default();
         out.push_str(&format!("\n {:>2}  {}{count}\n", i + 1, tag.tag));
     }
     out
@@ -1100,7 +1204,12 @@ pub fn format_zotero_search_list(resp: &PagedResponse<SavedSearch>) -> String {
     let mut out = header;
     for (i, search) in resp.items.iter().enumerate() {
         let n = search.data.conditions.len();
-        out.push_str(&format!("\n {:>2}  [{}] {}\n", i + 1, search.key, search.data.name));
+        out.push_str(&format!(
+            "\n {:>2}  [{}] {}\n",
+            i + 1,
+            search.key,
+            search.data.name
+        ));
         out.push_str(&format!("     {n} condition(s)\n"));
     }
     out
@@ -1113,7 +1222,10 @@ pub fn format_zotero_search_get(search: &SavedSearch) -> String {
     if !search.data.conditions.is_empty() {
         out.push_str("\nConditions:\n");
         for cond in &search.data.conditions {
-            out.push_str(&format!("  {} {} {}\n", cond.condition, cond.operator, cond.value));
+            out.push_str(&format!(
+                "  {} {} {}\n",
+                cond.condition, cond.operator, cond.value
+            ));
         }
     }
     out
@@ -1127,8 +1239,17 @@ pub fn format_zotero_group_list(resp: &PagedResponse<Group>) -> String {
     let mut out = header;
     for (i, group) in resp.items.iter().enumerate() {
         let gtype = group.data.group_type.as_deref().unwrap_or("?");
-        let items = group.meta.num_items.map(|n| format!(", {n} items")).unwrap_or_default();
-        out.push_str(&format!("\n {:>2}  [{}] {} ({gtype}){items}\n", i + 1, group.id, group.data.name));
+        let items = group
+            .meta
+            .num_items
+            .map(|n| format!(", {n} items"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\n {:>2}  [{}] {} ({gtype}){items}\n",
+            i + 1,
+            group.id,
+            group.data.name
+        ));
         if let Some(desc) = &group.data.description {
             if !desc.is_empty() {
                 let snippet = if desc.chars().count() > 100 {
@@ -1139,38 +1260,6 @@ pub fn format_zotero_group_list(resp: &PagedResponse<Group>) -> String {
                 out.push_str(&format!("     {snippet}\n"));
             }
         }
-    }
-    out
-}
-
-// ── Work text ─────────────────────────────────────────────────────────────
-
-pub fn format_work_text(result: &WorkTextResult) -> String {
-    let mut out = String::new();
-    if let Some(title) = &result.title {
-        out.push_str(&format!("Work: {title}\n"));
-    }
-    out.push_str(&format!("ID:   {}\n", result.work_id));
-    if let Some(doi) = &result.doi {
-        out.push_str(&format!("DOI:  {doi}\n"));
-    }
-    let source_desc = match &result.source {
-        papers_core::text::PdfSource::ZoteroLocal { path } => format!("Zotero (local: {path})"),
-        papers_core::text::PdfSource::ZoteroRemote { item_key } => {
-            format!("Zotero (remote: {item_key})")
-        }
-        papers_core::text::PdfSource::DirectUrl { url } => format!("Direct URL: {url}"),
-        papers_core::text::PdfSource::OpenAlexContent => "OpenAlex Content API".to_string(),
-        papers_core::text::PdfSource::DataLab => "DataLab Marker API".to_string(),
-    };
-    out.push_str(&format!("Source: {source_desc}\n"));
-    out.push_str(&format!(
-        "Length: {} characters\n\n",
-        result.text.len()
-    ));
-    out.push_str(&result.text);
-    if !result.text.ends_with('\n') {
-        out.push('\n');
     }
     out
 }
@@ -1206,7 +1295,9 @@ pub fn format_zotero_work_fulltext(resp: &VersionedResponse<ItemFulltext>) -> St
 
 // ── Zotero settings ───────────────────────────────────────────────────────
 
-pub fn format_zotero_setting_list(resp: &VersionedResponse<HashMap<String, SettingEntry>>) -> String {
+pub fn format_zotero_setting_list(
+    resp: &VersionedResponse<HashMap<String, SettingEntry>>,
+) -> String {
     let mut out = String::new();
     if let Some(v) = resp.last_modified_version {
         out.push_str(&format!("Library version: {v}\n"));
@@ -1226,7 +1317,8 @@ pub fn format_zotero_setting_get(key: &str, resp: &VersionedResponse<SettingEntr
     if let Some(v) = resp.last_modified_version {
         out.push_str(&format!("Version: {v}\n"));
     }
-    let val_str = serde_json::to_string_pretty(&resp.data.value).unwrap_or_else(|_| "?".to_string());
+    let val_str =
+        serde_json::to_string_pretty(&resp.data.value).unwrap_or_else(|_| "?".to_string());
     out.push_str(&format!("Setting: {key} (v{})\n", resp.data.version));
     out.push_str(&format!("Value:\n  {val_str}\n"));
     out
@@ -1253,8 +1345,11 @@ pub fn format_zotero_deleted_list(resp: &VersionedResponse<DeletedObjects>) -> S
     print_section(&mut out, "Deleted searches", &d.searches);
     print_section(&mut out, "Deleted tags", &d.tags);
     print_section(&mut out, "Deleted settings", &d.settings);
-    if d.items.is_empty() && d.collections.is_empty() && d.searches.is_empty()
-        && d.tags.is_empty() && d.settings.is_empty()
+    if d.items.is_empty()
+        && d.collections.is_empty()
+        && d.searches.is_empty()
+        && d.tags.is_empty()
+        && d.settings.is_empty()
     {
         out.push_str("No deletions since requested version.\n");
     }
@@ -1369,4 +1464,3 @@ pub fn format_selection_add(
 pub fn format_selection_remove(title: &str, selection_name: &str) -> String {
     format!("Removed {title:?} from selection {selection_name:?}\n")
 }
-

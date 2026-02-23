@@ -85,8 +85,8 @@ Requires `ZOTERO_USER_ID` and `ZOTERO_API_KEY` environment variables ([zotero.or
 ```sh
 papers zotero work list --tag Starred --sort dateModified --direction desc
 papers zotero work list --search "rendering" --type conferencePaper -n 5
-papers zotero work annotations <key>
-papers zotero attachment file <key> --output paper.pdf
+papers zotero work annotations <work>
+papers zotero attachment file <work> --output paper.pdf
 papers zotero collection list --top
 ```
 
@@ -99,10 +99,7 @@ PDF extraction uses vision-model-based OCR via marker to produce clean markdown 
 Requires `DATALAB_API_KEY` ([datalab.to](https://www.datalab.to/)).
 
 ```sh
-papers zotero work extract <item_key>                    # Extract a Zotero item (default: balanced)
-papers zotero work extract <item_key> -m accurate        # Highest quality, slowest
-papers zotero work extract <item_key> -m fast            # Fastest, lower layout accuracy
-papers work text <work_id> --advanced balanced            # Extract an OpenAlex work via Datalab
+papers zotero work extract <work>                    # Extract a Zotero item (default: balanced)
 ```
 
 Processing modes: `fast`, `balanced` (default), `accurate`.
@@ -111,9 +108,7 @@ Processing modes: `fast`, `balanced` (default), `accurate`.
 
 ```sh
 papers zotero extract list                               # List items with cached extractions
-papers zotero extract text <query>                       # Print cached markdown
-papers zotero extract json <query>                       # Print cached JSON
-papers zotero extract get <query>                        # Print cache directory path
+papers zotero extract text <work>                        # Get markdown
 papers zotero extract upload [--dry-run]                 # Upload local cache to Zotero
 papers zotero extract download [--dry-run]               # Download Zotero cache to local
 ```
@@ -141,8 +136,8 @@ Local semantic search over your papers using [LanceDB](https://github.com/lanced
 papers rag ingest                        # Index papers from marker cache
 papers rag search "differentiable rendering" -n 5
 papers rag search-figures "neural radiance field architecture"
-papers rag get-section <paper> <section>
-papers rag outline <paper>
+papers rag get-section <work> <section>
+papers rag outline <work>
 ```
 
 ## Filter aliases

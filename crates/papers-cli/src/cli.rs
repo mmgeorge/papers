@@ -14,7 +14,11 @@ pub enum AdvancedMode {
 }
 
 #[derive(Parser)]
-#[command(name = "papers", about = "Query the OpenAlex academic research database", term_width = 100)]
+#[command(
+    name = "papers",
+    about = "Query the OpenAlex academic research database",
+    term_width = 100
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub entity: EntityCommand,
@@ -611,7 +615,9 @@ pub struct SubfieldFilterArgs {
 #[derive(Subcommand)]
 pub enum WorkCommand {
     /// List works with optional search/filter/sort
-    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/works/filter-works")]
+    #[command(
+        after_help = "Advanced filtering: https://docs.openalex.org/api-entities/works/filter-works"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -648,27 +654,14 @@ pub enum WorkCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Extract full text from a work's PDF (tries Zotero, open-access URLs, OpenAlex content API)
-    Text {
-        /// Work ID (OpenAlex ID, DOI, PMID, or PMCID)
-        id: String,
-        /// Output raw JSON (includes source metadata)
-        #[arg(long)]
-        json: bool,
-        /// Skip interactive prompt when no PDF is found
-        #[arg(long)]
-        no_prompt: bool,
-        /// Use DataLab Marker API for markdown extraction instead of local pdfium.
-        /// Requires DATALAB_API_KEY. Quality: fast | balanced | accurate (default: balanced).
-        #[arg(long, value_name = "QUALITY")]
-        advanced: Option<AdvancedMode>,
-    },
 }
 
 #[derive(Subcommand)]
 pub enum AuthorCommand {
     /// List authors with optional search/filter/sort
-    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/authors/filter-authors")]
+    #[command(
+        after_help = "Advanced filtering: https://docs.openalex.org/api-entities/authors/filter-authors"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -692,7 +685,9 @@ pub enum AuthorCommand {
 #[derive(Subcommand)]
 pub enum SourceCommand {
     /// List sources with optional search/filter/sort
-    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/sources/filter-sources")]
+    #[command(
+        after_help = "Advanced filtering: https://docs.openalex.org/api-entities/sources/filter-sources"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -716,7 +711,9 @@ pub enum SourceCommand {
 #[derive(Subcommand)]
 pub enum InstitutionCommand {
     /// List institutions with optional search/filter/sort
-    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/institutions/filter-institutions")]
+    #[command(
+        after_help = "Advanced filtering: https://docs.openalex.org/api-entities/institutions/filter-institutions"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -740,7 +737,9 @@ pub enum InstitutionCommand {
 #[derive(Subcommand)]
 pub enum TopicCommand {
     /// List topics with optional search/filter/sort
-    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/topics/filter-topics")]
+    #[command(
+        after_help = "Advanced filtering: https://docs.openalex.org/api-entities/topics/filter-topics"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -758,7 +757,9 @@ pub enum TopicCommand {
 #[derive(Subcommand)]
 pub enum PublisherCommand {
     /// List publishers with optional search/filter/sort
-    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/publishers/filter-publishers")]
+    #[command(
+        after_help = "Advanced filtering: https://docs.openalex.org/api-entities/publishers/filter-publishers"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -782,7 +783,9 @@ pub enum PublisherCommand {
 #[derive(Subcommand)]
 pub enum FunderCommand {
     /// List funders with optional search/filter/sort
-    #[command(after_help = "Advanced filtering: https://docs.openalex.org/api-entities/funders/filter-funders")]
+    #[command(
+        after_help = "Advanced filtering: https://docs.openalex.org/api-entities/funders/filter-funders"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -806,7 +809,9 @@ pub enum FunderCommand {
 #[derive(Subcommand)]
 pub enum DomainCommand {
     /// List domains with optional search/filter/sort
-    #[command(after_help = "Example filters: works_count:>100000000, display_name.search:physical\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists")]
+    #[command(
+        after_help = "Example filters: works_count:>100000000, display_name.search:physical\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -824,7 +829,9 @@ pub enum DomainCommand {
 #[derive(Subcommand)]
 pub enum FieldCommand {
     /// List fields with optional search/filter/sort
-    #[command(after_help = "Example filters: domain.id:domains/3, works_count:>1000000\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists")]
+    #[command(
+        after_help = "Example filters: domain.id:domains/3, works_count:>1000000\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -842,7 +849,9 @@ pub enum FieldCommand {
 #[derive(Subcommand)]
 pub enum SubfieldCommand {
     /// List subfields with optional search/filter/sort
-    #[command(after_help = "Example filters: field.id:fields/17, works_count:>100000\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists")]
+    #[command(
+        after_help = "Example filters: field.id:fields/17, works_count:>100000\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists"
+    )]
     List {
         #[command(flatten)]
         args: ListArgs,
@@ -1532,9 +1541,10 @@ mod tests {
         let cli = parse(&["papers", "config", "set", "model", "embedding-gemma-300m"]);
         match cli.entity {
             EntityCommand::Config {
-                cmd: ConfigCommand::Set {
-                    cmd: ConfigSetCommand::Model { name },
-                },
+                cmd:
+                    ConfigCommand::Set {
+                        cmd: ConfigSetCommand::Model { name },
+                    },
             } => assert_eq!(name, "embedding-gemma-300m"),
             _ => panic!("wrong variant"),
         }
@@ -1545,9 +1555,10 @@ mod tests {
         let cli = parse(&["papers", "rag", "embed", "list"]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Embed {
-                    cmd: RagEmbedCommand::List { work, json: _ },
-                },
+                cmd:
+                    RagCommand::Embed {
+                        cmd: RagEmbedCommand::List { work, json: _ },
+                    },
             } => assert!(work.is_none()),
             _ => panic!("wrong variant"),
         }
@@ -1558,9 +1569,10 @@ mod tests {
         let cli = parse(&["papers", "rag", "embed", "list", "ABC123"]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Embed {
-                    cmd: RagEmbedCommand::List { work, json: _ },
-                },
+                cmd:
+                    RagCommand::Embed {
+                        cmd: RagEmbedCommand::List { work, json: _ },
+                    },
             } => assert_eq!(work.as_deref(), Some("ABC123")),
             _ => panic!("wrong variant"),
         }
@@ -1571,9 +1583,10 @@ mod tests {
         let cli = parse(&["papers", "rag", "embed", "add", "KEY1"]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Embed {
-                    cmd: RagEmbedCommand::Add { work, model, force },
-                },
+                cmd:
+                    RagCommand::Embed {
+                        cmd: RagEmbedCommand::Add { work, model, force },
+                    },
             } => {
                 assert_eq!(work.as_deref(), Some("KEY1"));
                 assert!(model.is_none());
@@ -1596,9 +1609,10 @@ mod tests {
         ]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Embed {
-                    cmd: RagEmbedCommand::Add { model, .. },
-                },
+                cmd:
+                    RagCommand::Embed {
+                        cmd: RagEmbedCommand::Add { model, .. },
+                    },
             } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
             _ => panic!("wrong variant"),
         }
@@ -1609,9 +1623,10 @@ mod tests {
         let cli = parse(&["papers", "rag", "embed", "add", "KEY1", "--force"]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Embed {
-                    cmd: RagEmbedCommand::Add { force, .. },
-                },
+                cmd:
+                    RagCommand::Embed {
+                        cmd: RagEmbedCommand::Add { force, .. },
+                    },
             } => assert!(force),
             _ => panic!("wrong variant"),
         }
@@ -1622,9 +1637,10 @@ mod tests {
         let cli = parse(&["papers", "rag", "embed", "delete", "KEY1"]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Embed {
-                    cmd: RagEmbedCommand::Delete { work, model },
-                },
+                cmd:
+                    RagCommand::Embed {
+                        cmd: RagEmbedCommand::Delete { work, model },
+                    },
             } => {
                 assert_eq!(work.as_deref(), Some("KEY1"));
                 assert!(model.is_none());
@@ -1646,9 +1662,10 @@ mod tests {
         ]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Embed {
-                    cmd: RagEmbedCommand::Delete { model, .. },
-                },
+                cmd:
+                    RagCommand::Embed {
+                        cmd: RagEmbedCommand::Delete { model, .. },
+                    },
             } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
             _ => panic!("wrong variant"),
         }
