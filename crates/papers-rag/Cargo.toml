@@ -23,6 +23,7 @@ serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
+regex = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ort = { version = "=2.0.0-rc.11", features = ["directml"] }

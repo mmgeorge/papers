@@ -4880,6 +4880,7 @@ dependencies = [
  "lancedb",
  "ort",
  "papers-core",
+ "regex",
  "serde",
  "serde_json",
  "serial_test",

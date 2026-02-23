@@ -20,8 +20,9 @@ impl RagStore {
     pub async fn open(path: &str) -> Result<Self, RagError> {
         let db = lancedb::connect(path).execute().await?;
 
-        // Create tables if they don't exist
-        ensure_table(&db, "papers_chunks", chunks_schema()).await?;
+        // Create tables if they don't exist; migrate chunks schema if needed
+        let chunks = ensure_table(&db, "papers_chunks", chunks_schema()).await?;
+        migrate_chunks_table(&chunks).await?;
         ensure_table(&db, "papers_figures", figures_schema()).await?;
 
         Ok(Self {
@@ -69,7 +70,8 @@ impl RagStore {
     #[cfg(test)]
     pub(crate) async fn open_for_test(path: &str) -> Result<Self, RagError> {
         let db = lancedb::connect(path).execute().await?;
-        ensure_table(&db, "papers_chunks", chunks_schema()).await?;
+        let chunks = ensure_table(&db, "papers_chunks", chunks_schema()).await?;
+        migrate_chunks_table(&chunks).await?;
         ensure_table(&db, "papers_figures", figures_schema()).await?;
         let embedder = OnceCell::new();
         embedder
@@ -141,5 +143,318 @@ async fn ensure_table(
                 .await
                 .map_err(Into::into)
         }
+    }
+}
+
+const SCHEMA_VERSION_KEY: &str = "papers_schema_version";
+
+/// Current schema version. Bump this when adding new migrations.
+const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// Versioned schema migrations for the chunks table.
+/// Each entry: (version, column_name, default_sql_expression).
+/// Entries must be ordered by version. A migration runs only once, when the
+/// on-disk version is below the entry's version number.
+const CHUNK_MIGRATIONS: &[(u32, &str, &str)] = &[
+    (1, "block_type", "'text'"),
+];
+
+/// Read the schema version stored in Arrow schema metadata, defaulting to 0.
+async fn read_schema_version(table: &Table) -> Result<u32, RagError> {
+    let schema = table.schema().await?;
+    Ok(schema
+        .metadata
+        .get(SCHEMA_VERSION_KEY)
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0))
+}
+
+/// Write the schema version into Arrow schema metadata via NativeTable.
+async fn write_schema_version(table: &Table, version: u32) -> Result<(), RagError> {
+    let native = table
+        .as_native()
+        .ok_or_else(|| RagError::Scope("table is not a NativeTable".into()))?;
+    native
+        .replace_schema_metadata(vec![(
+            SCHEMA_VERSION_KEY.to_string(),
+            version.to_string(),
+        )])
+        .await?;
+    Ok(())
+}
+
+/// Apply pending schema migrations to the chunks table. Only runs migrations
+/// whose version exceeds the stored schema version, then bumps the version.
+async fn migrate_chunks_table(table: &Table) -> Result<(), RagError> {
+    use lancedb::table::NewColumnTransform;
+
+    let current = read_schema_version(table).await?;
+    if current >= CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let mut applied = 0u32;
+    for &(ver, col, default_expr) in CHUNK_MIGRATIONS {
+        if ver <= current {
+            continue;
+        }
+        match table
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(col.into(), default_expr.into())]),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                eprintln!("  migrated v{ver}: added column '{col}'");
+                applied += 1;
+            }
+            Err(_) => {
+                // Column already exists (e.g. table was created with the
+                // latest schema but version metadata was missing).
+            }
+        }
+    }
+
+    write_schema_version(table, CURRENT_SCHEMA_VERSION).await?;
+    if applied > 0 {
+        eprintln!(
+            "  schema version: {current} → {CURRENT_SCHEMA_VERSION} ({applied} migration(s))"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt16Array,
+        builder::{ListBuilder, StringBuilder},
+    };
+    use arrow_schema::{DataType, Field};
+    use serial_test::serial;
+
+    /// Build the v0 chunks schema (before block_type was added).
+    fn chunks_schema_v0() -> Arc<Schema> {
+        let fields: Vec<Field> = chunks_schema()
+            .fields()
+            .iter()
+            .filter(|f| f.name() != "block_type")
+            .cloned()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Build an empty string list array with 1 row (empty list).
+    fn empty_string_list_array() -> arrow_array::ListArray {
+        let mut builder = ListBuilder::new(StringBuilder::new());
+        builder.append(true);
+        builder.finish()
+    }
+
+    /// Insert a single dummy row into the v0 table (no block_type column).
+    async fn insert_v0_row(table: &Table) {
+        let schema = chunks_schema_v0();
+        let dim = crate::schema::EMBED_DIM;
+        let zeros: Vec<f32> = vec![0.0; dim as usize];
+        let vector_field = Field::new("item", DataType::Float32, true);
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(vector_field),
+            dim,
+            Arc::new(Float32Array::from(zeros)),
+            None,
+        )
+        .unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["test/ch0/s0/p0"])),  // chunk_id
+                Arc::new(StringArray::from(vec!["test"])),             // paper_id
+                Arc::new(vectors) as Arc<dyn Array>,                   // vector
+                Arc::new(StringArray::from(vec![""])),                 // chapter_title
+                Arc::new(UInt16Array::from(vec![0u16])),               // chapter_idx
+                Arc::new(StringArray::from(vec![""])),                 // section_title
+                Arc::new(UInt16Array::from(vec![0u16])),               // section_idx
+                Arc::new(UInt16Array::from(vec![0u16])),               // chunk_idx
+                Arc::new(StringArray::from(vec!["paragraph"])),        // depth
+                Arc::new(StringArray::from(vec!["hello world"])),      // text
+                Arc::new(UInt16Array::from(vec![None::<u16>])),        // page_start
+                Arc::new(UInt16Array::from(vec![None::<u16>])),        // page_end
+                Arc::new(StringArray::from(vec!["Test Paper"])),       // title
+                Arc::new(empty_string_list_array()) as Arc<dyn Array>, // authors
+                Arc::new(UInt16Array::from(vec![None::<u16>])),        // year
+                Arc::new(StringArray::from(vec![None::<&str>])),       // venue
+                Arc::new(empty_string_list_array()) as Arc<dyn Array>, // tags
+                Arc::new(empty_string_list_array()) as Arc<dyn Array>, // figure_ids
+            ],
+        )
+        .unwrap();
+
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        table
+            .add(Box::new(reader))
+            .execute()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_migrate_v0_to_v1_adds_block_type() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let db = lancedb::connect(&db_path).execute().await.unwrap();
+
+        // Create table with v0 schema (no block_type)
+        let table = ensure_table(&db, "papers_chunks", chunks_schema_v0())
+            .await
+            .unwrap();
+
+        // No version metadata yet
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, 0);
+
+        // Insert a row before migration
+        insert_v0_row(&table).await;
+
+        // Run migration
+        migrate_chunks_table(&table).await.unwrap();
+
+        // Version should now be CURRENT_SCHEMA_VERSION
+        // Need to re-open to see updated schema metadata
+        let table = db.open_table("papers_chunks").execute().await.unwrap();
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+
+        // Table should now have block_type column
+        let schema = table.schema().await.unwrap();
+        assert!(
+            schema.field_with_name("block_type").is_ok(),
+            "block_type column should exist after migration"
+        );
+
+        // Existing row should have default value 'text'
+        use futures::TryStreamExt;
+        use lancedb::query::{ExecutableQuery, QueryBase};
+        let batches: Vec<RecordBatch> = table
+            .query()
+            .select(lancedb::query::Select::columns(&["chunk_id", "block_type"]))
+            .execute()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.len(), 1);
+        let bt_col = batches[0]
+            .column_by_name("block_type")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(bt_col.value(0), "text");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_migrate_idempotent_second_open_is_noop() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+
+        // First open: creates table + migrates
+        let db = lancedb::connect(&db_path).execute().await.unwrap();
+        let table = ensure_table(&db, "papers_chunks", chunks_schema()).await.unwrap();
+        migrate_chunks_table(&table).await.unwrap();
+
+        let table = db.open_table("papers_chunks").execute().await.unwrap();
+        let v1 = read_schema_version(&table).await.unwrap();
+        assert_eq!(v1, CURRENT_SCHEMA_VERSION);
+
+        // Second open: should skip migration entirely
+        drop(table);
+        let table = db.open_table("papers_chunks").execute().await.unwrap();
+        migrate_chunks_table(&table).await.unwrap();
+        let v2 = read_schema_version(&table).await.unwrap();
+        assert_eq!(v2, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_fresh_db_gets_version_stamped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let db = lancedb::connect(&db_path).execute().await.unwrap();
+
+        // Create with latest schema (already has block_type)
+        let table = ensure_table(&db, "papers_chunks", chunks_schema()).await.unwrap();
+
+        // Before migration: no version
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, 0);
+
+        // Migration should stamp version even though column already exists
+        migrate_chunks_table(&table).await.unwrap();
+
+        let table = db.open_table("papers_chunks").execute().await.unwrap();
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_read_write_schema_version_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let db = lancedb::connect(&db_path).execute().await.unwrap();
+        let table = ensure_table(&db, "papers_chunks", chunks_schema()).await.unwrap();
+
+        assert_eq!(read_schema_version(&table).await.unwrap(), 0);
+
+        write_schema_version(&table, 42).await.unwrap();
+        // Re-open to see metadata update
+        let table = db.open_table("papers_chunks").execute().await.unwrap();
+        assert_eq!(read_schema_version(&table).await.unwrap(), 42);
+
+        // Overwrite with different version
+        write_schema_version(&table, 99).await.unwrap();
+        let table = db.open_table("papers_chunks").execute().await.unwrap();
+        assert_eq!(read_schema_version(&table).await.unwrap(), 99);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_migrate_skips_when_already_at_current_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let db = lancedb::connect(&db_path).execute().await.unwrap();
+
+        // Create v0 table and manually stamp it at current version
+        let table = ensure_table(&db, "papers_chunks", chunks_schema_v0()).await.unwrap();
+        write_schema_version(&table, CURRENT_SCHEMA_VERSION).await.unwrap();
+
+        // Re-open and migrate — should be a no-op (won't try to add block_type)
+        let table = db.open_table("papers_chunks").execute().await.unwrap();
+        migrate_chunks_table(&table).await.unwrap();
+
+        // block_type should NOT exist since migration was skipped
+        let schema = table.schema().await.unwrap();
+        assert!(
+            schema.field_with_name("block_type").is_err(),
+            "block_type should not exist — migration was skipped due to version"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_open_for_test_stamps_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let store = RagStore::open_for_test(&db_path).await.unwrap();
+        let table = store.chunks_table().await.unwrap();
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
     }
 }

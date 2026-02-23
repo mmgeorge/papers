@@ -2143,12 +2143,10 @@ fn format_rag_search(results: &[papers_rag::SearchResult]) {
     for r in results {
         let c = &r.chunk;
         println!(
-            "{:.2}  {}  |  {}. {} › {} {}",
+            "{:.2}  {}  |  {} › {}",
             r.score,
             c.paper_id,
-            c.chapter_idx,
             c.chapter_title,
-            c.section_idx,
             c.section_title,
         );
         let preview: String = c.text.chars().take(200).collect();
@@ -2160,14 +2158,15 @@ fn format_rag_search(results: &[papers_rag::SearchResult]) {
     }
 }
 
-fn format_rag_figures(results: &[papers_rag::FigureResult]) {
+fn format_rag_figures(results: &[papers_rag::FigureSearchResult]) {
     if results.is_empty() {
         println!("No figures found.");
         return;
     }
     for f in results {
         println!(
-            "{}  {}  [{}]  (page {})",
+            "{:.2}  {}  {}  [{}]  (page {})",
+            f.score,
             f.figure_id,
             f.paper_id,
             f.figure_type,

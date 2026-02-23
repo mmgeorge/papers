@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct ChunkSummary {
     pub chunk_id: String,
     pub text_preview: String,
-    pub depth: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,16 +38,42 @@ pub struct ChunkWithPosition {
     pub section_idx: u16,
     pub chunk_idx: u16,
     pub depth: String,
+    pub block_type: String,
     pub figure_ids: Vec<String>,
     pub referenced_figures: Vec<ReferencedFigure>,
     pub position: PositionContext,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchChunkResult {
+    pub chunk_id: String,
+    pub paper_id: String,
+    pub paper_title: String,
+    pub block_type: String,
+    pub text: String,
+    pub chapter_title: String,
+    pub section_title: String,
+    pub chunk_idx: u16,
+    pub figure_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
-    pub chunk: ChunkWithPosition,
+    pub chunk: SearchChunkResult,
     pub prev: Option<ChunkSummary>,
     pub next: Option<ChunkSummary>,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FigureSearchResult {
+    pub figure_id: String,
+    pub paper_id: String,
+    pub figure_type: String,
+    pub caption: String,
+    pub description: String,
+    pub image_path: Option<String>,
+    pub page: Option<u16>,
     pub score: f32,
 }
 

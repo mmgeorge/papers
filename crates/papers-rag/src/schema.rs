@@ -41,6 +41,7 @@ pub fn chunks_schema() -> Arc<Schema> {
         Field::new("section_idx", DataType::UInt16, false),
         Field::new("chunk_idx", DataType::UInt16, false),
         Field::new("depth", DataType::Utf8, false),
+        Field::new("block_type", DataType::Utf8, false),
         Field::new("text", DataType::Utf8, false),
         Field::new("page_start", DataType::UInt16, true),
         Field::new("page_end", DataType::UInt16, true),

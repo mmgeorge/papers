@@ -9,10 +9,10 @@ use crate::error::RagError;
 use crate::filter::{validate_scope, FilterBuilder};
 use crate::store::RagStore;
 use crate::types::{
-    ChapterResult, ChapterSection, ChunkResult, ChunkSummary, ChunkWithPosition, FigureResult,
-    ListPapersParams, ListTagsParams, OutlineChapter, OutlineSection, PaperOutline, PaperSummary,
-    PositionContext, ReferencedFigure, SearchFiguresParams, SearchParams, SearchResult,
-    SectionResult, TagSummary,
+    ChapterResult, ChapterSection, ChunkResult, ChunkSummary, ChunkWithPosition,
+    FigureResult, FigureSearchResult, ListPapersParams, ListTagsParams, OutlineChapter,
+    OutlineSection, PaperOutline, PaperSummary, PositionContext, ReferencedFigure,
+    SearchChunkResult, SearchFiguresParams, SearchParams, SearchResult, SectionResult, TagSummary,
 };
 
 // ── Arrow extraction helpers ────────────────────────────────────────────────
@@ -106,6 +106,7 @@ fn chunk_from_row(batch: &RecordBatch, row: usize) -> ChunkData {
         section_idx: col_u16(batch, "section_idx", row),
         chunk_idx: col_u16(batch, "chunk_idx", row),
         depth: col_str(batch, "depth", row),
+        block_type: col_str(batch, "block_type", row),
         figure_ids: col_str_list(batch, "figure_ids", row),
     }
 }
@@ -124,10 +125,89 @@ struct ChunkData {
     section_idx: u16,
     chunk_idx: u16,
     depth: String,
+    block_type: String,
     figure_ids: Vec<String>,
 }
 
 // ── Shared async helpers ────────────────────────────────────────────────────
+
+const PREVIEW_MIN_CHARS: usize = 120;
+const PREVIEW_MAX_CHARS: usize = 300;
+
+/// Truncate `text` at a sentence boundary. Takes at least `min_chars`, then
+/// scans forward for `.`/`?`/`!` followed by whitespace or end-of-string.
+/// Caps at `max_chars` to prevent runaway.
+fn truncate_at_sentence(text: &str, min_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= min_chars {
+        return text.to_string();
+    }
+
+    let max_chars = PREVIEW_MAX_CHARS;
+    let chars: Vec<char> = text.chars().collect();
+    let limit = char_count.min(max_chars);
+
+    // Scan from min_chars forward for sentence-ending punctuation
+    for i in min_chars..limit {
+        if matches!(chars[i], '.' | '?' | '!') {
+            // Must be followed by whitespace or end-of-string
+            let at_end = i + 1 >= char_count;
+            let followed_by_space = !at_end && chars[i + 1].is_whitespace();
+            if at_end || followed_by_space {
+                return chars[..=i].iter().collect();
+            }
+        }
+    }
+
+    // No sentence boundary found — hard truncate at max_chars
+    let mut result: String = chars[..limit].iter().collect();
+    if limit < char_count {
+        result.push_str("...");
+    }
+    result
+}
+
+struct NeighborRow {
+    chunk_id: String,
+    text: String,
+    block_type: String,
+}
+
+async fn fetch_neighbor_row(
+    table: &lancedb::Table,
+    paper_id: &str,
+    chapter_idx: u16,
+    section_idx: u16,
+    chunk_idx: u16,
+) -> Result<Option<NeighborRow>, RagError> {
+    let filter = format!(
+        "paper_id = '{}' AND chapter_idx = {} AND section_idx = {} AND chunk_idx = {}",
+        paper_id.replace('\'', "''"),
+        chapter_idx,
+        section_idx,
+        chunk_idx
+    );
+    let batches = table
+        .query()
+        .only_if(&filter)
+        .select(Select::columns(&["chunk_id", "text", "block_type"]))
+        .limit(1)
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| RagError::LanceDb(e))?;
+    if total_rows(&batches) > 0 {
+        let b = &batches[0];
+        Ok(Some(NeighborRow {
+            chunk_id: col_str(b, "chunk_id", 0),
+            text: col_str(b, "text", 0),
+            block_type: col_str(b, "block_type", 0),
+        }))
+    } else {
+        Ok(None)
+    }
+}
 
 async fn fetch_neighbors(
     table: &lancedb::Table,
@@ -136,68 +216,69 @@ async fn fetch_neighbors(
     section_idx: u16,
     chunk_idx: u16,
 ) -> Result<(Option<ChunkSummary>, Option<ChunkSummary>), RagError> {
-    // Fetch prev
+    // Fetch prev neighbor (with formula look-through)
     let prev = if chunk_idx > 0 {
         let prev_idx = chunk_idx - 1;
-        let filter = format!(
-            "paper_id = '{}' AND chapter_idx = {} AND section_idx = {} AND chunk_idx = {}",
-            paper_id.replace('\'', "''"),
-            chapter_idx,
-            section_idx,
-            prev_idx
-        );
-        let batches = table
-            .query()
-            .only_if(&filter)
-            .select(Select::columns(&["chunk_id", "text", "depth"]))
-            .limit(1)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| RagError::LanceDb(e))?;
-        if total_rows(&batches) > 0 {
-            let b = &batches[0];
-            Some(ChunkSummary {
-                chunk_id: col_str(b, "chunk_id", 0),
-                text_preview: col_str(b, "text", 0).chars().take(120).collect(),
-                depth: col_str(b, "depth", 0),
-            })
-        } else {
-            None
+        match fetch_neighbor_row(table, paper_id, chapter_idx, section_idx, prev_idx).await? {
+            Some(row) if row.block_type == "equation" => {
+                // Equation neighbor: include full equation text and look one further back
+                let far_preview = if prev_idx > 0 {
+                    if let Some(far) = fetch_neighbor_row(
+                        table, paper_id, chapter_idx, section_idx, prev_idx - 1,
+                    ).await? {
+                        truncate_at_sentence(&far.text, PREVIEW_MIN_CHARS)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                let preview = if far_preview.is_empty() {
+                    row.text.clone()
+                } else {
+                    format!("{} {}", far_preview, row.text)
+                };
+                Some(ChunkSummary {
+                    chunk_id: row.chunk_id,
+                    text_preview: preview,
+                })
+            }
+            Some(row) => Some(ChunkSummary {
+                chunk_id: row.chunk_id,
+                text_preview: truncate_at_sentence(&row.text, PREVIEW_MIN_CHARS),
+            }),
+            None => None,
         }
     } else {
         None
     };
 
-    // Fetch next
+    // Fetch next neighbor (with formula look-through)
     let next_idx = chunk_idx + 1;
-    let filter = format!(
-        "paper_id = '{}' AND chapter_idx = {} AND section_idx = {} AND chunk_idx = {}",
-        paper_id.replace('\'', "''"),
-        chapter_idx,
-        section_idx,
-        next_idx
-    );
-    let batches = table
-        .query()
-        .only_if(&filter)
-        .select(Select::columns(&["chunk_id", "text", "depth"]))
-        .limit(1)
-        .execute()
-        .await?
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|e| RagError::LanceDb(e))?;
-    let next = if total_rows(&batches) > 0 {
-        let b = &batches[0];
-        Some(ChunkSummary {
-            chunk_id: col_str(b, "chunk_id", 0),
-            text_preview: col_str(b, "text", 0).chars().take(120).collect(),
-            depth: col_str(b, "depth", 0),
-        })
-    } else {
-        None
+    let next = match fetch_neighbor_row(table, paper_id, chapter_idx, section_idx, next_idx).await? {
+        Some(row) if row.block_type == "equation" => {
+            let far_preview = if let Some(far) = fetch_neighbor_row(
+                table, paper_id, chapter_idx, section_idx, next_idx + 1,
+            ).await? {
+                truncate_at_sentence(&far.text, PREVIEW_MIN_CHARS)
+            } else {
+                String::new()
+            };
+            let preview = if far_preview.is_empty() {
+                row.text.clone()
+            } else {
+                format!("{} {}", row.text, far_preview)
+            };
+            Some(ChunkSummary {
+                chunk_id: row.chunk_id,
+                text_preview: preview,
+            })
+        }
+        Some(row) => Some(ChunkSummary {
+            chunk_id: row.chunk_id,
+            text_preview: truncate_at_sentence(&row.text, PREVIEW_MIN_CHARS),
+        }),
+        None => None,
     };
 
     Ok((prev, next))
@@ -345,6 +426,7 @@ async fn build_chunk_with_position(
         section_idx: data.section_idx,
         chunk_idx: data.chunk_idx,
         depth: data.depth,
+        block_type: data.block_type,
         figure_ids: data.figure_ids,
         referenced_figures,
         position: pos,
@@ -404,9 +486,9 @@ pub async fn search(
         .await
         .map_err(|e| RagError::LanceDb(e))?;
 
+    let chunks_table = store.chunks_table().await?;
     let mut results = Vec::new();
     for batch in &batches {
-        // Check if _distance column is present
         let has_distance = batch.column_by_name("_distance").is_some();
         for row in 0..batch.num_rows() {
             let score = if has_distance {
@@ -415,17 +497,23 @@ pub async fn search(
                 0.0
             };
             let data = chunk_from_row(batch, row);
-            let paper_id = data.paper_id.clone();
-            let chapter_idx = data.chapter_idx;
-            let section_idx = data.section_idx;
-            let chunk_idx = data.chunk_idx;
-            let chunk = build_chunk_with_position(store, data).await?;
+            let chunk = SearchChunkResult {
+                chunk_id: data.chunk_id,
+                paper_id: data.paper_id.clone(),
+                paper_title: data.title,
+                block_type: data.block_type,
+                text: data.text,
+                chapter_title: data.chapter_title,
+                section_title: data.section_title,
+                chunk_idx: data.chunk_idx,
+                figure_ids: data.figure_ids,
+            };
             let (prev, next) = fetch_neighbors(
-                &store.chunks_table().await?,
-                &paper_id,
-                chapter_idx,
-                section_idx,
-                chunk_idx,
+                &chunks_table,
+                &data.paper_id,
+                data.chapter_idx,
+                data.section_idx,
+                data.chunk_idx,
             )
             .await?;
             results.push(SearchResult {
@@ -443,7 +531,7 @@ pub async fn search(
 pub async fn search_figures(
     store: &RagStore,
     params: SearchFiguresParams,
-) -> Result<Vec<FigureResult>, RagError> {
+) -> Result<Vec<FigureSearchResult>, RagError> {
     let embedding = store.embed_query(&params.query).await?;
     let table = store.figures_table().await?;
 
@@ -470,8 +558,14 @@ pub async fn search_figures(
 
     let mut results = Vec::new();
     for batch in &batches {
+        let has_distance = batch.column_by_name("_distance").is_some();
         for row in 0..batch.num_rows() {
-            results.push(FigureResult {
+            let score = if has_distance {
+                col_f32(batch, "_distance", row)
+            } else {
+                0.0
+            };
+            results.push(FigureSearchResult {
                 figure_id: col_str(batch, "figure_id", row),
                 paper_id: col_str(batch, "paper_id", row),
                 figure_type: col_str(batch, "figure_type", row),
@@ -479,7 +573,7 @@ pub async fn search_figures(
                 description: col_str(batch, "description", row),
                 image_path: col_str_opt(batch, "image_path", row),
                 page: col_u16_opt(batch, "page", row),
-                referenced_by: vec![],
+                score,
             });
         }
     }
@@ -954,4 +1048,126 @@ pub async fn list_tags(
         .collect();
     result.sort_by(|a, b| b.paper_count.cmp(&a.paper_count).then(a.tag.cmp(&b.tag)));
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate_at_sentence ──────────────────────────────────────────────
+
+    #[test]
+    fn short_text_under_min_chars() {
+        assert_eq!(truncate_at_sentence("Hello world.", 120), "Hello world.");
+    }
+
+    #[test]
+    fn empty_string() {
+        assert_eq!(truncate_at_sentence("", 120), "");
+    }
+
+    #[test]
+    fn sentence_ends_shortly_after_min_chars() {
+        // Build text where sentence ends at ~125 chars
+        let mut text = "A".repeat(120);
+        text.push_str("word. Next sentence continues here.");
+        let result = truncate_at_sentence(&text, 120);
+        assert!(result.ends_with('.'), "should end at period: {}", result);
+        assert!(result.len() <= 130, "should cut near 125: len={}", result.len());
+    }
+
+    #[test]
+    fn no_sentence_boundary_before_max() {
+        // Long run-on text with no sentence-ending punctuation
+        let text = "a ".repeat(200); // 400 chars, no period
+        let result = truncate_at_sentence(&text, 120);
+        assert!(result.ends_with("..."), "should have ellipsis: {}", result);
+        // 300 chars + "..."
+        assert!(result.chars().count() <= 303);
+    }
+
+    #[test]
+    fn period_inside_abbreviation_not_cut() {
+        // "Fig. 1" has a period at char 3, but it's before min_chars so irrelevant
+        let text = "Fig. 1 shows the results of the experiment that we conducted over multiple iterations of the algorithm to verify the convergence. The next step is analysis.";
+        let result = truncate_at_sentence(&text, 120);
+        // Should cut at the period after "convergence" (char ~128), not at "Fig."
+        assert!(result.contains("convergence."), "got: {}", result);
+    }
+
+    #[test]
+    fn multiple_sentence_endings_cuts_at_first_after_min() {
+        let s1 = "a".repeat(115);
+        let text = format!("{}First. Second. Third.", s1);
+        let result = truncate_at_sentence(&text, 120);
+        // Should cut at "First." (first sentence end after min_chars)
+        assert!(result.ends_with("First."), "got: {}", result);
+    }
+
+    #[test]
+    fn question_mark_ending() {
+        let prefix = "a".repeat(118);
+        let text = format!("{}what is the result? The answer is here.", prefix);
+        let result = truncate_at_sentence(&text, 120);
+        assert!(result.ends_with('?'), "should cut at question mark: {}", result);
+    }
+
+    #[test]
+    fn exclamation_mark_ending() {
+        let prefix = "a".repeat(118);
+        let text = format!("{}converges! This means progress.", prefix);
+        let result = truncate_at_sentence(&text, 120);
+        assert!(result.ends_with('!'), "should cut at exclamation: {}", result);
+    }
+
+    #[test]
+    fn period_at_end_of_string() {
+        let text = "Short sentence that ends with a period.";
+        let result = truncate_at_sentence(&text, 120);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn period_not_followed_by_space_decimal() {
+        // "3.14" has a period not followed by space — should NOT cut here
+        let prefix = "a".repeat(118);
+        let text = format!("{}uses 3.14 as pi value. Then we continue.", prefix);
+        let result = truncate_at_sentence(&text, 120);
+        // Should skip "3.14" (no space after '.') and cut at "value."
+        assert!(result.contains("value."), "got: {}", result);
+    }
+
+    #[test]
+    fn period_not_followed_by_space_url() {
+        let prefix = "a".repeat(118);
+        let text = format!("{}see arxiv.org for details. The paper shows.", prefix);
+        let result = truncate_at_sentence(&text, 120);
+        // Should skip "arxiv.org" and cut at "details."
+        assert!(result.contains("details."), "got: {}", result);
+    }
+
+    #[test]
+    fn text_with_latex() {
+        let prefix = "a".repeat(110);
+        let text = format!("{}where \\mathbf{{x}} = 0. The result follows.", prefix);
+        let result = truncate_at_sentence(&text, 120);
+        assert!(result.ends_with('.'), "should cut at period: {}", result);
+    }
+
+    #[test]
+    fn unicode_multibyte_chars() {
+        // Text with accented characters — should handle char boundaries
+        let text = "Lörem ïpsum dölor sit amet, cönsectetur adipïscing elït. Sed dö eïusmöd tempor incïdidunt ut labore et dölore magna aliqüa. Ut enim ad minim veniam.";
+        let result = truncate_at_sentence(&text, 120);
+        assert!(result.ends_with('.'), "got: {}", result);
+    }
+
+    #[test]
+    fn exactly_min_chars_no_period_after() {
+        // Text exactly at min_chars with no period after
+        let text = "a".repeat(120);
+        let result = truncate_at_sentence(&text, 120);
+        // Under max, no period, returns as-is (no truncation needed since == min)
+        assert_eq!(result, text);
+    }
 }

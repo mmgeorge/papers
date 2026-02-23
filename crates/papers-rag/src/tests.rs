@@ -743,11 +743,14 @@ async fn test_figure_ids_have_correct_format() {
     let fig = get_figure(&store, "FIGID/fig1").await.unwrap();
     assert_eq!(fig.figure_id, "FIGID/fig1");
     assert_eq!(fig.figure_type, "figure");
-    assert_eq!(fig.caption, "Figure 1: A diagram");
+    // Caption comes from the adjacent Caption block, not from alt text
+    assert_eq!(fig.caption, "Caption for figure 1.");
+    assert_eq!(fig.description, "Figure 1: A diagram");
 
     let tbl = get_figure(&store, "FIGID/fig2").await.unwrap();
     assert_eq!(tbl.figure_id, "FIGID/fig2");
     assert_eq!(tbl.figure_type, "table");
+    // No adjacent Caption block for the table, so caption falls back to alt text
     assert_eq!(tbl.caption, "Table 1: Results");
 }
 
@@ -1308,4 +1311,329 @@ async fn test_realistic_yfacfa8c_structure() {
     let after_alg = get_chunk(&store, "VBD/ch4/s0/p1").await.unwrap();
     assert_eq!(after_alg.chunk.chapter_idx, 4);
     assert_eq!(after_alg.chunk.section_idx, 0);
+}
+
+// ── block_type field ──────────────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_block_type_stored_correctly() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+    let json = make_json(&[
+        ("SectionHeader", "sh1", "<h2>Method</h2>"),
+        ("Text", "t0", "<p>Some text.</p>"),
+        ("Equation", "eq0", "<p>x = y</p>"),
+        ("ListGroup", "lg0", "<ul><li>item</li></ul>"),
+    ]);
+    let params = make_cache_from_json(&cache_dir, "BTYPE", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let text_chunk = get_chunk(&store, "BTYPE/ch1/s0/p0").await.unwrap();
+    assert_eq!(text_chunk.chunk.block_type, "text");
+
+    let eq_chunk = get_chunk(&store, "BTYPE/ch1/s0/p1").await.unwrap();
+    assert_eq!(eq_chunk.chunk.block_type, "equation");
+
+    let list_chunk = get_chunk(&store, "BTYPE/ch1/s0/p2").await.unwrap();
+    assert_eq!(list_chunk.chunk.block_type, "list");
+}
+
+// ── search result shape tests ───────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_search_result_has_paper_title() {
+    use crate::query::search;
+    use crate::types::SearchParams;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+    let params = make_test_cache(&cache_dir, "SRCH1");
+    ingest_paper(&store, params).await.unwrap();
+
+    let results = search(
+        &store,
+        SearchParams {
+            query: "introduction".to_string(),
+            paper_ids: Some(vec!["SRCH1".to_string()]),
+            chapter_idx: None,
+            section_idx: None,
+            filter_year_min: None,
+            filter_year_max: None,
+            filter_venue: None,
+            filter_tags: None,
+            filter_depth: None,
+            limit: 5,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!results.is_empty(), "should find at least one result");
+    let r = &results[0];
+    // SearchChunkResult has paper_title, not title
+    assert_eq!(r.chunk.paper_title, "Test Paper");
+    // Has block_type
+    assert!(!r.chunk.block_type.is_empty());
+    // Has figure_ids field
+    let _ = &r.chunk.figure_ids;
+    // Has chunk_idx
+    let _ = r.chunk.chunk_idx;
+}
+
+// ── sentence-aware preview in neighbors ──────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_neighbor_preview_sentence_truncation() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // Create a paper with a long text chunk followed by a short one
+    let long_text = format!(
+        "<p>{}. Next sentence after the boundary.</p>",
+        "A".repeat(125)
+    );
+    let json = serde_json::json!({
+        "children": [{
+            "block_type": "Page",
+            "children": [
+                {"block_type": "SectionHeader", "id": "h1", "html": "<h2>Test</h2>", "page": 1},
+                {"block_type": "Text", "id": "t0", "html": long_text, "page": 1},
+                {"block_type": "Text", "id": "t1", "html": "<p>Second chunk.</p>", "page": 1}
+            ]
+        }]
+    });
+    let item_dir = cache_dir.path().join("SENTPREV");
+    fs::create_dir_all(&item_dir).unwrap();
+    fs::write(item_dir.join("SENTPREV.json"), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let params = IngestParams {
+        item_key: "SENTPREV".to_string(),
+        paper_id: "SENTPREV".to_string(),
+        title: "Test".to_string(),
+        authors: vec![],
+        year: None,
+        venue: None,
+        tags: vec![],
+        cache_dir: item_dir,
+        force: false,
+    };
+    ingest_paper(&store, params).await.unwrap();
+
+    // Get the second chunk — its prev should have a sentence-truncated preview
+    let result = get_chunk(&store, "SENTPREV/ch1/s0/p1").await.unwrap();
+    let prev = result.prev.unwrap();
+    // Preview should end at a sentence boundary (period)
+    assert!(
+        prev.text_preview.ends_with('.'),
+        "preview should end at sentence boundary: {}",
+        prev.text_preview
+    );
+    // Preview should NOT contain the second sentence
+    assert!(
+        !prev.text_preview.contains("Next sentence"),
+        "preview should truncate: {}",
+        prev.text_preview
+    );
+}
+
+// ── formula-aware neighbor expansion ─────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_neighbor_equation_expansion() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // [TextA, Equation, TextB(target)]
+    let json = serde_json::json!({
+        "children": [{
+            "block_type": "Page",
+            "children": [
+                {"block_type": "SectionHeader", "id": "h1", "html": "<h2>Method</h2>", "page": 1},
+                {"block_type": "Text", "id": "t0", "html": "<p>We define the objective function as follows.</p>", "page": 1},
+                {"block_type": "Equation", "id": "eq0", "html": "<p><math>E = mc^2</math></p>", "page": 1},
+                {"block_type": "Text", "id": "t1", "html": "<p>Where m is mass and c is the speed of light.</p>", "page": 1}
+            ]
+        }]
+    });
+    let item_dir = cache_dir.path().join("EQNBR");
+    fs::create_dir_all(&item_dir).unwrap();
+    fs::write(item_dir.join("EQNBR.json"), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let params = IngestParams {
+        item_key: "EQNBR".to_string(),
+        paper_id: "EQNBR".to_string(),
+        title: "Test".to_string(),
+        authors: vec![],
+        year: None,
+        venue: None,
+        tags: vec![],
+        cache_dir: item_dir,
+        force: false,
+    };
+    ingest_paper(&store, params).await.unwrap();
+
+    // Get TextB (chunk_idx=2) — prev is Equation (chunk_idx=1)
+    let result = get_chunk(&store, "EQNBR/ch1/s0/p2").await.unwrap();
+    let prev = result.prev.unwrap();
+    // prev.chunk_id should be the equation chunk
+    assert_eq!(prev.chunk_id, "EQNBR/ch1/s0/p1");
+    // Preview should contain the equation text
+    assert!(
+        prev.text_preview.contains("E = mc^2"),
+        "preview should contain equation: {}",
+        prev.text_preview
+    );
+    // Preview should also contain TextA's content (look-through)
+    assert!(
+        prev.text_preview.contains("objective function"),
+        "preview should contain far text: {}",
+        prev.text_preview
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn test_neighbor_next_equation_expansion() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // [TextA(target), Equation, TextB]
+    let json = serde_json::json!({
+        "children": [{
+            "block_type": "Page",
+            "children": [
+                {"block_type": "SectionHeader", "id": "h1", "html": "<h2>Method</h2>", "page": 1},
+                {"block_type": "Text", "id": "t0", "html": "<p>The following equation defines energy.</p>", "page": 1},
+                {"block_type": "Equation", "id": "eq0", "html": "<p><math>\\nabla f = 0</math></p>", "page": 1},
+                {"block_type": "Text", "id": "t1", "html": "<p>This result holds for all cases.</p>", "page": 1}
+            ]
+        }]
+    });
+    let item_dir = cache_dir.path().join("EQNEXT");
+    fs::create_dir_all(&item_dir).unwrap();
+    fs::write(item_dir.join("EQNEXT.json"), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let params = IngestParams {
+        item_key: "EQNEXT".to_string(),
+        paper_id: "EQNEXT".to_string(),
+        title: "Test".to_string(),
+        authors: vec![],
+        year: None,
+        venue: None,
+        tags: vec![],
+        cache_dir: item_dir,
+        force: false,
+    };
+    ingest_paper(&store, params).await.unwrap();
+
+    // Get TextA (chunk_idx=0) — next is Equation (chunk_idx=1)
+    let result = get_chunk(&store, "EQNEXT/ch1/s0/p0").await.unwrap();
+    let next = result.next.unwrap();
+    assert_eq!(next.chunk_id, "EQNEXT/ch1/s0/p1");
+    // Preview should contain equation text and far text
+    assert!(
+        next.text_preview.contains("\\nabla f = 0"),
+        "preview should contain equation: {}",
+        next.text_preview
+    );
+    assert!(
+        next.text_preview.contains("result holds"),
+        "preview should contain far text: {}",
+        next.text_preview
+    );
+}
+
+#[serial]
+#[tokio::test]
+async fn test_neighbor_equation_at_boundary_no_far_chunk() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // [Equation(chunk_idx=0), Text(target, chunk_idx=1)]
+    let json = serde_json::json!({
+        "children": [{
+            "block_type": "Page",
+            "children": [
+                {"block_type": "SectionHeader", "id": "h1", "html": "<h2>Method</h2>", "page": 1},
+                {"block_type": "Equation", "id": "eq0", "html": "<p><math>x = 0</math></p>", "page": 1},
+                {"block_type": "Text", "id": "t0", "html": "<p>Where x is defined above.</p>", "page": 1}
+            ]
+        }]
+    });
+    let item_dir = cache_dir.path().join("EQBOUND");
+    fs::create_dir_all(&item_dir).unwrap();
+    fs::write(item_dir.join("EQBOUND.json"), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let params = IngestParams {
+        item_key: "EQBOUND".to_string(),
+        paper_id: "EQBOUND".to_string(),
+        title: "Test".to_string(),
+        authors: vec![],
+        year: None,
+        venue: None,
+        tags: vec![],
+        cache_dir: item_dir,
+        force: false,
+    };
+    ingest_paper(&store, params).await.unwrap();
+
+    // Get Text (chunk_idx=1) — prev is Equation (chunk_idx=0), no far chunk before it
+    let result = get_chunk(&store, "EQBOUND/ch1/s0/p1").await.unwrap();
+    let prev = result.prev.unwrap();
+    assert_eq!(prev.chunk_id, "EQBOUND/ch1/s0/p0");
+    // Preview should just be the equation text (no far chunk)
+    assert!(
+        prev.text_preview.contains("x = 0"),
+        "preview should contain equation: {}",
+        prev.text_preview
+    );
+}
+
+// ── figure search result with score ──────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_search_figures_has_score() {
+    use crate::query::search_figures;
+    use crate::types::SearchFiguresParams;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+    let params = make_test_cache(&cache_dir, "FIGSCORE");
+    ingest_paper(&store, params).await.unwrap();
+
+    let results = search_figures(
+        &store,
+        SearchFiguresParams {
+            query: "diagram".to_string(),
+            paper_ids: Some(vec!["FIGSCORE".to_string()]),
+            filter_figure_type: None,
+            limit: 5,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!results.is_empty(), "should find at least one figure");
+    // FigureSearchResult should have score field
+    // With zero-vector embedder, distances will be 0.0
+    let _ = results[0].score;
+    // Should have all expected fields
+    assert!(!results[0].figure_id.is_empty());
+    assert!(!results[0].paper_id.is_empty());
+    assert!(!results[0].figure_type.is_empty());
 }

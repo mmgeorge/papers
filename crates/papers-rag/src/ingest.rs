@@ -34,6 +34,7 @@ struct ChunkRecord {
     section_title: String,
     section_idx: u16,
     chunk_idx: u16,
+    block_type: String,
     text: String,
     page: Option<u16>,
     figure_ids: Vec<String>,
@@ -43,6 +44,7 @@ struct FigureRecord {
     figure_id: String,
     figure_type: String,
     caption: String,
+    description: String,
     image_path: Option<String>,
     page: Option<u16>,
     chapter_idx: u16,
@@ -63,6 +65,39 @@ fn strip_html(html: &str) -> String {
     }
     // Normalize whitespace
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Strip HTML tags but preserve the text content of `<math>` elements as LaTeX.
+///
+/// `<math ...>content</math>` is replaced by `content` before other tags are
+/// stripped, so equations survive as readable LaTeX strings.
+fn strip_html_preserve_math(html: &str) -> String {
+    let mut buf = String::with_capacity(html.len());
+    let mut remaining = html;
+
+    while let Some(start) = remaining.find("<math") {
+        // Copy everything before the <math> tag
+        buf.push_str(&remaining[..start]);
+        remaining = &remaining[start..];
+
+        // Find the closing > of the opening <math ...> tag
+        if let Some(tag_end) = remaining.find('>') {
+            remaining = &remaining[tag_end + 1..];
+            // Find </math>
+            if let Some(close) = remaining.find("</math>") {
+                buf.push_str(&remaining[..close]);
+                remaining = &remaining[close + 7..]; // skip "</math>"
+            }
+            // else: malformed, skip the opening tag and keep going
+        } else {
+            // Malformed tag, skip the '<' and keep going
+            buf.push('<');
+            remaining = &remaining[1..];
+        }
+    }
+    buf.push_str(remaining);
+
+    strip_html(&buf)
 }
 
 /// Extract `src` attribute value from an `<img>` tag.
@@ -239,7 +274,47 @@ fn parse_paper_blocks(
     // Track per-section chunk counter (reset when section changes)
     let mut last_section_key: (u16, u16) = (0, 0);
 
-    for block in &flat_blocks {
+    // Set of block indices consumed as captions (to avoid double-processing)
+    let mut consumed_captions: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    /// Helper: look for an adjacent `Caption` block at `idx` in `blocks`.
+    /// Returns the stripped caption text if found.
+    fn try_consume_caption(
+        blocks: &[&Value],
+        idx: usize,
+        consumed: &mut std::collections::HashSet<usize>,
+    ) -> Option<String> {
+        if idx >= blocks.len() || consumed.contains(&idx) {
+            return None;
+        }
+        let bt = blocks[idx]
+            .get("block_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if bt != "Caption" {
+            return None;
+        }
+        let html = blocks[idx]
+            .get("html")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let text = strip_html_preserve_math(html);
+        if text.trim().is_empty() {
+            return None;
+        }
+        consumed.insert(idx);
+        Some(text)
+    }
+
+    let mut i = 0;
+    while i < flat_blocks.len() {
+        // Skip already-consumed caption indices
+        if consumed_captions.contains(&i) {
+            i += 1;
+            continue;
+        }
+
+        let block = flat_blocks[i];
         let block_type = block
             .get("block_type")
             .and_then(|v| v.as_str())
@@ -251,8 +326,16 @@ fn parse_paper_blocks(
             .map(|p| p as u16);
 
         match block_type {
-            "Page" | "PageHeader" | "PageFooter" | "TableOfContents" | "Caption"
-            | "Picture" => continue,
+            "Page" | "PageHeader" | "PageFooter" | "TableOfContents" => {
+                i += 1;
+                continue;
+            }
+
+            "Caption" => {
+                // Standalone caption not consumed by a figure — skip
+                i += 1;
+                continue;
+            }
 
             "SectionHeader" => {
                 // Determine level from the HTML heading tag (h1–h6).
@@ -301,8 +384,13 @@ fn parse_paper_blocks(
 
             "Text" | "ListGroup" | "Equation" => {
                 let html = block.get("html").and_then(|v| v.as_str()).unwrap_or("");
-                let text = strip_html(html);
+                let text = if block_type == "Equation" {
+                    strip_html_preserve_math(html)
+                } else {
+                    strip_html(html)
+                };
                 if text.trim().is_empty() {
+                    i += 1;
                     continue;
                 }
 
@@ -317,6 +405,11 @@ fn parse_paper_blocks(
                     "{}/ch{}/s{}/p{}",
                     params.paper_id, chapter_idx, section_idx, chunk_idx
                 );
+                let bt = match block_type {
+                    "Equation" => "equation",
+                    "ListGroup" => "list",
+                    _ => "text",
+                };
                 chunk_records.push(ChunkRecord {
                     chunk_id,
                     chapter_title: current_chapter_title.clone(),
@@ -324,6 +417,7 @@ fn parse_paper_blocks(
                     section_title: current_section_title.clone(),
                     section_idx,
                     chunk_idx,
+                    block_type: bt.to_string(),
                     text,
                     page: page_num,
                     figure_ids: vec![],
@@ -331,10 +425,42 @@ fn parse_paper_blocks(
                 chunk_idx += 1;
             }
 
-            "Figure" | "Table" => {
+            "Figure" | "Table" | "Picture" => {
                 let html = block.get("html").and_then(|v| v.as_str()).unwrap_or("");
-                let caption = extract_img_alt(html).unwrap_or_default();
+                let alt_text = extract_img_alt(html).unwrap_or_default();
                 let src = extract_img_src(html);
+
+                // Look for an adjacent Caption block (after or before)
+                let adjacent_caption =
+                    try_consume_caption(&flat_blocks, i + 1, &mut consumed_captions)
+                        .or_else(|| {
+                            if i > 0 {
+                                try_consume_caption(
+                                    &flat_blocks,
+                                    i - 1,
+                                    &mut consumed_captions,
+                                )
+                            } else {
+                                None
+                            }
+                        });
+
+                // For Picture blocks, require an adjacent Caption to distinguish
+                // real figures from logos/icons
+                if block_type == "Picture" && adjacent_caption.is_none() {
+                    i += 1;
+                    continue;
+                }
+
+                let caption = adjacent_caption
+                    .clone()
+                    .unwrap_or_else(|| alt_text.clone());
+                let description = if alt_text.is_empty() {
+                    caption.clone()
+                } else {
+                    alt_text
+                };
+
                 let image_path = src.map(|s| {
                     params
                         .cache_dir
@@ -350,6 +476,7 @@ fn parse_paper_blocks(
                     figure_id,
                     figure_type: figure_type.to_string(),
                     caption,
+                    description,
                     image_path,
                     page: page_num,
                     chapter_idx,
@@ -358,6 +485,57 @@ fn parse_paper_blocks(
             }
 
             _ => {} // skip unknown block types
+        }
+
+        i += 1;
+    }
+
+    // ── Post-process: populate figure_ids on chunks ────────────────────────
+    if !figure_records.is_empty() {
+        // Build map: figure/table number → figure_id
+        // Parse patterns like "Fig. 1.", "Figure 12.", "Table 3." from captions
+        let fig_num_re = regex::Regex::new(r"(?:Figure|Fig\.)\s+(\d+)").unwrap();
+        let tbl_num_re = regex::Regex::new(r"Table\s+(\d+)").unwrap();
+
+        let mut fig_number_to_id: HashMap<(String, u32), String> = HashMap::new();
+        for fr in &figure_records {
+            if let Some(caps) = fig_num_re.captures(&fr.caption) {
+                if let Ok(n) = caps[1].parse::<u32>() {
+                    fig_number_to_id.insert(("figure".to_string(), n), fr.figure_id.clone());
+                }
+            }
+            if let Some(caps) = tbl_num_re.captures(&fr.caption) {
+                if let Ok(n) = caps[1].parse::<u32>() {
+                    fig_number_to_id.insert(("table".to_string(), n), fr.figure_id.clone());
+                }
+            }
+        }
+
+        // Scan each chunk's text for figure/table references
+        let ref_re = regex::Regex::new(r"(?:Figure|Fig\.)\s+(\d+)").unwrap();
+        let tbl_ref_re = regex::Regex::new(r"Table\s+(\d+)").unwrap();
+
+        for chunk in &mut chunk_records {
+            let mut ids: Vec<String> = Vec::new();
+            for caps in ref_re.captures_iter(&chunk.text) {
+                if let Ok(n) = caps[1].parse::<u32>() {
+                    if let Some(fid) = fig_number_to_id.get(&("figure".to_string(), n)) {
+                        if !ids.contains(fid) {
+                            ids.push(fid.clone());
+                        }
+                    }
+                }
+            }
+            for caps in tbl_ref_re.captures_iter(&chunk.text) {
+                if let Ok(n) = caps[1].parse::<u32>() {
+                    if let Some(fid) = fig_number_to_id.get(&("table".to_string(), n)) {
+                        if !ids.contains(fid) {
+                            ids.push(fid.clone());
+                        }
+                    }
+                }
+            }
+            chunk.figure_ids = ids;
         }
     }
 
@@ -548,7 +726,7 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
     };
 
     // ── Embed figure captions ───────────────────────────────────────────────
-    let fig_texts: Vec<String> = figure_records.iter().map(|f| f.caption.clone()).collect();
+    let fig_texts: Vec<String> = figure_records.iter().map(|f| f.description.clone()).collect();
     let fig_embeddings = if fig_texts.is_empty() {
         vec![]
     } else {
@@ -643,6 +821,7 @@ fn build_chunks_batch(
     let section_idxs: Vec<u16> = records.iter().map(|r| r.section_idx).collect();
     let chunk_idxs: Vec<u16> = records.iter().map(|r| r.chunk_idx).collect();
     let depths: Vec<&str> = vec!["paragraph"; n];
+    let block_types: Vec<&str> = records.iter().map(|r| r.block_type.as_str()).collect();
     let texts: Vec<&str> = records.iter().map(|r| r.text.as_str()).collect();
     let page_starts: Vec<Option<u16>> = records.iter().map(|r| r.page).collect();
     let page_ends: Vec<Option<u16>> = records.iter().map(|r| r.page).collect();
@@ -665,6 +844,7 @@ fn build_chunks_batch(
             Arc::new(UInt16Array::from(section_idxs)),
             Arc::new(UInt16Array::from(chunk_idxs)),
             Arc::new(StringArray::from(depths)),
+            Arc::new(StringArray::from(block_types)),
             Arc::new(StringArray::from(texts)),
             Arc::new(UInt16Array::from(page_starts)),
             Arc::new(UInt16Array::from(page_ends)),
@@ -694,7 +874,7 @@ fn build_figures_batch(
     let vectors = build_vector_array(embeddings);
     let figure_types: Vec<&str> = records.iter().map(|r| r.figure_type.as_str()).collect();
     let captions: Vec<&str> = records.iter().map(|r| r.caption.as_str()).collect();
-    let descriptions: Vec<&str> = records.iter().map(|r| r.caption.as_str()).collect();
+    let descriptions: Vec<&str> = records.iter().map(|r| r.description.as_str()).collect();
     let image_paths: Vec<Option<&str>> = records
         .iter()
         .map(|r| r.image_path.as_deref())
@@ -982,6 +1162,474 @@ mod tests {
         )
         .unwrap();
     }
+
+    // ── strip_html_preserve_math ──────────────────────────────────────────
+
+    #[test]
+    fn test_strip_html_preserve_math() {
+        let input = r#"<p><math display="block">\mathbf{x} = 0 \quad (1)</math></p>"#;
+        assert_eq!(
+            strip_html_preserve_math(input),
+            r"\mathbf{x} = 0 \quad (1)"
+        );
+    }
+
+    #[test]
+    fn test_strip_html_preserve_math_inline() {
+        let input = r"<p>where <math>\alpha</math> is a constant</p>";
+        assert_eq!(
+            strip_html_preserve_math(input),
+            r"where \alpha is a constant"
+        );
+    }
+
+    #[test]
+    fn test_strip_html_preserve_math_no_math() {
+        let input = "<p>No math here</p>";
+        assert_eq!(strip_html_preserve_math(input), "No math here");
+    }
+
+    #[test]
+    fn test_extract_caption_text() {
+        let input = r"<p><b>Fig. 1.</b> A description of the figure with <math>\mu_c</math> values.</p>";
+        let result = strip_html_preserve_math(input);
+        assert!(result.contains(r"\mu_c"));
+        assert!(result.contains("Fig. 1."));
+        assert!(result.contains("A description of the figure"));
+    }
+
+    // ── figure number extraction ────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_figure_number_from_caption() {
+        let re = regex::Regex::new(r"(?:Figure|Fig\.)\s+(\d+)").unwrap();
+        let tbl_re = regex::Regex::new(r"Table\s+(\d+)").unwrap();
+
+        assert_eq!(
+            re.captures("Fig. 1. A caption").unwrap()[1].parse::<u32>().unwrap(),
+            1
+        );
+        assert_eq!(
+            re.captures("Fig. 12. Another caption").unwrap()[1].parse::<u32>().unwrap(),
+            12
+        );
+        assert_eq!(
+            tbl_re.captures("Table 1. Results").unwrap()[1].parse::<u32>().unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_extract_figure_number_no_match() {
+        let re = regex::Regex::new(r"(?:Figure|Fig\.)\s+(\d+)").unwrap();
+        assert!(re.captures("Just some caption text").is_none());
+    }
+
+    // ── parse_paper_blocks integration tests ────────────────────────────────
+
+    /// Helper: write a custom DataLab JSON structure and return IngestParams.
+    fn write_custom_datalab_json(
+        dir: &std::path::Path,
+        item_key: &str,
+        blocks: Vec<serde_json::Value>,
+    ) -> IngestParams {
+        let item_dir = dir.join(item_key);
+        fs::create_dir_all(&item_dir).unwrap();
+        let json = serde_json::json!({
+            "children": [{
+                "block_type": "Page",
+                "children": blocks
+            }]
+        });
+        fs::write(
+            item_dir.join(format!("{item_key}.json")),
+            serde_json::to_vec_pretty(&json).unwrap(),
+        )
+        .unwrap();
+        IngestParams {
+            item_key: item_key.to_string(),
+            paper_id: item_key.to_string(),
+            title: "Test Paper".to_string(),
+            authors: vec![],
+            year: None,
+            venue: None,
+            tags: vec![],
+            cache_dir: item_dir,
+            force: false,
+        }
+    }
+
+    #[test]
+    fn test_picture_with_caption_indexed_as_figure() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "SectionHeader", "id": "h1",
+                "html": "<h2>Results</h2>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t1",
+                "html": "<p>Some text.</p>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Picture", "id": "pic1",
+                "html": r#"<img src="fig1.png" alt="Figure 1: A stress test result showing convergence"/>"#,
+                "page": 2
+            }),
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap1",
+                "html": "<p><b>Fig. 1.</b> Convergence results for the stress test.</p>",
+                "page": 2
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t2",
+                "html": "<p>More text.</p>", "page": 2
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "PICTEST1", blocks);
+        let (chunks, figures) = parse_paper_blocks(&params).unwrap();
+
+        assert_eq!(figures.len(), 1);
+        assert_eq!(figures[0].figure_type, "figure");
+        assert!(figures[0].caption.contains("Fig. 1."));
+        assert!(figures[0].caption.contains("Convergence results"));
+        assert!(figures[0].description.contains("stress test result"));
+        assert!(figures[0].image_path.is_some());
+        assert_eq!(chunks.len(), 2); // two Text blocks
+    }
+
+    #[test]
+    fn test_picture_without_caption_skipped() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "Picture", "id": "pic1",
+                "html": r#"<img src="cc_logo.png" alt="Creative Commons Attribution"/>"#,
+                "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t1",
+                "html": "<p>Some text.</p>", "page": 1
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "PICTEST2", blocks);
+        let (_chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 0);
+    }
+
+    #[test]
+    fn test_figure_block_with_caption() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "Figure", "id": "fig1",
+                "html": r#"<img src="fig6.png" alt="Figure 6: AI description of the figure"/>"#,
+                "page": 5
+            }),
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap1",
+                "html": "<p><b>Fig. 6.</b> The paper's original caption text.</p>",
+                "page": 5
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "FIGTEST1", blocks);
+        let (_chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 1);
+        assert!(figures[0].caption.contains("Fig. 6."));
+        assert!(figures[0].description.contains("AI description"));
+    }
+
+    #[test]
+    fn test_figure_block_without_caption_uses_alt() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "Figure", "id": "fig1",
+                "html": r#"<img src="fig6.png" alt="Figure 6: description from alt"/>"#,
+                "page": 5
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "FIGTEST2", blocks);
+        let (_chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 1);
+        // No adjacent Caption, so caption falls back to alt text
+        assert!(figures[0].caption.contains("Figure 6: description from alt"));
+    }
+
+    #[test]
+    fn test_table_block_indexed() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap1",
+                "html": "<p><b>Table 1.</b> Comparison of methods.</p>",
+                "page": 3
+            }),
+            serde_json::json!({
+                "block_type": "Table", "id": "tbl1",
+                "html": r#"<img src="tbl1.png" alt="Table showing method comparison"/>"#,
+                "page": 3
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "TBLTEST1", blocks);
+        let (_chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 1);
+        assert_eq!(figures[0].figure_type, "table");
+        assert!(figures[0].caption.contains("Table 1."));
+    }
+
+    #[test]
+    fn test_caption_before_picture() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "Text", "id": "t1",
+                "html": "<p>Intro text.</p>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap1",
+                "html": "<p><b>Fig. 15.</b> A preceding caption.</p>",
+                "page": 8
+            }),
+            serde_json::json!({
+                "block_type": "Picture", "id": "pic1",
+                "html": r#"<img src="fig15.png" alt="Figure 15: description"/>"#,
+                "page": 8
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t2",
+                "html": "<p>Following text.</p>", "page": 8
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "CAPBEFORE", blocks);
+        let (chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 1);
+        assert!(figures[0].caption.contains("Fig. 15."));
+        assert!(figures[0].caption.contains("preceding caption"));
+        // Caption was consumed, not turned into a chunk
+        assert_eq!(chunks.len(), 2); // only the two Text blocks
+    }
+
+    #[test]
+    fn test_equation_preserves_latex() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "SectionHeader", "id": "h1",
+                "html": "<h2>Method</h2>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Equation", "id": "eq1",
+                "html": r#"<p><math display="block">\mathbf{x} = 0</math></p>"#,
+                "page": 2
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "EQTEST1", blocks);
+        let (chunks, _figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0].text.contains(r"\mathbf{x}"),
+            "LaTeX should be preserved, got: {}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn test_equation_among_text_chunks() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "SectionHeader", "id": "h1",
+                "html": "<h2>Method</h2>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t1",
+                "html": "<p>We define</p>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Equation", "id": "eq1",
+                "html": "<p><math>E = mc^2</math></p>",
+                "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t2",
+                "html": "<p>where m is mass</p>", "page": 1
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "EQTEST2", blocks);
+        let (chunks, _figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks[1].text.contains("E = mc^2"));
+        // chunk_idx values are sequential
+        assert_eq!(chunks[0].chunk_idx, 0);
+        assert_eq!(chunks[1].chunk_idx, 1);
+        assert_eq!(chunks[2].chunk_idx, 2);
+    }
+
+    #[test]
+    fn test_figure_ids_populated_on_chunks() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "SectionHeader", "id": "h1",
+                "html": "<h2>Results</h2>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Picture", "id": "pic1",
+                "html": r#"<img src="fig1.png" alt="Figure 1: plot"/>"#,
+                "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap1",
+                "html": "<p><b>Fig. 1.</b> The convergence plot.</p>",
+                "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t1",
+                "html": "<p>As shown in Figure 1, the results converge.</p>",
+                "page": 2
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "XREFTEST1", blocks);
+        let (chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 1);
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0].figure_ids.contains(&figures[0].figure_id),
+            "chunk should reference figure; figure_ids={:?}, expected={}",
+            chunks[0].figure_ids,
+            figures[0].figure_id
+        );
+    }
+
+    #[test]
+    fn test_figure_ids_multiple_references() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "SectionHeader", "id": "h1",
+                "html": "<h2>Results</h2>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Figure", "id": "fig1",
+                "html": r#"<img src="fig1.png" alt="Plot"/>"#, "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap1",
+                "html": "<p><b>Fig. 1.</b> A figure.</p>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Table", "id": "tbl1",
+                "html": r#"<img src="tbl2.png" alt="Table data"/>"#, "page": 2
+            }),
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap2",
+                "html": "<p><b>Table 2.</b> Comparison data.</p>", "page": 2
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t1",
+                "html": "<p>See Figure 1 and Table 2 for details.</p>",
+                "page": 3
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "XREFTEST2", blocks);
+        let (chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 2);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].figure_ids.len(), 2);
+        assert!(chunks[0].figure_ids.contains(&figures[0].figure_id));
+        assert!(chunks[0].figure_ids.contains(&figures[1].figure_id));
+    }
+
+    #[test]
+    fn test_figure_ids_no_references() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "SectionHeader", "id": "h1",
+                "html": "<h2>Intro</h2>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t1",
+                "html": "<p>No figure references here.</p>", "page": 1
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "XREFTEST3", blocks);
+        let (chunks, _figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].figure_ids.is_empty());
+    }
+
+    #[test]
+    fn test_mixed_document() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "SectionHeader", "id": "h1",
+                "html": "<h2>Method</h2>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t1",
+                "html": "<p>We propose a method.</p>", "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Equation", "id": "eq1",
+                "html": r#"<p><math display="block">\nabla f(x) = 0</math></p>"#,
+                "page": 1
+            }),
+            serde_json::json!({
+                "block_type": "Picture", "id": "pic1",
+                "html": r#"<img src="fig1.png" alt="Figure 1: AI description of method overview"/>"#,
+                "page": 2
+            }),
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap1",
+                "html": "<p><b>Fig. 1.</b> Method overview showing the pipeline.</p>",
+                "page": 2
+            }),
+            serde_json::json!({
+                "block_type": "Text", "id": "t2",
+                "html": "<p>As shown in Figure 1, the pipeline processes data.</p>",
+                "page": 2
+            }),
+            serde_json::json!({
+                "block_type": "Caption", "id": "cap2",
+                "html": "<p><b>Table 1.</b> Quantitative results.</p>",
+                "page": 3
+            }),
+            serde_json::json!({
+                "block_type": "Table", "id": "tbl1",
+                "html": r#"<img src="tbl1.png" alt="Results table"/>"#,
+                "page": 3
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "MIXTEST1", blocks);
+        let (chunks, figures) = parse_paper_blocks(&params).unwrap();
+
+        // 3 chunks: text, equation, text
+        assert_eq!(chunks.len(), 3, "expected 3 chunks, got {}", chunks.len());
+        // 2 figures: picture + table
+        assert_eq!(figures.len(), 2, "expected 2 figures, got {}", figures.len());
+
+        // Equation preserves LaTeX
+        assert!(chunks[1].text.contains(r"\nabla f(x) = 0"));
+
+        // Figure captions vs descriptions
+        assert!(figures[0].caption.contains("Fig. 1."));
+        assert!(figures[0].description.contains("AI description"));
+        assert_eq!(figures[0].figure_type, "figure");
+
+        assert!(figures[1].caption.contains("Table 1."));
+        assert_eq!(figures[1].figure_type, "table");
+
+        // Cross-references populated on the text chunk that mentions Figure 1
+        assert!(
+            chunks[2].figure_ids.contains(&figures[0].figure_id),
+            "text chunk referencing Figure 1 should have its figure_id"
+        );
+    }
+
+    // ── embed cache integration ───────────────────────────────────────────────
 
     #[serial]
     #[tokio::test]

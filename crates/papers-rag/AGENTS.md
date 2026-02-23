@@ -87,6 +87,17 @@ or unreadable, the fallback is `"embedding-gemma-300m"`.
 | `cache_dir` | `PathBuf` | Path to `{datalab_cache}/{item_key}/` |
 | `force` | `bool` | Bypass embed cache and LanceDB skip-check |
 
+### Search result types
+
+`search()` returns slim `SearchResult` with `SearchChunkResult` (no
+`authors`/`year`/`venue`/`position`/`referenced_figures` — use `get_chunk` for
+full details).  `search_figures()` returns `FigureSearchResult` with a `score`
+field.
+
+Neighbor previews (`ChunkSummary`) use sentence-aware truncation (120–300
+chars) and look through equation chunks to provide context from the text chunk
+beyond the formula.
+
 ### `EmbedCache`
 
 Located at `{base_dir}/embeddings/{model}/{item_key}/`:
@@ -129,6 +140,7 @@ which returns zero vectors without loading any model weights.
 | `section_idx` | UInt16 | |
 | `chunk_idx` | UInt16 | within-section index |
 | `depth` | Utf8 | always "paragraph" |
+| `block_type` | Utf8 | "text", "equation", or "list" |
 | `text` | Utf8 | |
 | `page_start` | UInt16 | nullable |
 | `page_end` | UInt16 | nullable |
@@ -163,6 +175,41 @@ which returns zero vectors without loading any model weights.
 - `PAPERS_DATALAB_CACHE_DIR` — redirect DataLab cache in tests
 - `PAPERS_EMBED_CACHE_DIR` — redirect embed cache in tests
 - `tempfile::TempDir` — all test state is isolated
+
+---
+
+## Schema migrations
+
+LanceDB tables on disk may have been created with an older schema. The
+`migrate_chunks_table()` function in `store.rs` runs automatically on every
+`RagStore::open()` call and applies any pending migrations.
+
+### How it works
+
+Schema version is stored in Arrow schema metadata under the key
+`papers_schema_version` using `NativeTable::replace_schema_metadata()`.
+On startup the version is read via `table.schema().metadata`, and only
+migrations with a version number greater than the stored version are applied.
+After all pending migrations run, the version is bumped.
+
+`CHUNK_MIGRATIONS` is a `&[(u32, &str, &str)]` array of
+`(version, column_name, default_sql_expression)`. Each migration adds a column
+via `table.add_columns()`. If the column already exists (e.g. the table was
+created with the latest schema but the version metadata was missing), the
+`add_columns` call fails silently.
+
+`CURRENT_SCHEMA_VERSION` must equal the highest version in `CHUNK_MIGRATIONS`.
+
+### How to add a new column
+
+1. Bump `CURRENT_SCHEMA_VERSION` in `store.rs`
+2. Add a `(new_version, column_name, default_expr)` entry to `CHUNK_MIGRATIONS`
+   (or create a `FIGURE_MIGRATIONS` array + `migrate_figures_table()` if for figures)
+3. Add the column to `schema.rs` (`chunks_schema()` or `figures_schema()`)
+4. Add the column to the ingest path (`ChunkRecord`, `build_chunks_batch()`, etc.)
+5. Update `ChunkData` / `chunk_from_row()` in `query.rs` to read the new column
+6. Update `AGENTS.md` table schemas
+7. Existing databases will auto-migrate on next open — no manual steps needed
 
 ---
 
