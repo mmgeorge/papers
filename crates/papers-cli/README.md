@@ -5,7 +5,7 @@
 > [!WARNING]
 > Under active development. Expect bugs and breaking changes.
 
-Search, manage, and explore academic papers from the terminal or LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers embeddings (using DirectML and CoreML) with [LanceDB](https://lancedb.com) so you can semantically search across sections, figures, and chunks locally.
+Search, manage, and explore academic papers from the terminal or LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers embeddings (using DirectML and CoreML) with [LanceDB](https://github.com/lancedb/lancedb) so you can semantically search across sections, figures, and chunks locally.
 
 Also runs as an [MCP](https://modelcontextprotocol.io) server, exposing all functionality as tools for LLMs.
 
@@ -74,7 +74,7 @@ Entities: `work`, `attachment`, `annotation`, `note`, `collection`, `tag`, `sear
 
 ## RAG
 
-Local semantic search over your papers using [LanceDB](https://lancedb.com) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Inference runs on-device with hardware acceleration via DirectML on Windows and CoreML on macOS.
+Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Inference runs on-device with hardware acceleration via DirectML on Windows and CoreML on macOS.
 
 ```sh
 papers rag ingest                        # Index papers from marker cache
