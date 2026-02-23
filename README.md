@@ -7,11 +7,9 @@ Search, manage, and explore academic papers from the terminal or LLM. Queries 24
 Also runs as an [MCP](https://modelcontextprotocol.io) server, exposing all functionality as tools for LLMs.
 
 > [!NOTE]
-> Producing a high quality OCR for a technical paper is complex. Even the best PDF-extraction libraries I tested (pdfium, mupdf) still yield garbled LaTeX and unreadable tables. Headers and footers can also muddy the output.
+> Producing a high quality OCR for technical papers is complex. Even the best PDF-extraction mangle LaTeX and tables. This project uses vision-model-based OCR via [Datalab](https://www.datalab.to/) (requires API key) to produce clean markdown with math and tables preserved. Extracted results (JSON, markdown, images) sync back to your Zotero library.
 >
-> Instead, state of the art techniques run vision models that can understand the layout of a paper, generating markdown and a parsed representation from that. From my tests, [marker](https://github.com/datalab-to/marker) does a very good job at this. However, the model used has [restrictions on use](https://github.com/datalab-to/marker?tab=readme-ov-file#commercial-usage). Right now, the CLI connects to [datalab](https://www.datalab.to/) (requires key). We sync the extracted PDF (json, markdown, and images) with your Zotero library so that you can use the results directly if you choose.
->
-> If you meet the restriction requirements, you can use marker directly. Place generated artifacts into the cache directory where we store results from datalab. Working on a nicer path for this.
+> You can also run [marker](https://github.com/datalab-to/marker) locally if you meet its [license requirements](https://github.com/datalab-to/marker?tab=readme-ov-file#commercial-usage) — just place the output in the cache directory.
 
 ## Install
 
