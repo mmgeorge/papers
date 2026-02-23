@@ -121,3 +121,8 @@ When `rmcp` updates:
 - The `#[tool]` macro transforms async fns — they return `Pin<Box<dyn Future>>`, not regular futures
 - `tool_router` visibility must be set via `#[tool_router(vis = "pub")]` for external access
 - Tool methods need `pub` visibility to be testable from integration tests
+- **Never use `panic!`/`expect`/`unwrap` in code reachable from tool handlers.** The `rmcp`
+  framework catches panics from tool handlers and returns a generic MCP error to the client.
+  The actual panic message only appears in server stderr — the client never sees the real
+  error, resulting in silently failing tools or opaque timeouts. Always use `Result` and `?`
+  to propagate errors so they surface as readable MCP error responses.

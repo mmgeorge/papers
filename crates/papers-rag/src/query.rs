@@ -18,78 +18,76 @@ use crate::types::{
 
 // ── Arrow extraction helpers ────────────────────────────────────────────────
 
-fn col_str(batch: &RecordBatch, name: &str, row: usize) -> String {
-    let col = batch.column_by_name(name).expect("column exists");
+fn arrow_err(name: &str, expected: &str, actual: &DataType) -> RagError {
+    RagError::Arrow(format!(
+        "column '{name}': expected {expected}, got {actual:?}"
+    ))
+}
+
+fn missing_col(name: &str) -> RagError {
+    RagError::Arrow(format!("missing column '{name}'"))
+}
+
+fn col_str(batch: &RecordBatch, name: &str, row: usize) -> Result<String, RagError> {
+    let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-        if arr.is_null(row) { String::new() } else { arr.value(row).to_string() }
+        Ok(if arr.is_null(row) { String::new() } else { arr.value(row).to_string() })
     } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-        if arr.is_null(row) { String::new() } else { arr.value(row).to_string() }
+        Ok(if arr.is_null(row) { String::new() } else { arr.value(row).to_string() })
     } else {
-        panic!("column '{name}' has unexpected type {:?}", col.data_type());
+        Err(arrow_err(name, "Utf8 or LargeUtf8", col.data_type()))
     }
 }
 
-fn col_str_opt(batch: &RecordBatch, name: &str, row: usize) -> Option<String> {
-    let col = batch.column_by_name(name).expect("column exists");
-    // Migrated columns with bare NULL default produce Arrow Null type
+fn col_str_opt(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>, RagError> {
+    let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     if *col.data_type() == DataType::Null {
-        return None;
+        return Ok(None);
     }
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-        if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) }
+        Ok(if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) })
     } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
-        if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) }
+        Ok(if arr.is_null(row) { None } else { Some(arr.value(row).to_string()) })
     } else {
-        panic!("column '{name}' has unexpected type {:?}", col.data_type());
+        Err(arrow_err(name, "Utf8 or LargeUtf8", col.data_type()))
     }
 }
 
-fn col_u16(batch: &RecordBatch, name: &str, row: usize) -> u16 {
-    let col = batch.column_by_name(name).expect("column exists");
-    let arr = col
-        .as_any()
-        .downcast_ref::<UInt16Array>()
-        .expect("UInt16Array");
-    arr.value(row)
+fn col_u16(batch: &RecordBatch, name: &str, row: usize) -> Result<u16, RagError> {
+    let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
+    let arr = col.as_any().downcast_ref::<UInt16Array>()
+        .ok_or_else(|| arrow_err(name, "UInt16", col.data_type()))?;
+    Ok(arr.value(row))
 }
 
-fn col_u16_opt(batch: &RecordBatch, name: &str, row: usize) -> Option<u16> {
-    let col = batch.column_by_name(name).expect("column exists");
-    let arr = col
-        .as_any()
-        .downcast_ref::<UInt16Array>()
-        .expect("UInt16Array");
-    if arr.is_null(row) {
-        None
-    } else {
-        Some(arr.value(row))
-    }
+fn col_u16_opt(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<u16>, RagError> {
+    let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
+    let arr = col.as_any().downcast_ref::<UInt16Array>()
+        .ok_or_else(|| arrow_err(name, "UInt16", col.data_type()))?;
+    Ok(if arr.is_null(row) { None } else { Some(arr.value(row)) })
 }
 
-fn col_str_list(batch: &RecordBatch, name: &str, row: usize) -> Vec<String> {
-    let col = batch.column_by_name(name).expect("column exists");
+fn col_str_list(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<String>, RagError> {
+    let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     if col.is_null(row) {
-        return vec![];
+        return Ok(vec![]);
     }
-    let arr = col.as_any().downcast_ref::<ListArray>().expect("ListArray");
+    let arr = col.as_any().downcast_ref::<ListArray>()
+        .ok_or_else(|| arrow_err(name, "List", col.data_type()))?;
     let list_val = arr.value(row);
-    let str_arr = list_val
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("StringArray in list");
-    (0..str_arr.len())
+    let str_arr = list_val.as_any().downcast_ref::<StringArray>()
+        .ok_or_else(|| arrow_err(name, "List<Utf8>", col.data_type()))?;
+    Ok((0..str_arr.len())
         .filter(|&i| !str_arr.is_null(i))
         .map(|i| str_arr.value(i).to_string())
-        .collect()
+        .collect())
 }
 
-fn col_f32(batch: &RecordBatch, name: &str, row: usize) -> f32 {
-    let col = batch.column_by_name(name).expect("column exists");
-    let arr = col
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .expect("Float32Array");
-    arr.value(row)
+fn col_f32(batch: &RecordBatch, name: &str, row: usize) -> Result<f32, RagError> {
+    let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
+    let arr = col.as_any().downcast_ref::<Float32Array>()
+        .ok_or_else(|| arrow_err(name, "Float32", col.data_type()))?;
+    Ok(arr.value(row))
 }
 
 fn total_rows(batches: &[RecordBatch]) -> usize {
@@ -98,24 +96,24 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 
 // ── Chunk building ──────────────────────────────────────────────────────────
 
-fn chunk_from_row(batch: &RecordBatch, row: usize) -> ChunkData {
-    ChunkData {
-        chunk_id: col_str(batch, "chunk_id", row),
-        paper_id: col_str(batch, "paper_id", row),
-        title: col_str(batch, "title", row),
-        authors: col_str_list(batch, "authors", row),
-        year: col_u16_opt(batch, "year", row),
-        venue: col_str_opt(batch, "venue", row),
-        text: col_str(batch, "text", row),
-        chapter_title: col_str(batch, "chapter_title", row),
-        chapter_idx: col_u16(batch, "chapter_idx", row),
-        section_title: col_str(batch, "section_title", row),
-        section_idx: col_u16(batch, "section_idx", row),
-        chunk_idx: col_u16(batch, "chunk_idx", row),
-        depth: col_str(batch, "depth", row),
-        block_type: col_str(batch, "block_type", row),
-        figure_ids: col_str_list(batch, "figure_ids", row),
-    }
+fn chunk_from_row(batch: &RecordBatch, row: usize) -> Result<ChunkData, RagError> {
+    Ok(ChunkData {
+        chunk_id: col_str(batch, "chunk_id", row)?,
+        paper_id: col_str(batch, "paper_id", row)?,
+        title: col_str(batch, "title", row)?,
+        authors: col_str_list(batch, "authors", row)?,
+        year: col_u16_opt(batch, "year", row)?,
+        venue: col_str_opt(batch, "venue", row)?,
+        text: col_str(batch, "text", row)?,
+        chapter_title: col_str(batch, "chapter_title", row)?,
+        chapter_idx: col_u16(batch, "chapter_idx", row)?,
+        section_title: col_str(batch, "section_title", row)?,
+        section_idx: col_u16(batch, "section_idx", row)?,
+        chunk_idx: col_u16(batch, "chunk_idx", row)?,
+        depth: col_str(batch, "depth", row)?,
+        block_type: col_str(batch, "block_type", row)?,
+        figure_ids: col_str_list(batch, "figure_ids", row)?,
+    })
 }
 
 struct ChunkData {
@@ -229,17 +227,17 @@ async fn batch_fetch_neighbor_rows(
     for batch in &batches {
         for row in 0..batch.num_rows() {
             let key = (
-                col_str(batch, "paper_id", row),
-                col_u16(batch, "chapter_idx", row),
-                col_u16(batch, "section_idx", row),
-                col_u16(batch, "chunk_idx", row),
+                col_str(batch, "paper_id", row)?,
+                col_u16(batch, "chapter_idx", row)?,
+                col_u16(batch, "section_idx", row)?,
+                col_u16(batch, "chunk_idx", row)?,
             );
             map.insert(
                 key,
                 NeighborRow {
-                    chunk_id: col_str(batch, "chunk_id", row),
-                    text: col_str(batch, "text", row),
-                    block_type: col_str(batch, "block_type", row),
+                    chunk_id: col_str(batch, "chunk_id", row)?,
+                    text: col_str(batch, "text", row)?,
+                    block_type: col_str(batch, "block_type", row)?,
                 },
             );
         }
@@ -381,10 +379,10 @@ async fn resolve_figures(
     for batch in &batches {
         for row in 0..batch.num_rows() {
             results.push(ReferencedFigure {
-                figure_id: col_str(batch, "figure_id", row),
-                figure_type: col_str(batch, "figure_type", row),
-                caption: col_str(batch, "caption", row),
-                description: col_str(batch, "description", row),
+                figure_id: col_str(batch, "figure_id", row)?,
+                figure_type: col_str(batch, "figure_type", row)?,
+                caption: col_str(batch, "caption", row)?,
+                description: col_str(batch, "description", row)?,
             });
         }
     }
@@ -430,7 +428,7 @@ async fn position_context(
     let mut section_set = std::collections::HashSet::new();
     for b in &chapter_batches {
         for r in 0..b.num_rows() {
-            section_set.insert(col_u16(b, "section_idx", r));
+            section_set.insert(col_u16(b, "section_idx", r)?);
         }
     }
     let total_sections = section_set.len() as u32;
@@ -448,7 +446,7 @@ async fn position_context(
     let mut chapter_set = std::collections::HashSet::new();
     for b in &paper_batches {
         for r in 0..b.num_rows() {
-            chapter_set.insert(col_u16(b, "chapter_idx", r));
+            chapter_set.insert(col_u16(b, "chapter_idx", r)?);
         }
     }
     let total_chapters = chapter_set.len() as u32;
@@ -526,9 +524,9 @@ pub async fn resolve_paper_id(store: &RagStore, input: &str) -> Result<String, R
     let mut papers: Vec<(String, String)> = Vec::new();
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            let pid = col_str(batch, "paper_id", row);
+            let pid = col_str(batch, "paper_id", row)?;
             if seen.insert(pid.clone()) {
-                let title = col_str(batch, "title", row);
+                let title = col_str(batch, "title", row)?;
                 papers.push((pid, title));
             }
         }
@@ -647,11 +645,11 @@ async fn search_with_embedding_inner(
         let has_distance = batch.column_by_name("_distance").is_some();
         for row in 0..batch.num_rows() {
             let score = if has_distance {
-                col_f32(batch, "_distance", row)
+                col_f32(batch, "_distance", row)?
             } else {
                 0.0
             };
-            chunk_data_list.push((chunk_from_row(batch, row), score));
+            chunk_data_list.push((chunk_from_row(batch, row)?, score));
         }
     }
 
@@ -762,19 +760,19 @@ async fn search_figures_with_embedding_inner(
         let has_distance = batch.column_by_name("_distance").is_some();
         for row in 0..batch.num_rows() {
             let score = if has_distance {
-                col_f32(batch, "_distance", row)
+                col_f32(batch, "_distance", row)?
             } else {
                 0.0
             };
             results.push(FigureSearchResult {
-                figure_id: col_str(batch, "figure_id", row),
-                paper_id: col_str(batch, "paper_id", row),
-                figure_type: col_str(batch, "figure_type", row),
-                caption: col_str(batch, "caption", row),
-                description: col_str(batch, "description", row),
-                image_path: col_str_opt(batch, "image_path", row),
-                content: col_str_opt(batch, "content", row),
-                page: col_u16_opt(batch, "page", row),
+                figure_id: col_str(batch, "figure_id", row)?,
+                paper_id: col_str(batch, "paper_id", row)?,
+                figure_type: col_str(batch, "figure_type", row)?,
+                caption: col_str(batch, "caption", row)?,
+                description: col_str(batch, "description", row)?,
+                image_path: col_str_opt(batch, "image_path", row)?,
+                content: col_str_opt(batch, "content", row)?,
+                page: col_u16_opt(batch, "page", row)?,
                 score,
             });
         }
@@ -801,7 +799,7 @@ pub async fn get_chunk(store: &RagStore, chunk_id: &str) -> Result<ChunkResult, 
         return Err(RagError::NotFound(format!("chunk not found: {chunk_id}")));
     }
     let batch = &batches[0];
-    let data = chunk_from_row(batch, 0);
+    let data = chunk_from_row(batch, 0)?;
     let paper_id = data.paper_id.clone();
     let chapter_idx = data.chapter_idx;
     let section_idx = data.section_idx;
@@ -836,7 +834,7 @@ pub async fn get_section(
     let mut rows: Vec<(u16, &RecordBatch, usize)> = Vec::new();
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            rows.push((col_u16(batch, "chunk_idx", row), batch, row));
+            rows.push((col_u16(batch, "chunk_idx", row)?, batch, row));
         }
     }
     rows.sort_by_key(|(idx, _, _)| *idx);
@@ -845,7 +843,7 @@ pub async fn get_section(
     let mut section_title = String::new();
     let mut chunks = Vec::new();
     for (_, batch, row) in rows {
-        let data = chunk_from_row(batch, row);
+        let data = chunk_from_row(batch, row)?;
         if chapter_title.is_empty() {
             chapter_title = data.chapter_title.clone();
             section_title = data.section_title.clone();
@@ -887,8 +885,8 @@ pub async fn get_chapter(
     for batch in &batches {
         for row in 0..batch.num_rows() {
             rows.push((
-                col_u16(batch, "section_idx", row),
-                col_u16(batch, "chunk_idx", row),
+                col_u16(batch, "section_idx", row)?,
+                col_u16(batch, "chunk_idx", row)?,
                 batch,
                 row,
             ));
@@ -904,7 +902,7 @@ pub async fn get_chapter(
     let mut current_chunks: Vec<ChunkWithPosition> = Vec::new();
 
     for (section_idx, _, batch, row) in rows {
-        let data = chunk_from_row(batch, row);
+        let data = chunk_from_row(batch, row)?;
         if chapter_title.is_empty() {
             chapter_title = data.chapter_title.clone();
         }
@@ -969,14 +967,14 @@ pub async fn get_figure(store: &RagStore, figure_id: &str) -> Result<FigureResul
     }
     let batch = &batches[0];
     Ok(FigureResult {
-        figure_id: col_str(batch, "figure_id", 0),
-        paper_id: col_str(batch, "paper_id", 0),
-        figure_type: col_str(batch, "figure_type", 0),
-        caption: col_str(batch, "caption", 0),
-        description: col_str(batch, "description", 0),
-        image_path: col_str_opt(batch, "image_path", 0),
-        content: col_str_opt(batch, "content", 0),
-        page: col_u16_opt(batch, "page", 0),
+        figure_id: col_str(batch, "figure_id", 0)?,
+        paper_id: col_str(batch, "paper_id", 0)?,
+        figure_type: col_str(batch, "figure_type", 0)?,
+        caption: col_str(batch, "caption", 0)?,
+        description: col_str(batch, "description", 0)?,
+        image_path: col_str_opt(batch, "image_path", 0)?,
+        content: col_str_opt(batch, "content", 0)?,
+        page: col_u16_opt(batch, "page", 0)?,
         referenced_by: vec![],
     })
 }
@@ -1020,11 +1018,11 @@ pub async fn get_paper_outline(
 
     // Collect paper metadata from first row
     let first_batch = &batches[0];
-    let paper_title = col_str(first_batch, "title", 0);
-    let authors = col_str_list(first_batch, "authors", 0);
-    let year = col_u16_opt(first_batch, "year", 0);
-    let venue = col_str_opt(first_batch, "venue", 0);
-    let tags = col_str_list(first_batch, "tags", 0);
+    let paper_title = col_str(first_batch, "title", 0)?;
+    let authors = col_str_list(first_batch, "authors", 0)?;
+    let year = col_u16_opt(first_batch, "year", 0)?;
+    let venue = col_str_opt(first_batch, "venue", 0)?;
+    let tags = col_str_list(first_batch, "tags", 0)?;
 
     // Group by chapter → section
     let mut chapter_map: HashMap<u16, (String, HashMap<u16, (String, usize)>)> = HashMap::new();
@@ -1032,10 +1030,10 @@ pub async fn get_paper_outline(
 
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            let ch_idx = col_u16(batch, "chapter_idx", row);
-            let ch_title = col_str(batch, "chapter_title", row);
-            let sec_idx = col_u16(batch, "section_idx", row);
-            let sec_title = col_str(batch, "section_title", row);
+            let ch_idx = col_u16(batch, "chapter_idx", row)?;
+            let ch_title = col_str(batch, "chapter_title", row)?;
+            let sec_idx = col_u16(batch, "section_idx", row)?;
+            let sec_title = col_str(batch, "section_title", row)?;
 
             let entry = chapter_map
                 .entry(ch_idx)
@@ -1062,7 +1060,7 @@ pub async fn get_paper_outline(
     let mut fig_per_chapter: HashMap<u16, usize> = HashMap::new();
     for batch in &fig_batches {
         for row in 0..batch.num_rows() {
-            let ch_idx = col_u16(batch, "chapter_idx", row);
+            let ch_idx = col_u16(batch, "chapter_idx", row)?;
             *fig_per_chapter.entry(ch_idx).or_insert(0) += 1;
         }
     }
@@ -1149,18 +1147,20 @@ pub async fn list_papers(
     let mut paper_map: HashMap<String, PaperSummary> = HashMap::new();
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            let pid = col_str(batch, "paper_id", row);
-            let entry = paper_map.entry(pid.clone()).or_insert_with(|| PaperSummary {
-                paper_id: pid,
-                title: col_str(batch, "title", row),
-                authors: col_str_list(batch, "authors", row),
-                year: col_u16_opt(batch, "year", row),
-                venue: col_str_opt(batch, "venue", row),
-                tags: col_str_list(batch, "tags", row),
-                chunk_count: 0,
-                figure_count: 0,
-            });
-            entry.chunk_count += 1;
+            let pid = col_str(batch, "paper_id", row)?;
+            if !paper_map.contains_key(&pid) {
+                paper_map.insert(pid.clone(), PaperSummary {
+                    paper_id: pid.clone(),
+                    title: col_str(batch, "title", row)?,
+                    authors: col_str_list(batch, "authors", row)?,
+                    year: col_u16_opt(batch, "year", row)?,
+                    venue: col_str_opt(batch, "venue", row)?,
+                    tags: col_str_list(batch, "tags", row)?,
+                    chunk_count: 0,
+                    figure_count: 0,
+                });
+            }
+            paper_map.get_mut(&pid).unwrap().chunk_count += 1;
         }
     }
 
@@ -1186,7 +1186,7 @@ pub async fn list_papers(
         .map_err(|e| RagError::LanceDb(e))?;
     for batch in &fig_batches {
         for row in 0..batch.num_rows() {
-            let pid = col_str(batch, "paper_id", row);
+            let pid = col_str(batch, "paper_id", row)?;
             if let Some(entry) = paper_map.get_mut(&pid) {
                 entry.figure_count += 1;
             }
@@ -1231,8 +1231,8 @@ pub async fn list_tags(
     let mut tag_papers: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            let pid = col_str(batch, "paper_id", row);
-            let tags = col_str_list(batch, "tags", row);
+            let pid = col_str(batch, "paper_id", row)?;
+            let tags = col_str_list(batch, "tags", row)?;
             for tag in tags {
                 tag_papers
                     .entry(tag)
