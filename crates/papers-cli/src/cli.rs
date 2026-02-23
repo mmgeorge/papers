@@ -1513,7 +1513,7 @@ pub enum ConfigCommand {
 pub enum ConfigSetCommand {
     /// Set the default embedding model
     Model {
-        /// Model name (e.g. nomic-embed-text-v2-moe)
+        /// Model name (e.g. embedding-gemma-300m)
         name: String,
     },
 }
@@ -1529,13 +1529,13 @@ mod tests {
 
     #[test]
     fn test_parse_config_set_model_valid() {
-        let cli = parse(&["papers", "config", "set", "model", "nomic-embed-text-v2-moe"]);
+        let cli = parse(&["papers", "config", "set", "model", "embedding-gemma-300m"]);
         match cli.entity {
             EntityCommand::Config {
                 cmd: ConfigCommand::Set {
                     cmd: ConfigSetCommand::Model { name },
                 },
-            } => assert_eq!(name, "nomic-embed-text-v2-moe"),
+            } => assert_eq!(name, "embedding-gemma-300m"),
             _ => panic!("wrong variant"),
         }
     }
@@ -1592,14 +1592,14 @@ mod tests {
             "add",
             "KEY1",
             "--model",
-            "nomic-embed-text-v2-moe",
+            "embedding-gemma-300m",
         ]);
         match cli.entity {
             EntityCommand::Rag {
                 cmd: RagCommand::Embed {
                     cmd: RagEmbedCommand::Add { model, .. },
                 },
-            } => assert_eq!(model.as_deref(), Some("nomic-embed-text-v2-moe")),
+            } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
             _ => panic!("wrong variant"),
         }
     }
@@ -1642,14 +1642,14 @@ mod tests {
             "delete",
             "KEY1",
             "--model",
-            "nomic-embed-text-v2-moe",
+            "embedding-gemma-300m",
         ]);
         match cli.entity {
             EntityCommand::Rag {
                 cmd: RagCommand::Embed {
                     cmd: RagEmbedCommand::Delete { model, .. },
                 },
-            } => assert_eq!(model.as_deref(), Some("nomic-embed-text-v2-moe")),
+            } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
             _ => panic!("wrong variant"),
         }
     }

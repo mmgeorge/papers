@@ -2,7 +2,7 @@
 
 Local vector RAG (Retrieval-Augmented Generation) index for academic papers.
 Ingests PDF extractions produced by DataLab Marker, embeds text chunks with
-[Nomic Embed v2 MoE](https://huggingface.co/nomic-ai/nomic-embed-text-v2-moe),
+[Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX),
 stores vectors in [LanceDB](https://lancedb.github.io/lancedb/), and exposes
 semantic search over indexed papers.
 
@@ -25,7 +25,7 @@ use papers_rag::RagStore;
 let store = RagStore::open(&RagStore::default_path()).await?;
 ```
 
-`RagStore::open` loads the Nomic Embed model (downloads weights on first run)
+`RagStore::open` loads the embedding model (downloads weights on first run)
 and creates the LanceDB tables if they don't exist.
 
 ### Ingest a paper
@@ -94,7 +94,7 @@ rebuilt without re-running GPU inference.
 use papers_rag::{default_embed_cache, cache_paper_embeddings};
 
 // Pre-warm the cache for a paper
-let n = cache_paper_embeddings(&store, &params, "nomic-embed-text-v2-moe", false).await?;
+let n = cache_paper_embeddings(&store, &params, "embedding-gemma-300m", false).await?;
 println!("Cached {n} chunks");
 
 // Inspect what's cached
@@ -103,8 +103,8 @@ let models = cache.list_models("YFACFA8C")?;
 println!("Cached models: {:?}", models);
 
 // Load embeddings back
-if let Some(manifest) = cache.load_manifest("nomic-embed-text-v2-moe", "YFACFA8C")? {
-    let embeddings = cache.load_embeddings("nomic-embed-text-v2-moe", "YFACFA8C", &manifest)?;
+if let Some(manifest) = cache.load_manifest("embedding-gemma-300m", "YFACFA8C")? {
+    let embeddings = cache.load_embeddings("embedding-gemma-300m", "YFACFA8C", &manifest)?;
     println!("{} chunks × {} dims", embeddings.len(), manifest.dim);
 }
 ```

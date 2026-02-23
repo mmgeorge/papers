@@ -3,7 +3,7 @@ name = "papers-rag"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Local vector RAG system for academic papers using LanceDB and Nomic Embed"
+description = "Local vector RAG system for academic papers using LanceDB and FastEmbed"
 license.workspace = true
 repository.workspace = true
 

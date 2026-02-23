@@ -2021,7 +2021,7 @@ async fn handle_rag_embed_command(cmd: RagEmbedCommand) {
     let default_model = || {
         papers_core::config::PapersConfig::load()
             .map(|c| c.embedding_model)
-            .unwrap_or_else(|_| "nomic-embed-text-v2-moe".to_string())
+            .unwrap_or_else(|_| "embedding-gemma-300m".to_string())
     };
 
     match cmd {

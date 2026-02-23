@@ -261,7 +261,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    const MODEL: &str = "nomic-embed-text-v2-moe";
+    const MODEL: &str = "embedding-gemma-300m";
     const DIM: usize = 768;
 
     fn make_manifest(dim: usize, n: usize) -> EmbedManifest {

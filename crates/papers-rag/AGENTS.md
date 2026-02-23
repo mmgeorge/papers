@@ -1,6 +1,6 @@
 # papers-rag — Internal Architecture
 
-Local vector RAG system built on LanceDB + Nomic Embed v2 MoE (768-dim). Ingests
+Local vector RAG system built on LanceDB + Embedding Gemma 300M (768-dim). Ingests
 DataLab Marker JSON, embeds text chunks, caches embeddings on disk, and serves
 semantic search over indexed papers.
 
@@ -11,7 +11,7 @@ semantic search over indexed papers.
 ```
 src/
   lib.rs          — pub mod declarations, re-exports, default_embed_cache()
-  embed.rs        — Embedder wrapper (NomicV2MoeTextEmbedding, fake for tests)
+  embed.rs        — Embedder wrapper (EmbeddingGemma300M, fake for tests)
   embed_cache.rs  — EmbedCache: persistent f32 binary cache per (model, item_key)
   error.rs        — RagError enum (LanceDb, Embed, Arrow, Cache, Io, Json, …)
   ingest.rs       — parse_paper_blocks, ingest_paper, cache_paper_embeddings
@@ -69,7 +69,7 @@ Total size: `N * dim * 4` bytes. `N` and `dim` come from `manifest.json`
 
 `ingest_paper` and `cache_paper_embeddings` call `default_embed_model()` which
 reads `papers_core::config::PapersConfig::load()`. If the config file is missing
-or unreadable, the fallback is `"nomic-embed-text-v2-moe"`.
+or unreadable, the fallback is `"embedding-gemma-300m"`.
 
 `embed_cache_base()` checks `PAPERS_EMBED_CACHE_DIR` first, then falls back to
 `{cache_dir}/papers`.
