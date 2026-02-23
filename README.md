@@ -4,9 +4,7 @@
 [![CI](https://github.com/mmgeorge/papers/actions/workflows/ci.yml/badge.svg)](https://github.com/mmgeorge/papers/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Search, manage, and explore academic papers from the terminal or LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers embeddings (using DirectML and CoreML) with [LanceDB](https://github.com/lancedb/lancedb) so you can semantically search across sections, figures, and chunks locally.
-
-Also runs as an [MCP](https://modelcontextprotocol.io) server, exposing all functionality as tools for LLMs.
+Search, manage, and explore academic papers from the terminal. Or run as an [MCP](https://github.com/mmgeorge/papers/tree/main?tab=readme-ov-file#mcp-server) to query your papers with an LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers embeddings (using DirectML and CoreML) with [LanceDB](https://github.com/lancedb/lancedb) so you can semantically search across sections, figures, and chunks locally.
 
 > [!NOTE]
 > Even the best analytical PDF-extraction methods mangle LaTeX and tables for technical papers. This project uses vision-model-based OCR via [Datalab](https://www.datalab.to/) (requires API key) to produce clean markdown with math and tables preserved. Extracted results (JSON, markdown, images) sync back to your Zotero library.
