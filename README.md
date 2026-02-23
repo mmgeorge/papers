@@ -7,9 +7,7 @@
 Search, manage, and explore academic papers from the terminal. Or run as an [MCP](https://github.com/mmgeorge/papers/tree/main?tab=readme-ov-file#mcp-server) to query your papers with an LLM. Queries 240M+ works via [OpenAlex](https://openalex.org), integrates with your [Zotero](https://www.zotero.org) library, and builds a local vector index over your papers with [LanceDB](https://github.com/lancedb/lancedb) so you can semantically search across sections and figures. Embedding accelerated with DirectML and CoreML on Windows and macOS.
 
 > [!NOTE]
-> Even the best analytical PDF-extraction methods mangle LaTeX and tables for technical papers. This project uses vision-model-based OCR via [Datalab](https://www.datalab.to/) (requires API key) to produce clean markdown with math and tables preserved. Extracted results (JSON, markdown, images) sync back to your Zotero library.
->
-> You can also run [marker](https://github.com/datalab-to/marker) locally if you meet its [license requirements](https://github.com/datalab-to/marker?tab=readme-ov-file#commercial-usage) — just place the output in the cache directory.
+> Even the best analytical PDF-extraction methods mangle LaTeX and tables for technical papers. This project uses vision-model-based OCR via [Datalab](https://www.datalab.to/) (requires API key) to produce clean markdown with math and tables preserved. Extracted results (JSON, markdown, images) sync back to your Zotero library. You can also [run marker locally](#using-marker-locally).
 
 ## Install
 
@@ -32,6 +30,8 @@ cargo install --path crates/papers-cli
 Commands accepts `--json` for machine-readable output.
 
 ## OpenAlex
+
+OpenAlex works without authentication but is rate-limited. Set `OPENALEX_KEY` for higher rate limits ([openalex.org/pricing](https://openalex.org/pricing)).
 
 ### Search and filter
 
@@ -80,6 +80,47 @@ papers rag search-figures "neural radiance field architecture"
 papers rag get-section <paper> <section>
 papers rag outline <paper>
 ```
+
+## Extraction
+
+PDF extraction uses vision-model-based OCR via marker to produce clean markdown with LaTeX math and tables preserved. Extracted results (markdown, JSON, images) are cached locally and synced back to your Zotero library as attachments.
+
+Requires `DATALAB_API_KEY` ([datalab.to](https://www.datalab.to/)).
+
+```sh
+papers zotero work extract <item_key>                    # Extract a Zotero item (default: balanced)
+papers zotero work extract <item_key> -m accurate        # Highest quality, slowest
+papers zotero work extract <item_key> -m fast            # Fastest, lower layout accuracy
+papers work text <work_id> --advanced balanced            # Extract an OpenAlex work via Datalab
+```
+
+Processing modes: `fast`, `balanced` (default), `accurate`.
+
+### Managing cached extractions
+
+```sh
+papers zotero extract list                               # List items with cached extractions
+papers zotero extract text <query>                       # Print cached markdown
+papers zotero extract json <query>                       # Print cached JSON
+papers zotero extract get <query>                        # Print cache directory path
+papers zotero extract upload [--dry-run]                 # Upload local cache to Zotero
+papers zotero extract download [--dry-run]               # Download Zotero cache to local
+```
+
+Cache location: `~/.cache/papers/datalab/` (Linux/macOS) or `%APPDATA%\papers\datalab\` (Windows). Override with `PAPERS_DATALAB_CACHE_DIR`.
+
+### Using marker locally
+
+You can run [marker](https://github.com/datalab-to/marker) locally instead of using the Datalab API if you meet its [license requirements](https://github.com/datalab-to/marker?tab=readme-ov-file#commercial-usage). Place the output files in the cache directory:
+
+```
+~/.cache/papers/datalab/<item_key>/
+├── <item_key>.md
+├── <item_key>.json     # optional
+└── images/             # optional
+```
+
+The extraction will be picked up automatically from the local cache.
 
 ## MCP server
 
