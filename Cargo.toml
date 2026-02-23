@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Matt George"]
 description = "CLI and MCP server for academic paper search, management, and local RAG"
@@ -13,10 +13,10 @@ repository = "https://github.com/mmgeorge/papers"
 
 [workspace.dependencies]
 base64 = "0.22"
-papers-openalex = { path = "crates/papers-openalex", version = "0.2.0" }
-papers-zotero = { path = "crates/papers-zotero", version = "0.2.0" }
-papers-core = { path = "crates/papers-core", version = "0.2.0" }
-papers-rag = { path = "crates/papers-rag", version = "0.2.0" }
+papers-openalex = { path = "crates/papers-openalex", version = "0.2.1" }
+papers-zotero = { path = "crates/papers-zotero", version = "0.2.1" }
+papers-core = { path = "crates/papers-core", version = "0.2.1" }
+papers-rag = { path = "crates/papers-rag", version = "0.2.1" }
 dirs = "6"
 bon = "3"
 clap = { version = "4", features = ["derive", "wrap_help"] }
@@ -31,8 +31,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 pdf-extract = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 md-5 = "0.10"
-papers-datalab = { path = "crates/papers-datalab", version = "0.2.0" }
-papers-mcp = { path = "crates/papers-mcp", version = "0.2.0" }
+papers-datalab = { path = "crates/papers-datalab", version = "0.2.1" }
+papers-mcp = { path = "crates/papers-mcp", version = "0.2.1" }
 wiremock = "0.6"
 serial_test = "3"
 tempfile = "3"
