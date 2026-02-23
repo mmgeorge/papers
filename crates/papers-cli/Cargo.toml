@@ -3,9 +3,10 @@ name = "papers-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "CLI for searching academic research via OpenAlex"
+description = "CLI for academic paper search, management, and local RAG"
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 
 [[bin]]
 name = "papers"

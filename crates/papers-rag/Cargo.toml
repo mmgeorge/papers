@@ -6,6 +6,7 @@ authors.workspace = true
 description = "Local vector RAG system for academic papers using LanceDB and FastEmbed"
 license.workspace = true
 repository.workspace = true
+readme = "../../README.md"
 
 [lib]
 doctest = false

@@ -3,7 +3,7 @@ name = "papers-datalab"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description.workspace = true
+description = "Rust client for the Datalab document processing API"
 license.workspace = true
 repository.workspace = true
 
