@@ -22,10 +22,10 @@ cargo install --path crates/papers-cli
 | Command | Description |
 |---------|-------------|
 | `work`, `author`, `source`, `institution`, `topic`, `publisher`, `funder`, `domain`, `field`, `subfield` | Query the OpenAlex catalog |
-| `zotero` | Access your personal Zotero library |
+| `zotero` | Access your Zotero library |
 | `rag` | Semantic search over locally indexed papers |
 | `selection` | Manage named groups of papers |
-| `mcp start` | Start the MCP server (stdio transport) |
+| `mcp` | MCP server integration |
 
 Commands accepts `--json` for machine-readable output.
 
@@ -81,7 +81,7 @@ papers rag outline <paper>
 
 ## MCP server
 
-Exposes all functionality as MCP tools for AI assistants.
+Exposes CLI commands as MCP tools for LLMs. Currently only --stdio is supported.
 
 **Claude Code:**
 
