@@ -133,19 +133,17 @@ The extraction will be picked up automatically from the local cache.
 Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Hardware-accelerated with DirectML (Windows) and CoreML (macOS).
 
 ```
- Marker OCR            Structural            Embed
- (Datalab API)         Chunking              (Gemma 300M)
-                                                              ┌─────────┐
- ┌──────────┐    ┌──────────────────┐    ┌───────────┐        │         │
- │  marker  │──► │ JSON block tree  │──► │ 768-d f32 │ ──►    │ LanceDB │
- │  OCR     │.md │ per paragraph,   │vec │ vectors   │        │         │
- │          │.json│ equation, table, │    └───────────┘        │ chunks  │
- └──────────┘    │ figure, list     │       ▲                 │ figures │
-                 └──────────────────┘       │                 │         │
-                                            │  Query          └────┬────┘
-                                     ┌──────┴──────┐              │
-                                     │ embed query │ ─── ANN ─────┘
-                                     └─────────────┘
+  Marker OCR          Structural Chunking        Embed (Gemma 300M)
+                                                                     ┌─────────┐
+ ┌──────────┐    ┌─────────────────────┐    ┌───────────┐            │         │
+ │  marker  ├───►│  JSON block tree    ├───►│ 768-d f32 ├───────────►│ LanceDB │
+ │  OCR     │    │  per paragraph,     │    │ vectors   │            │         │
+ │          │    │  equation, table,   │    └───────────┘            │ chunks  │
+ └──────────┘    │  figure, list       │         ▲                   │ figures │
+   .md .json     └─────────────────────┘         │                   │         │
+                                          ┌──────┴──────┐            └────┬────┘
+                                          │ embed query │───── ANN ──────┘
+                                          └─────────────┘
 ```
 
 PDFs are sent to [Datalab Marker](https://www.datalab.to/) for vision-model OCR, which returns a structured JSON block tree alongside markdown. Each block (paragraph, equation, list, table, figure) becomes one chunk — no fixed-size splitting or overlap. Chunks and figure captions are embedded into 768-d vectors and stored in LanceDB. At query time, the query is embedded with the same model and matched via ANN search.
