@@ -32,6 +32,7 @@ pdf-extract = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 md-5 = "0.10"
 papers-datalab = { path = "crates/papers-datalab", version = "0.2.0" }
+papers-mcp = { path = "crates/papers-mcp", version = "0.2.0" }
 wiremock = "0.6"
 serial_test = "3"
 tempfile = "3"

@@ -17,8 +17,8 @@ organizing, and citing research papers.
 
 | Crate | Description |
 |-------|-------------|
-| [`papers-cli`](crates/papers-cli/) | CLI with human-readable or JSON output. |
-| [`papers-mcp`](crates/papers-mcp/) | MCP server. |
+| [`papers-cli`](crates/papers-cli/) | CLI with human-readable or JSON output. Includes `papers mcp start --stdio` to run the MCP server. |
+| [`papers-mcp`](crates/papers-mcp/) | MCP server library (started via `papers mcp start --stdio`). |
 | [`papers-openalex`](crates/papers-openalex/) | Typed client for the OpenAlex REST API. |
 | [`papers-zotero`](crates/papers-zotero/) | Typed client for the Zotero Web API v3. |
 | [`papers-datalab`](crates/papers-datalab/) | Client for the Datalab document processing API. |

@@ -5,7 +5,7 @@ use clap::Parser;
 use cli::{
     AdvancedMode, AuthorCommand, AuthorFilterArgs, Cli, ConfigCommand, ConfigSetCommand,
     DomainCommand, DomainFilterArgs, EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand,
-    FunderFilterArgs, InstitutionCommand, InstitutionFilterArgs, PublisherCommand,
+    FunderFilterArgs, InstitutionCommand, InstitutionFilterArgs, McpCommand, PublisherCommand,
     PublisherFilterArgs, RagCommand, RagEmbedCommand, SelectionCommand, SourceCommand,
     SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand, TopicFilterArgs,
     WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand, ZoteroAttachmentCommand,
@@ -1624,6 +1624,9 @@ async fn papers_main() {
         EntityCommand::Config { cmd } => {
             handle_config_command(cmd);
         }
+        EntityCommand::Mcp { cmd } => {
+            handle_mcp_command(cmd).await;
+        }
     }
 }
 
@@ -1998,6 +2001,16 @@ fn handle_config_command(cmd: ConfigCommand) {
                     papers_core::config::PapersConfig::config_path().display()
                 ),
                 Err(e) => exit_err(&e.to_string()),
+            }
+        }
+    }
+}
+
+async fn handle_mcp_command(cmd: McpCommand) {
+    match cmd {
+        McpCommand::Start { stdio: _ } => {
+            if let Err(e) = papers_mcp::start_stdio().await {
+                exit_err(&format!("MCP server error: {e}"));
             }
         }
     }

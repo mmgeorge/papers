@@ -37,10 +37,10 @@ topics, publishers, and funders — all queryable from Claude.
 ### Build
 
 ```sh
-cargo build --release --bin papers-mcp
+cargo build --release --bin papers
 ```
 
-The binary is at `target/release/papers-mcp` (or `papers-mcp.exe` on Windows).
+The binary is at `target/release/papers` (or `papers.exe` on Windows).
 
 ### Claude Desktop
 
@@ -51,7 +51,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
 {
   "mcpServers": {
     "papers": {
-      "command": "/absolute/path/to/papers-mcp"
+      "command": "/absolute/path/to/papers",
+      "args": ["mcp", "start", "--stdio"]
     }
   }
 }
@@ -63,7 +64,8 @@ For semantic search (`work_find`), add your OpenAlex API key:
 {
   "mcpServers": {
     "papers": {
-      "command": "/absolute/path/to/papers-mcp",
+      "command": "/absolute/path/to/papers",
+      "args": ["mcp", "start", "--stdio"],
       "env": {
         "OPENALEX_KEY": "your-api-key-here"
       }
@@ -77,7 +79,7 @@ For semantic search (`work_find`), add your OpenAlex API key:
 Add to your project's `.mcp.json` or run:
 
 ```sh
-claude mcp add papers /absolute/path/to/papers-mcp
+claude mcp add papers -- /absolute/path/to/papers mcp start --stdio
 ```
 
 Or configure in `~/.claude/settings.json`:
@@ -86,7 +88,8 @@ Or configure in `~/.claude/settings.json`:
 {
   "mcpServers": {
     "papers": {
-      "command": "/absolute/path/to/papers-mcp",
+      "command": "/absolute/path/to/papers",
+      "args": ["mcp", "start", "--stdio"],
       "env": {
         "OPENALEX_KEY": "your-api-key-here"
       }

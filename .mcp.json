@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "papers-mcp": {
+    "papers": {
       "command": "cargo",
-      "args": ["run", "-p", "papers-mcp", "--release"]
+      "args": ["run", "--release", "-p", "papers-cli", "--", "mcp", "start", "--stdio"]
     }
   }
 }

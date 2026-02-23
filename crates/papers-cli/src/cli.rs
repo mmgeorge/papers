@@ -92,6 +92,21 @@ pub enum EntityCommand {
         #[command(subcommand)]
         cmd: ConfigCommand,
     },
+    /// MCP server for use with AI assistants
+    Mcp {
+        #[command(subcommand)]
+        cmd: McpCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum McpCommand {
+    /// Start the MCP server
+    Start {
+        /// Run with stdio transport (required by MCP clients)
+        #[arg(long)]
+        stdio: bool,
+    },
 }
 
 #[derive(Subcommand)]
