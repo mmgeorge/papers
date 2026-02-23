@@ -71,8 +71,8 @@ fn strip_html(html: &str) -> String {
 
 /// Strip HTML tags but preserve the text content of `<math>` elements as LaTeX.
 ///
-/// `<math ...>content</math>` is replaced by `content` before other tags are
-/// stripped, so equations survive as readable LaTeX strings.
+/// `<math ...>content</math>` is replaced by `$content$` before other tags are
+/// stripped, so equations survive as renderable inline LaTeX.
 fn strip_html_preserve_math(html: &str) -> String {
     let mut buf = String::with_capacity(html.len());
     let mut remaining = html;
@@ -87,7 +87,9 @@ fn strip_html_preserve_math(html: &str) -> String {
             remaining = &remaining[tag_end + 1..];
             // Find </math>
             if let Some(close) = remaining.find("</math>") {
+                buf.push('$');
                 buf.push_str(&remaining[..close]);
+                buf.push('$');
                 remaining = &remaining[close + 7..]; // skip "</math>"
             }
             // else: malformed, skip the opening tag and keep going
@@ -1026,11 +1028,18 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
     };
 
     // ── Embed figure captions ───────────────────────────────────────────────
+    // Embed caption + description for all figures/tables. Table content is
+    // stored but not embedded — the small embedding model doesn't benefit
+    // from tabular data.
     let fig_texts: Vec<String> = figure_records
         .iter()
-        .map(|f| match &f.content {
-            Some(content) => format!("{}\n{}", f.caption, content),
-            None => f.description.clone(),
+        .map(|f| {
+            match (f.caption.is_empty(), f.description.is_empty()) {
+                (false, false) => format!("{}\n{}", f.caption, f.description),
+                (false, true) => f.caption.clone(),
+                (true, false) => f.description.clone(),
+                (true, true) => String::new(),
+            }
         })
         .collect();
     let fig_embeddings = if fig_texts.is_empty() {
@@ -1497,7 +1506,7 @@ mod tests {
         let input = r#"<p><math display="block">\mathbf{x} = 0 \quad (1)</math></p>"#;
         assert_eq!(
             strip_html_preserve_math(input),
-            r"\mathbf{x} = 0 \quad (1)"
+            r"$\mathbf{x} = 0 \quad (1)$"
         );
     }
 
@@ -1506,7 +1515,7 @@ mod tests {
         let input = r"<p>where <math>\alpha</math> is a constant</p>";
         assert_eq!(
             strip_html_preserve_math(input),
-            r"where \alpha is a constant"
+            r"where $\alpha$ is a constant"
         );
     }
 
@@ -1520,7 +1529,7 @@ mod tests {
     fn test_extract_caption_text() {
         let input = r"<p><b>Fig. 1.</b> A description of the figure with <math>\mu_c</math> values.</p>";
         let result = strip_html_preserve_math(input);
-        assert!(result.contains(r"\mu_c"));
+        assert!(result.contains(r"$\mu_c$"));
         assert!(result.contains("Fig. 1."));
         assert!(result.contains("A description of the figure"));
     }
@@ -2198,7 +2207,7 @@ mod tests {
     fn test_table_to_md_math_in_cells() {
         let html = r#"<table><thead><tr><th>Param</th></tr></thead><tbody><tr><td><math>\mu = 5e4</math></td></tr></tbody></table>"#;
         let md = html_table_to_markdown(html).unwrap();
-        assert!(md.contains(r"\mu = 5e4"), "math should be preserved: {}", md);
+        assert!(md.contains(r"$\mu = 5e4$"), "math should be wrapped in $: {}", md);
     }
 
     #[test]
@@ -2713,7 +2722,8 @@ mod tests {
     // ── embedding text for tables ────────────────────────────────────────
 
     #[test]
-    fn test_table_embedding_text_uses_caption_plus_content() {
+    fn test_table_embedding_uses_caption_and_description() {
+        // Table content is stored but NOT embedded — caption+description only.
         let rec = FigureRecord {
             figure_id: "test/fig1".to_string(),
             figure_type: "table".to_string(),
@@ -2728,17 +2738,70 @@ mod tests {
         let records = vec![rec];
         let text: Vec<String> = records
             .iter()
-            .map(|f| match &f.content {
-                Some(content) => format!("{}\n{}", f.caption, content),
-                None => f.description.clone(),
+            .map(|f| match (f.caption.is_empty(), f.description.is_empty()) {
+                (false, false) => format!("{}\n{}", f.caption, f.description),
+                (false, true) => f.caption.clone(),
+                (true, false) => f.description.clone(),
+                (true, true) => String::new(),
             })
             .collect();
-        assert!(text[0].starts_with("Table 1. Results\n"));
-        assert!(text[0].contains("| A | B |"));
+        assert_eq!(text[0], "Table 1. Results\nTable alt text");
     }
 
     #[test]
-    fn test_figure_embedding_text_uses_description() {
+    fn test_embedding_text_caption_only_when_no_description() {
+        let rec = FigureRecord {
+            figure_id: "test/fig1".to_string(),
+            figure_type: "table".to_string(),
+            caption: "Table 1. Results".to_string(),
+            description: String::new(),
+            image_path: None,
+            content: Some("| A | B |\n| --- | --- |\n| 1 | 2 |".to_string()),
+            page: None,
+            chapter_idx: 0,
+            section_idx: 0,
+        };
+        let records = vec![rec];
+        let text: Vec<String> = records
+            .iter()
+            .map(|f| match (f.caption.is_empty(), f.description.is_empty()) {
+                (false, false) => format!("{}\n{}", f.caption, f.description),
+                (false, true) => f.caption.clone(),
+                (true, false) => f.description.clone(),
+                (true, true) => String::new(),
+            })
+            .collect();
+        assert_eq!(text[0], "Table 1. Results");
+    }
+
+    #[test]
+    fn test_embedding_text_falls_back_to_description() {
+        let rec = FigureRecord {
+            figure_id: "test/fig1".to_string(),
+            figure_type: "figure".to_string(),
+            caption: String::new(),
+            description: "Alt text description".to_string(),
+            image_path: None,
+            content: None,
+            page: None,
+            chapter_idx: 0,
+            section_idx: 0,
+        };
+        let records = vec![rec];
+        let text: Vec<String> = records
+            .iter()
+            .map(|f| match (f.caption.is_empty(), f.description.is_empty()) {
+                (false, false) => format!("{}\n{}", f.caption, f.description),
+                (false, true) => f.caption.clone(),
+                (true, false) => f.description.clone(),
+                (true, true) => String::new(),
+            })
+            .collect();
+        assert_eq!(text[0], "Alt text description");
+    }
+
+    #[test]
+    fn test_figure_embedding_uses_caption_and_description() {
         let rec = FigureRecord {
             figure_id: "test/fig1".to_string(),
             figure_type: "figure".to_string(),
@@ -2753,11 +2816,13 @@ mod tests {
         let records = vec![rec];
         let text: Vec<String> = records
             .iter()
-            .map(|f| match &f.content {
-                Some(content) => format!("{}\n{}", f.caption, content),
-                None => f.description.clone(),
+            .map(|f| match (f.caption.is_empty(), f.description.is_empty()) {
+                (false, false) => format!("{}\n{}", f.caption, f.description),
+                (false, true) => f.caption.clone(),
+                (true, false) => f.description.clone(),
+                (true, true) => String::new(),
             })
             .collect();
-        assert_eq!(text[0], "Alt text description");
+        assert_eq!(text[0], "Fig. 1. A caption\nAlt text description");
     }
 }
