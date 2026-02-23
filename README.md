@@ -13,6 +13,8 @@ Search, manage, and explore academic papers from the terminal. Or run as an [MCP
 
 ## Install
 
+Download a prebuilt binary from [releases](https://github.com/mmgeorge/papers/releases), or build from source:
+
 ```sh
 cargo install --path crates/papers-cli
 ```
