@@ -73,6 +73,7 @@ pub struct FigureSearchResult {
     pub caption: String,
     pub description: String,
     pub image_path: Option<String>,
+    pub content: Option<String>,
     pub page: Option<u16>,
     pub score: f32,
 }
@@ -118,6 +119,7 @@ pub struct FigureResult {
     pub caption: String,
     pub description: String,
     pub image_path: Option<String>,
+    pub content: Option<String>,
     pub page: Option<u16>,
     pub referenced_by: Vec<String>,
 }

@@ -1601,6 +1601,146 @@ async fn test_neighbor_equation_at_boundary_no_far_chunk() {
     );
 }
 
+// ── table content in figures ────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_table_block_stores_content() {
+    use crate::query::get_figure;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // Create a paper with a Table block containing actual <table> HTML
+    let json = serde_json::json!({
+        "children": [{
+            "block_type": "Page",
+            "children": [
+                {
+                    "block_type": "SectionHeader", "id": "h1",
+                    "html": "<h2>Results</h2>", "page": 1
+                },
+                {
+                    "block_type": "Text", "id": "t0",
+                    "html": "<p>See Table 1.</p>", "page": 1
+                },
+                {
+                    "block_type": "Caption", "id": "cap1",
+                    "html": "<p><b>Table 1.</b> Performance comparison.</p>", "page": 2
+                },
+                {
+                    "block_type": "Table", "id": "tbl1",
+                    "html": "<table><thead><tr><th>Method</th><th>Time</th></tr></thead><tbody><tr><td>Ours</td><td>5ms</td></tr><tr><td>Baseline</td><td>12ms</td></tr></tbody></table>",
+                    "page": 2
+                }
+            ]
+        }]
+    });
+    let item_dir = cache_dir.path().join("TBLCONT");
+    fs::create_dir_all(&item_dir).unwrap();
+    fs::write(item_dir.join("TBLCONT.json"), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let params = crate::ingest::IngestParams {
+        item_key: "TBLCONT".to_string(),
+        paper_id: "TBLCONT".to_string(),
+        title: "Test".to_string(),
+        authors: vec![],
+        year: None,
+        venue: None,
+        tags: vec![],
+        cache_dir: item_dir,
+        force: false,
+    };
+    ingest_paper(&store, params).await.unwrap();
+
+    let fig = get_figure(&store, "TBLCONT/fig1").await.unwrap();
+    assert_eq!(fig.figure_type, "table");
+    assert!(fig.content.is_some(), "table should have content");
+    let content = fig.content.unwrap();
+    assert!(content.contains("Ours"), "content should have cell values: {}", content);
+    assert!(content.contains("5ms"), "content should have cell values: {}", content);
+}
+
+#[serial]
+#[tokio::test]
+async fn test_figure_block_has_null_content() {
+    use crate::query::get_figure;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+    let params = make_test_cache(&cache_dir, "FIGNULL");
+    ingest_paper(&store, params).await.unwrap();
+
+    // fig1 is a Figure block, should have no content
+    let fig = get_figure(&store, "FIGNULL/fig1").await.unwrap();
+    assert_eq!(fig.figure_type, "figure");
+    assert!(fig.content.is_none(), "figure should have null content");
+}
+
+#[serial]
+#[tokio::test]
+async fn test_search_figures_returns_content() {
+    use crate::query::search_figures;
+    use crate::types::SearchFiguresParams;
+
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let json = serde_json::json!({
+        "children": [{
+            "block_type": "Page",
+            "children": [
+                {
+                    "block_type": "SectionHeader", "id": "h1",
+                    "html": "<h2>Results</h2>", "page": 1
+                },
+                {
+                    "block_type": "Table", "id": "tbl1",
+                    "html": "<table><thead><tr><th>Solver</th></tr></thead><tbody><tr><td>NeoHookean</td></tr></tbody></table>",
+                    "page": 2
+                }
+            ]
+        }]
+    });
+    let item_dir = cache_dir.path().join("SFCONT");
+    fs::create_dir_all(&item_dir).unwrap();
+    fs::write(item_dir.join("SFCONT.json"), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let params = crate::ingest::IngestParams {
+        item_key: "SFCONT".to_string(),
+        paper_id: "SFCONT".to_string(),
+        title: "Test".to_string(),
+        authors: vec![],
+        year: None,
+        venue: None,
+        tags: vec![],
+        cache_dir: item_dir,
+        force: false,
+    };
+    ingest_paper(&store, params).await.unwrap();
+
+    let results = search_figures(
+        &store,
+        SearchFiguresParams {
+            query: "solver".to_string(),
+            paper_ids: Some(vec!["SFCONT".to_string()]),
+            filter_figure_type: None,
+            limit: 5,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(!results.is_empty());
+    let r = &results[0];
+    assert!(r.content.is_some(), "search result should include content");
+    assert!(r.content.as_ref().unwrap().contains("NeoHookean"));
+}
+
 // ── figure search result with score ──────────────────────────────────────
 
 #[serial]

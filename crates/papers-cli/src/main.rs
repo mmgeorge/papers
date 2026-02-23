@@ -2223,6 +2223,12 @@ fn format_rag_figure(f: &papers_rag::FigureResult) {
     if let Some(p) = f.page {
         println!("  Page: {p}");
     }
+    if let Some(content) = &f.content {
+        println!("  Content:");
+        for line in content.lines() {
+            println!("    {line}");
+        }
+    }
 }
 
 fn format_rag_outline(r: &papers_rag::PaperOutline) {

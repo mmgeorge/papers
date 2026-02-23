@@ -162,6 +162,7 @@ which returns zero vectors without loading any model weights.
 | `caption` | Utf8 |
 | `description` | Utf8 |
 | `image_path` | Utf8 nullable |
+| `content` | Utf8 nullable (markdown table for Table blocks) |
 | `page` | UInt16 nullable |
 | `chapter_idx` | UInt16 |
 | `section_idx` | UInt16 |
@@ -192,19 +193,24 @@ On startup the version is read via `table.schema().metadata`, and only
 migrations with a version number greater than the stored version are applied.
 After all pending migrations run, the version is bumped.
 
-`CHUNK_MIGRATIONS` is a `&[(u32, &str, &str)]` array of
+`CHUNK_MIGRATIONS` and `FIGURE_MIGRATIONS` are `&[(u32, &str, &str)]` arrays of
 `(version, column_name, default_sql_expression)`. Each migration adds a column
 via `table.add_columns()`. If the column already exists (e.g. the table was
 created with the latest schema but the version metadata was missing), the
 `add_columns` call fails silently.
 
-`CURRENT_SCHEMA_VERSION` must equal the highest version in `CHUNK_MIGRATIONS`.
+Each table tracks its own version independently via Arrow schema metadata:
+- `CURRENT_CHUNKS_VERSION` must equal the highest version in `CHUNK_MIGRATIONS`
+- `CURRENT_FIGURES_VERSION` must equal the highest version in `FIGURE_MIGRATIONS`
+
+`migrate_chunks_table()` and `migrate_figures_table()` run automatically on
+every `RagStore::open()` call.
 
 ### How to add a new column
 
-1. Bump `CURRENT_SCHEMA_VERSION` in `store.rs`
+1. Bump `CURRENT_CHUNKS_VERSION` or `CURRENT_FIGURES_VERSION` in `store.rs`
 2. Add a `(new_version, column_name, default_expr)` entry to `CHUNK_MIGRATIONS`
-   (or create a `FIGURE_MIGRATIONS` array + `migrate_figures_table()` if for figures)
+   or `FIGURE_MIGRATIONS`
 3. Add the column to `schema.rs` (`chunks_schema()` or `figures_schema()`)
 4. Add the column to the ingest path (`ChunkRecord`, `build_chunks_batch()`, etc.)
 5. Update `ChunkData` / `chunk_from_row()` in `query.rs` to read the new column

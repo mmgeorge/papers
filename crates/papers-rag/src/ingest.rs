@@ -46,6 +46,7 @@ struct FigureRecord {
     caption: String,
     description: String,
     image_path: Option<String>,
+    content: Option<String>,
     page: Option<u16>,
     chapter_idx: u16,
     section_idx: u16,
@@ -98,6 +99,122 @@ fn strip_html_preserve_math(html: &str) -> String {
     buf.push_str(remaining);
 
     strip_html(&buf)
+}
+
+/// Convert DataLab `<table>` HTML to pipe-delimited markdown.
+///
+/// Returns `None` if the html doesn't contain a `<table` tag (i.e. it's an
+/// `<img>` reference, not a real table).
+fn html_table_to_markdown(html: &str) -> Option<String> {
+    if !html.contains("<table") && !html.contains("<TABLE") {
+        return None;
+    }
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut thead_row_count = 0usize;
+
+    // Normalize <br/> and <br> to space before processing
+    let html = html.replace("<br/>", " ").replace("<br>", " ").replace("<br />", " ");
+
+    // Determine thead boundary
+    let thead_end = html.find("</thead>").or_else(|| html.find("</THEAD>"));
+    let thead_html = thead_end.map(|end| {
+        let start = html.find("<thead").or_else(|| html.find("<THEAD")).unwrap_or(0);
+        &html[start..end]
+    });
+
+    // Extract all <tr> blocks
+    let mut search_from = 0;
+    while let Some(tr_start) = html[search_from..].find("<tr").or_else(|| html[search_from..].find("<TR")) {
+        let tr_abs = search_from + tr_start;
+        let tr_end_tag = html[tr_abs..].find("</tr>").or_else(|| html[tr_abs..].find("</TR>"));
+        let tr_end = match tr_end_tag {
+            Some(e) => tr_abs + e,
+            None => {
+                search_from = tr_abs + 1;
+                continue;
+            }
+        };
+        let tr_html = &html[tr_abs..tr_end];
+
+        // Check if this row is inside thead
+        let in_thead = thead_html.map_or(false, |th| {
+            let th_ptr = th.as_ptr() as usize;
+            let tr_ptr = tr_html.as_ptr() as usize;
+            tr_ptr >= th_ptr && tr_ptr < th_ptr + th.len()
+        });
+
+        // Extract cells: <th> or <td>
+        let mut cells: Vec<String> = Vec::new();
+        let mut cell_search = 0;
+        while cell_search < tr_html.len() {
+            // Find next <th or <td
+            let th_pos = tr_html[cell_search..].find("<th").or_else(|| tr_html[cell_search..].find("<TH"));
+            let td_pos = tr_html[cell_search..].find("<td").or_else(|| tr_html[cell_search..].find("<TD"));
+
+            let cell_start = match (th_pos, td_pos) {
+                (Some(a), Some(b)) => a.min(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => break,
+            };
+            let cell_abs = cell_search + cell_start;
+
+            // Find the > that closes the opening tag
+            let tag_close = match tr_html[cell_abs..].find('>') {
+                Some(p) => cell_abs + p + 1,
+                None => break,
+            };
+
+            // Find the closing </th> or </td>
+            let close_tag = tr_html[tag_close..].find("</th>")
+                .or_else(|| tr_html[tag_close..].find("</TH>"))
+                .or_else(|| tr_html[tag_close..].find("</td>"))
+                .or_else(|| tr_html[tag_close..].find("</TD>"));
+
+            let cell_content_end = match close_tag {
+                Some(p) => tag_close + p,
+                None => {
+                    cell_search = tag_close;
+                    continue;
+                }
+            };
+
+            let cell_html = &tr_html[tag_close..cell_content_end];
+            let cell_text = strip_html_preserve_math(cell_html);
+            cells.push(cell_text);
+
+            cell_search = cell_content_end + 5; // skip past </t?>
+        }
+
+        if !cells.is_empty() {
+            if in_thead {
+                thead_row_count += 1;
+            }
+            rows.push(cells);
+        }
+
+        search_from = tr_end + 5;
+    }
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    // Build markdown lines
+    let mut lines: Vec<String> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let line = format!("| {} |", row.join(" | "));
+        lines.push(line);
+
+        // Add separator after the last thead row
+        if thead_row_count > 0 && i + 1 == thead_row_count {
+            let sep = format!("| {} |", row.iter().map(|_| "---").collect::<Vec<_>>().join(" | "));
+            lines.push(sep);
+        }
+    }
+
+    Some(lines.join("\n"))
 }
 
 /// Extract `src` attribute value from an `<img>` tag.
@@ -461,6 +578,13 @@ fn parse_paper_blocks(
                     alt_text
                 };
 
+                // Extract table content as markdown for Table blocks
+                let content = if block_type == "Table" {
+                    html_table_to_markdown(html)
+                } else {
+                    None
+                };
+
                 let image_path = src.map(|s| {
                     params
                         .cache_dir
@@ -478,6 +602,7 @@ fn parse_paper_blocks(
                     caption,
                     description,
                     image_path,
+                    content,
                     page: page_num,
                     chapter_idx,
                     section_idx,
@@ -726,7 +851,13 @@ pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<Inge
     };
 
     // ── Embed figure captions ───────────────────────────────────────────────
-    let fig_texts: Vec<String> = figure_records.iter().map(|f| f.description.clone()).collect();
+    let fig_texts: Vec<String> = figure_records
+        .iter()
+        .map(|f| match &f.content {
+            Some(content) => format!("{}\n{}", f.caption, content),
+            None => f.description.clone(),
+        })
+        .collect();
     let fig_embeddings = if fig_texts.is_empty() {
         vec![]
     } else {
@@ -879,6 +1010,10 @@ fn build_figures_batch(
         .iter()
         .map(|r| r.image_path.as_deref())
         .collect();
+    let contents: Vec<Option<&str>> = records
+        .iter()
+        .map(|r| r.content.as_deref())
+        .collect();
     let pages: Vec<Option<u16>> = records.iter().map(|r| r.page).collect();
     let chapter_idxs: Vec<u16> = records.iter().map(|r| r.chapter_idx).collect();
     let section_idxs: Vec<u16> = records.iter().map(|r| r.section_idx).collect();
@@ -898,6 +1033,7 @@ fn build_figures_batch(
             Arc::new(StringArray::from(captions)),
             Arc::new(StringArray::from(descriptions)),
             Arc::new(StringArray::from(image_paths)),
+            Arc::new(StringArray::from(contents)),
             Arc::new(UInt16Array::from(pages)),
             Arc::new(UInt16Array::from(chapter_idxs)),
             Arc::new(UInt16Array::from(section_idxs)),
@@ -1848,5 +1984,192 @@ mod tests {
             std::env::remove_var("PAPERS_DATALAB_CACHE_DIR");
             std::env::remove_var("PAPERS_EMBED_CACHE_DIR");
         }
+    }
+
+    // ── html_table_to_markdown ────────────────────────────────────────────
+
+    #[test]
+    fn test_table_to_md_simple_2x2() {
+        let html = "<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody><tr><td>1</td><td>2</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert_eq!(md, "| A | B |\n| --- | --- |\n| 1 | 2 |");
+    }
+
+    #[test]
+    fn test_table_to_md_no_thead() {
+        let html = "<table><tbody><tr><td>A</td><td>B</td></tr><tr><td>1</td><td>2</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        // No thead → no separator line
+        assert_eq!(md, "| A | B |\n| 1 | 2 |");
+    }
+
+    #[test]
+    fn test_table_to_md_math_in_cells() {
+        let html = r#"<table><thead><tr><th>Param</th></tr></thead><tbody><tr><td><math>\mu = 5e4</math></td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.contains(r"\mu = 5e4"), "math should be preserved: {}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_br_tags() {
+        let html = "<table><thead><tr><th>Number of<br/>Vert.</th></tr></thead><tbody><tr><td>97K</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.contains("Number of Vert."), "br should become space: {}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_empty_cells() {
+        let html = "<table><thead><tr><th>A</th><th>B</th></tr></thead><tbody><tr><td></td><td>x</td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.contains("|  | x |"), "empty cell should be empty string: {}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_not_a_table() {
+        let html = r#"<img src="tbl.png" alt="Table 1"/>"#;
+        assert!(html_table_to_markdown(html).is_none());
+    }
+
+    #[test]
+    fn test_table_to_md_rowspan_doesnt_crash() {
+        let html = r#"<table><thead><tr><th rowspan="2">Name</th><th>Col1</th></tr><tr><th>Sub</th></tr></thead><tbody><tr><td>A</td><td>1</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html);
+        assert!(md.is_some(), "should not crash on rowspan");
+    }
+
+    #[test]
+    fn test_table_to_md_multi_row_thead() {
+        let html = r#"<table><thead><tr><th>Name</th><th>Value</th></tr><tr><th>Sub1</th><th>Sub2</th></tr></thead><tbody><tr><td>A</td><td>1</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        // Two header rows, then separator, then data
+        assert_eq!(lines.len(), 4, "expected 4 lines: {}", md);
+        assert!(lines[2].contains("---"), "separator should be after second header row");
+    }
+
+    #[test]
+    fn test_table_to_md_whitespace_normalization() {
+        let html = "<table><thead><tr><th>  A   B  </th></tr></thead><tbody><tr><td>  1   2  </td></tr></tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.contains("| A B |"), "whitespace should be normalized: {}", md);
+    }
+
+    #[test]
+    fn test_table_to_md_real_datalab_table() {
+        // Simplified version of a real DataLab table from YFACFA8C
+        let html = r#"<table border="1"><thead><tr><th>Experiment Name</th><th>Number of Vert.</th><th>Material</th></tr></thead><tbody><tr><td>Twisting Thin Beams</td><td>97K</td><td>NeoHookean</td></tr><tr><td>Armadillo</td><td>15K</td><td>StVK</td></tr></tbody></table>"#;
+        let md = html_table_to_markdown(html).unwrap();
+        assert!(md.contains("Twisting Thin Beams"), "should contain cell value");
+        assert!(md.contains("97K"), "should contain cell value");
+        assert!(md.contains("NeoHookean"), "should contain cell value");
+        assert!(md.contains("Armadillo"), "should contain cell value");
+        // Count data rows (lines after separator)
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines.len(), 4, "header + separator + 2 data rows: {}", md);
+    }
+
+    // ── table content in FigureRecord ────────────────────────────────────
+
+    #[test]
+    fn test_table_block_extracts_content() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "Table", "id": "tbl1",
+                "html": "<table><thead><tr><th>Method</th><th>Score</th></tr></thead><tbody><tr><td>Ours</td><td>95</td></tr></tbody></table>",
+                "page": 3
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "TBLCONTENT1", blocks);
+        let (_chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 1);
+        assert!(figures[0].content.is_some(), "table block should have content");
+        let content = figures[0].content.as_ref().unwrap();
+        assert!(content.contains("Method"), "content should have cell values: {}", content);
+        assert!(content.contains("95"), "content should have cell values: {}", content);
+    }
+
+    #[test]
+    fn test_figure_block_has_no_content() {
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "Figure", "id": "fig1",
+                "html": r#"<img src="fig1.png" alt="A figure"/>"#,
+                "page": 1
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "FIGNOCONTENT", blocks);
+        let (_chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 1);
+        assert!(figures[0].content.is_none(), "figure block should not have content");
+    }
+
+    #[test]
+    fn test_table_with_img_only_has_no_content() {
+        // Table block that only has an <img> tag (no actual <table>)
+        let dir = TempDir::new().unwrap();
+        let blocks = vec![
+            serde_json::json!({
+                "block_type": "Table", "id": "tbl1",
+                "html": r#"<img src="tbl1.png" alt="Table 1: Results"/>"#,
+                "page": 3
+            }),
+        ];
+        let params = write_custom_datalab_json(dir.path(), "TBLIMG", blocks);
+        let (_chunks, figures) = parse_paper_blocks(&params).unwrap();
+        assert_eq!(figures.len(), 1);
+        assert!(figures[0].content.is_none(), "img-only table should not have content");
+    }
+
+    // ── embedding text for tables ────────────────────────────────────────
+
+    #[test]
+    fn test_table_embedding_text_uses_caption_plus_content() {
+        let rec = FigureRecord {
+            figure_id: "test/fig1".to_string(),
+            figure_type: "table".to_string(),
+            caption: "Table 1. Results".to_string(),
+            description: "Table alt text".to_string(),
+            image_path: None,
+            content: Some("| A | B |\n| --- | --- |\n| 1 | 2 |".to_string()),
+            page: None,
+            chapter_idx: 0,
+            section_idx: 0,
+        };
+        let records = vec![rec];
+        let text: Vec<String> = records
+            .iter()
+            .map(|f| match &f.content {
+                Some(content) => format!("{}\n{}", f.caption, content),
+                None => f.description.clone(),
+            })
+            .collect();
+        assert!(text[0].starts_with("Table 1. Results\n"));
+        assert!(text[0].contains("| A | B |"));
+    }
+
+    #[test]
+    fn test_figure_embedding_text_uses_description() {
+        let rec = FigureRecord {
+            figure_id: "test/fig1".to_string(),
+            figure_type: "figure".to_string(),
+            caption: "Fig. 1. A caption".to_string(),
+            description: "Alt text description".to_string(),
+            image_path: None,
+            content: None,
+            page: None,
+            chapter_idx: 0,
+            section_idx: 0,
+        };
+        let records = vec![rec];
+        let text: Vec<String> = records
+            .iter()
+            .map(|f| match &f.content {
+                Some(content) => format!("{}\n{}", f.caption, content),
+                None => f.description.clone(),
+            })
+            .collect();
+        assert_eq!(text[0], "Alt text description");
     }
 }

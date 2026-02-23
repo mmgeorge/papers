@@ -20,10 +20,11 @@ impl RagStore {
     pub async fn open(path: &str) -> Result<Self, RagError> {
         let db = lancedb::connect(path).execute().await?;
 
-        // Create tables if they don't exist; migrate chunks schema if needed
+        // Create tables if they don't exist; migrate schemas if needed
         let chunks = ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         migrate_chunks_table(&chunks).await?;
-        ensure_table(&db, "papers_figures", figures_schema()).await?;
+        let figures = ensure_table(&db, "papers_figures", figures_schema()).await?;
+        migrate_figures_table(&figures).await?;
 
         Ok(Self {
             db,
@@ -72,7 +73,8 @@ impl RagStore {
         let db = lancedb::connect(path).execute().await?;
         let chunks = ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         migrate_chunks_table(&chunks).await?;
-        ensure_table(&db, "papers_figures", figures_schema()).await?;
+        let figures = ensure_table(&db, "papers_figures", figures_schema()).await?;
+        migrate_figures_table(&figures).await?;
         let embedder = OnceCell::new();
         embedder
             .set(Arc::new(Mutex::new(Embedder::fake())))
@@ -148,8 +150,8 @@ async fn ensure_table(
 
 const SCHEMA_VERSION_KEY: &str = "papers_schema_version";
 
-/// Current schema version. Bump this when adding new migrations.
-const CURRENT_SCHEMA_VERSION: u32 = 1;
+/// Current schema version for the chunks table.
+const CURRENT_CHUNKS_VERSION: u32 = 1;
 
 /// Versioned schema migrations for the chunks table.
 /// Each entry: (version, column_name, default_sql_expression).
@@ -189,7 +191,7 @@ async fn migrate_chunks_table(table: &Table) -> Result<(), RagError> {
     use lancedb::table::NewColumnTransform;
 
     let current = read_schema_version(table).await?;
-    if current >= CURRENT_SCHEMA_VERSION {
+    if current >= CURRENT_CHUNKS_VERSION {
         return Ok(());
     }
 
@@ -216,10 +218,58 @@ async fn migrate_chunks_table(table: &Table) -> Result<(), RagError> {
         }
     }
 
-    write_schema_version(table, CURRENT_SCHEMA_VERSION).await?;
+    write_schema_version(table, CURRENT_CHUNKS_VERSION).await?;
     if applied > 0 {
         eprintln!(
-            "  schema version: {current} → {CURRENT_SCHEMA_VERSION} ({applied} migration(s))"
+            "  schema version: {current} → {CURRENT_CHUNKS_VERSION} ({applied} migration(s))"
+        );
+    }
+    Ok(())
+}
+
+/// Current schema version for the figures table.
+const CURRENT_FIGURES_VERSION: u32 = 1;
+
+/// Versioned schema migrations for the figures table.
+const FIGURE_MIGRATIONS: &[(u32, &str, &str)] = &[
+    (1, "content", "NULL"),
+];
+
+/// Apply pending schema migrations to the figures table.
+async fn migrate_figures_table(table: &Table) -> Result<(), RagError> {
+    use lancedb::table::NewColumnTransform;
+
+    let current = read_schema_version(table).await?;
+    if current >= CURRENT_FIGURES_VERSION {
+        return Ok(());
+    }
+
+    let mut applied = 0u32;
+    for &(ver, col, default_expr) in FIGURE_MIGRATIONS {
+        if ver <= current {
+            continue;
+        }
+        match table
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(col.into(), default_expr.into())]),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                eprintln!("  migrated figures v{ver}: added column '{col}'");
+                applied += 1;
+            }
+            Err(_) => {
+                // Column already exists
+            }
+        }
+    }
+
+    write_schema_version(table, CURRENT_FIGURES_VERSION).await?;
+    if applied > 0 {
+        eprintln!(
+            "  figures schema version: {current} → {CURRENT_FIGURES_VERSION} ({applied} migration(s))"
         );
     }
     Ok(())
@@ -323,11 +373,11 @@ mod tests {
         // Run migration
         migrate_chunks_table(&table).await.unwrap();
 
-        // Version should now be CURRENT_SCHEMA_VERSION
+        // Version should now be CURRENT_CHUNKS_VERSION
         // Need to re-open to see updated schema metadata
         let table = db.open_table("papers_chunks").execute().await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
-        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+        assert_eq!(v, CURRENT_CHUNKS_VERSION);
 
         // Table should now have block_type column
         let schema = table.schema().await.unwrap();
@@ -371,14 +421,14 @@ mod tests {
 
         let table = db.open_table("papers_chunks").execute().await.unwrap();
         let v1 = read_schema_version(&table).await.unwrap();
-        assert_eq!(v1, CURRENT_SCHEMA_VERSION);
+        assert_eq!(v1, CURRENT_CHUNKS_VERSION);
 
         // Second open: should skip migration entirely
         drop(table);
         let table = db.open_table("papers_chunks").execute().await.unwrap();
         migrate_chunks_table(&table).await.unwrap();
         let v2 = read_schema_version(&table).await.unwrap();
-        assert_eq!(v2, CURRENT_SCHEMA_VERSION);
+        assert_eq!(v2, CURRENT_CHUNKS_VERSION);
     }
 
     #[tokio::test]
@@ -400,7 +450,7 @@ mod tests {
 
         let table = db.open_table("papers_chunks").execute().await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
-        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+        assert_eq!(v, CURRENT_CHUNKS_VERSION);
     }
 
     #[tokio::test]
@@ -433,7 +483,7 @@ mod tests {
 
         // Create v0 table and manually stamp it at current version
         let table = ensure_table(&db, "papers_chunks", chunks_schema_v0()).await.unwrap();
-        write_schema_version(&table, CURRENT_SCHEMA_VERSION).await.unwrap();
+        write_schema_version(&table, CURRENT_CHUNKS_VERSION).await.unwrap();
 
         // Re-open and migrate — should be a no-op (won't try to add block_type)
         let table = db.open_table("papers_chunks").execute().await.unwrap();
@@ -455,6 +505,118 @@ mod tests {
         let store = RagStore::open_for_test(&db_path).await.unwrap();
         let table = store.chunks_table().await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
-        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+        assert_eq!(v, CURRENT_CHUNKS_VERSION);
+    }
+
+    // ── Figures migration tests ──────────────────────────────────────────
+
+    /// Build the v0 figures schema (before content was added).
+    fn figures_schema_v0() -> Arc<Schema> {
+        let fields: Vec<Field> = figures_schema()
+            .fields()
+            .iter()
+            .filter(|f| f.name() != "content")
+            .cloned()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_migrate_figures_v0_to_v1_adds_content() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let db = lancedb::connect(&db_path).execute().await.unwrap();
+
+        // Create figures table with v0 schema (no content)
+        let table = ensure_table(&db, "papers_figures", figures_schema_v0())
+            .await
+            .unwrap();
+
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, 0);
+
+        // Run migration
+        migrate_figures_table(&table).await.unwrap();
+
+        // Re-open to see updated schema
+        let table = db.open_table("papers_figures").execute().await.unwrap();
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, CURRENT_FIGURES_VERSION);
+
+        let schema = table.schema().await.unwrap();
+        assert!(
+            schema.field_with_name("content").is_ok(),
+            "content column should exist after migration"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_figures_migration_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let db = lancedb::connect(&db_path).execute().await.unwrap();
+
+        let table = ensure_table(&db, "papers_figures", figures_schema()).await.unwrap();
+        migrate_figures_table(&table).await.unwrap();
+
+        let table = db.open_table("papers_figures").execute().await.unwrap();
+        let v1 = read_schema_version(&table).await.unwrap();
+        assert_eq!(v1, CURRENT_FIGURES_VERSION);
+
+        // Second migration should be a no-op
+        migrate_figures_table(&table).await.unwrap();
+        let v2 = read_schema_version(&table).await.unwrap();
+        assert_eq!(v2, CURRENT_FIGURES_VERSION);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_figures_version_stamped_on_fresh_db() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let db = lancedb::connect(&db_path).execute().await.unwrap();
+
+        let table = ensure_table(&db, "papers_figures", figures_schema()).await.unwrap();
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, 0);
+
+        migrate_figures_table(&table).await.unwrap();
+
+        let table = db.open_table("papers_figures").execute().await.unwrap();
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, CURRENT_FIGURES_VERSION);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_chunks_version_unchanged_after_figures_migration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let store = RagStore::open_for_test(&db_path).await.unwrap();
+
+        let chunks_table = store.chunks_table().await.unwrap();
+        let chunks_v = read_schema_version(&chunks_table).await.unwrap();
+        assert_eq!(chunks_v, CURRENT_CHUNKS_VERSION);
+
+        let figures_table = store.figures_table().await.unwrap();
+        let figures_v = read_schema_version(&figures_table).await.unwrap();
+        assert_eq!(figures_v, CURRENT_FIGURES_VERSION);
+
+        // Versions are independent
+        assert_eq!(chunks_v, CURRENT_CHUNKS_VERSION);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_open_for_test_stamps_figures_version() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
+        let store = RagStore::open_for_test(&db_path).await.unwrap();
+        let table = store.figures_table().await.unwrap();
+        let v = read_schema_version(&table).await.unwrap();
+        assert_eq!(v, CURRENT_FIGURES_VERSION);
     }
 }

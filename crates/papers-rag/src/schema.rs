@@ -63,6 +63,7 @@ pub fn figures_schema() -> Arc<Schema> {
         Field::new("caption", DataType::Utf8, false),
         Field::new("description", DataType::Utf8, false),
         Field::new("image_path", DataType::Utf8, true),
+        Field::new("content", DataType::Utf8, true),
         Field::new("page", DataType::UInt16, true),
         Field::new("chapter_idx", DataType::UInt16, false),
         Field::new("section_idx", DataType::UInt16, false),

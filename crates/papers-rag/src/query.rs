@@ -572,6 +572,7 @@ pub async fn search_figures(
                 caption: col_str(batch, "caption", row),
                 description: col_str(batch, "description", row),
                 image_path: col_str_opt(batch, "image_path", row),
+                content: col_str_opt(batch, "content", row),
                 page: col_u16_opt(batch, "page", row),
                 score,
             });
@@ -773,6 +774,7 @@ pub async fn get_figure(store: &RagStore, figure_id: &str) -> Result<FigureResul
         caption: col_str(batch, "caption", 0),
         description: col_str(batch, "description", 0),
         image_path: col_str_opt(batch, "image_path", 0),
+        content: col_str_opt(batch, "content", 0),
         page: col_u16_opt(batch, "page", 0),
         referenced_by: vec![],
     })
