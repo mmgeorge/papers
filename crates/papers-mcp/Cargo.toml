@@ -3,14 +3,14 @@ name = "papers-mcp"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "MCP server for academic paper search, management, and local RAG"
+description = "MCP server for academic paper search, management, and semantic search"
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"
 
 [dependencies]
 papers-core.workspace = true
-papers-rag.workspace = true
+papers-db.workspace = true
 papers-zotero.workspace = true
 papers-datalab.workspace = true
 reqwest.workspace = true

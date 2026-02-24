@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::error::RagError;
+use crate::error::DbError;
 use crate::schema::{EMBED_DIM, chunks_schema, figures_schema};
-use crate::store::RagStore;
+use crate::store::DbStore;
 use crate::types::IngestStats;
 use lancedb::index::Index;
 
@@ -421,13 +421,13 @@ fn cache_root() -> Option<PathBuf> {
 }
 
 /// Build IngestParams from a cached item_key using meta.json.
-pub fn ingest_params_from_cache(item_key: &str) -> Result<IngestParams, RagError> {
+pub fn ingest_params_from_cache(item_key: &str) -> Result<IngestParams, DbError> {
     let root = cache_root().ok_or_else(|| {
-        RagError::NotFound("cannot determine cache directory".into())
+        DbError::NotFound("cannot determine cache directory".into())
     })?;
     let cache_dir = root.join(item_key);
     if !cache_dir.is_dir() {
-        return Err(RagError::NotFound(format!(
+        return Err(DbError::NotFound(format!(
             "cache directory not found: {}",
             cache_dir.display()
         )));
@@ -491,9 +491,9 @@ fn default_embed_model() -> String {
         .unwrap_or_else(|_| "embedding-gemma-300m".to_string())
 }
 
-/// Convenience helper: convert an `EmbedCacheError` to `RagError::Cache`.
-fn cache_err(e: crate::embed_cache::EmbedCacheError) -> RagError {
-    RagError::Cache(e.to_string())
+/// Convenience helper: convert an `EmbedCacheError` to `DbError::Cache`.
+fn cache_err(e: crate::embed_cache::EmbedCacheError) -> DbError {
+    DbError::Cache(e.to_string())
 }
 
 /// Return the current Unix timestamp as a decimal string.
@@ -510,7 +510,7 @@ fn unix_timestamp_str() -> String {
 /// `cache_paper_embeddings`.
 fn parse_paper_blocks(
     params: &IngestParams,
-) -> Result<(Vec<ChunkRecord>, Vec<FigureRecord>), RagError> {
+) -> Result<(Vec<ChunkRecord>, Vec<FigureRecord>), DbError> {
     let json_path = params.cache_dir.join(format!("{}.json", params.item_key));
     let json_bytes = std::fs::read(&json_path)?;
     let root: Value = serde_json::from_slice(&json_bytes)?;
@@ -855,11 +855,11 @@ fn parse_paper_blocks(
 ///   count without re-embedding.
 /// - Saves figure embeddings are **not** cached — only text chunks.
 pub async fn cache_paper_embeddings(
-    store: &RagStore,
+    store: &DbStore,
     params: &IngestParams,
     model: &str,
     force: bool,
-) -> Result<usize, RagError> {
+) -> Result<usize, DbError> {
     let cache = crate::embed_cache::EmbedCache::new(embed_cache_base());
 
     // Cache hit: skip embedding
@@ -924,7 +924,7 @@ pub async fn cache_paper_embeddings(
 }
 
 /// Ingest a paper from the DataLab Marker JSON cache into LanceDB.
-pub async fn ingest_paper(store: &RagStore, params: IngestParams) -> Result<IngestStats, RagError> {
+pub async fn ingest_paper(store: &DbStore, params: IngestParams) -> Result<IngestStats, DbError> {
     let t_total = std::time::Instant::now();
     let (chunk_records, figure_records) = parse_paper_blocks(&params)?;
 
@@ -1135,7 +1135,7 @@ fn build_chunks_batch(
     params: &IngestParams,
     records: &[ChunkRecord],
     embeddings: &[Vec<f32>],
-) -> Result<RecordBatch, RagError> {
+) -> Result<RecordBatch, DbError> {
     let n = records.len();
     let schema = chunks_schema();
 
@@ -1183,7 +1183,7 @@ fn build_chunks_batch(
             Arc::new(build_string_list_array(&figure_ids_list)),
         ],
     )
-    .map_err(|e: ArrowError| RagError::Arrow(e.to_string()))?;
+    .map_err(|e: ArrowError| DbError::Arrow(e.to_string()))?;
 
     Ok(batch)
 }
@@ -1192,7 +1192,7 @@ fn build_figures_batch(
     params: &IngestParams,
     records: &[FigureRecord],
     embeddings: &[Vec<f32>],
-) -> Result<RecordBatch, RagError> {
+) -> Result<RecordBatch, DbError> {
     let n = records.len();
     let schema = figures_schema();
 
@@ -1240,13 +1240,13 @@ fn build_figures_batch(
             Arc::new(build_string_list_array(&tags_list)),
         ],
     )
-    .map_err(|e: ArrowError| RagError::Arrow(e.to_string()))?;
+    .map_err(|e: ArrowError| DbError::Arrow(e.to_string()))?;
 
     Ok(batch)
 }
 
 /// Check if a paper is already indexed in the RAG database.
-pub async fn is_ingested(store: &RagStore, paper_id: &str) -> bool {
+pub async fn is_ingested(store: &DbStore, paper_id: &str) -> bool {
     use futures::TryStreamExt;
     use lancedb::query::{ExecutableQuery, QueryBase};
     let table = match store.chunks_table().await {
@@ -1978,7 +1978,7 @@ mod tests {
             std::env::set_var("PAPERS_EMBED_CACHE_DIR", embed_dir.path());
         }
 
-        let rag = crate::store::RagStore::open_for_test(
+        let rag = crate::store::DbStore::open_for_test(
             rag_dir.path().to_str().unwrap(),
         )
         .await
@@ -2025,7 +2025,7 @@ mod tests {
             std::env::set_var("PAPERS_EMBED_CACHE_DIR", embed_dir.path());
         }
 
-        let rag = crate::store::RagStore::open_for_test(
+        let rag = crate::store::DbStore::open_for_test(
             rag_dir.path().to_str().unwrap(),
         )
         .await
@@ -2103,7 +2103,7 @@ mod tests {
             std::env::set_var("PAPERS_EMBED_CACHE_DIR", embed_dir.path());
         }
 
-        let rag = crate::store::RagStore::open_for_test(
+        let rag = crate::store::DbStore::open_for_test(
             rag_dir.path().to_str().unwrap(),
         )
         .await

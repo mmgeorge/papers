@@ -99,8 +99,8 @@ Structs with `Deserialize` + `JsonSchema`:
 - `ZoteroCollectionListToolParams`, `ZoteroCollectionWorksToolParams`, `ZoteroCollectionNotesToolParams`
 - `ZoteroCollectionSubcollectionsToolParams`, `ZoteroCollectionTagsToolParams`
 - `ZoteroTagListToolParams`, `ZoteroKeyToolParams`, `ZoteroTagGetToolParams`, `ZoteroNoParamsToolParams`
-- RAG params: `RagChunkSearchParams`, `RagChunkGetParams`, `RagFigureSearchParams`, `RagFigureGetParams`,
-  `RagPaperListParams`, `RagPaperOutlineParams`, `RagSectionGetParams`, `RagChapterGetParams`, `RagTagListParams`
+- DB params: `DbChunkSearchParams`, `DbChunkGetParams`, `DbFigureSearchParams`, `DbFigureGetParams`,
+  `DbWorkListParams`, `DbWorkOutlineParams`, `DbSectionGetParams`, `DbChapterGetParams`, `DbTagListParams`
 
 ## How to update
 

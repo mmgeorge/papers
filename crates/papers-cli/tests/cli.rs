@@ -2981,13 +2981,13 @@ fn test_datalab_cached_markdown_miss() {
     assert!(result.is_none(), "unknown key should return None");
 }
 
-// ── `papers rag work extract` tests ──────────────────────────────────────
+// ── `papers db work extract` tests ──────────────────────────────────────
 //
 // These tests exercise the two user-visible behaviours of the simplified
 // `extract` command:
 //
-//   papers rag work extract <work>         → cached markdown text
-//   papers rag work extract <work> --json  → cached structured JSON
+//   papers db work extract <work>         → cached markdown text
+//   papers db work extract <work> --json  → cached structured JSON
 //
 // All tests write files into an isolated test cache directory controlled by
 // the `PAPERS_DATALAB_CACHE_DIR` environment variable so they never touch the
@@ -3074,7 +3074,7 @@ fn test_rag_work_extract_json_cache_miss() {
 /// End-to-end: a title-search query resolves to a Zotero item key via the
 /// mock server, then `datalab_cached_markdown` returns the cached text.
 ///
-/// Mirrors the `--json=false` (default) path of `papers rag work extract`.
+/// Mirrors the `--json=false` (default) path of `papers db work extract`.
 #[tokio::test]
 async fn test_rag_work_extract_resolves_title_then_reads_markdown() {
     // Seed the cache so the resolved key has a markdown file.
@@ -3113,7 +3113,7 @@ async fn test_rag_work_extract_resolves_title_then_reads_markdown() {
 /// End-to-end: a title-search query resolves to a Zotero item key via the
 /// mock server, then `datalab_cached_json` returns the cached JSON.
 ///
-/// Mirrors the `--json` path of `papers rag work extract`.
+/// Mirrors the `--json` path of `papers db work extract`.
 #[tokio::test]
 async fn test_rag_work_extract_resolves_title_then_reads_json() {
     // Seed the cache so the resolved key has a JSON file.
@@ -3679,7 +3679,7 @@ fn test_rag_add_ingest_params_from_cache_falls_back_without_meta() {
     // Write only .md — no meta.json
     write_md_cache(KEY_NO_META, "# No Meta Paper\n");
 
-    let result = papers_rag::ingest_params_from_cache(KEY_NO_META);
+    let result = papers_db::ingest_params_from_cache(KEY_NO_META);
     assert!(result.is_ok(),
         "ingest_params_from_cache should succeed even without meta.json (falls back gracefully)");
     let params = result.unwrap();
@@ -3700,7 +3700,7 @@ fn test_rag_add_list_cached_keys_requires_json_file() {
     write_md_cache(KEY_WITH_JSON, "# With JSON\n");
     write_json_cache(KEY_WITH_JSON, r#"{"pages":[]}"#);
 
-    let keys = papers_rag::list_cached_item_keys();
+    let keys = papers_db::list_cached_item_keys();
     assert!(
         keys.contains(&KEY_WITH_JSON.to_string()),
         "key with .json should appear in list_cached_item_keys"

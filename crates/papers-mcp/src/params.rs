@@ -1772,11 +1772,11 @@ pub struct SelectionRemoveToolParams {
     pub selection: Option<String>,
 }
 
-// ── RAG tool params ──────────────────────────────────────────────────────────
+// ── DB tool params ──────────────────────────────────────────────────────────
 
-/// Parameters for the `rag_chunk_search` tool.
+/// Parameters for the `db_chunk_search` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagChunkSearchParams {
+pub struct DbChunkSearchParams {
     /// Natural language search query.
     pub query: String,
     /// Scope to papers in this named selection.
@@ -1801,9 +1801,9 @@ pub struct RagChunkSearchParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_figure_search` tool.
+/// Parameters for the `db_figure_search` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagFigureSearchParams {
+pub struct DbFigureSearchParams {
     /// Natural language description of the figure, table, or diagram to find.
     pub query: String,
     /// Scope to papers in this named selection.
@@ -1816,16 +1816,16 @@ pub struct RagFigureSearchParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_chunk_get` tool.
+/// Parameters for the `db_chunk_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagChunkGetParams {
+pub struct DbChunkGetParams {
     /// Chunk ID (e.g. "10.1145/abc/ch1/s2/p3" or "YFACFA8C/ch1/s0/p0").
     pub chunk_id: String,
 }
 
-/// Parameters for the `rag_section_get` tool.
+/// Parameters for the `db_section_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagSectionGetParams {
+pub struct DbSectionGetParams {
     /// Paper: DOI, item key, or title search.
     pub paper_id: String,
     /// Chapter index (1-based).
@@ -1834,32 +1834,32 @@ pub struct RagSectionGetParams {
     pub section_idx: u16,
 }
 
-/// Parameters for the `rag_chapter_get` tool.
+/// Parameters for the `db_chapter_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagChapterGetParams {
+pub struct DbChapterGetParams {
     /// Paper: DOI, item key, or title search.
     pub paper_id: String,
     /// Chapter index (1-based).
     pub chapter_idx: u16,
 }
 
-/// Parameters for the `rag_figure_get` tool.
+/// Parameters for the `db_figure_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagFigureGetParams {
+pub struct DbFigureGetParams {
     /// Figure ID (e.g. "YFACFA8C/fig3").
     pub figure_id: String,
 }
 
-/// Parameters for the `rag_work_outline` tool.
+/// Parameters for the `db_work_outline` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagWorkOutlineParams {
+pub struct DbWorkOutlineParams {
     /// Paper: DOI, item key, or title search.
     pub paper_id: String,
 }
 
-/// Parameters for the `rag_work_list` tool.
+/// Parameters for the `db_work_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagWorkListParams {
+pub struct DbWorkListParams {
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
     /// Minimum publication year.
@@ -1878,23 +1878,23 @@ pub struct RagWorkListParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_tag_list` tool.
+/// Parameters for the `db_tag_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagTagListParams {
+pub struct DbTagListParams {
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
 }
 
-/// Parameters for the `rag_work_get` tool.
+/// Parameters for the `db_work_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagWorkGetParams {
+pub struct DbWorkGetParams {
     /// Paper: DOI, item key, or title search.
     pub paper_id: String,
 }
 
-/// Parameters for the `rag_work_search` tool.
+/// Parameters for the `db_work_search` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagWorkSearchParams {
+pub struct DbWorkSearchParams {
     /// Natural language search query.
     pub query: String,
     /// Scope to papers in this named selection.
@@ -1911,9 +1911,9 @@ pub struct RagWorkSearchParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_chunk_list` tool.
+/// Parameters for the `db_chunk_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagChunkListParams {
+pub struct DbChunkListParams {
     /// Paper: DOI, item key, or title search (omit to list all papers).
     pub work: Option<String>,
     /// Scope to a chapter (1-based).
@@ -1924,9 +1924,9 @@ pub struct RagChunkListParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_section_search` tool.
+/// Parameters for the `db_section_search` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagSectionSearchParams {
+pub struct DbSectionSearchParams {
     /// Natural language search query.
     pub query: String,
     /// Scope to papers in this named selection.
@@ -1947,16 +1947,16 @@ pub struct RagSectionSearchParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_section_list` tool.
+/// Parameters for the `db_section_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagSectionListParams {
+pub struct DbSectionListParams {
     /// Paper: DOI, item key, or title search (omit to list all papers).
     pub work: Option<String>,
 }
 
-/// Parameters for the `rag_chapter_search` tool.
+/// Parameters for the `db_chapter_search` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagChapterSearchParams {
+pub struct DbChapterSearchParams {
     /// Natural language search query.
     pub query: String,
     /// Scope to papers in this named selection.
@@ -1975,9 +1975,9 @@ pub struct RagChapterSearchParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_chapter_list` tool.
+/// Parameters for the `db_chapter_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RagChapterListParams {
+pub struct DbChapterListParams {
     /// Paper: DOI, item key, or title search (omit to list all papers).
     pub work: Option<String>,
 }

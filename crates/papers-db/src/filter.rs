@@ -1,4 +1,4 @@
-use crate::error::RagError;
+use crate::error::DbError;
 
 /// Builds a SQL WHERE clause from optional filter components.
 pub struct FilterBuilder {
@@ -88,12 +88,12 @@ pub fn validate_scope(
     chapter_idx: Option<u16>,
     section_idx: Option<u16>,
     paper_id: Option<&str>,
-) -> Result<(), RagError> {
+) -> Result<(), DbError> {
     if section_idx.is_some() && chapter_idx.is_none() {
-        return Err(RagError::Scope("section_idx requires chapter_idx".into()));
+        return Err(DbError::Scope("section_idx requires chapter_idx".into()));
     }
     if chapter_idx.is_some() && paper_id.is_none() {
-        return Err(RagError::Scope("chapter_idx requires paper_id".into()));
+        return Err(DbError::Scope("chapter_idx requires paper_id".into()));
     }
     Ok(())
 }

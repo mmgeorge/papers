@@ -10,7 +10,7 @@ mod embed;
 mod filter;
 
 pub use embed_cache::EmbedCache;
-pub use error::RagError;
+pub use error::DbError;
 pub use ingest::{
     cache_paper_embeddings, embed_cache_base, IngestParams, ingest_paper, ingest_params_from_cache,
     is_ingested, list_cached_item_keys,
@@ -18,7 +18,7 @@ pub use ingest::{
 pub use query::resolve_paper_id;
 #[cfg(any(test, feature = "bench"))]
 pub use query::{search_figures_with_embedding, search_with_embedding};
-pub use store::RagStore;
+pub use store::DbStore;
 pub use types::*;
 
 /// Returns an `EmbedCache` pointed at the default on-disk location.

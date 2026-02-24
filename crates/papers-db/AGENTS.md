@@ -1,6 +1,6 @@
-# papers-rag — Internal Architecture
+# papers-db — Internal Architecture
 
-Local vector RAG system built on LanceDB + Embedding Gemma 300M (768-dim). Ingests
+Local vector database built on LanceDB + Embedding Gemma 300M (768-dim). Ingests
 DataLab Marker JSON, embeds text chunks, caches embeddings on disk, and serves
 semantic search over indexed papers.
 
@@ -13,11 +13,11 @@ src/
   lib.rs          — pub mod declarations, re-exports, default_embed_cache()
   embed.rs        — Embedder wrapper (EmbeddingGemma300M, fake for tests)
   embed_cache.rs  — EmbedCache: persistent f32 binary cache per (model, item_key)
-  error.rs        — RagError enum (LanceDb, Embed, Arrow, Cache, Io, Json, …)
+  error.rs        — DbError enum (LanceDb, Embed, Arrow, Cache, Io, Json, …)
   ingest.rs       — parse_paper_blocks, ingest_paper, cache_paper_embeddings
   query.rs        — search, search_figures, get_chunk, get_section, list_papers, …
   schema.rs       — Arrow schemas for chunks + figures tables; EMBED_DIM = 768
-  store.rs        — RagStore: LanceDB connection + Arc<Mutex<Embedder>>
+  store.rs        — DbStore: LanceDB connection + Arc<Mutex<Embedder>>
   types.rs        — IngestStats, SearchParams, SearchResult, FigureResult, …
   filter.rs       — LanceDB filter string builders
   tests.rs        — integration tests (tokio, open_for_test)
@@ -114,14 +114,14 @@ The manifest chunk list and binary rows are always in sync (written atomically).
 
 ---
 
-## `RagStore` and embedding
+## `DbStore` and embedding
 
 The embedding model (`EmbeddingGemma300M`) is loaded eagerly at MCP server
 startup via `store.warm_up()`, which triggers the `OnceCell` init. This avoids
 a 30-60s delay on the first search call. The `warm_up()` call is in
-`PapersMcp::open_rag_store()` — failure is logged but doesn't block the server.
+`PapersMcp::open_db_store()` — failure is logged but doesn't block the server.
 
-In tests, `RagStore::open_for_test` uses `Embedder::fake()` which returns zero
+In tests, `DbStore::open_for_test` uses `Embedder::fake()` which returns zero
 vectors without loading any model weights.
 
 `store.embed_documents(texts)` and `store.embed_query(query)` both delegate to
@@ -179,7 +179,7 @@ vectors without loading any model weights.
 LanceDB does not auto-create vector indexes. Without an index, `nearest_to()`
 does a brute-force scan over all rows.
 
-- `RagStore::ensure_indexes()` runs on startup (end of `open()`) and creates
+- `DbStore::ensure_indexes()` runs on startup (end of `open()`) and creates
   `Index::Auto` indexes on the `vector` column of both tables.
 - After each ingestion (`ingest_paper`), the index is rebuilt for the affected
   table via `create_index`. This replaces any existing index.
@@ -191,22 +191,22 @@ does a brute-force scan over all rows.
 
 ## Database path
 
-Default LanceDB path: `{dirs::data_dir()}/papers/rag`
+Default LanceDB path: `{dirs::data_dir()}/papers/db`
 
 | Platform | Default path |
 |----------|-------------|
-| Linux | `~/.local/share/papers/rag` |
-| macOS | `~/Library/Application Support/papers/rag` |
+| Linux | `~/.local/share/papers/db` |
+| macOS | `~/Library/Application Support/papers/db` |
 | Windows | `C:\Users\<user>\AppData\Roaming\papers\rag` |
 
-Override with `PAPERS_RAG_DB` env var, or set `PAPERS_DATA_DIR` to relocate
+Override with `PAPERS_DB_PATH` env var, or set `PAPERS_DATA_DIR` to relocate
 the entire `papers/` data root.
 
 ---
 
 ## Test infrastructure
 
-- `RagStore::open_for_test(path)` — no GPU; uses `Embedder::fake()` (zero vectors)
+- `DbStore::open_for_test(path)` — no GPU; uses `Embedder::fake()` (zero vectors)
 - `PAPERS_DATALAB_CACHE_DIR` — redirect DataLab cache in tests
 - `PAPERS_EMBED_CACHE_DIR` — redirect embed cache in tests
 - `tempfile::TempDir` — all test state is isolated
@@ -215,7 +215,7 @@ the entire `papers/` data root.
 
 ## Benchmarks
 
-Run with: `cargo bench -p papers-rag --features bench`
+Run with: `cargo bench -p papers-db --features bench`
 
 Uses `criterion` with `async_tokio` support. Benchmarks measure the LanceDB
 query path only — no real embedding model is loaded (uses `open_for_test` with
@@ -234,7 +234,7 @@ Parameterized over table sizes: 100, 500, 1000 rows.
 
 LanceDB tables on disk may have been created with an older schema. The
 `migrate_chunks_table()` function in `store.rs` runs automatically on every
-`RagStore::open()` call and applies any pending migrations.
+`DbStore::open()` call and applies any pending migrations.
 
 ### How it works
 
@@ -261,7 +261,7 @@ Each table tracks its own version independently via Arrow schema metadata:
 - `CURRENT_FIGURES_VERSION` must equal the highest version in `FIGURE_MIGRATIONS`
 
 `migrate_chunks_table()` and `migrate_figures_table()` run automatically on
-every `RagStore::open()` call.
+every `DbStore::open()` call.
 
 ### How to add a new column
 
@@ -279,11 +279,11 @@ every `RagStore::open()` call.
 
 ## How to add a new query function
 
-1. Add the function to `query.rs` (takes `&RagStore`, returns `Result<T, RagError>`)
+1. Add the function to `query.rs` (takes `&DbStore`, returns `Result<T, DbError>`)
 2. Add the return type to `types.rs` if new
 3. Export from `lib.rs`
-4. Add a CLI arm in `papers-cli/src/cli.rs` (new variant in `RagCommand`)
-5. Add handler in `papers-cli/src/main.rs` (`handle_rag_command`)
+4. Add a CLI arm in `papers-cli/src/cli.rs` (new variant in `DbCommand`)
+5. Add handler in `papers-cli/src/main.rs` (`handle_db_command`)
 6. Add tests in `tests.rs`
 
 ## How to add a new embedding model
@@ -291,5 +291,5 @@ every `RagStore::open()` call.
 1. Add the model name to `papers_core::config::VALID_MODELS`
 2. Add the fastembed feature flag and model constant to `embed.rs`
 3. Update `Embedder::new` to select the model based on a `model: &str` parameter
-4. Update `RagStore::open` to accept a model name
+4. Update `DbStore::open` to accept a model name
 5. Update tests to cover the new model path

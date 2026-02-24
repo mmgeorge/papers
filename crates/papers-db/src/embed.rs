@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-use crate::error::RagError;
+use crate::error::DbError;
 #[cfg(any(test, feature = "bench"))]
 use crate::schema::EMBED_DIM;
 
@@ -38,7 +38,7 @@ impl std::fmt::Debug for Embedder {
 impl Embedder {
     /// Blocking constructor — call from spawn_blocking.
     /// Downloads model weights on first run from the HF Hub cache.
-    pub fn new() -> Result<Self, RagError> {
+    pub fn new() -> Result<Self, DbError> {
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("papers")
@@ -57,7 +57,7 @@ impl Embedder {
             opts = opts.with_execution_providers(vec![ort::ep::coreml::CoreML::default().build()]);
         }
 
-        let model = TextEmbedding::try_new(opts).map_err(|e| RagError::Embed(e.to_string()))?;
+        let model = TextEmbedding::try_new(opts).map_err(|e| DbError::Embed(e.to_string()))?;
         Ok(Self { model: Some(model) })
     }
 
@@ -68,7 +68,7 @@ impl Embedder {
     }
 
     /// Embed documents at ingest time.
-    pub fn embed_documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, RagError> {
+    pub fn embed_documents(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, DbError> {
         if texts.is_empty() {
             return Ok(vec![]);
         }
@@ -87,11 +87,11 @@ impl Embedder {
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         model
             .embed(refs, None)
-            .map_err(|e| RagError::Embed(e.to_string()))
+            .map_err(|e| DbError::Embed(e.to_string()))
     }
 
     /// Embed a query at search time.
-    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>, RagError> {
+    pub fn embed_query(&mut self, query: &str) -> Result<Vec<f32>, DbError> {
         let model = match &mut self.model {
             Some(m) => m,
             None => {
@@ -103,10 +103,10 @@ impl Embedder {
         };
         let result = model
             .embed(vec![query], None)
-            .map_err(|e| RagError::Embed(e.to_string()))?;
+            .map_err(|e| DbError::Embed(e.to_string()))?;
         result
             .into_iter()
             .next()
-            .ok_or_else(|| RagError::Embed("empty embedding result".into()))
+            .ok_or_else(|| DbError::Embed("empty embedding result".into()))
     }
 }

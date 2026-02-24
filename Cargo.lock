@@ -4896,8 +4896,8 @@ dependencies = [
  "dirs",
  "papers-core",
  "papers-datalab",
+ "papers-db",
  "papers-mcp",
- "papers-rag",
  "papers-zotero",
  "serde",
  "serde_json",
@@ -4940,12 +4940,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "papers-db"
+version = "0.3.1"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "criterion",
+ "dirs",
+ "fastembed",
+ "futures",
+ "lancedb",
+ "ort",
+ "papers-core",
+ "rand 0.8.5",
+ "regex",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "papers-mcp"
 version = "0.3.1"
 dependencies = [
  "papers-core",
  "papers-datalab",
- "papers-rag",
+ "papers-db",
  "papers-zotero",
  "reqwest 0.13.2",
  "rmcp",
@@ -4969,29 +4992,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "wiremock",
-]
-
-[[package]]
-name = "papers-rag"
-version = "0.3.1"
-dependencies = [
- "arrow-array",
- "arrow-schema",
- "criterion",
- "dirs",
- "fastembed",
- "futures",
- "lancedb",
- "ort",
- "papers-core",
- "rand 0.8.5",
- "regex",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]

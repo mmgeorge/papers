@@ -85,7 +85,7 @@ local cache or Zotero (`papers_extract_{key}.zip` backup), with two checkmarks p
 `[✓ local] [✓ zotero]`. Items with neither are omitted.
 
 `extract text` / `extract json` / `extract get` are **read-only** — they never
-invoke DataLab. Use `papers rag work add <key>` to run extraction and index the paper.
+invoke DataLab. Use `papers db work add <key>` to run extraction and index the paper.
 
 Default output is human-readable text. Add `--json` for raw JSON.
 Default `--per-page` is 10 (vs API default of 25).

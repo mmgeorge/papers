@@ -23,11 +23,11 @@
 - Add Zotero extraction management and metadata
 - Add selection management for papers
 - Add schedule manager extension
-- Add rag cli
+- Add db cli
 - Add caching
 - Add directml execution provider support for embedding
-- Add timing logs to rag ingestion and store initialization
-- Implement lazy loading for rag embedder
+- Add timing logs to db ingestion and store initialization
+- Implement lazy loading for db embedder
 - Integrate mcp server into papers-cli
 
 ### Bug Fixes

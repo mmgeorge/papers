@@ -1,4 +1,4 @@
-//! Integration tests for the papers-rag crate.
+//! Integration tests for the papers-db crate.
 //!
 //! These tests exercise the full ingest → query pipeline using a fake embedder
 //! (zero vectors, no model download) against a temporary LanceDB directory.
@@ -11,7 +11,7 @@ use crate::ingest::{IngestParams, ingest_paper, is_ingested, list_cached_item_ke
 use crate::query::{
     get_chapter, get_chunk, get_paper_outline, get_section, list_papers, list_tags,
 };
-use crate::store::RagStore;
+use crate::store::DbStore;
 use crate::types::{ListPapersParams, ListTagsParams};
 
 // ── Test isolation ────────────────────────────────────────────────────────────
@@ -177,9 +177,9 @@ fn make_test_cache(dir: &TempDir, item_key: &str) -> IngestParams {
 }
 
 /// Open a test store against a temporary directory.
-async fn open_test_store(dir: &TempDir) -> RagStore {
+async fn open_test_store(dir: &TempDir) -> DbStore {
     let path = dir.path().join("rag_db");
-    RagStore::open_for_test(path.to_str().unwrap())
+    DbStore::open_for_test(path.to_str().unwrap())
         .await
         .expect("open_for_test")
 }

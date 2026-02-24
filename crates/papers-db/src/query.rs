@@ -6,9 +6,9 @@ use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase, Select};
 use std::collections::HashMap;
 
-use crate::error::RagError;
+use crate::error::DbError;
 use crate::filter::{validate_scope, FilterBuilder};
-use crate::store::RagStore;
+use crate::store::DbStore;
 use crate::types::{
     ChapterListItem, ChapterResult, ChapterSearchResult, ChapterSection, ChunkListItem, ChunkResult,
     ChunkSummary, ChunkWithPosition, FigureResult, FigureSearchResult, ListChaptersParams,
@@ -21,17 +21,17 @@ use crate::types::{
 
 // ── Arrow extraction helpers ────────────────────────────────────────────────
 
-fn arrow_err(name: &str, expected: &str, actual: &DataType) -> RagError {
-    RagError::Arrow(format!(
+fn arrow_err(name: &str, expected: &str, actual: &DataType) -> DbError {
+    DbError::Arrow(format!(
         "column '{name}': expected {expected}, got {actual:?}"
     ))
 }
 
-fn missing_col(name: &str) -> RagError {
-    RagError::Arrow(format!("missing column '{name}'"))
+fn missing_col(name: &str) -> DbError {
+    DbError::Arrow(format!("missing column '{name}'"))
 }
 
-fn col_str(batch: &RecordBatch, name: &str, row: usize) -> Result<String, RagError> {
+fn col_str(batch: &RecordBatch, name: &str, row: usize) -> Result<String, DbError> {
     let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
         Ok(if arr.is_null(row) { String::new() } else { arr.value(row).to_string() })
@@ -42,7 +42,7 @@ fn col_str(batch: &RecordBatch, name: &str, row: usize) -> Result<String, RagErr
     }
 }
 
-fn col_str_opt(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>, RagError> {
+fn col_str_opt(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>, DbError> {
     let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     if *col.data_type() == DataType::Null {
         return Ok(None);
@@ -56,21 +56,21 @@ fn col_str_opt(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<Str
     }
 }
 
-fn col_u16(batch: &RecordBatch, name: &str, row: usize) -> Result<u16, RagError> {
+fn col_u16(batch: &RecordBatch, name: &str, row: usize) -> Result<u16, DbError> {
     let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     let arr = col.as_any().downcast_ref::<UInt16Array>()
         .ok_or_else(|| arrow_err(name, "UInt16", col.data_type()))?;
     Ok(arr.value(row))
 }
 
-fn col_u16_opt(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<u16>, RagError> {
+fn col_u16_opt(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<u16>, DbError> {
     let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     let arr = col.as_any().downcast_ref::<UInt16Array>()
         .ok_or_else(|| arrow_err(name, "UInt16", col.data_type()))?;
     Ok(if arr.is_null(row) { None } else { Some(arr.value(row)) })
 }
 
-fn col_str_list(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<String>, RagError> {
+fn col_str_list(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<String>, DbError> {
     let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     if col.is_null(row) {
         return Ok(vec![]);
@@ -86,7 +86,7 @@ fn col_str_list(batch: &RecordBatch, name: &str, row: usize) -> Result<Vec<Strin
         .collect())
 }
 
-fn col_f32(batch: &RecordBatch, name: &str, row: usize) -> Result<f32, RagError> {
+fn col_f32(batch: &RecordBatch, name: &str, row: usize) -> Result<f32, DbError> {
     let col = batch.column_by_name(name).ok_or_else(|| missing_col(name))?;
     let arr = col.as_any().downcast_ref::<Float32Array>()
         .ok_or_else(|| arrow_err(name, "Float32", col.data_type()))?;
@@ -99,7 +99,7 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
 
 // ── Chunk building ──────────────────────────────────────────────────────────
 
-fn chunk_from_row(batch: &RecordBatch, row: usize) -> Result<ChunkData, RagError> {
+fn chunk_from_row(batch: &RecordBatch, row: usize) -> Result<ChunkData, DbError> {
     Ok(ChunkData {
         chunk_id: col_str(batch, "chunk_id", row)?,
         paper_id: col_str(batch, "paper_id", row)?,
@@ -189,7 +189,7 @@ struct NeighborRow {
 async fn batch_fetch_neighbor_rows(
     table: &lancedb::Table,
     keys: &[NeighborKey],
-) -> Result<HashMap<NeighborKey, NeighborRow>, RagError> {
+) -> Result<HashMap<NeighborKey, NeighborRow>, DbError> {
     if keys.is_empty() {
         return Ok(HashMap::new());
     }
@@ -224,7 +224,7 @@ async fn batch_fetch_neighbor_rows(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     let mut map = HashMap::new();
     for batch in &batches {
@@ -328,7 +328,7 @@ async fn fetch_neighbors(
     chapter_idx: u16,
     section_idx: u16,
     chunk_idx: u16,
-) -> Result<(Option<ChunkSummary>, Option<ChunkSummary>), RagError> {
+) -> Result<(Option<ChunkSummary>, Option<ChunkSummary>), DbError> {
     // Collect all candidate keys (prev, prev-1, next, next+1)
     let mut keys: Vec<NeighborKey> = Vec::with_capacity(4);
     if chunk_idx > 0 {
@@ -353,7 +353,7 @@ async fn fetch_neighbors(
 async fn resolve_figures(
     figures_table: &lancedb::Table,
     figure_ids: &[String],
-) -> Result<Vec<ReferencedFigure>, RagError> {
+) -> Result<Vec<ReferencedFigure>, DbError> {
     if figure_ids.is_empty() {
         return Ok(vec![]);
     }
@@ -376,7 +376,7 @@ async fn resolve_figures(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     let mut results = Vec::new();
     for batch in &batches {
@@ -398,7 +398,7 @@ async fn position_context(
     chapter_idx: u16,
     section_idx: u16,
     chunk_idx: u16,
-) -> Result<PositionContext, RagError> {
+) -> Result<PositionContext, DbError> {
     let paper_id_esc = paper_id.replace('\'', "''");
 
     // Total chunks in this section
@@ -413,7 +413,7 @@ async fn position_context(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
     let total_in_section = total_rows(&section_batches) as u32;
 
     // Total sections in this chapter
@@ -427,7 +427,7 @@ async fn position_context(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
     let mut section_set = std::collections::HashSet::new();
     for b in &chapter_batches {
         for r in 0..b.num_rows() {
@@ -445,7 +445,7 @@ async fn position_context(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
     let mut chapter_set = std::collections::HashSet::new();
     for b in &paper_batches {
         for r in 0..b.num_rows() {
@@ -464,9 +464,9 @@ async fn position_context(
 }
 
 async fn build_chunk_with_position(
-    store: &RagStore,
+    store: &DbStore,
     data: ChunkData,
-) -> Result<ChunkWithPosition, RagError> {
+) -> Result<ChunkWithPosition, DbError> {
     let chunks_table = store.chunks_table().await?;
     let figures_table = store.figures_table().await?;
     let pos = position_context(
@@ -509,7 +509,7 @@ async fn build_chunk_with_position(
 ///    returns the first match's `paper_id`.
 ///
 /// Returns a `NotFound` error with a list of available papers when no match is found.
-pub async fn resolve_paper_id(store: &RagStore, input: &str) -> Result<String, RagError> {
+pub async fn resolve_paper_id(store: &DbStore, input: &str) -> Result<String, DbError> {
     let table = store.chunks_table().await?;
 
     // Fetch all distinct (paper_id, title) pairs
@@ -520,7 +520,7 @@ pub async fn resolve_paper_id(store: &RagStore, input: &str) -> Result<String, R
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     // Deduplicate into (paper_id, title) pairs
     let mut seen = std::collections::HashSet::new();
@@ -555,7 +555,7 @@ pub async fn resolve_paper_id(store: &RagStore, input: &str) -> Result<String, R
                 .iter()
                 .map(|(pid, title)| format!("  {pid} — {title}"))
                 .collect();
-            Err(RagError::NotFound(format!(
+            Err(DbError::NotFound(format!(
                 "no paper matching '{}'. Available papers:\n{}",
                 input,
                 available.join("\n")
@@ -567,9 +567,9 @@ pub async fn resolve_paper_id(store: &RagStore, input: &str) -> Result<String, R
 
 /// Semantic search across indexed paper chunks.
 pub async fn search(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchParams,
-) -> Result<Vec<SearchResult>, RagError> {
+) -> Result<Vec<SearchResult>, DbError> {
     let embedding = store.embed_query(&params.query).await?;
     search_with_embedding(store, params, &embedding).await
 }
@@ -577,27 +577,27 @@ pub async fn search(
 /// Search with a pre-computed embedding vector (used by benchmarks to bypass the embedder).
 #[cfg(any(test, feature = "bench"))]
 pub async fn search_with_embedding(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchParams,
     embedding: &[f32],
-) -> Result<Vec<SearchResult>, RagError> {
+) -> Result<Vec<SearchResult>, DbError> {
     search_with_embedding_inner(store, params, embedding).await
 }
 
 #[cfg(not(any(test, feature = "bench")))]
 async fn search_with_embedding(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchParams,
     embedding: &[f32],
-) -> Result<Vec<SearchResult>, RagError> {
+) -> Result<Vec<SearchResult>, DbError> {
     search_with_embedding_inner(store, params, embedding).await
 }
 
 async fn search_with_embedding_inner(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchParams,
     embedding: &[f32],
-) -> Result<Vec<SearchResult>, RagError> {
+) -> Result<Vec<SearchResult>, DbError> {
     validate_scope(
         params.chapter_idx,
         params.section_idx,
@@ -640,7 +640,7 @@ async fn search_with_embedding_inner(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     // Collect all chunk data and scores first
     let mut chunk_data_list: Vec<(ChunkData, f32)> = Vec::new();
@@ -713,9 +713,9 @@ async fn search_with_embedding_inner(
 
 /// Search for figures/tables by description.
 pub async fn search_figures(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchFiguresParams,
-) -> Result<Vec<FigureSearchResult>, RagError> {
+) -> Result<Vec<FigureSearchResult>, DbError> {
     let embedding = store.embed_query(&params.query).await?;
     search_figures_with_embedding_inner(store, params, &embedding).await
 }
@@ -723,18 +723,18 @@ pub async fn search_figures(
 /// Search figures with a pre-computed embedding vector (for benchmarks).
 #[cfg(any(test, feature = "bench"))]
 pub async fn search_figures_with_embedding(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchFiguresParams,
     embedding: &[f32],
-) -> Result<Vec<FigureSearchResult>, RagError> {
+) -> Result<Vec<FigureSearchResult>, DbError> {
     search_figures_with_embedding_inner(store, params, embedding).await
 }
 
 async fn search_figures_with_embedding_inner(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchFiguresParams,
     embedding: &[f32],
-) -> Result<Vec<FigureSearchResult>, RagError> {
+) -> Result<Vec<FigureSearchResult>, DbError> {
     let table = store.figures_table().await?;
 
     let mut fb = FilterBuilder::new();
@@ -756,7 +756,7 @@ async fn search_figures_with_embedding_inner(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     let mut results = Vec::new();
     for batch in &batches {
@@ -784,7 +784,7 @@ async fn search_figures_with_embedding_inner(
 }
 
 /// Get a single chunk by ID with prev/next neighbors.
-pub async fn get_chunk(store: &RagStore, chunk_id: &str) -> Result<ChunkResult, RagError> {
+pub async fn get_chunk(store: &DbStore, chunk_id: &str) -> Result<ChunkResult, DbError> {
     let table = store.chunks_table().await?;
     let escaped = chunk_id.replace('\'', "''");
     let filter = format!("chunk_id = '{escaped}'");
@@ -796,10 +796,10 @@ pub async fn get_chunk(store: &RagStore, chunk_id: &str) -> Result<ChunkResult, 
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     if total_rows(&batches) == 0 {
-        return Err(RagError::NotFound(format!("chunk not found: {chunk_id}")));
+        return Err(DbError::NotFound(format!("chunk not found: {chunk_id}")));
     }
     let batch = &batches[0];
     let data = chunk_from_row(batch, 0)?;
@@ -814,11 +814,11 @@ pub async fn get_chunk(store: &RagStore, chunk_id: &str) -> Result<ChunkResult, 
 
 /// Fetch all chunks in a section in reading order.
 pub async fn get_section(
-    store: &RagStore,
+    store: &DbStore,
     paper_id: &str,
     chapter_idx: u16,
     section_idx: u16,
-) -> Result<SectionResult, RagError> {
+) -> Result<SectionResult, DbError> {
     let table = store.chunks_table().await?;
     let paper_id_esc = paper_id.replace('\'', "''");
     let filter = format!(
@@ -831,7 +831,7 @@ pub async fn get_section(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     // Sort by chunk_idx
     let mut rows: Vec<(u16, &RecordBatch, usize)> = Vec::new();
@@ -867,10 +867,10 @@ pub async fn get_section(
 
 /// Fetch all content of a chapter, grouped by section.
 pub async fn get_chapter(
-    store: &RagStore,
+    store: &DbStore,
     paper_id: &str,
     chapter_idx: u16,
-) -> Result<ChapterResult, RagError> {
+) -> Result<ChapterResult, DbError> {
     let table = store.chunks_table().await?;
     let paper_id_esc = paper_id.replace('\'', "''");
     let filter = format!("paper_id = '{paper_id_esc}' AND chapter_idx = {chapter_idx}");
@@ -881,7 +881,7 @@ pub async fn get_chapter(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     // Sort by (section_idx, chunk_idx)
     let mut rows: Vec<(u16, u16, &RecordBatch, usize)> = Vec::new();
@@ -949,7 +949,7 @@ pub async fn get_chapter(
 }
 
 /// Retrieve a figure by ID.
-pub async fn get_figure(store: &RagStore, figure_id: &str) -> Result<FigureResult, RagError> {
+pub async fn get_figure(store: &DbStore, figure_id: &str) -> Result<FigureResult, DbError> {
     let table = store.figures_table().await?;
     let escaped = figure_id.replace('\'', "''");
     let filter = format!("figure_id = '{escaped}'");
@@ -961,10 +961,10 @@ pub async fn get_figure(store: &RagStore, figure_id: &str) -> Result<FigureResul
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     if total_rows(&batches) == 0 {
-        return Err(RagError::NotFound(format!(
+        return Err(DbError::NotFound(format!(
             "figure not found: {figure_id}"
         )));
     }
@@ -984,9 +984,9 @@ pub async fn get_figure(store: &RagStore, figure_id: &str) -> Result<FigureResul
 
 /// Get the table of contents for a paper.
 pub async fn get_paper_outline(
-    store: &RagStore,
+    store: &DbStore,
     paper_id: &str,
-) -> Result<PaperOutline, RagError> {
+) -> Result<PaperOutline, DbError> {
     let table = store.chunks_table().await?;
     let figures_table = store.figures_table().await?;
     let paper_id_esc = paper_id.replace('\'', "''");
@@ -1011,10 +1011,10 @@ pub async fn get_paper_outline(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     if total_rows(&batches) == 0 {
-        return Err(RagError::NotFound(format!(
+        return Err(DbError::NotFound(format!(
             "paper not found: {paper_id}"
         )));
     }
@@ -1056,7 +1056,7 @@ pub async fn get_paper_outline(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
     let total_figures = total_rows(&fig_batches);
 
     // Count figures per chapter
@@ -1112,9 +1112,9 @@ pub async fn get_paper_outline(
 
 /// Browse indexed papers with optional filters.
 pub async fn list_papers(
-    store: &RagStore,
+    store: &DbStore,
     params: ListPapersParams,
-) -> Result<Vec<PaperSummary>, RagError> {
+) -> Result<Vec<PaperSummary>, DbError> {
     let table = store.chunks_table().await?;
     let figures_table = store.figures_table().await?;
 
@@ -1144,7 +1144,7 @@ pub async fn list_papers(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     // Aggregate by paper_id
     let mut paper_map: HashMap<String, PaperSummary> = HashMap::new();
@@ -1186,7 +1186,7 @@ pub async fn list_papers(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
     for batch in &fig_batches {
         for row in 0..batch.num_rows() {
             let pid = col_str(batch, "paper_id", row)?;
@@ -1210,9 +1210,9 @@ pub async fn list_papers(
 
 /// List all tags with paper counts.
 pub async fn list_tags(
-    store: &RagStore,
+    store: &DbStore,
     params: ListTagsParams,
-) -> Result<Vec<TagSummary>, RagError> {
+) -> Result<Vec<TagSummary>, DbError> {
     let table = store.chunks_table().await?;
 
     let mut query = table.query().select(Select::columns(&["paper_id", "tags"]));
@@ -1228,7 +1228,7 @@ pub async fn list_tags(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(|e| RagError::LanceDb(e))?;
+        .map_err(|e| DbError::LanceDb(e))?;
 
     // Collect (paper_id, tag) pairs and count unique papers per tag
     let mut tag_papers: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
@@ -1259,7 +1259,7 @@ pub async fn list_tags(
 // ── Work-level queries ───────────────────────────────────────────────────────
 
 /// Get metadata for a single work (paper).
-pub async fn get_work(store: &RagStore, paper_id: &str) -> Result<WorkMetadata, RagError> {
+pub async fn get_work(store: &DbStore, paper_id: &str) -> Result<WorkMetadata, DbError> {
     let table = store.chunks_table().await?;
     let figures_table = store.figures_table().await?;
     let paper_id_esc = paper_id.replace('\'', "''");
@@ -1274,11 +1274,11 @@ pub async fn get_work(store: &RagStore, paper_id: &str) -> Result<WorkMetadata, 
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     let chunk_count = total_rows(&batches);
     if chunk_count == 0 {
-        return Err(RagError::NotFound(format!("paper not found: {paper_id}")));
+        return Err(DbError::NotFound(format!("paper not found: {paper_id}")));
     }
     let batch = &batches[0];
     let title = col_str(batch, "title", 0)?;
@@ -1295,7 +1295,7 @@ pub async fn get_work(store: &RagStore, paper_id: &str) -> Result<WorkMetadata, 
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
     let figure_count = total_rows(&fig_batches);
 
     Ok(WorkMetadata {
@@ -1312,9 +1312,9 @@ pub async fn get_work(store: &RagStore, paper_id: &str) -> Result<WorkMetadata, 
 
 /// Semantic search returning one result per matching work (paper).
 pub async fn search_works(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchWorksParams,
-) -> Result<Vec<WorkSearchResult>, RagError> {
+) -> Result<Vec<WorkSearchResult>, DbError> {
     let embedding = store.embed_query(&params.query).await?;
     let table = store.chunks_table().await?;
     let inner_limit = (params.limit as usize) * 15;
@@ -1342,7 +1342,7 @@ pub async fn search_works(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     struct WorkEntry {
         title: String,
@@ -1399,13 +1399,13 @@ pub async fn search_works(
 }
 
 /// Delete all chunks and figures for a paper from the index.
-pub async fn remove_work(store: &RagStore, paper_id: &str) -> Result<(), RagError> {
+pub async fn remove_work(store: &DbStore, paper_id: &str) -> Result<(), DbError> {
     let paper_id_esc = paper_id.replace('\'', "''");
     let filter = format!("paper_id = '{paper_id_esc}'");
     let chunks_table = store.chunks_table().await?;
-    chunks_table.delete(&filter).await.map_err(RagError::LanceDb)?;
+    chunks_table.delete(&filter).await.map_err(DbError::LanceDb)?;
     let figures_table = store.figures_table().await?;
-    figures_table.delete(&filter).await.map_err(RagError::LanceDb)?;
+    figures_table.delete(&filter).await.map_err(DbError::LanceDb)?;
     Ok(())
 }
 
@@ -1413,9 +1413,9 @@ pub async fn remove_work(store: &RagStore, paper_id: &str) -> Result<(), RagErro
 
 /// List chunks in a paper with optional chapter/section scope.
 pub async fn list_chunks(
-    store: &RagStore,
+    store: &DbStore,
     params: ListChunksParams,
-) -> Result<Vec<ChunkListItem>, RagError> {
+) -> Result<Vec<ChunkListItem>, DbError> {
     let table = store.chunks_table().await?;
     let mut fb = FilterBuilder::new();
     if let Some(ref pid) = params.paper_id {
@@ -1443,7 +1443,7 @@ pub async fn list_chunks(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     let mut rows: Vec<(String, u16, u16, u16, &RecordBatch, usize)> = Vec::new();
     for batch in &batches {
@@ -1487,9 +1487,9 @@ pub async fn list_chunks(
 
 /// Semantic search returning one result per matching section.
 pub async fn search_sections(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchSectionsParams,
-) -> Result<Vec<SectionSearchResult>, RagError> {
+) -> Result<Vec<SectionSearchResult>, DbError> {
     let embedding = store.embed_query(&params.query).await?;
     let table = store.chunks_table().await?;
     let inner_limit = (params.limit as usize) * 10;
@@ -1520,7 +1520,7 @@ pub async fn search_sections(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     type SectionKey = (String, u16, u16);
     struct SectionEntry {
@@ -1581,9 +1581,9 @@ pub async fn search_sections(
 
 /// List all sections in a paper as a flat table.
 pub async fn list_sections(
-    store: &RagStore,
+    store: &DbStore,
     params: ListSectionsParams,
-) -> Result<Vec<SectionListItem>, RagError> {
+) -> Result<Vec<SectionListItem>, DbError> {
     let table = store.chunks_table().await?;
     let mut query = table
         .query()
@@ -1599,7 +1599,7 @@ pub async fn list_sections(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     type SectionKey2 = (u16, u16);
     let mut sec_map: HashMap<SectionKey2, (String, String, usize)> = HashMap::new();
@@ -1634,9 +1634,9 @@ pub async fn list_sections(
 
 /// Semantic search returning one result per matching chapter.
 pub async fn search_chapters(
-    store: &RagStore,
+    store: &DbStore,
     params: SearchChaptersParams,
-) -> Result<Vec<ChapterSearchResult>, RagError> {
+) -> Result<Vec<ChapterSearchResult>, DbError> {
     let embedding = store.embed_query(&params.query).await?;
     let table = store.chunks_table().await?;
     let inner_limit = (params.limit as usize) * 15;
@@ -1664,7 +1664,7 @@ pub async fn search_chapters(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     type ChapterKey = (String, u16);
     struct ChapterEntry {
@@ -1727,9 +1727,9 @@ pub async fn search_chapters(
 
 /// List all chapters in a paper (chapter index, title, section count, chunk count).
 pub async fn list_chapters(
-    store: &RagStore,
+    store: &DbStore,
     params: ListChaptersParams,
-) -> Result<Vec<ChapterListItem>, RagError> {
+) -> Result<Vec<ChapterListItem>, DbError> {
     let table = store.chunks_table().await?;
     let mut query = table
         .query()
@@ -1743,7 +1743,7 @@ pub async fn list_chapters(
         .await?
         .try_collect::<Vec<_>>()
         .await
-        .map_err(RagError::LanceDb)?;
+        .map_err(DbError::LanceDb)?;
 
     let mut ch_map: HashMap<u16, (String, std::collections::HashSet<u16>, usize)> = HashMap::new();
     for batch in &batches {

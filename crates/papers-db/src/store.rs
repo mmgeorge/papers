@@ -6,19 +6,19 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::OnceCell;
 
 use crate::embed::Embedder;
-use crate::error::RagError;
+use crate::error::DbError;
 use crate::schema::{chunks_schema, figures_schema};
 
-pub struct RagStore {
+pub struct DbStore {
     pub(crate) db: Connection,
     pub(crate) embedder: OnceCell<Arc<Mutex<Embedder>>>,
 }
 
-impl RagStore {
+impl DbStore {
     /// Open (or create) the RAG database at the given path.
     /// Creates both tables with correct schemas if they don't exist yet.
     /// The embedding model is loaded lazily on first use.
-    pub async fn open(path: &str) -> Result<Self, RagError> {
+    pub async fn open(path: &str) -> Result<Self, DbError> {
         let db = lancedb::connect(path).execute().await?;
 
         // Create tables if they don't exist; migrate schemas if needed
@@ -36,7 +36,7 @@ impl RagStore {
     }
 
     /// Get or initialize the embedder (lazy loading).
-    async fn embedder(&self) -> Result<Arc<Mutex<Embedder>>, RagError> {
+    async fn embedder(&self) -> Result<Arc<Mutex<Embedder>>, DbError> {
         self.embedder
             .get_or_try_init(|| async {
                 eprintln!(
@@ -47,8 +47,8 @@ impl RagStore {
                 let t = std::time::Instant::now();
                 let embedder = tokio::task::spawn_blocking(Embedder::new)
                     .await
-                    .map_err(|e| RagError::Embed(format!("spawn_blocking join error: {e}")))?
-                    .map_err(|e| RagError::Embed(e.to_string()))?;
+                    .map_err(|e| DbError::Embed(format!("spawn_blocking join error: {e}")))?
+                    .map_err(|e| DbError::Embed(e.to_string()))?;
                 eprintln!("    embedding model ready ({:.1}s)", t.elapsed().as_secs_f64());
                 Ok(Arc::new(Mutex::new(embedder)))
             })
@@ -56,9 +56,9 @@ impl RagStore {
             .cloned()
     }
 
-    /// Default path: $PAPERS_RAG_DB or {PAPERS_DATA_DIR}/rag or platform data dir.
+    /// Default path: $PAPERS_DB_PATH or {PAPERS_DATA_DIR}/rag or platform data dir.
     pub fn default_path() -> String {
-        if let Ok(p) = std::env::var("PAPERS_RAG_DB") {
+        if let Ok(p) = std::env::var("PAPERS_DB_PATH") {
             return p;
         }
         let base = std::env::var("PAPERS_DATA_DIR")
@@ -72,7 +72,7 @@ impl RagStore {
     /// Test/bench-only: open (or create) the RAG database without loading the embedding model.
     /// All embed calls return zero vectors via `Embedder::fake()`.
     #[cfg(any(test, feature = "bench"))]
-    pub async fn open_for_test(path: &str) -> Result<Self, RagError> {
+    pub async fn open_for_test(path: &str) -> Result<Self, DbError> {
         let db = lancedb::connect(path).execute().await?;
         let chunks = ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         migrate_chunks_table(&chunks).await?;
@@ -85,7 +85,7 @@ impl RagStore {
         Ok(Self { db, embedder })
     }
 
-    pub async fn chunks_table(&self) -> Result<Table, RagError> {
+    pub async fn chunks_table(&self) -> Result<Table, DbError> {
         self.db
             .open_table("papers_chunks")
             .execute()
@@ -93,7 +93,7 @@ impl RagStore {
             .map_err(Into::into)
     }
 
-    pub async fn figures_table(&self) -> Result<Table, RagError> {
+    pub async fn figures_table(&self) -> Result<Table, DbError> {
         self.db
             .open_table("papers_figures")
             .execute()
@@ -128,36 +128,36 @@ impl RagStore {
 
     /// Eagerly initialize the embedding model so the first search call is fast.
     /// Safe to call multiple times — subsequent calls are no-ops.
-    pub async fn warm_up(&self) -> Result<(), RagError> {
+    pub async fn warm_up(&self) -> Result<(), DbError> {
         self.embedder().await?;
         Ok(())
     }
 
     /// Embed a query string asynchronously.
-    pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>, RagError> {
+    pub async fn embed_query(&self, query: &str) -> Result<Vec<f32>, DbError> {
         let embedder = self.embedder().await?;
         let query = query.to_string();
         tokio::task::spawn_blocking(move || {
             embedder
                 .lock()
-                .map_err(|e| RagError::Embed(format!("mutex poisoned: {e}")))?
+                .map_err(|e| DbError::Embed(format!("mutex poisoned: {e}")))?
                 .embed_query(&query)
         })
         .await
-        .map_err(|e| RagError::Embed(format!("spawn_blocking join error: {e}")))?
+        .map_err(|e| DbError::Embed(format!("spawn_blocking join error: {e}")))?
     }
 
     /// Embed document texts asynchronously.
-    pub async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, RagError> {
+    pub async fn embed_documents(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, DbError> {
         let embedder = self.embedder().await?;
         tokio::task::spawn_blocking(move || {
             embedder
                 .lock()
-                .map_err(|e| RagError::Embed(format!("mutex poisoned: {e}")))?
+                .map_err(|e| DbError::Embed(format!("mutex poisoned: {e}")))?
                 .embed_documents(&texts)
         })
         .await
-        .map_err(|e| RagError::Embed(format!("spawn_blocking join error: {e}")))?
+        .map_err(|e| DbError::Embed(format!("spawn_blocking join error: {e}")))?
     }
 }
 
@@ -166,7 +166,7 @@ async fn ensure_table(
     db: &Connection,
     name: &str,
     schema: Arc<Schema>,
-) -> Result<Table, RagError> {
+) -> Result<Table, DbError> {
     match db.open_table(name).execute().await {
         Ok(table) => Ok(table),
         Err(_) => {
@@ -197,7 +197,7 @@ const CHUNK_MIGRATIONS: &[(u32, &str, &str)] = &[
 ];
 
 /// Read the schema version stored in Arrow schema metadata, defaulting to 0.
-async fn read_schema_version(table: &Table) -> Result<u32, RagError> {
+async fn read_schema_version(table: &Table) -> Result<u32, DbError> {
     let schema = table.schema().await?;
     Ok(schema
         .metadata
@@ -207,10 +207,10 @@ async fn read_schema_version(table: &Table) -> Result<u32, RagError> {
 }
 
 /// Write the schema version into Arrow schema metadata via NativeTable.
-async fn write_schema_version(table: &Table, version: u32) -> Result<(), RagError> {
+async fn write_schema_version(table: &Table, version: u32) -> Result<(), DbError> {
     let native = table
         .as_native()
-        .ok_or_else(|| RagError::Scope("table is not a NativeTable".into()))?;
+        .ok_or_else(|| DbError::Scope("table is not a NativeTable".into()))?;
     native
         .replace_schema_metadata(vec![(
             SCHEMA_VERSION_KEY.to_string(),
@@ -222,7 +222,7 @@ async fn write_schema_version(table: &Table, version: u32) -> Result<(), RagErro
 
 /// Apply pending schema migrations to the chunks table. Only runs migrations
 /// whose version exceeds the stored schema version, then bumps the version.
-async fn migrate_chunks_table(table: &Table) -> Result<(), RagError> {
+async fn migrate_chunks_table(table: &Table) -> Result<(), DbError> {
     use lancedb::table::NewColumnTransform;
 
     let current = read_schema_version(table).await?;
@@ -271,7 +271,7 @@ const FIGURE_MIGRATIONS: &[(u32, &str, &str)] = &[
 ];
 
 /// Apply pending schema migrations to the figures table.
-async fn migrate_figures_table(table: &Table) -> Result<(), RagError> {
+async fn migrate_figures_table(table: &Table) -> Result<(), DbError> {
     use lancedb::table::NewColumnTransform;
 
     let current = read_schema_version(table).await?;
@@ -537,7 +537,7 @@ mod tests {
     async fn test_open_for_test_stamps_version() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
-        let store = RagStore::open_for_test(&db_path).await.unwrap();
+        let store = DbStore::open_for_test(&db_path).await.unwrap();
         let table = store.chunks_table().await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
         assert_eq!(v, CURRENT_CHUNKS_VERSION);
@@ -630,7 +630,7 @@ mod tests {
     async fn test_chunks_version_unchanged_after_figures_migration() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
-        let store = RagStore::open_for_test(&db_path).await.unwrap();
+        let store = DbStore::open_for_test(&db_path).await.unwrap();
 
         let chunks_table = store.chunks_table().await.unwrap();
         let chunks_v = read_schema_version(&chunks_table).await.unwrap();
@@ -649,7 +649,7 @@ mod tests {
     async fn test_open_for_test_stamps_figures_version() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
-        let store = RagStore::open_for_test(&db_path).await.unwrap();
+        let store = DbStore::open_for_test(&db_path).await.unwrap();
         let table = store.figures_table().await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
         assert_eq!(v, CURRENT_FIGURES_VERSION);

@@ -1,9 +1,9 @@
 [package]
-name = "papers-rag"
+name = "papers-db"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-description = "Local vector RAG system for academic papers using LanceDB and FastEmbed"
+description = "Local vector database for academic papers using LanceDB and FastEmbed"
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"

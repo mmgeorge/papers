@@ -6,7 +6,7 @@ resolver = "3"
 version = "0.3.1"
 edition = "2024"
 authors = ["Matt George"]
-description = "CLI and MCP server for academic paper search, management, and local RAG"
+description = "CLI and MCP server for academic paper search, management, and local semantic search"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/mmgeorge/papers"
@@ -16,7 +16,7 @@ base64 = "0.22"
 papers-openalex = { path = "crates/papers-openalex", version = "0.3.1" }
 papers-zotero = { path = "crates/papers-zotero", version = "0.3.1" }
 papers-core = { path = "crates/papers-core", version = "0.3.1" }
-papers-rag = { path = "crates/papers-rag", version = "0.3.1" }
+papers-db = { path = "crates/papers-db", version = "0.3.1" }
 dirs = "6"
 bon = "3"
 clap = { version = "4", features = ["derive", "wrap_help"] }

@@ -6,8 +6,8 @@ use cli::{
     AdvancedMode, AuthorCommand, AuthorFilterArgs, Cli, ConfigCommand, ConfigSetCommand,
     DomainCommand, DomainFilterArgs, EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand,
     FunderFilterArgs, InstitutionCommand, InstitutionFilterArgs, McpCommand, PublisherCommand,
-    PublisherFilterArgs, RagChapterCommand, RagChunkCommand, RagCommand, RagEmbedCommand,
-    RagFigureCommand, RagSectionCommand, RagTagCommand, RagWorkCommand, SelectionCommand,
+    PublisherFilterArgs, DbChapterCommand, DbChunkCommand, DbCommand, DbEmbedCommand,
+    DbFigureCommand, DbSectionCommand, DbTagCommand, DbWorkCommand, SelectionCommand,
     SourceCommand,
     SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand, TopicFilterArgs,
     WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand, ZoteroAttachmentCommand,
@@ -1846,8 +1846,8 @@ async fn papers_main() {
         EntityCommand::Selection { cmd } => {
             handle_selection_command(cmd, &client).await;
         }
-        EntityCommand::Rag { cmd } => {
-            handle_rag_command(cmd).await;
+        EntityCommand::Db { cmd } => {
+            handle_db_command(cmd).await;
         }
         EntityCommand::Config { cmd } => {
             handle_config_command(cmd);
@@ -1858,22 +1858,22 @@ async fn papers_main() {
     }
 }
 
-async fn open_rag_store() -> papers_rag::RagStore {
-    let path = papers_rag::RagStore::default_path();
-    match papers_rag::RagStore::open(&path).await {
+async fn open_db_store() -> papers_db::DbStore {
+    let path = papers_db::DbStore::default_path();
+    match papers_db::DbStore::open(&path).await {
         Ok(store) => store,
         Err(e) => exit_err(&format!("Failed to open RAG database: {e}")),
     }
 }
 
-async fn handle_rag_command(cmd: RagCommand) {
+async fn handle_db_command(cmd: DbCommand) {
     match cmd {
-        RagCommand::Chunk { cmd } => match cmd {
-            RagChunkCommand::Search {
+        DbCommand::Chunk { cmd } => match cmd {
+            DbChunkCommand::Search {
                 query, selection, work, chapter_idx, section_idx,
                 year_min, year_max, venue, tag, depth, limit, json,
             } => {
-                let rag = open_rag_store().await;
+                let rag = open_db_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
                     Ok(s) => Some(s.entries.iter().flat_map(|e| {
@@ -1883,7 +1883,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                 },
                 None => match work {
                     Some(id) => {
-                        let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
+                        let resolved = match papers_db::resolve_paper_id(&rag, &id).await {
                             Ok(r) => r,
                             Err(e) => exit_err(&e.to_string()),
                         };
@@ -1892,30 +1892,30 @@ async fn handle_rag_command(cmd: RagCommand) {
                     None => None,
                 },
             };
-                let params = papers_rag::SearchParams {
+                let params = papers_db::SearchParams {
                     query, paper_ids, chapter_idx, section_idx,
                     filter_year_min: year_min, filter_year_max: year_max,
                     filter_venue: venue, filter_tags: tag, filter_depth: depth, limit,
                 };
-                match papers_rag::query::search(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_search(&results); } }
+                match papers_db::query::search(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_search(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagChunkCommand::Get { chunk_id, json } => {
-                let rag = open_rag_store().await;
-                match papers_rag::query::get_chunk(&rag, &chunk_id).await {
-                    Ok(result) => { if json { print_json(&result); } else { format_rag_chunk_result(&result); } }
+            DbChunkCommand::Get { chunk_id, json } => {
+                let rag = open_db_store().await;
+                match papers_db::query::get_chunk(&rag, &chunk_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_db_chunk_result(&result); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagChunkCommand::List { work, chapter_idx, section_idx, limit, json } => {
-                let rag = open_rag_store().await;
+            DbChunkCommand::List { work, chapter_idx, section_idx, limit, json } => {
+                let rag = open_db_store().await;
                 let paper_id = match work {
                     Some(ref id) => {
-                        let resolved = match papers_rag::resolve_paper_id(&rag, id).await {
+                        let resolved = match papers_db::resolve_paper_id(&rag, id).await {
                             Ok(r) => r,
                             Err(e) => exit_err(&e.to_string()),
                         };
@@ -1923,17 +1923,17 @@ async fn handle_rag_command(cmd: RagCommand) {
                     }
                     None => None,
                 };
-                let params = papers_rag::ListChunksParams { paper_id, chapter_idx, section_idx, limit };
-                match papers_rag::query::list_chunks(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_chunk_list(&results); } }
+                let params = papers_db::ListChunksParams { paper_id, chapter_idx, section_idx, limit };
+                match papers_db::query::list_chunks(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_chunk_list(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
         },
 
-        RagCommand::Figure { cmd } => match cmd {
-            RagFigureCommand::Search { query, selection, work, figure_type, limit, json } => {
-                let rag = open_rag_store().await;
+        DbCommand::Figure { cmd } => match cmd {
+            DbFigureCommand::Search { query, selection, work, figure_type, limit, json } => {
+                let rag = open_db_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
                     Ok(s) => Some(s.entries.iter().flat_map(|e| {
@@ -1943,7 +1943,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                 },
                 None => match work {
                     Some(id) => {
-                        let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
+                        let resolved = match papers_db::resolve_paper_id(&rag, &id).await {
                             Ok(r) => r,
                             Err(e) => exit_err(&e.to_string()),
                         };
@@ -1952,29 +1952,29 @@ async fn handle_rag_command(cmd: RagCommand) {
                     None => None,
                 },
             };
-                let params = papers_rag::SearchFiguresParams {
+                let params = papers_db::SearchFiguresParams {
                     query, paper_ids, filter_figure_type: figure_type, limit,
                 };
-                match papers_rag::query::search_figures(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_figures(&results); } }
+                match papers_db::query::search_figures(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_figures(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagFigureCommand::Get { figure_id, json } => {
-                let rag = open_rag_store().await;
-                match papers_rag::query::get_figure(&rag, &figure_id).await {
-                    Ok(result) => { if json { print_json(&result); } else { format_rag_figure(&result); } }
+            DbFigureCommand::Get { figure_id, json } => {
+                let rag = open_db_store().await;
+                match papers_db::query::get_figure(&rag, &figure_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_db_figure(&result); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
         },
 
-        RagCommand::Work { cmd } => match cmd {
-            RagWorkCommand::List {
+        DbCommand::Work { cmd } => match cmd {
+            DbWorkCommand::List {
                 selection, year_min, year_max, venue, tag, author, sort, limit, json,
             } => {
-                let rag = open_rag_store().await;
+                let rag = open_db_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
                     Ok(s) => Some(s.entries.iter().flat_map(|e| {
@@ -1984,31 +1984,31 @@ async fn handle_rag_command(cmd: RagCommand) {
                 },
                 None => None,
             };
-                let params = papers_rag::ListPapersParams {
+                let params = papers_db::ListPapersParams {
                     paper_ids, filter_year_min: year_min, filter_year_max: year_max,
                     filter_venue: venue, filter_tags: tag, filter_authors: author,
                     sort_by: sort, limit,
                 };
-                match papers_rag::query::list_papers(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_papers(&results); } }
+                match papers_db::query::list_papers(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_papers(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagWorkCommand::Get { paper_id, json } => {
-                let rag = open_rag_store().await;
-                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+            DbWorkCommand::Get { paper_id, json } => {
+                let rag = open_db_store().await;
+                let paper_id = match papers_db::resolve_paper_id(&rag, &paper_id).await {
                     Ok(r) => r,
                     Err(e) => exit_err(&e.to_string()),
                 };
-                match papers_rag::query::get_work(&rag, &paper_id).await {
-                    Ok(result) => { if json { print_json(&result); } else { format_rag_work_metadata(&result); } }
+                match papers_db::query::get_work(&rag, &paper_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_db_work_metadata(&result); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagWorkCommand::Search { query, selection, year_min, year_max, venue, tag, limit, json } => {
-                let rag = open_rag_store().await;
+            DbWorkCommand::Search { query, selection, year_min, year_max, venue, tag, limit, json } => {
+                let rag = open_db_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
                     Ok(s) => Some(s.entries.iter().flat_map(|e| {
@@ -2018,20 +2018,20 @@ async fn handle_rag_command(cmd: RagCommand) {
                 },
                 None => None,
             };
-                let params = papers_rag::SearchWorksParams {
+                let params = papers_db::SearchWorksParams {
                     query, paper_ids, filter_year_min: year_min, filter_year_max: year_max,
                     filter_venue: venue, filter_tags: tag, limit,
                 };
-                match papers_rag::query::search_works(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_work_search(&results); } }
+                match papers_db::query::search_works(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_work_search(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagWorkCommand::Add { work: item_key, all, tag, force, json, mode, force_extract } => {
-                let rag = open_rag_store().await;
+            DbWorkCommand::Add { work: item_key, all, tag, force, json, mode, force_extract } => {
+                let rag = open_db_store().await;
                 if all {
-                    let keys = papers_rag::list_cached_item_keys();
+                    let keys = papers_db::list_cached_item_keys();
                     if keys.is_empty() {
                         if json {
                             print_json(&serde_json::json!({ "ingested": 0, "message": "no cached papers found" }));
@@ -2055,17 +2055,17 @@ async fn handle_rag_command(cmd: RagCommand) {
                         }
                     }
                     for key in &keys {
-                        let mut params = match papers_rag::ingest_params_from_cache(key) {
+                        let mut params = match papers_db::ingest_params_from_cache(key) {
                             Ok(p) => p,
                             Err(e) => { eprintln!("  [skip] {key}: {e}"); failed += 1; continue; }
                         };
                         params.force = force;
-                        if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
+                        if !force && papers_db::is_ingested(&rag, &params.paper_id).await {
                             if !json { println!("  [skip] {key}: already indexed"); }
                             continue;
                         }
                         if !json { print!("  [ingest] {key}... "); }
-                        match papers_rag::ingest_paper(&rag, params).await {
+                        match papers_db::ingest_paper(&rag, params).await {
                             Ok(stats) => {
                                 total_chunks += stats.chunks_added;
                                 total_figures += stats.figures_added;
@@ -2124,13 +2124,13 @@ async fn handle_rag_command(cmd: RagCommand) {
                         key
                     };
 
-                    let mut params = match papers_rag::ingest_params_from_cache(&key) {
+                    let mut params = match papers_db::ingest_params_from_cache(&key) {
                         Ok(p) => p,
                         Err(e) => exit_err(&format!("Failed to read cache for {key}: {e}")),
                     };
                     if let Some(tags) = tag { params.tags.extend(tags); }
                     params.force = force;
-                    if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
+                    if !force && papers_db::is_ingested(&rag, &params.paper_id).await {
                         if json {
                             print_json(&serde_json::json!({
                                 "skipped": true, "paper_id": params.paper_id,
@@ -2141,7 +2141,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                         }
                         return;
                     }
-                    match papers_rag::ingest_paper(&rag, params).await {
+                    match papers_db::ingest_paper(&rag, params).await {
                         Ok(stats) => {
                             if json {
                                 print_json(&serde_json::json!({
@@ -2159,13 +2159,13 @@ async fn handle_rag_command(cmd: RagCommand) {
                 }
             }
 
-            RagWorkCommand::Remove { paper_id, json } => {
-                let rag = open_rag_store().await;
-                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+            DbWorkCommand::Remove { paper_id, json } => {
+                let rag = open_db_store().await;
+                let paper_id = match papers_db::resolve_paper_id(&rag, &paper_id).await {
                     Ok(r) => r,
                     Err(e) => exit_err(&e.to_string()),
                 };
-                match papers_rag::query::remove_work(&rag, &paper_id).await {
+                match papers_db::query::remove_work(&rag, &paper_id).await {
                     Ok(()) => {
                         if json {
                             print_json(&serde_json::json!({ "removed": true, "paper_id": paper_id }));
@@ -2177,19 +2177,19 @@ async fn handle_rag_command(cmd: RagCommand) {
                 }
             }
 
-            RagWorkCommand::Outline { paper_id, json } => {
-                let rag = open_rag_store().await;
-                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+            DbWorkCommand::Outline { paper_id, json } => {
+                let rag = open_db_store().await;
+                let paper_id = match papers_db::resolve_paper_id(&rag, &paper_id).await {
                     Ok(r) => r,
                     Err(e) => exit_err(&e.to_string()),
                 };
-                match papers_rag::query::get_paper_outline(&rag, &paper_id).await {
-                    Ok(result) => { if json { print_json(&result); } else { format_rag_outline(&result); } }
+                match papers_db::query::get_paper_outline(&rag, &paper_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_db_outline(&result); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagWorkCommand::Extract { work, json } => {
+            DbWorkCommand::Extract { work, json } => {
                 let zotero = zotero_client().await.unwrap_or_else(|e| match e {
                     papers_zotero::ZoteroError::NotRunning { path } => exit_err(&format!(
                         "Zotero is installed ({path}) but the local API is not enabled.\n\
@@ -2204,25 +2204,25 @@ async fn handle_rag_command(cmd: RagCommand) {
                     match papers_core::text::datalab_cached_json(&key) {
                         Some(json_str) => print!("{json_str}"),
                         None => exit_err(&format!(
-                            "No cached extraction for {key}. Run: papers rag work add {key}"
+                            "No cached extraction for {key}. Run: papers db work add {key}"
                         )),
                     }
                 } else {
                     match papers_core::text::datalab_cached_markdown(&key) {
                         Some(md) => print!("{md}"),
                         None => exit_err(&format!(
-                            "No cached extraction for {key}. Run: papers rag work add {key}"
+                            "No cached extraction for {key}. Run: papers db work add {key}"
                         )),
                     }
                 }
             }
         },
 
-        RagCommand::Section { cmd } => match cmd {
-            RagSectionCommand::Search {
+        DbCommand::Section { cmd } => match cmd {
+            DbSectionCommand::Search {
                 query, selection, work, chapter_idx, year_min, year_max, venue, tag, limit, json,
             } => {
-                let rag = open_rag_store().await;
+                let rag = open_db_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
                     Ok(s) => Some(s.entries.iter().flat_map(|e| {
@@ -2232,7 +2232,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                 },
                 None => match work {
                     Some(id) => {
-                        let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
+                        let resolved = match papers_db::resolve_paper_id(&rag, &id).await {
                             Ok(r) => r,
                             Err(e) => exit_err(&e.to_string()),
                         };
@@ -2241,21 +2241,21 @@ async fn handle_rag_command(cmd: RagCommand) {
                     None => None,
                 },
             };
-                let params = papers_rag::SearchSectionsParams {
+                let params = papers_db::SearchSectionsParams {
                     query, paper_ids, chapter_idx, filter_year_min: year_min, filter_year_max: year_max,
                     filter_venue: venue, filter_tags: tag, limit,
                 };
-                match papers_rag::query::search_sections(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_section_search(&results); } }
+                match papers_db::query::search_sections(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_section_search(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagSectionCommand::List { work, json } => {
-                let rag = open_rag_store().await;
+            DbSectionCommand::List { work, json } => {
+                let rag = open_db_store().await;
                 let paper_id = match work {
                     Some(ref id) => {
-                        let resolved = match papers_rag::resolve_paper_id(&rag, id).await {
+                        let resolved = match papers_db::resolve_paper_id(&rag, id).await {
                             Ok(r) => r,
                             Err(e) => exit_err(&e.to_string()),
                         };
@@ -2263,30 +2263,30 @@ async fn handle_rag_command(cmd: RagCommand) {
                     }
                     None => None,
                 };
-                match papers_rag::query::list_sections(&rag, papers_rag::ListSectionsParams { paper_id }).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_section_list(&results); } }
+                match papers_db::query::list_sections(&rag, papers_db::ListSectionsParams { paper_id }).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_section_list(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagSectionCommand::Get { paper_id, chapter_idx, section_idx, json } => {
-                let rag = open_rag_store().await;
-                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+            DbSectionCommand::Get { paper_id, chapter_idx, section_idx, json } => {
+                let rag = open_db_store().await;
+                let paper_id = match papers_db::resolve_paper_id(&rag, &paper_id).await {
                     Ok(r) => r,
                     Err(e) => exit_err(&e.to_string()),
                 };
-                match papers_rag::query::get_section(&rag, &paper_id, chapter_idx, section_idx).await {
-                    Ok(result) => { if json { print_json(&result); } else { format_rag_section(&result); } }
+                match papers_db::query::get_section(&rag, &paper_id, chapter_idx, section_idx).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_db_section(&result); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
         },
 
-        RagCommand::Chapter { cmd } => match cmd {
-            RagChapterCommand::Search {
+        DbCommand::Chapter { cmd } => match cmd {
+            DbChapterCommand::Search {
                 query, selection, work, year_min, year_max, venue, tag, limit, json,
             } => {
-                let rag = open_rag_store().await;
+                let rag = open_db_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
                     Ok(s) => Some(s.entries.iter().flat_map(|e| {
@@ -2296,7 +2296,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                 },
                 None => match work {
                     Some(id) => {
-                        let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
+                        let resolved = match papers_db::resolve_paper_id(&rag, &id).await {
                             Ok(r) => r,
                             Err(e) => exit_err(&e.to_string()),
                         };
@@ -2305,21 +2305,21 @@ async fn handle_rag_command(cmd: RagCommand) {
                     None => None,
                 },
             };
-                let params = papers_rag::SearchChaptersParams {
+                let params = papers_db::SearchChaptersParams {
                     query, paper_ids, filter_year_min: year_min, filter_year_max: year_max,
                     filter_venue: venue, filter_tags: tag, limit,
                 };
-                match papers_rag::query::search_chapters(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_chapter_search(&results); } }
+                match papers_db::query::search_chapters(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_chapter_search(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagChapterCommand::List { work, json } => {
-                let rag = open_rag_store().await;
+            DbChapterCommand::List { work, json } => {
+                let rag = open_db_store().await;
                 let paper_id = match work {
                     Some(ref id) => {
-                        let resolved = match papers_rag::resolve_paper_id(&rag, id).await {
+                        let resolved = match papers_db::resolve_paper_id(&rag, id).await {
                             Ok(r) => r,
                             Err(e) => exit_err(&e.to_string()),
                         };
@@ -2327,28 +2327,28 @@ async fn handle_rag_command(cmd: RagCommand) {
                     }
                     None => None,
                 };
-                match papers_rag::query::list_chapters(&rag, papers_rag::ListChaptersParams { paper_id }).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_chapter_list(&results); } }
+                match papers_db::query::list_chapters(&rag, papers_db::ListChaptersParams { paper_id }).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_chapter_list(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            RagChapterCommand::Get { paper_id, chapter_idx, json } => {
-                let rag = open_rag_store().await;
-                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+            DbChapterCommand::Get { paper_id, chapter_idx, json } => {
+                let rag = open_db_store().await;
+                let paper_id = match papers_db::resolve_paper_id(&rag, &paper_id).await {
                     Ok(r) => r,
                     Err(e) => exit_err(&e.to_string()),
                 };
-                match papers_rag::query::get_chapter(&rag, &paper_id, chapter_idx).await {
-                    Ok(result) => { if json { print_json(&result); } else { format_rag_chapter(&result); } }
+                match papers_db::query::get_chapter(&rag, &paper_id, chapter_idx).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_db_chapter(&result); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
         },
 
-        RagCommand::Tag { cmd } => match cmd {
-            RagTagCommand::List { selection, json } => {
-                let rag = open_rag_store().await;
+        DbCommand::Tag { cmd } => match cmd {
+            DbTagCommand::List { selection, json } => {
+                let rag = open_db_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
                     Ok(s) => Some(s.entries.iter().flat_map(|e| {
@@ -2358,22 +2358,22 @@ async fn handle_rag_command(cmd: RagCommand) {
                 },
                 None => None,
             };
-                let params = papers_rag::ListTagsParams { paper_ids };
-                match papers_rag::query::list_tags(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_rag_tags(&results); } }
+                let params = papers_db::ListTagsParams { paper_ids };
+                match papers_db::query::list_tags(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_tags(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
         },
 
-        RagCommand::Embed { cmd } => {
-            handle_rag_embed_command(cmd).await;
+        DbCommand::Embed { cmd } => {
+            handle_db_embed_command(cmd).await;
         }
     }
 }
 
 
-fn format_rag_work_metadata(w: &papers_rag::WorkMetadata) {
+fn format_db_work_metadata(w: &papers_db::WorkMetadata) {
     println!("{}", w.paper_id);
     println!("  title: {}", w.title);
     if !w.authors.is_empty() { println!("  authors: {}", w.authors.join(", ")); }
@@ -2383,7 +2383,7 @@ fn format_rag_work_metadata(w: &papers_rag::WorkMetadata) {
     println!("  chunks: {}  figures: {}", w.chunk_count, w.figure_count);
 }
 
-fn format_rag_work_search(results: &[papers_rag::WorkSearchResult]) {
+fn format_db_work_search(results: &[papers_db::WorkSearchResult]) {
     if results.is_empty() { println!("No matching papers found."); return; }
     for r in results {
         let year = r.year.map(|y| y.to_string()).unwrap_or_else(|| "?".into());
@@ -2395,7 +2395,7 @@ fn format_rag_work_search(results: &[papers_rag::WorkSearchResult]) {
     }
 }
 
-fn format_rag_chunk_list(chunks: &[papers_rag::ChunkListItem]) {
+fn format_db_chunk_list(chunks: &[papers_db::ChunkListItem]) {
     if chunks.is_empty() { println!("No chunks found."); return; }
     for c in chunks {
         println!("[{}.{}.{}] {} / {} [{}]",
@@ -2405,7 +2405,7 @@ fn format_rag_chunk_list(chunks: &[papers_rag::ChunkListItem]) {
     }
 }
 
-fn format_rag_section_search(results: &[papers_rag::SectionSearchResult]) {
+fn format_db_section_search(results: &[papers_db::SectionSearchResult]) {
     if results.is_empty() { println!("No matching sections found."); return; }
     for r in results {
         println!("[{:.3}] {}.{} {} \u{2014} {}",
@@ -2416,7 +2416,7 @@ fn format_rag_section_search(results: &[papers_rag::SectionSearchResult]) {
     }
 }
 
-fn format_rag_section_list(sections: &[papers_rag::SectionListItem]) {
+fn format_db_section_list(sections: &[papers_db::SectionListItem]) {
     if sections.is_empty() { println!("No sections found."); return; }
     for s in sections {
         println!("  {}.{} {}  [{} chunks]",
@@ -2424,7 +2424,7 @@ fn format_rag_section_list(sections: &[papers_rag::SectionListItem]) {
     }
 }
 
-fn format_rag_chapter_search(results: &[papers_rag::ChapterSearchResult]) {
+fn format_db_chapter_search(results: &[papers_db::ChapterSearchResult]) {
     if results.is_empty() { println!("No matching chapters found."); return; }
     for r in results {
         println!("[{:.3}] Ch.{} {} \u{2014} {}", r.score, r.chapter_idx, r.chapter_title, r.paper_title);
@@ -2434,7 +2434,7 @@ fn format_rag_chapter_search(results: &[papers_rag::ChapterSearchResult]) {
     }
 }
 
-fn format_rag_chapter_list(chapters: &[papers_rag::ChapterListItem]) {
+fn format_db_chapter_list(chapters: &[papers_db::ChapterListItem]) {
     if chapters.is_empty() { println!("No chapters found."); return; }
     for c in chapters {
         println!("  Ch.{} {}  [{} sections, {} chunks]",
@@ -2477,8 +2477,8 @@ async fn handle_mcp_command(cmd: McpCommand) {
     }
 }
 
-async fn handle_rag_embed_command(cmd: RagEmbedCommand) {
-    let cache = papers_rag::default_embed_cache();
+async fn handle_db_embed_command(cmd: DbEmbedCommand) {
+    let cache = papers_db::default_embed_cache();
     let default_model = || {
         papers_core::config::PapersConfig::load()
             .map(|c| c.embedding_model)
@@ -2486,7 +2486,7 @@ async fn handle_rag_embed_command(cmd: RagEmbedCommand) {
     };
 
     match cmd {
-        RagEmbedCommand::List { work, json } => {
+        DbEmbedCommand::List { work, json } => {
             if let Some(key) = work {
                 match cache.list_models(&key) {
                     Ok(models) => {
@@ -2542,7 +2542,7 @@ async fn handle_rag_embed_command(cmd: RagEmbedCommand) {
             }
         }
 
-        RagEmbedCommand::Add { work, model, force } => {
+        DbEmbedCommand::Add { work, model, force } => {
             let model_name = model.unwrap_or_else(default_model);
             if let Err(e) = papers_core::config::PapersConfig::validate_model(&model_name) {
                 exit_err(&e.to_string());
@@ -2551,7 +2551,7 @@ async fn handle_rag_embed_command(cmd: RagEmbedCommand) {
             let keys = if let Some(key) = work {
                 vec![key]
             } else {
-                papers_rag::list_cached_item_keys()
+                papers_db::list_cached_item_keys()
             };
 
             if keys.is_empty() {
@@ -2559,29 +2559,29 @@ async fn handle_rag_embed_command(cmd: RagEmbedCommand) {
                 return;
             }
 
-            let rag = open_rag_store().await;
+            let rag = open_db_store().await;
             for key in &keys {
-                let params = match papers_rag::ingest_params_from_cache(key) {
+                let params = match papers_db::ingest_params_from_cache(key) {
                     Ok(p) => p,
                     Err(e) => {
                         eprintln!("  [skip] {key}: {e}");
                         continue;
                     }
                 };
-                match papers_rag::cache_paper_embeddings(&rag, &params, &model_name, force).await {
+                match papers_db::cache_paper_embeddings(&rag, &params, &model_name, force).await {
                     Ok(n) => println!("Cached {n} chunks for {key} [{model_name}]"),
                     Err(e) => eprintln!("  [fail] {key}: {e}"),
                 }
             }
         }
 
-        RagEmbedCommand::Delete { work, model } => {
+        DbEmbedCommand::Delete { work, model } => {
             let model_name = model.unwrap_or_else(default_model);
 
             let keys = if let Some(key) = work {
                 vec![key]
             } else {
-                papers_rag::list_cached_item_keys()
+                papers_db::list_cached_item_keys()
             };
 
             for key in &keys {
@@ -2596,7 +2596,7 @@ async fn handle_rag_embed_command(cmd: RagEmbedCommand) {
 
 // ── RAG human-readable formatters ────────────────────────────────────────────
 
-fn format_rag_search(results: &[papers_rag::SearchResult]) {
+fn format_db_search(results: &[papers_db::SearchResult]) {
     if results.is_empty() {
         println!("No results found.");
         return;
@@ -2624,7 +2624,7 @@ fn format_rag_search(results: &[papers_rag::SearchResult]) {
     }
 }
 
-fn format_rag_figures(results: &[papers_rag::FigureSearchResult]) {
+fn format_db_figures(results: &[papers_db::FigureSearchResult]) {
     if results.is_empty() {
         println!("No figures found.");
         return;
@@ -2646,7 +2646,7 @@ fn format_rag_figures(results: &[papers_rag::FigureSearchResult]) {
     }
 }
 
-fn format_rag_chunk_result(r: &papers_rag::ChunkResult) {
+fn format_db_chunk_result(r: &papers_db::ChunkResult) {
     let c = &r.chunk;
     println!(
         "[{}]  {} — Ch.{} {} / Sec.{} {}",
@@ -2668,7 +2668,7 @@ fn format_rag_chunk_result(r: &papers_rag::ChunkResult) {
     println!("← {}  /  {} →", prev, next);
 }
 
-fn format_rag_section(r: &papers_rag::SectionResult) {
+fn format_db_section(r: &papers_db::SectionResult) {
     println!(
         "[{}] Ch.{} {} / Sec.{} {} ({} chunks)",
         r.paper_id, 0, r.chapter_title, 0, r.section_title, r.total_chunks
@@ -2680,7 +2680,7 @@ fn format_rag_section(r: &papers_rag::SectionResult) {
     }
 }
 
-fn format_rag_chapter(r: &papers_rag::ChapterResult) {
+fn format_db_chapter(r: &papers_db::ChapterResult) {
     println!(
         "[{}] Ch.{} {} ({} chunks)",
         r.paper_id, r.chapter_idx, r.chapter_title, r.total_chunks
@@ -2696,7 +2696,7 @@ fn format_rag_chapter(r: &papers_rag::ChapterResult) {
     }
 }
 
-fn format_rag_figure(f: &papers_rag::FigureResult) {
+fn format_db_figure(f: &papers_db::FigureResult) {
     println!("{} [{}]", f.figure_id, f.figure_type);
     println!("  Paper: {}", f.paper_id);
     println!("  Caption: {}", f.caption);
@@ -2714,7 +2714,7 @@ fn format_rag_figure(f: &papers_rag::FigureResult) {
     }
 }
 
-fn format_rag_outline(r: &papers_rag::PaperOutline) {
+fn format_db_outline(r: &papers_db::PaperOutline) {
     println!(
         "{}  {:?}  ({}{})",
         r.paper_id,
@@ -2744,7 +2744,7 @@ fn format_rag_outline(r: &papers_rag::PaperOutline) {
     );
 }
 
-fn format_rag_papers(papers: &[papers_rag::PaperSummary]) {
+fn format_db_papers(papers: &[papers_db::PaperSummary]) {
     if papers.is_empty() {
         println!("No indexed papers found.");
         return;
@@ -2764,7 +2764,7 @@ fn format_rag_papers(papers: &[papers_rag::PaperSummary]) {
     }
 }
 
-fn format_rag_tags(tags: &[papers_rag::TagSummary]) {
+fn format_db_tags(tags: &[papers_db::TagSummary]) {
     if tags.is_empty() {
         println!("No tags found.");
         return;

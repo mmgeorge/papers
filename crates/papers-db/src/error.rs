@@ -1,5 +1,5 @@
 #[derive(thiserror::Error, Debug)]
-pub enum RagError {
+pub enum DbError {
     #[error("LanceDB error: {0}")]
     LanceDb(#[from] lancedb::Error),
     #[error("Embedding error: {0}")]

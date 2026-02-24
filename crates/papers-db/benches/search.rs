@@ -7,7 +7,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rand::Rng;
 use std::sync::Arc;
 
-use papers_rag::schema::{EMBED_DIM, chunks_schema, figures_schema};
+use papers_db::schema::{EMBED_DIM, chunks_schema, figures_schema};
 
 fn build_string_list_array(lists: &[Vec<String>]) -> arrow_array::ListArray {
     let mut builder = ListBuilder::new(StringBuilder::new());
@@ -32,7 +32,7 @@ fn random_vector(rng: &mut impl Rng) -> Vec<f32> {
 }
 
 /// Insert `n` synthetic chunks into the store, spread across sections.
-async fn insert_synthetic_chunks(store: &papers_rag::RagStore, n: usize) {
+async fn insert_synthetic_chunks(store: &papers_db::DbStore, n: usize) {
     let mut rng = rand::thread_rng();
     let schema = chunks_schema();
 
@@ -127,7 +127,7 @@ async fn insert_synthetic_chunks(store: &papers_rag::RagStore, n: usize) {
 }
 
 /// Insert `n` synthetic figures into the store.
-async fn insert_synthetic_figures(store: &papers_rag::RagStore, n: usize) {
+async fn insert_synthetic_figures(store: &papers_db::DbStore, n: usize) {
     let mut rng = rand::thread_rng();
     let schema = figures_schema();
 
@@ -216,7 +216,7 @@ fn bench_search(c: &mut Criterion) {
         let db_path = tmp.path().join("bench.lance").to_string_lossy().into_owned();
 
         let store = rt.block_on(async {
-            let s = papers_rag::RagStore::open_for_test(&db_path).await.unwrap();
+            let s = papers_db::DbStore::open_for_test(&db_path).await.unwrap();
             insert_synthetic_chunks(&s, n).await;
             s
         });
@@ -226,7 +226,7 @@ fn bench_search(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("chunks", n), &n, |b, _| {
             b.to_async(&rt).iter(|| {
-                let params = papers_rag::SearchParams {
+                let params = papers_db::SearchParams {
                     query: String::new(),
                     paper_ids: None,
                     chapter_idx: None,
@@ -238,7 +238,7 @@ fn bench_search(c: &mut Criterion) {
                     filter_depth: None,
                     limit: 5,
                 };
-                papers_rag::search_with_embedding(&store, params, &query_vec)
+                papers_db::search_with_embedding(&store, params, &query_vec)
             });
         });
     }
@@ -256,7 +256,7 @@ fn bench_search_figures(c: &mut Criterion) {
         let db_path = tmp.path().join("bench.lance").to_string_lossy().into_owned();
 
         let store = rt.block_on(async {
-            let s = papers_rag::RagStore::open_for_test(&db_path).await.unwrap();
+            let s = papers_db::DbStore::open_for_test(&db_path).await.unwrap();
             insert_synthetic_figures(&s, n).await;
             s
         });
@@ -266,13 +266,13 @@ fn bench_search_figures(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("figures", n), &n, |b, _| {
             b.to_async(&rt).iter(|| {
-                let params = papers_rag::SearchFiguresParams {
+                let params = papers_db::SearchFiguresParams {
                     query: String::new(),
                     paper_ids: None,
                     filter_figure_type: None,
                     limit: 5,
                 };
-                papers_rag::search_figures_with_embedding(&store, params, &query_vec)
+                papers_db::search_figures_with_embedding(&store, params, &query_vec)
             });
         });
     }

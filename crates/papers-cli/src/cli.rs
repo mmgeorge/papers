@@ -86,10 +86,10 @@ pub enum EntityCommand {
         #[command(subcommand)]
         cmd: SelectionCommand,
     },
-    /// Local RAG index: semantic search over your indexed papers
-    Rag {
+    /// Local DB index: semantic search over your indexed papers
+    Db {
         #[command(subcommand)]
-        cmd: RagCommand,
+        cmd: DbCommand,
     },
     /// Manage papers CLI configuration
     Config {
@@ -114,46 +114,46 @@ pub enum McpCommand {
 }
 
 #[derive(Subcommand)]
-pub enum RagCommand {
+pub enum DbCommand {
     /// Text chunks: search and retrieve indexed content
     Chunk {
         #[command(subcommand)]
-        cmd: RagChunkCommand,
+        cmd: DbChunkCommand,
     },
     /// Figures, tables, and diagrams
     Figure {
         #[command(subcommand)]
-        cmd: RagFigureCommand,
+        cmd: DbFigureCommand,
     },
     /// Indexed papers: list, add, search, and inspect
     Work {
         #[command(subcommand)]
-        cmd: RagWorkCommand,
+        cmd: DbWorkCommand,
     },
     /// Sections: read full section content in order
     Section {
         #[command(subcommand)]
-        cmd: RagSectionCommand,
+        cmd: DbSectionCommand,
     },
     /// Chapters: read full chapter content in order
     Chapter {
         #[command(subcommand)]
-        cmd: RagChapterCommand,
+        cmd: DbChapterCommand,
     },
     /// Tags across indexed papers
     Tag {
         #[command(subcommand)]
-        cmd: RagTagCommand,
+        cmd: DbTagCommand,
     },
     /// Manage the on-disk embedding cache
     Embed {
         #[command(subcommand)]
-        cmd: RagEmbedCommand,
+        cmd: DbEmbedCommand,
     },
 }
 
 #[derive(Subcommand)]
-pub enum RagChunkCommand {
+pub enum DbChunkCommand {
     /// Semantic search over indexed paper chunks
     Search {
         /// Natural language search query
@@ -221,7 +221,7 @@ pub enum RagChunkCommand {
 }
 
 #[derive(Subcommand)]
-pub enum RagFigureCommand {
+pub enum DbFigureCommand {
     /// Search for figures, tables, and diagrams
     Search {
         /// Natural language description of the figure to find
@@ -253,7 +253,7 @@ pub enum RagFigureCommand {
 }
 
 #[derive(Subcommand)]
-pub enum RagWorkCommand {
+pub enum DbWorkCommand {
     /// List indexed papers with optional filters
     List {
         /// Scope to papers in a named selection
@@ -370,7 +370,7 @@ pub enum RagWorkCommand {
 }
 
 #[derive(Subcommand)]
-pub enum RagSectionCommand {
+pub enum DbSectionCommand {
     /// Semantic search returning one result per matching section
     Search {
         /// Natural language search query
@@ -429,7 +429,7 @@ pub enum RagSectionCommand {
 }
 
 #[derive(Subcommand)]
-pub enum RagChapterCommand {
+pub enum DbChapterCommand {
     /// Semantic search returning one result per matching chapter
     Search {
         /// Natural language search query
@@ -482,7 +482,7 @@ pub enum RagChapterCommand {
 }
 
 #[derive(Subcommand)]
-pub enum RagTagCommand {
+pub enum DbTagCommand {
     /// List all tags across indexed papers with counts
     List {
         /// Scope to papers in a named selection
@@ -1810,7 +1810,7 @@ pub enum ZoteroPermissionCommand {
 }
 
 #[derive(Subcommand)]
-pub enum RagEmbedCommand {
+pub enum DbEmbedCommand {
     /// List cached embeddings for a paper (or all papers when work is omitted)
     List {
         /// Paper identifier (Zotero key)
@@ -1882,13 +1882,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_embed_list_no_args() {
-        let cli = parse(&["papers", "rag", "embed", "list"]);
+    fn test_parse_db_embed_list_no_args() {
+        let cli = parse(&["papers", "db", "embed", "list"]);
         match cli.entity {
-            EntityCommand::Rag {
+            EntityCommand::Db {
                 cmd:
-                    RagCommand::Embed {
-                        cmd: RagEmbedCommand::List { work, json: _ },
+                    DbCommand::Embed {
+                        cmd: DbEmbedCommand::List { work, json: _ },
                     },
             } => assert!(work.is_none()),
             _ => panic!("wrong variant"),
@@ -1896,13 +1896,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_embed_list_with_work() {
-        let cli = parse(&["papers", "rag", "embed", "list", "ABC123"]);
+    fn test_parse_db_embed_list_with_work() {
+        let cli = parse(&["papers", "db", "embed", "list", "ABC123"]);
         match cli.entity {
-            EntityCommand::Rag {
+            EntityCommand::Db {
                 cmd:
-                    RagCommand::Embed {
-                        cmd: RagEmbedCommand::List { work, json: _ },
+                    DbCommand::Embed {
+                        cmd: DbEmbedCommand::List { work, json: _ },
                     },
             } => assert_eq!(work.as_deref(), Some("ABC123")),
             _ => panic!("wrong variant"),
@@ -1910,13 +1910,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_embed_add_no_model() {
-        let cli = parse(&["papers", "rag", "embed", "add", "KEY1"]);
+    fn test_parse_db_embed_add_no_model() {
+        let cli = parse(&["papers", "db", "embed", "add", "KEY1"]);
         match cli.entity {
-            EntityCommand::Rag {
+            EntityCommand::Db {
                 cmd:
-                    RagCommand::Embed {
-                        cmd: RagEmbedCommand::Add { work, model, force },
+                    DbCommand::Embed {
+                        cmd: DbEmbedCommand::Add { work, model, force },
                     },
             } => {
                 assert_eq!(work.as_deref(), Some("KEY1"));
@@ -1928,10 +1928,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_embed_add_explicit_model() {
+    fn test_parse_db_embed_add_explicit_model() {
         let cli = parse(&[
             "papers",
-            "rag",
+            "db",
             "embed",
             "add",
             "KEY1",
@@ -1939,10 +1939,10 @@ mod tests {
             "embedding-gemma-300m",
         ]);
         match cli.entity {
-            EntityCommand::Rag {
+            EntityCommand::Db {
                 cmd:
-                    RagCommand::Embed {
-                        cmd: RagEmbedCommand::Add { model, .. },
+                    DbCommand::Embed {
+                        cmd: DbEmbedCommand::Add { model, .. },
                     },
             } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
             _ => panic!("wrong variant"),
@@ -1950,13 +1950,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_embed_add_force_flag() {
-        let cli = parse(&["papers", "rag", "embed", "add", "KEY1", "--force"]);
+    fn test_parse_db_embed_add_force_flag() {
+        let cli = parse(&["papers", "db", "embed", "add", "KEY1", "--force"]);
         match cli.entity {
-            EntityCommand::Rag {
+            EntityCommand::Db {
                 cmd:
-                    RagCommand::Embed {
-                        cmd: RagEmbedCommand::Add { force, .. },
+                    DbCommand::Embed {
+                        cmd: DbEmbedCommand::Add { force, .. },
                     },
             } => assert!(force),
             _ => panic!("wrong variant"),
@@ -1964,13 +1964,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_embed_delete() {
-        let cli = parse(&["papers", "rag", "embed", "delete", "KEY1"]);
+    fn test_parse_db_embed_delete() {
+        let cli = parse(&["papers", "db", "embed", "delete", "KEY1"]);
         match cli.entity {
-            EntityCommand::Rag {
+            EntityCommand::Db {
                 cmd:
-                    RagCommand::Embed {
-                        cmd: RagEmbedCommand::Delete { work, model },
+                    DbCommand::Embed {
+                        cmd: DbEmbedCommand::Delete { work, model },
                     },
             } => {
                 assert_eq!(work.as_deref(), Some("KEY1"));
@@ -1981,10 +1981,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_embed_delete_with_model() {
+    fn test_parse_db_embed_delete_with_model() {
         let cli = parse(&[
             "papers",
-            "rag",
+            "db",
             "embed",
             "delete",
             "KEY1",
@@ -1992,10 +1992,10 @@ mod tests {
             "embedding-gemma-300m",
         ]);
         match cli.entity {
-            EntityCommand::Rag {
+            EntityCommand::Db {
                 cmd:
-                    RagCommand::Embed {
-                        cmd: RagEmbedCommand::Delete { model, .. },
+                    DbCommand::Embed {
+                        cmd: DbEmbedCommand::Delete { model, .. },
                     },
             } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
             _ => panic!("wrong variant"),
@@ -2003,44 +2003,44 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_chunk_search() {
-        let cli = parse(&["papers", "rag", "chunk", "search", "neural rendering"]);
+    fn test_parse_db_chunk_search() {
+        let cli = parse(&["papers", "db", "chunk", "search", "neural rendering"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Chunk { cmd: RagChunkCommand::Search { query, .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Chunk { cmd: DbChunkCommand::Search { query, .. } },
             } => assert_eq!(query, "neural rendering"),
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn test_parse_rag_chunk_get() {
-        let cli = parse(&["papers", "rag", "chunk", "get", "YFACFA8C/ch1/s2/p3"]);
+    fn test_parse_db_chunk_get() {
+        let cli = parse(&["papers", "db", "chunk", "get", "YFACFA8C/ch1/s2/p3"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Chunk { cmd: RagChunkCommand::Get { chunk_id, .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Chunk { cmd: DbChunkCommand::Get { chunk_id, .. } },
             } => assert_eq!(chunk_id, "YFACFA8C/ch1/s2/p3"),
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn test_parse_rag_work_list() {
-        let cli = parse(&["papers", "rag", "work", "list"]);
+    fn test_parse_db_work_list() {
+        let cli = parse(&["papers", "db", "work", "list"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Work { cmd: RagWorkCommand::List { .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Work { cmd: DbWorkCommand::List { .. } },
             } => {}
             _ => panic!("wrong variant"),
         }
     }
 
     #[test]
-    fn test_parse_rag_work_add_single() {
-        let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C"]);
+    fn test_parse_db_work_add_single() {
+        let cli = parse(&["papers", "db", "work", "add", "YFACFA8C"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { work, all, .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Work { cmd: DbWorkCommand::Add { work, all, .. } },
             } => {
                 assert_eq!(work.as_deref(), Some("YFACFA8C"));
                 assert!(!all);
@@ -2050,11 +2050,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_work_add_all() {
-        let cli = parse(&["papers", "rag", "work", "add", "--all"]);
+    fn test_parse_db_work_add_all() {
+        let cli = parse(&["papers", "db", "work", "add", "--all"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { work, all, .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Work { cmd: DbWorkCommand::Add { work, all, .. } },
             } => {
                 assert!(work.is_none());
                 assert!(all);
@@ -2064,11 +2064,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_work_add_with_mode() {
-        let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C", "-m", "accurate"]);
+    fn test_parse_db_work_add_with_mode() {
+        let cli = parse(&["papers", "db", "work", "add", "YFACFA8C", "-m", "accurate"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { work, mode, .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Work { cmd: DbWorkCommand::Add { work, mode, .. } },
             } => {
                 assert_eq!(work.as_deref(), Some("YFACFA8C"));
                 assert!(matches!(mode, AdvancedMode::Accurate));
@@ -2078,11 +2078,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_work_add_force_extract() {
-        let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C", "--force-extract"]);
+    fn test_parse_db_work_add_force_extract() {
+        let cli = parse(&["papers", "db", "work", "add", "YFACFA8C", "--force-extract"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { work, force_extract, .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Work { cmd: DbWorkCommand::Add { work, force_extract, .. } },
             } => {
                 assert_eq!(work.as_deref(), Some("YFACFA8C"));
                 assert!(force_extract);
@@ -2092,11 +2092,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_work_add_mode_default_balanced() {
-        let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C"]);
+    fn test_parse_db_work_add_mode_default_balanced() {
+        let cli = parse(&["papers", "db", "work", "add", "YFACFA8C"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { mode, .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Work { cmd: DbWorkCommand::Add { mode, .. } },
             } => {
                 assert!(matches!(mode, AdvancedMode::Balanced));
             }
@@ -2105,11 +2105,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_rag_tag_list() {
-        let cli = parse(&["papers", "rag", "tag", "list"]);
+    fn test_parse_db_tag_list() {
+        let cli = parse(&["papers", "db", "tag", "list"]);
         match cli.entity {
-            EntityCommand::Rag {
-                cmd: RagCommand::Tag { cmd: RagTagCommand::List { .. } },
+            EntityCommand::Db {
+                cmd: DbCommand::Tag { cmd: DbTagCommand::List { .. } },
             } => {}
             _ => panic!("wrong variant"),
         }
