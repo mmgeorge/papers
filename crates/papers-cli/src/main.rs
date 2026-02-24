@@ -6,7 +6,9 @@ use cli::{
     AdvancedMode, AuthorCommand, AuthorFilterArgs, Cli, ConfigCommand, ConfigSetCommand,
     DomainCommand, DomainFilterArgs, EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand,
     FunderFilterArgs, InstitutionCommand, InstitutionFilterArgs, McpCommand, PublisherCommand,
-    PublisherFilterArgs, RagCommand, RagEmbedCommand, SelectionCommand, SourceCommand,
+    PublisherFilterArgs, RagChapterCommand, RagChunkCommand, RagCommand, RagEmbedCommand,
+    RagFigureCommand, RagSectionCommand, RagTagCommand, RagWorkCommand, SelectionCommand,
+    SourceCommand,
     SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand, TopicFilterArgs,
     WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand, ZoteroAttachmentCommand,
     ZoteroCollectionCommand, ZoteroCommand, ZoteroDeletedCommand, ZoteroExtractCommand,
@@ -1103,410 +1105,6 @@ async fn papers_main() {
                     }
                 },
 
-                ZoteroCommand::Extract { cmd } => match cmd {
-                    ZoteroExtractCommand::List {
-                        search,
-                        limit,
-                        json,
-                    } => {
-                        use std::collections::{HashMap, HashSet};
-
-                        // 1. Local cache keys (filesystem scan)
-                        let local_keys: HashSet<String> =
-                            papers_core::text::datalab_cached_item_keys()
-                                .into_iter()
-                                .collect();
-
-                        // 2. Zotero-backed keys: find all `papers_extract_*.zip` attachments
-                        //    with a single targeted query — the embedded key in the filename
-                        //    lets us skip parent_item lookups entirely.
-                        let mut backed_up_keys: HashSet<String> = HashSet::new();
-                        let att_params = ItemListParams {
-                            item_type: Some("attachment".into()),
-                            q: Some("papers_extract".into()),
-                            limit: Some(100),
-                            ..Default::default()
-                        };
-                        if let Ok(att_resp) = zotero.list_items(&att_params).await {
-                            for item in &att_resp.items {
-                                if let Some(filename) = &item.data.filename {
-                                    if let Some(key) = filename
-                                        .strip_prefix("papers_extract_")
-                                        .and_then(|s| s.strip_suffix(".zip"))
-                                    {
-                                        backed_up_keys.insert(key.to_string());
-                                    }
-                                }
-                            }
-                        }
-
-                        // 3. Union of both sources, sorted for deterministic output
-                        let mut all_keys: Vec<String> =
-                            local_keys.union(&backed_up_keys).cloned().collect();
-                        all_keys.sort();
-
-                        // 4. Apply optional search: intersect union with Zotero search results
-                        let filtered_keys: Vec<String> = if let Some(ref q) = search {
-                            let search_params = ItemListParams {
-                                q: Some(q.clone()),
-                                limit: Some(limit),
-                                ..Default::default()
-                            };
-                            let search_resp = zotero
-                                .list_top_items(&search_params)
-                                .await
-                                .unwrap_or_else(|e| exit_err(&e.to_string()));
-                            let search_set: HashSet<String> =
-                                search_resp.items.into_iter().map(|i| i.key).collect();
-                            all_keys
-                                .into_iter()
-                                .filter(|k| search_set.contains(k))
-                                .collect()
-                        } else {
-                            all_keys.into_iter().take(limit as usize).collect()
-                        };
-
-                        // 5. Batch-fetch titles — also tells us which items still exist in Zotero.
-                        //    Use list_items (not list_top_items) so items aren't filtered out by
-                        //    the /items/top "top-level only" constraint when itemKey is specified.
-                        //    Set limit == chunk size so we never silently truncate to the default 25.
-                        let mut title_map: HashMap<String, String> = HashMap::new();
-                        for chunk in filtered_keys.chunks(50) {
-                            let keys_str = chunk.join(",");
-                            let batch_params = ItemListParams {
-                                item_key: Some(keys_str),
-                                limit: Some(chunk.len() as u32),
-                                ..Default::default()
-                            };
-                            if let Ok(resp) = zotero.list_items(&batch_params).await {
-                                for item in resp.items {
-                                    // Always insert — even empty title — so title_map.contains_key()
-                                    // reliably indicates "item exists in Zotero".
-                                    title_map.insert(item.key, item.data.title.unwrap_or_default());
-                                }
-                            }
-                        }
-
-                        // 6. Output: [local] [remote]
-                        //    local  = extraction exists in the local cache
-                        //    remote = papers_extract_*.zip backup exists in Zotero
-                        //             annotated with "*no item*" when the parent item
-                        //             is no longer in the Zotero library
-                        // Helper: resolve title for a key using meta.json first,
-                        // then the Zotero batch fetch, then a fallback based on presence.
-                        let resolve_title = |key: &str| -> String {
-                            // 1. meta.json title (fastest, no network needed)
-                            if let Some(meta) = papers_core::text::read_extraction_meta(key) {
-                                if let Some(t) = meta.title {
-                                    if !t.is_empty() {
-                                        return t;
-                                    }
-                                }
-                            }
-                            // 2. Zotero batch-fetched title
-                            if let Some(t) = title_map.get(key) {
-                                return if t.is_empty() {
-                                    "(no title)".to_string()
-                                } else {
-                                    t.clone()
-                                };
-                            }
-                            // 3. Fallback depends on whether item or backup exists
-                            if backed_up_keys.contains(key) {
-                                "(title unknown)".to_string()
-                            } else {
-                                "(not in Zotero)".to_string()
-                            }
-                        };
-
-                        if json {
-                            let items: Vec<_> = filtered_keys
-                                .iter()
-                                .map(|k| {
-                                    let remote_status = if backed_up_keys.contains(k) {
-                                        "ok"
-                                    } else if title_map.contains_key(k) {
-                                        "no_backup"
-                                    } else {
-                                        "no_item"
-                                    };
-                                    serde_json::json!({
-                                        "key": k,
-                                        "title": resolve_title(k),
-                                        "local":  local_keys.contains(k),
-                                        "remote": backed_up_keys.contains(k),
-                                        "remote_status": remote_status,
-                                    })
-                                })
-                                .collect();
-                            print_json(&items);
-                        } else {
-                            for key in &filtered_keys {
-                                let lmark = if local_keys.contains(key) {
-                                    "✓"
-                                } else {
-                                    "✗"
-                                };
-                                let remote_col = if backed_up_keys.contains(key) {
-                                    "[✓ remote]"
-                                } else if title_map.contains_key(key) {
-                                    "[✗ remote]"
-                                } else {
-                                    "[✗ remote *no item*]"
-                                };
-                                println!(
-                                    "{key}  [{lmark} local]  {remote_col}  {}",
-                                    resolve_title(key)
-                                );
-                            }
-                        }
-                    }
-                    ZoteroExtractCommand::Upload { dry_run } => {
-                        use std::collections::HashSet;
-                        let local_keys: HashSet<String> =
-                            papers_core::text::datalab_cached_item_keys()
-                                .into_iter()
-                                .collect();
-
-                        // Keys already backed up in Zotero
-                        let backed_up_keys: HashSet<String> = {
-                            let p = ItemListParams {
-                                item_type: Some("attachment".into()),
-                                q: Some("papers_extract".into()),
-                                limit: Some(100),
-                                ..Default::default()
-                            };
-                            match zotero.list_items(&p).await {
-                                Ok(r) => r
-                                    .items
-                                    .iter()
-                                    .filter_map(|i| {
-                                        let f = i.data.filename.as_deref()?;
-                                        let k = f
-                                            .strip_prefix("papers_extract_")?
-                                            .strip_suffix(".zip")?;
-                                        Some(k.to_string())
-                                    })
-                                    .collect(),
-                                Err(e) => exit_err(&e.to_string()),
-                            }
-                        };
-
-                        let mut to_upload: Vec<String> =
-                            local_keys.difference(&backed_up_keys).cloned().collect();
-                        to_upload.sort();
-
-                        if to_upload.is_empty() {
-                            println!("All local extractions already backed up to Zotero.");
-                        } else {
-                            // Batch-check which keys still exist as items in Zotero.
-                            // Zotero item keys are scoped to a library — if the item was
-                            // deleted the key cannot be reused, so we simply skip those.
-                            let mut item_exists: HashSet<String> = HashSet::new();
-                            for chunk in to_upload.chunks(50) {
-                                let keys_str = chunk.join(",");
-                                let p = ItemListParams {
-                                    item_key: Some(keys_str),
-                                    ..Default::default()
-                                };
-                                if let Ok(resp) = zotero.list_top_items(&p).await {
-                                    for item in resp.items {
-                                        item_exists.insert(item.key);
-                                    }
-                                }
-                            }
-
-                            let mut uploaded = 0usize;
-                            for key in &to_upload {
-                                if !item_exists.contains(key) {
-                                    if dry_run {
-                                        println!("skipping: {key}  (item not in Zotero)");
-                                    } else {
-                                        eprintln!("skipping: {key}  (item not in Zotero)");
-                                    }
-                                    continue;
-                                }
-                                if dry_run {
-                                    println!("would upload: {key}");
-                                } else {
-                                    eprint!("Uploading backup {key}... ");
-                                    match papers_core::text::upload_extraction_to_zotero(
-                                        &zotero, key,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => {
-                                            eprintln!("ok");
-                                            uploaded += 1;
-                                        }
-                                        Err(e) => eprintln!("error: {e}"),
-                                    }
-                                }
-                            }
-                            if !dry_run {
-                                eprintln!("Done. Uploaded {uploaded} extraction(s).");
-                            }
-                        }
-                    }
-
-                    ZoteroExtractCommand::Download { dry_run } => {
-                        use std::collections::HashSet;
-                        let local_keys: HashSet<String> =
-                            papers_core::text::datalab_cached_item_keys()
-                                .into_iter()
-                                .collect();
-
-                        // Collect (att_key, item_key) for all Zotero-backed extractions
-                        let p = ItemListParams {
-                            item_type: Some("attachment".into()),
-                            q: Some("papers_extract".into()),
-                            limit: Some(100),
-                            ..Default::default()
-                        };
-                        let att_resp = zotero
-                            .list_items(&p)
-                            .await
-                            .unwrap_or_else(|e| exit_err(&e.to_string()));
-
-                        let mut to_download: Vec<(String, String)> = att_resp
-                            .items
-                            .iter()
-                            .filter_map(|i| {
-                                let f = i.data.filename.as_deref()?;
-                                let item_key =
-                                    f.strip_prefix("papers_extract_")?.strip_suffix(".zip")?;
-                                if local_keys.contains(item_key) {
-                                    return None;
-                                }
-                                Some((i.key.clone(), item_key.to_string()))
-                            })
-                            .collect();
-                        to_download.sort_by(|a, b| a.1.cmp(&b.1));
-
-                        if to_download.is_empty() {
-                            println!("All Zotero extractions already present locally.");
-                        } else {
-                            for (att_key, item_key) in &to_download {
-                                if dry_run {
-                                    println!("would download: {item_key}");
-                                } else {
-                                    eprint!("Downloading {item_key}... ");
-                                    match papers_core::text::download_extraction_from_zotero(
-                                        &zotero, att_key, item_key,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => eprintln!("ok"),
-                                        Err(e) => eprintln!("error: {e}"),
-                                    }
-                                }
-                            }
-                            if !dry_run {
-                                eprintln!("Done. Downloaded {} extraction(s).", to_download.len());
-                            }
-                        }
-                    }
-
-                    other => {
-                        #[derive(PartialEq)]
-                        enum OutputKind {
-                            Text,
-                            Json,
-                            Get,
-                        }
-                        let (query, output_kind) = match other {
-                            ZoteroExtractCommand::Text { query } => (query, OutputKind::Text),
-                            ZoteroExtractCommand::Json { query } => (query, OutputKind::Json),
-                            ZoteroExtractCommand::Get { query } => (query, OutputKind::Get),
-                            ZoteroExtractCommand::List { .. } => unreachable!(),
-                            ZoteroExtractCommand::Upload { .. } => unreachable!(),
-                            ZoteroExtractCommand::Download { .. } => unreachable!(),
-                        };
-
-                        let key = smart_resolve_item_key(&zotero, &query)
-                            .await
-                            .unwrap_or_else(|e| exit_err(&e));
-
-                        match output_kind {
-                            OutputKind::Text => {
-                                match papers_core::text::datalab_cached_markdown(&key) {
-                                    Some(md) => print!("{md}"),
-                                    None => exit_err(&format!(
-                                        "No cached extraction for {key}. Run: papers zotero work extract {key}"
-                                    )),
-                                }
-                            }
-                            OutputKind::Json => {
-                                match papers_core::text::datalab_cached_json(&key) {
-                                    Some(json_str) => print!("{json_str}"),
-                                    None => exit_err(&format!(
-                                        "No cached extraction for {key}. Run: papers zotero work extract {key}"
-                                    )),
-                                }
-                            }
-                            OutputKind::Get => {
-                                let local_dir = papers_core::text::datalab_cache_dir_path(&key);
-                                let local_ok = local_dir
-                                    .as_ref()
-                                    .map(|d| d.join(format!("{key}.md")).exists())
-                                    .unwrap_or(false);
-                                let item_exists = zotero.get_item(&key).await.is_ok();
-                                // Only check for backup ZIP when the item exists
-                                let remote_col = if item_exists {
-                                    let expected_zip = format!("papers_extract_{key}.zip");
-                                    let backup_ok = match zotero
-                                        .list_item_children(
-                                            &key,
-                                            &ItemListParams {
-                                                item_type: Some("attachment".into()),
-                                                ..Default::default()
-                                            },
-                                        )
-                                        .await
-                                    {
-                                        Ok(children) => children.items.iter().any(|c| {
-                                            c.data.filename.as_deref() == Some(&expected_zip)
-                                                && c.data.link_mode.as_deref()
-                                                    == Some("imported_file")
-                                        }),
-                                        Err(_) => false,
-                                    };
-                                    if backup_ok { "✓" } else { "✗" }
-                                } else {
-                                    "✗  *no item*"
-                                };
-                                println!("{key}");
-                                match &local_dir {
-                                    Some(dir) if local_ok => {
-                                        println!("  local:✓  {}", dir.display())
-                                    }
-                                    _ => println!("  local:✗"),
-                                }
-                                println!("  remote:{remote_col}");
-                                if let Some(meta) = papers_core::text::read_extraction_meta(&key) {
-                                    if let Some(t) = meta.title {
-                                        println!("  title: {t}");
-                                    }
-                                    if let Some(authors) = meta.authors {
-                                        println!("  authors: {}", authors.join(", "));
-                                    }
-                                    if let Some(et) = meta.extracted_at {
-                                        println!("  extracted: {et}");
-                                    }
-                                    if let Some(mode) = meta.processing_mode {
-                                        println!("  mode: {mode}");
-                                    }
-                                }
-                                if !local_ok && remote_col == "✗" {
-                                    eprintln!(
-                                        "No extraction found. Run: papers zotero work extract {key}"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                },
-
                 ZoteroCommand::Attachment { cmd } => match cmd {
                     ZoteroAttachmentCommand::List {
                         search,
@@ -2077,35 +1675,17 @@ async fn open_rag_store() -> papers_rag::RagStore {
 
 async fn handle_rag_command(cmd: RagCommand) {
     match cmd {
-        RagCommand::Search {
-            query,
-            selection,
-            paper_id,
-            chapter_idx,
-            section_idx,
-            year_min,
-            year_max,
-            venue,
-            tag,
-            depth,
-            limit,
-            json,
-        } => {
-            let rag = open_rag_store().await;
+        RagCommand::Chunk { cmd } => match cmd {
+            RagChunkCommand::Search {
+                query, selection, paper_id, chapter_idx, section_idx,
+                year_min, year_max, venue, tag, depth, limit, json,
+            } => {
+                let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
-                    Ok(s) => Some(
-                        s.entries
-                            .iter()
-                            .flat_map(|e| {
-                                e.doi
-                                    .iter()
-                                    .chain(e.openalex_id.iter())
-                                    .chain(e.zotero_key.iter())
-                                    .cloned()
-                            })
-                            .collect(),
-                    ),
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
                     Err(e) => exit_err(&e.to_string()),
                 },
                 None => match paper_id {
@@ -2119,53 +1699,47 @@ async fn handle_rag_command(cmd: RagCommand) {
                     None => None,
                 },
             };
-            let params = papers_rag::SearchParams {
-                query,
-                paper_ids,
-                chapter_idx,
-                section_idx,
-                filter_year_min: year_min,
-                filter_year_max: year_max,
-                filter_venue: venue,
-                filter_tags: tag,
-                filter_depth: depth,
-                limit,
-            };
-            match papers_rag::query::search(&rag, params).await {
-                Ok(results) => {
-                    if json {
-                        print_json(&results);
-                    } else {
-                        format_rag_search(&results);
-                    }
+                let params = papers_rag::SearchParams {
+                    query, paper_ids, chapter_idx, section_idx,
+                    filter_year_min: year_min, filter_year_max: year_max,
+                    filter_venue: venue, filter_tags: tag, filter_depth: depth, limit,
+                };
+                match papers_rag::query::search(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_search(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
                 }
-                Err(e) => exit_err(&e.to_string()),
             }
-        }
 
-        RagCommand::SearchFigures {
-            query,
-            selection,
-            paper_id,
-            figure_type,
-            limit,
-            json,
-        } => {
-            let rag = open_rag_store().await;
+            RagChunkCommand::Get { chunk_id, json } => {
+                let rag = open_rag_store().await;
+                match papers_rag::query::get_chunk(&rag, &chunk_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_rag_chunk_result(&result); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+
+            RagChunkCommand::List { paper_id, chapter_idx, section_idx, limit, json } => {
+                let rag = open_rag_store().await;
+                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                    Ok(r) => r,
+                    Err(e) => exit_err(&e.to_string()),
+                };
+                let params = papers_rag::ListChunksParams { paper_id, chapter_idx, section_idx, limit };
+                match papers_rag::query::list_chunks(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_chunk_list(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+        },
+
+        RagCommand::Figure { cmd } => match cmd {
+            RagFigureCommand::Search { query, selection, paper_id, figure_type, limit, json } => {
+                let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
-                    Ok(s) => Some(
-                        s.entries
-                            .iter()
-                            .flat_map(|e| {
-                                e.doi
-                                    .iter()
-                                    .chain(e.openalex_id.iter())
-                                    .chain(e.zotero_key.iter())
-                                    .cloned()
-                            })
-                            .collect(),
-                    ),
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
                     Err(e) => exit_err(&e.to_string()),
                 },
                 None => match paper_id {
@@ -2179,332 +1753,671 @@ async fn handle_rag_command(cmd: RagCommand) {
                     None => None,
                 },
             };
-            let params = papers_rag::SearchFiguresParams {
-                query,
-                paper_ids,
-                filter_figure_type: figure_type,
-                limit,
-            };
-            match papers_rag::query::search_figures(&rag, params).await {
-                Ok(results) => {
-                    if json {
-                        print_json(&results);
-                    } else {
-                        format_rag_figures(&results);
-                    }
+                let params = papers_rag::SearchFiguresParams {
+                    query, paper_ids, filter_figure_type: figure_type, limit,
+                };
+                match papers_rag::query::search_figures(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_figures(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
                 }
-                Err(e) => exit_err(&e.to_string()),
             }
-        }
 
-        RagCommand::GetChunk { chunk_id, json } => {
-            let rag = open_rag_store().await;
-            match papers_rag::query::get_chunk(&rag, &chunk_id).await {
-                Ok(result) => {
-                    if json {
-                        print_json(&result);
-                    } else {
-                        format_rag_chunk_result(&result);
-                    }
+            RagFigureCommand::Get { figure_id, json } => {
+                let rag = open_rag_store().await;
+                match papers_rag::query::get_figure(&rag, &figure_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_rag_figure(&result); } }
+                    Err(e) => exit_err(&e.to_string()),
                 }
-                Err(e) => exit_err(&e.to_string()),
             }
-        }
+        },
 
-        RagCommand::GetSection {
-            paper_id,
-            chapter_idx,
-            section_idx,
-            json,
-        } => {
-            let rag = open_rag_store().await;
-            let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
-                Ok(r) => r,
-                Err(e) => exit_err(&e.to_string()),
-            };
-            match papers_rag::query::get_section(&rag, &paper_id, chapter_idx, section_idx).await {
-                Ok(result) => {
-                    if json {
-                        print_json(&result);
-                    } else {
-                        format_rag_section(&result);
-                    }
-                }
-                Err(e) => exit_err(&e.to_string()),
-            }
-        }
-
-        RagCommand::GetChapter {
-            paper_id,
-            chapter_idx,
-            json,
-        } => {
-            let rag = open_rag_store().await;
-            let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
-                Ok(r) => r,
-                Err(e) => exit_err(&e.to_string()),
-            };
-            match papers_rag::query::get_chapter(&rag, &paper_id, chapter_idx).await {
-                Ok(result) => {
-                    if json {
-                        print_json(&result);
-                    } else {
-                        format_rag_chapter(&result);
-                    }
-                }
-                Err(e) => exit_err(&e.to_string()),
-            }
-        }
-
-        RagCommand::GetFigure { figure_id, json } => {
-            let rag = open_rag_store().await;
-            match papers_rag::query::get_figure(&rag, &figure_id).await {
-                Ok(result) => {
-                    if json {
-                        print_json(&result);
-                    } else {
-                        format_rag_figure(&result);
-                    }
-                }
-                Err(e) => exit_err(&e.to_string()),
-            }
-        }
-
-        RagCommand::Outline { paper_id, json } => {
-            let rag = open_rag_store().await;
-            let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
-                Ok(r) => r,
-                Err(e) => exit_err(&e.to_string()),
-            };
-            match papers_rag::query::get_paper_outline(&rag, &paper_id).await {
-                Ok(result) => {
-                    if json {
-                        print_json(&result);
-                    } else {
-                        format_rag_outline(&result);
-                    }
-                }
-                Err(e) => exit_err(&e.to_string()),
-            }
-        }
-
-        RagCommand::ListPapers {
-            selection,
-            year_min,
-            year_max,
-            venue,
-            tag,
-            author,
-            sort,
-            limit,
-            json,
-        } => {
-            let rag = open_rag_store().await;
+        RagCommand::Work { cmd } => match cmd {
+            RagWorkCommand::List {
+                selection, year_min, year_max, venue, tag, author, sort, limit, json,
+            } => {
+                let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
-                    Ok(s) => Some(
-                        s.entries
-                            .iter()
-                            .flat_map(|e| {
-                                e.doi
-                                    .iter()
-                                    .chain(e.openalex_id.iter())
-                                    .chain(e.zotero_key.iter())
-                                    .cloned()
-                            })
-                            .collect(),
-                    ),
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
                     Err(e) => exit_err(&e.to_string()),
                 },
                 None => None,
             };
-            let params = papers_rag::ListPapersParams {
-                paper_ids,
-                filter_year_min: year_min,
-                filter_year_max: year_max,
-                filter_venue: venue,
-                filter_tags: tag,
-                filter_authors: author,
-                sort_by: sort,
-                limit,
-            };
-            match papers_rag::query::list_papers(&rag, params).await {
-                Ok(results) => {
-                    if json {
-                        print_json(&results);
-                    } else {
-                        format_rag_papers(&results);
-                    }
+                let params = papers_rag::ListPapersParams {
+                    paper_ids, filter_year_min: year_min, filter_year_max: year_max,
+                    filter_venue: venue, filter_tags: tag, filter_authors: author,
+                    sort_by: sort, limit,
+                };
+                match papers_rag::query::list_papers(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_papers(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
                 }
-                Err(e) => exit_err(&e.to_string()),
             }
-        }
 
-        RagCommand::ListTags { selection, json } => {
-            let rag = open_rag_store().await;
+            RagWorkCommand::Get { paper_id, json } => {
+                let rag = open_rag_store().await;
+                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                    Ok(r) => r,
+                    Err(e) => exit_err(&e.to_string()),
+                };
+                match papers_rag::query::get_work(&rag, &paper_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_rag_work_metadata(&result); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+
+            RagWorkCommand::Search { query, selection, year_min, year_max, venue, tag, limit, json } => {
+                let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
-                    Ok(s) => Some(
-                        s.entries
-                            .iter()
-                            .flat_map(|e| {
-                                e.doi
-                                    .iter()
-                                    .chain(e.openalex_id.iter())
-                                    .chain(e.zotero_key.iter())
-                                    .cloned()
-                            })
-                            .collect(),
-                    ),
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
                     Err(e) => exit_err(&e.to_string()),
                 },
                 None => None,
             };
-            let params = papers_rag::ListTagsParams { paper_ids };
-            match papers_rag::query::list_tags(&rag, params).await {
-                Ok(results) => {
-                    if json {
-                        print_json(&results);
-                    } else {
-                        format_rag_tags(&results);
-                    }
+                let params = papers_rag::SearchWorksParams {
+                    query, paper_ids, filter_year_min: year_min, filter_year_max: year_max,
+                    filter_venue: venue, filter_tags: tag, limit,
+                };
+                match papers_rag::query::search_works(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_work_search(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
                 }
-                Err(e) => exit_err(&e.to_string()),
             }
-        }
 
-        RagCommand::Ingest {
-            item_key,
-            paper_id,
-            tag,
-            force,
-            json,
-        } => {
-            let rag = open_rag_store().await;
-            let mut params = match papers_rag::ingest_params_from_cache(&item_key) {
-                Ok(p) => p,
-                Err(e) => exit_err(&format!("Failed to read cache for {item_key}: {e}")),
-            };
-            if let Some(pid) = paper_id {
-                params.paper_id = pid;
-            }
-            if let Some(tags) = tag {
-                params.tags.extend(tags);
-            }
-            params.force = force;
-            // Check if already indexed (unless --force)
-            if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
-                if json {
-                    print_json(&serde_json::json!({
-                        "skipped": true,
-                        "paper_id": params.paper_id,
-                        "message": "already indexed; use --force to re-index"
-                    }));
-                } else {
-                    println!(
-                        "Already indexed: {} (use --force to re-index)",
-                        params.paper_id
-                    );
-                }
-                return;
-            }
-            match papers_rag::ingest_paper(&rag, params).await {
-                Ok(stats) => {
+            RagWorkCommand::Add { item_key, all, paper_id, tag, force, json } => {
+                let rag = open_rag_store().await;
+                if all {
+                    let keys = papers_rag::list_cached_item_keys();
+                    if keys.is_empty() {
+                        if json {
+                            print_json(&serde_json::json!({ "ingested": 0, "message": "no cached papers found" }));
+                        } else {
+                            println!("No cached papers found in DataLab cache.");
+                        }
+                        return;
+                    }
+                    let mut total_chunks = 0usize;
+                    let mut total_figures = 0usize;
+                    let mut ingested = 0usize;
+                    let mut failed = 0usize;
+                    for key in &keys {
+                        let mut params = match papers_rag::ingest_params_from_cache(key) {
+                            Ok(p) => p,
+                            Err(e) => { eprintln!("  [skip] {key}: {e}"); failed += 1; continue; }
+                        };
+                        params.force = force;
+                        if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
+                            if !json { println!("  [skip] {key}: already indexed"); }
+                            continue;
+                        }
+                        if !json { print!("  [ingest] {key}... "); }
+                        match papers_rag::ingest_paper(&rag, params).await {
+                            Ok(stats) => {
+                                total_chunks += stats.chunks_added;
+                                total_figures += stats.figures_added;
+                                ingested += 1;
+                                if !json { println!("{} chunks, {} figures", stats.chunks_added, stats.figures_added); }
+                            }
+                            Err(e) => {
+                                failed += 1;
+                                if !json { println!("FAILED: {e}"); } else { eprintln!("  [fail] {key}: {e}"); }
+                            }
+                        }
+                    }
                     if json {
                         print_json(&serde_json::json!({
-                            "chunks_added": stats.chunks_added,
-                            "figures_added": stats.figures_added,
-                            "item_key": item_key,
+                            "ingested": ingested, "failed": failed,
+                            "total_chunks": total_chunks, "total_figures": total_figures,
                         }));
                     } else {
-                        println!(
-                            "Ingested {} chunks and {} figures for {}",
-                            stats.chunks_added, stats.figures_added, item_key
-                        );
+                        println!("Ingested {} papers: {} chunks, {} figures ({} failed)",
+                            ingested, total_chunks, total_figures, failed);
                     }
-                }
-                Err(e) => exit_err(&e.to_string()),
-            }
-        }
-
-        RagCommand::IngestAll { force, json } => {
-            let rag = open_rag_store().await;
-            let keys = papers_rag::list_cached_item_keys();
-            if keys.is_empty() {
-                if json {
-                    print_json(
-                        &serde_json::json!({ "ingested": 0, "message": "no cached papers found" }),
-                    );
                 } else {
-                    println!("No cached papers found in DataLab cache.");
-                }
-                return;
-            }
-            let mut total_chunks = 0usize;
-            let mut total_figures = 0usize;
-            let mut ingested = 0usize;
-            let mut failed = 0usize;
-            for key in &keys {
-                let mut params = match papers_rag::ingest_params_from_cache(key) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("  [skip] {key}: {e}");
-                        failed += 1;
-                        continue;
-                    }
-                };
-                params.force = force;
-                if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
-                    if !json {
-                        println!("  [skip] {key}: already indexed");
-                    }
-                    continue;
-                }
-                if !json {
-                    print!("  [ingest] {key}... ");
-                }
-                match papers_rag::ingest_paper(&rag, params).await {
-                    Ok(stats) => {
-                        total_chunks += stats.chunks_added;
-                        total_figures += stats.figures_added;
-                        ingested += 1;
-                        if !json {
-                            println!(
-                                "{} chunks, {} figures",
-                                stats.chunks_added, stats.figures_added
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        if !json {
-                            println!("FAILED: {e}");
+                    let key = match item_key {
+                        Some(k) => k,
+                        None => exit_err("item_key is required unless --all is set"),
+                    };
+                    let mut params = match papers_rag::ingest_params_from_cache(&key) {
+                        Ok(p) => p,
+                        Err(e) => exit_err(&format!("Failed to read cache for {key}: {e}")),
+                    };
+                    if let Some(pid) = paper_id { params.paper_id = pid; }
+                    if let Some(tags) = tag { params.tags.extend(tags); }
+                    params.force = force;
+                    if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
+                        if json {
+                            print_json(&serde_json::json!({
+                                "skipped": true, "paper_id": params.paper_id,
+                                "message": "already indexed; use --force to re-index"
+                            }));
                         } else {
-                            eprintln!("  [fail] {key}: {e}");
+                            println!("Already indexed: {} (use --force to re-index)", params.paper_id);
                         }
+                        return;
+                    }
+                    match papers_rag::ingest_paper(&rag, params).await {
+                        Ok(stats) => {
+                            if json {
+                                print_json(&serde_json::json!({
+                                    "chunks_added": stats.chunks_added,
+                                    "figures_added": stats.figures_added,
+                                    "item_key": key,
+                                }));
+                            } else {
+                                println!("Ingested {} chunks and {} figures for {}",
+                                    stats.chunks_added, stats.figures_added, key);
+                            }
+                        }
+                        Err(e) => exit_err(&e.to_string()),
                     }
                 }
             }
-            if json {
-                print_json(&serde_json::json!({
-                    "ingested": ingested,
-                    "failed": failed,
-                    "total_chunks": total_chunks,
-                    "total_figures": total_figures,
-                }));
-            } else {
-                println!(
-                    "Ingested {} papers: {} chunks, {} figures ({} failed)",
-                    ingested, total_chunks, total_figures, failed
-                );
+
+            RagWorkCommand::Remove { paper_id, json } => {
+                let rag = open_rag_store().await;
+                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                    Ok(r) => r,
+                    Err(e) => exit_err(&e.to_string()),
+                };
+                match papers_rag::query::remove_work(&rag, &paper_id).await {
+                    Ok(()) => {
+                        if json {
+                            print_json(&serde_json::json!({ "removed": true, "paper_id": paper_id }));
+                        } else {
+                            println!("Removed: {paper_id}");
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
             }
-        }
+
+            RagWorkCommand::Outline { paper_id, json } => {
+                let rag = open_rag_store().await;
+                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                    Ok(r) => r,
+                    Err(e) => exit_err(&e.to_string()),
+                };
+                match papers_rag::query::get_paper_outline(&rag, &paper_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_rag_outline(&result); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+
+            RagWorkCommand::Extract { cmd } => {
+                let zotero = zotero_client().await.unwrap_or_else(|e| match e {
+                    papers_zotero::ZoteroError::NotRunning { path } => exit_err(&format!(
+                        "Zotero is installed ({path}) but the local API is not enabled.\n\
+                         Fix: Zotero \u{2192} Settings \u{2192} Advanced \u{2192} check \"Enable Local API\".\n\
+                         Or set ZOTERO_CHECK_LAUNCHED=0 to skip this check."
+                    )),
+                    _ => exit_err("Zotero not configured. Set ZOTERO_USER_ID and ZOTERO_API_KEY."),
+                });
+                handle_extract_command(cmd, &zotero).await;
+            }
+        },
+
+        RagCommand::Section { cmd } => match cmd {
+            RagSectionCommand::Search {
+                query, selection, paper_id, chapter_idx, year_min, year_max, venue, tag, limit, json,
+            } => {
+                let rag = open_rag_store().await;
+            let paper_ids = match selection.as_deref() {
+                Some(sel) => match papers_core::selection::load_selection(sel) {
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => match paper_id {
+                    Some(id) => {
+                        let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
+                            Ok(r) => r,
+                            Err(e) => exit_err(&e.to_string()),
+                        };
+                        Some(vec![resolved])
+                    }
+                    None => None,
+                },
+            };
+                let params = papers_rag::SearchSectionsParams {
+                    query, paper_ids, chapter_idx, filter_year_min: year_min, filter_year_max: year_max,
+                    filter_venue: venue, filter_tags: tag, limit,
+                };
+                match papers_rag::query::search_sections(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_section_search(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+
+            RagSectionCommand::List { paper_id, json } => {
+                let rag = open_rag_store().await;
+                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                    Ok(r) => r,
+                    Err(e) => exit_err(&e.to_string()),
+                };
+                match papers_rag::query::list_sections(&rag, papers_rag::ListSectionsParams { paper_id }).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_section_list(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+
+            RagSectionCommand::Get { paper_id, chapter_idx, section_idx, json } => {
+                let rag = open_rag_store().await;
+                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                    Ok(r) => r,
+                    Err(e) => exit_err(&e.to_string()),
+                };
+                match papers_rag::query::get_section(&rag, &paper_id, chapter_idx, section_idx).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_rag_section(&result); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+        },
+
+        RagCommand::Chapter { cmd } => match cmd {
+            RagChapterCommand::Search {
+                query, selection, paper_id, year_min, year_max, venue, tag, limit, json,
+            } => {
+                let rag = open_rag_store().await;
+            let paper_ids = match selection.as_deref() {
+                Some(sel) => match papers_core::selection::load_selection(sel) {
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => match paper_id {
+                    Some(id) => {
+                        let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
+                            Ok(r) => r,
+                            Err(e) => exit_err(&e.to_string()),
+                        };
+                        Some(vec![resolved])
+                    }
+                    None => None,
+                },
+            };
+                let params = papers_rag::SearchChaptersParams {
+                    query, paper_ids, filter_year_min: year_min, filter_year_max: year_max,
+                    filter_venue: venue, filter_tags: tag, limit,
+                };
+                match papers_rag::query::search_chapters(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_chapter_search(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+
+            RagChapterCommand::List { paper_id, json } => {
+                let rag = open_rag_store().await;
+                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                    Ok(r) => r,
+                    Err(e) => exit_err(&e.to_string()),
+                };
+                match papers_rag::query::list_chapters(&rag, papers_rag::ListChaptersParams { paper_id }).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_chapter_list(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+
+            RagChapterCommand::Get { paper_id, chapter_idx, json } => {
+                let rag = open_rag_store().await;
+                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
+                    Ok(r) => r,
+                    Err(e) => exit_err(&e.to_string()),
+                };
+                match papers_rag::query::get_chapter(&rag, &paper_id, chapter_idx).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_rag_chapter(&result); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+        },
+
+        RagCommand::Tag { cmd } => match cmd {
+            RagTagCommand::List { selection, json } => {
+                let rag = open_rag_store().await;
+            let paper_ids = match selection.as_deref() {
+                Some(sel) => match papers_core::selection::load_selection(sel) {
+                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
+                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
+                    }).collect()),
+                    Err(e) => exit_err(&e.to_string()),
+                },
+                None => None,
+            };
+                let params = papers_rag::ListTagsParams { paper_ids };
+                match papers_rag::query::list_tags(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_rag_tags(&results); } }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+        },
 
         RagCommand::Embed { cmd } => {
             handle_rag_embed_command(cmd).await;
         }
     }
 }
+
+async fn handle_extract_command(cmd: ZoteroExtractCommand, zotero: &papers_zotero::ZoteroClient) {
+    use papers_zotero::params::ItemListParams;
+    match cmd {
+        ZoteroExtractCommand::List { search, limit, json } => {
+            use std::collections::{HashMap, HashSet};
+            let local_keys: HashSet<String> =
+                papers_core::text::datalab_cached_item_keys().into_iter().collect();
+            let mut backed_up_keys: HashSet<String> = HashSet::new();
+            let att_params = ItemListParams {
+                item_type: Some("attachment".into()),
+                q: Some("papers_extract".into()),
+                limit: Some(100),
+                ..Default::default()
+            };
+            if let Ok(att_resp) = zotero.list_items(&att_params).await {
+                for item in &att_resp.items {
+                    if let Some(filename) = &item.data.filename {
+                        if let Some(key) = filename
+                            .strip_prefix("papers_extract_")
+                            .and_then(|s| s.strip_suffix(".zip"))
+                        {
+                            backed_up_keys.insert(key.to_string());
+                        }
+                    }
+                }
+            }
+            let mut all_keys: Vec<String> = local_keys.union(&backed_up_keys).cloned().collect();
+            all_keys.sort();
+            let filtered_keys: Vec<String> = if let Some(ref q) = search {
+                let search_params = ItemListParams {
+                    q: Some(q.clone()), limit: Some(limit), ..Default::default()
+                };
+                let search_resp = zotero.list_top_items(&search_params).await
+                    .unwrap_or_else(|e| exit_err(&e.to_string()));
+                let search_set: HashSet<String> =
+                    search_resp.items.into_iter().map(|i| i.key).collect();
+                all_keys.into_iter().filter(|k| search_set.contains(k)).collect()
+            } else {
+                all_keys.into_iter().take(limit as usize).collect()
+            };
+            let mut title_map: HashMap<String, String> = HashMap::new();
+            for chunk in filtered_keys.chunks(50) {
+                let batch_params = ItemListParams {
+                    item_key: Some(chunk.join(",")),
+                    limit: Some(chunk.len() as u32),
+                    ..Default::default()
+                };
+                if let Ok(resp) = zotero.list_items(&batch_params).await {
+                    for item in resp.items {
+                        title_map.insert(item.key, item.data.title.unwrap_or_default());
+                    }
+                }
+            }
+            let resolve_title = |key: &str| -> String {
+                if let Some(meta) = papers_core::text::read_extraction_meta(key) {
+                    if let Some(t) = meta.title { if !t.is_empty() { return t; } }
+                }
+                if let Some(t) = title_map.get(key) {
+                    return if t.is_empty() { "(no title)".to_string() } else { t.clone() };
+                }
+                if backed_up_keys.contains(key) { "(title unknown)".to_string() }
+                else { "(not in Zotero)".to_string() }
+            };
+            if json {
+                let items: Vec<_> = filtered_keys.iter().map(|k| {
+                    let remote_status = if backed_up_keys.contains(k) { "ok" }
+                        else if title_map.contains_key(k) { "no_backup" } else { "no_item" };
+                    serde_json::json!({
+                        "key": k, "title": resolve_title(k),
+                        "local": local_keys.contains(k),
+                        "remote": backed_up_keys.contains(k),
+                        "remote_status": remote_status,
+                    })
+                }).collect();
+                print_json(&items);
+            } else {
+                for key in &filtered_keys {
+                    let lmark = if local_keys.contains(key) { "\u{2713}" } else { "\u{2717}" };
+                    let remote_col = if backed_up_keys.contains(key) { "[\u{2713} remote]" }
+                        else if title_map.contains_key(key) { "[\u{2717} remote]" }
+                        else { "[\u{2717} remote *no item*]" };
+                    println!("{key}  [{lmark} local]  {remote_col}  {}", resolve_title(key));
+                }
+            }
+        }
+        ZoteroExtractCommand::Upload { dry_run } => {
+            use std::collections::HashSet;
+            let local_keys: HashSet<String> =
+                papers_core::text::datalab_cached_item_keys().into_iter().collect();
+            let backed_up_keys: HashSet<String> = {
+                let p = ItemListParams {
+                    item_type: Some("attachment".into()),
+                    q: Some("papers_extract".into()),
+                    limit: Some(100),
+                    ..Default::default()
+                };
+                match zotero.list_items(&p).await {
+                    Ok(r) => r.items.iter().filter_map(|i| {
+                        let f = i.data.filename.as_deref()?;
+                        Some(f.strip_prefix("papers_extract_")?.strip_suffix(".zip")?.to_string())
+                    }).collect(),
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            };
+            let mut to_upload: Vec<String> =
+                local_keys.difference(&backed_up_keys).cloned().collect();
+            to_upload.sort();
+            if to_upload.is_empty() {
+                println!("All local extractions already backed up to Zotero.");
+            } else {
+                let mut item_exists: HashSet<String> = HashSet::new();
+                for chunk in to_upload.chunks(50) {
+                    let p = ItemListParams { item_key: Some(chunk.join(",")), ..Default::default() };
+                    if let Ok(resp) = zotero.list_top_items(&p).await {
+                        for item in resp.items { item_exists.insert(item.key); }
+                    }
+                }
+                let mut uploaded = 0usize;
+                for key in &to_upload {
+                    if !item_exists.contains(key) {
+                        if dry_run { println!("skipping: {key}  (item not in Zotero)"); }
+                        else { eprintln!("skipping: {key}  (item not in Zotero)"); }
+                        continue;
+                    }
+                    if dry_run { println!("would upload: {key}"); }
+                    else {
+                        eprint!("Uploading backup {key}... ");
+                        match papers_core::text::upload_extraction_to_zotero(zotero, key).await {
+                            Ok(()) => { eprintln!("ok"); uploaded += 1; }
+                            Err(e) => eprintln!("error: {e}"),
+                        }
+                    }
+                }
+                if !dry_run { eprintln!("Done. Uploaded {uploaded} extraction(s)."); }
+            }
+        }
+        ZoteroExtractCommand::Download { dry_run } => {
+            use std::collections::HashSet;
+            let local_keys: HashSet<String> =
+                papers_core::text::datalab_cached_item_keys().into_iter().collect();
+            let p = ItemListParams {
+                item_type: Some("attachment".into()),
+                q: Some("papers_extract".into()),
+                limit: Some(100),
+                ..Default::default()
+            };
+            let att_resp = zotero.list_items(&p).await
+                .unwrap_or_else(|e| exit_err(&e.to_string()));
+            let mut to_download: Vec<(String, String)> = att_resp.items.iter().filter_map(|i| {
+                let f = i.data.filename.as_deref()?;
+                let item_key = f.strip_prefix("papers_extract_")?.strip_suffix(".zip")?;
+                if local_keys.contains(item_key) { return None; }
+                Some((i.key.clone(), item_key.to_string()))
+            }).collect();
+            to_download.sort_by(|a, b| a.1.cmp(&b.1));
+            if to_download.is_empty() {
+                println!("All Zotero extractions already present locally.");
+            } else {
+                for (att_key, item_key) in &to_download {
+                    if dry_run { println!("would download: {item_key}"); }
+                    else {
+                        eprint!("Downloading {item_key}... ");
+                        match papers_core::text::download_extraction_from_zotero(
+                            zotero, att_key, item_key,
+                        ).await {
+                            Ok(()) => eprintln!("ok"),
+                            Err(e) => eprintln!("error: {e}"),
+                        }
+                    }
+                }
+                if !dry_run { eprintln!("Done. Downloaded {} extraction(s).", to_download.len()); }
+            }
+        }
+        other => {
+            #[derive(PartialEq)]
+            enum OutputKind { Text, Json, Get }
+            let (query, output_kind) = match other {
+                ZoteroExtractCommand::Text { query } => (query, OutputKind::Text),
+                ZoteroExtractCommand::Json { query } => (query, OutputKind::Json),
+                ZoteroExtractCommand::Get { query } => (query, OutputKind::Get),
+                ZoteroExtractCommand::List { .. } => unreachable!(),
+                ZoteroExtractCommand::Upload { .. } => unreachable!(),
+                ZoteroExtractCommand::Download { .. } => unreachable!(),
+            };
+            let key = smart_resolve_item_key(zotero, &query).await
+                .unwrap_or_else(|e| exit_err(&e));
+            match output_kind {
+                OutputKind::Text => match papers_core::text::datalab_cached_markdown(&key) {
+                    Some(md) => print!("{md}"),
+                    None => exit_err(&format!(
+                        "No cached extraction for {key}. Run: papers rag work extract text {key}"
+                    )),
+                },
+                OutputKind::Json => match papers_core::text::datalab_cached_json(&key) {
+                    Some(json_str) => print!("{json_str}"),
+                    None => exit_err(&format!(
+                        "No cached extraction for {key}. Run: papers rag work extract json {key}"
+                    )),
+                },
+                OutputKind::Get => {
+                    let local_dir = papers_core::text::datalab_cache_dir_path(&key);
+                    let local_ok = local_dir.as_ref()
+                        .map(|d| d.join(format!("{key}.md")).exists()).unwrap_or(false);
+                    let item_exists = zotero.get_item(&key).await.is_ok();
+                    let remote_col = if item_exists {
+                        let expected_zip = format!("papers_extract_{key}.zip");
+                        let backup_ok = match zotero.list_item_children(
+                            &key,
+                            &ItemListParams {
+                                item_type: Some("attachment".into()), ..Default::default()
+                            },
+                        ).await {
+                            Ok(children) => children.items.iter().any(|c| {
+                                c.data.filename.as_deref() == Some(&expected_zip)
+                                    && c.data.link_mode.as_deref() == Some("imported_file")
+                            }),
+                            Err(_) => false,
+                        };
+                        if backup_ok { "\u{2713}" } else { "\u{2717}" }
+                    } else { "\u{2717}  *no item*" };
+                    println!("{key}");
+                    match &local_dir {
+                        Some(dir) if local_ok => println!("  local:\u{2713}  {}", dir.display()),
+                        _ => println!("  local:\u{2717}"),
+                    }
+                    println!("  remote:{remote_col}");
+                    if let Some(meta) = papers_core::text::read_extraction_meta(&key) {
+                        if let Some(t) = meta.title { println!("  title: {t}"); }
+                        if let Some(authors) = meta.authors {
+                            println!("  authors: {}", authors.join(", "));
+                        }
+                        if let Some(et) = meta.extracted_at { println!("  extracted: {et}"); }
+                        if let Some(mode) = meta.processing_mode { println!("  mode: {mode}"); }
+                    }
+                    if !local_ok && remote_col == "\u{2717}" {
+                        eprintln!(
+                            "No extraction found. Run: papers rag work extract text {key}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn format_rag_work_metadata(w: &papers_rag::WorkMetadata) {
+    println!("{}", w.paper_id);
+    println!("  title: {}", w.title);
+    if !w.authors.is_empty() { println!("  authors: {}", w.authors.join(", ")); }
+    if let Some(y) = w.year { println!("  year: {y}"); }
+    if let Some(v) = &w.venue { println!("  venue: {v}"); }
+    if !w.tags.is_empty() { println!("  tags: {}", w.tags.join(", ")); }
+    println!("  chunks: {}  figures: {}", w.chunk_count, w.figure_count);
+}
+
+fn format_rag_work_search(results: &[papers_rag::WorkSearchResult]) {
+    if results.is_empty() { println!("No matching papers found."); return; }
+    for r in results {
+        let year = r.year.map(|y| y.to_string()).unwrap_or_else(|| "?".into());
+        let venue = r.venue.as_deref().unwrap_or("");
+        println!("[{:.3}] {} ({}, {})", r.score, r.title, year, venue);
+        println!("       {} chunks  |  {}", r.chunk_count, r.paper_id);
+        println!("       {}", r.top_chunk.chars().take(100).collect::<String>());
+        println!();
+    }
+}
+
+fn format_rag_chunk_list(chunks: &[papers_rag::ChunkListItem]) {
+    if chunks.is_empty() { println!("No chunks found."); return; }
+    for c in chunks {
+        println!("[{}.{}.{}] {} / {} [{}]",
+            c.chapter_idx, c.section_idx, c.chunk_idx,
+            c.chapter_title, c.section_title, c.block_type);
+        println!("    {}", c.text_preview.chars().take(100).collect::<String>());
+    }
+}
+
+fn format_rag_section_search(results: &[papers_rag::SectionSearchResult]) {
+    if results.is_empty() { println!("No matching sections found."); return; }
+    for r in results {
+        println!("[{:.3}] {}.{} {} \u{2014} {}",
+            r.score, r.chapter_idx, r.section_idx, r.section_title, r.paper_title);
+        println!("       {} chunks  |  {}", r.chunk_count, r.paper_id);
+        println!("       {}", r.top_chunk.chars().take(100).collect::<String>());
+        println!();
+    }
+}
+
+fn format_rag_section_list(sections: &[papers_rag::SectionListItem]) {
+    if sections.is_empty() { println!("No sections found."); return; }
+    for s in sections {
+        println!("  {}.{} {}  [{} chunks]",
+            s.chapter_idx, s.section_idx, s.section_title, s.chunk_count);
+    }
+}
+
+fn format_rag_chapter_search(results: &[papers_rag::ChapterSearchResult]) {
+    if results.is_empty() { println!("No matching chapters found."); return; }
+    for r in results {
+        println!("[{:.3}] Ch.{} {} \u{2014} {}", r.score, r.chapter_idx, r.chapter_title, r.paper_title);
+        println!("       {} sections, {} chunks  |  {}", r.section_count, r.chunk_count, r.paper_id);
+        println!("       {}", r.top_chunk.chars().take(100).collect::<String>());
+        println!();
+    }
+}
+
+fn format_rag_chapter_list(chapters: &[papers_rag::ChapterListItem]) {
+    if chapters.is_empty() { println!("No chapters found."); return; }
+    for c in chapters {
+        println!("  Ch.{} {}  [{} sections, {} chunks]",
+            c.chapter_idx, c.chapter_title, c.section_count, c.chunk_count);
+    }
+}
+
 
 fn handle_config_command(cmd: ConfigCommand) {
     match cmd {

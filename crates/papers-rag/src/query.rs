@@ -10,10 +10,13 @@ use crate::error::RagError;
 use crate::filter::{validate_scope, FilterBuilder};
 use crate::store::RagStore;
 use crate::types::{
-    ChapterResult, ChapterSection, ChunkResult, ChunkSummary, ChunkWithPosition,
-    FigureResult, FigureSearchResult, ListPapersParams, ListTagsParams, OutlineChapter,
+    ChapterListItem, ChapterResult, ChapterSearchResult, ChapterSection, ChunkListItem, ChunkResult,
+    ChunkSummary, ChunkWithPosition, FigureResult, FigureSearchResult, ListChaptersParams,
+    ListChunksParams, ListPapersParams, ListSectionsParams, ListTagsParams, OutlineChapter,
     OutlineSection, PaperOutline, PaperSummary, PositionContext, ReferencedFigure,
-    SearchChunkResult, SearchFiguresParams, SearchParams, SearchResult, SectionResult, TagSummary,
+    SearchChaptersParams, SearchChunkResult, SearchFiguresParams, SearchParams, SearchResult,
+    SearchSectionsParams, SearchWorksParams, SectionListItem, SectionResult, SectionSearchResult,
+    TagSummary, WorkMetadata, WorkSearchResult,
 };
 
 // ── Arrow extraction helpers ────────────────────────────────────────────────
@@ -1251,6 +1254,511 @@ pub async fn list_tags(
         .collect();
     result.sort_by(|a, b| b.paper_count.cmp(&a.paper_count).then(a.tag.cmp(&b.tag)));
     Ok(result)
+}
+
+// ── Work-level queries ───────────────────────────────────────────────────────
+
+/// Get metadata for a single work (paper).
+pub async fn get_work(store: &RagStore, paper_id: &str) -> Result<WorkMetadata, RagError> {
+    let table = store.chunks_table().await?;
+    let figures_table = store.figures_table().await?;
+    let paper_id_esc = paper_id.replace('\'', "''");
+    let filter = format!("paper_id = '{paper_id_esc}'");
+    let batches = table
+        .query()
+        .only_if(&filter)
+        .select(Select::columns(&[
+            "paper_id", "title", "authors", "year", "venue", "tags",
+        ]))
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+
+    let chunk_count = total_rows(&batches);
+    if chunk_count == 0 {
+        return Err(RagError::NotFound(format!("paper not found: {paper_id}")));
+    }
+    let batch = &batches[0];
+    let title = col_str(batch, "title", 0)?;
+    let authors = col_str_list(batch, "authors", 0)?;
+    let year = col_u16_opt(batch, "year", 0)?;
+    let venue = col_str_opt(batch, "venue", 0)?;
+    let tags = col_str_list(batch, "tags", 0)?;
+
+    let fig_batches = figures_table
+        .query()
+        .only_if(&filter)
+        .select(Select::columns(&["figure_id"]))
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+    let figure_count = total_rows(&fig_batches);
+
+    Ok(WorkMetadata {
+        paper_id: paper_id.to_string(),
+        title,
+        authors,
+        year,
+        venue,
+        tags,
+        chunk_count,
+        figure_count,
+    })
+}
+
+/// Semantic search returning one result per matching work (paper).
+pub async fn search_works(
+    store: &RagStore,
+    params: SearchWorksParams,
+) -> Result<Vec<WorkSearchResult>, RagError> {
+    let embedding = store.embed_query(&params.query).await?;
+    let table = store.chunks_table().await?;
+    let inner_limit = (params.limit as usize) * 15;
+
+    let mut fb = FilterBuilder::new();
+    if let Some(ids) = params.paper_ids.as_deref() {
+        fb = fb.paper_ids(ids);
+    }
+    fb = fb.year_range(params.filter_year_min, params.filter_year_max);
+    if let Some(venue) = &params.filter_venue {
+        fb = fb.eq_str("venue", venue);
+    }
+    if let Some(tags) = params.filter_tags.as_deref() {
+        fb = fb.tags_any(tags);
+    }
+
+    let mut query_builder = table.query().nearest_to(embedding)?;
+    query_builder = query_builder.limit(inner_limit);
+    if let Some(filter) = fb.build() {
+        query_builder = query_builder.only_if(filter);
+    }
+
+    let batches = query_builder
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+
+    struct WorkEntry {
+        title: String,
+        authors: Vec<String>,
+        year: Option<u16>,
+        venue: Option<String>,
+        best_score: f32,
+        chunk_count: usize,
+        top_chunk: String,
+    }
+    let mut work_map: HashMap<String, WorkEntry> = HashMap::new();
+    for batch in &batches {
+        let has_distance = batch.column_by_name("_distance").is_some();
+        for row in 0..batch.num_rows() {
+            let score = if has_distance { col_f32(batch, "_distance", row)? } else { 0.0 };
+            let pid = col_str(batch, "paper_id", row)?;
+            let text = col_str(batch, "text", row)?;
+            if let Some(entry) = work_map.get_mut(&pid) {
+                entry.chunk_count += 1;
+                if score < entry.best_score {
+                    entry.best_score = score;
+                    entry.top_chunk = truncate_at_sentence(&text, PREVIEW_MIN_CHARS);
+                }
+            } else {
+                work_map.insert(pid.clone(), WorkEntry {
+                    title: col_str(batch, "title", row)?,
+                    authors: col_str_list(batch, "authors", row)?,
+                    year: col_u16_opt(batch, "year", row)?,
+                    venue: col_str_opt(batch, "venue", row)?,
+                    best_score: score,
+                    chunk_count: 1,
+                    top_chunk: truncate_at_sentence(&text, PREVIEW_MIN_CHARS),
+                });
+            }
+        }
+    }
+
+    let mut results: Vec<WorkSearchResult> = work_map
+        .into_iter()
+        .map(|(paper_id, e)| WorkSearchResult {
+            paper_id,
+            title: e.title,
+            authors: e.authors,
+            year: e.year,
+            venue: e.venue,
+            score: e.best_score,
+            chunk_count: e.chunk_count,
+            top_chunk: e.top_chunk,
+        })
+        .collect();
+    results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(params.limit as usize);
+    Ok(results)
+}
+
+/// Delete all chunks and figures for a paper from the index.
+pub async fn remove_work(store: &RagStore, paper_id: &str) -> Result<(), RagError> {
+    let paper_id_esc = paper_id.replace('\'', "''");
+    let filter = format!("paper_id = '{paper_id_esc}'");
+    let chunks_table = store.chunks_table().await?;
+    chunks_table.delete(&filter).await.map_err(RagError::LanceDb)?;
+    let figures_table = store.figures_table().await?;
+    figures_table.delete(&filter).await.map_err(RagError::LanceDb)?;
+    Ok(())
+}
+
+// ── Chunk list ───────────────────────────────────────────────────────────────
+
+/// List chunks in a paper with optional chapter/section scope.
+pub async fn list_chunks(
+    store: &RagStore,
+    params: ListChunksParams,
+) -> Result<Vec<ChunkListItem>, RagError> {
+    let table = store.chunks_table().await?;
+    let mut fb = FilterBuilder::new().paper_ids(&[params.paper_id.clone()]);
+    if let Some(ch) = params.chapter_idx {
+        fb = fb.chapter_idx(ch);
+    }
+    if let Some(sec) = params.section_idx {
+        fb = fb.section_idx(sec);
+    }
+    let filter = fb.build().unwrap();
+
+    let batches = table
+        .query()
+        .only_if(&filter)
+        .select(Select::columns(&[
+            "chunk_id", "chapter_idx", "chapter_title", "section_idx", "section_title",
+            "chunk_idx", "depth", "block_type", "text",
+        ]))
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+
+    let mut rows: Vec<(u16, u16, u16, &RecordBatch, usize)> = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.num_rows() {
+            rows.push((
+                col_u16(batch, "chapter_idx", row)?,
+                col_u16(batch, "section_idx", row)?,
+                col_u16(batch, "chunk_idx", row)?,
+                batch,
+                row,
+            ));
+        }
+    }
+    rows.sort_by_key(|(ch, sec, ci, _, _)| (*ch, *sec, *ci));
+
+    let limit = params.limit as usize;
+    let mut results = Vec::new();
+    for (_, _, _, batch, row) in rows {
+        results.push(ChunkListItem {
+            chunk_id: col_str(batch, "chunk_id", row)?,
+            chapter_idx: col_u16(batch, "chapter_idx", row)?,
+            chapter_title: col_str(batch, "chapter_title", row)?,
+            section_idx: col_u16(batch, "section_idx", row)?,
+            section_title: col_str(batch, "section_title", row)?,
+            chunk_idx: col_u16(batch, "chunk_idx", row)?,
+            depth: col_str(batch, "depth", row)?,
+            block_type: col_str(batch, "block_type", row)?,
+            text_preview: truncate_at_sentence(&col_str(batch, "text", row)?, PREVIEW_MIN_CHARS),
+        });
+        if results.len() >= limit {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+// ── Section-level queries ────────────────────────────────────────────────────
+
+/// Semantic search returning one result per matching section.
+pub async fn search_sections(
+    store: &RagStore,
+    params: SearchSectionsParams,
+) -> Result<Vec<SectionSearchResult>, RagError> {
+    let embedding = store.embed_query(&params.query).await?;
+    let table = store.chunks_table().await?;
+    let inner_limit = (params.limit as usize) * 10;
+
+    let mut fb = FilterBuilder::new();
+    if let Some(ids) = params.paper_ids.as_deref() {
+        fb = fb.paper_ids(ids);
+    }
+    if let Some(ch) = params.chapter_idx {
+        fb = fb.chapter_idx(ch);
+    }
+    fb = fb.year_range(params.filter_year_min, params.filter_year_max);
+    if let Some(venue) = &params.filter_venue {
+        fb = fb.eq_str("venue", venue);
+    }
+    if let Some(tags) = params.filter_tags.as_deref() {
+        fb = fb.tags_any(tags);
+    }
+
+    let mut query_builder = table.query().nearest_to(embedding)?;
+    query_builder = query_builder.limit(inner_limit);
+    if let Some(filter) = fb.build() {
+        query_builder = query_builder.only_if(filter);
+    }
+
+    let batches = query_builder
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+
+    type SectionKey = (String, u16, u16);
+    struct SectionEntry {
+        paper_title: String,
+        chapter_title: String,
+        section_title: String,
+        best_score: f32,
+        chunk_count: usize,
+        top_chunk: String,
+    }
+    let mut sec_map: HashMap<SectionKey, SectionEntry> = HashMap::new();
+    for batch in &batches {
+        let has_distance = batch.column_by_name("_distance").is_some();
+        for row in 0..batch.num_rows() {
+            let score = if has_distance { col_f32(batch, "_distance", row)? } else { 0.0 };
+            let pid = col_str(batch, "paper_id", row)?;
+            let ch_idx = col_u16(batch, "chapter_idx", row)?;
+            let sec_idx = col_u16(batch, "section_idx", row)?;
+            let key = (pid, ch_idx, sec_idx);
+            let text = col_str(batch, "text", row)?;
+            if let Some(entry) = sec_map.get_mut(&key) {
+                entry.chunk_count += 1;
+                if score < entry.best_score {
+                    entry.best_score = score;
+                    entry.top_chunk = truncate_at_sentence(&text, PREVIEW_MIN_CHARS);
+                }
+            } else {
+                sec_map.insert(key, SectionEntry {
+                    paper_title: col_str(batch, "title", row)?,
+                    chapter_title: col_str(batch, "chapter_title", row)?,
+                    section_title: col_str(batch, "section_title", row)?,
+                    best_score: score,
+                    chunk_count: 1,
+                    top_chunk: truncate_at_sentence(&text, PREVIEW_MIN_CHARS),
+                });
+            }
+        }
+    }
+
+    let mut results: Vec<SectionSearchResult> = sec_map
+        .into_iter()
+        .map(|((paper_id, chapter_idx, section_idx), e)| SectionSearchResult {
+            paper_id,
+            paper_title: e.paper_title,
+            chapter_idx,
+            chapter_title: e.chapter_title,
+            section_idx,
+            section_title: e.section_title,
+            score: e.best_score,
+            chunk_count: e.chunk_count,
+            top_chunk: e.top_chunk,
+        })
+        .collect();
+    results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(params.limit as usize);
+    Ok(results)
+}
+
+/// List all sections in a paper as a flat table.
+pub async fn list_sections(
+    store: &RagStore,
+    params: ListSectionsParams,
+) -> Result<Vec<SectionListItem>, RagError> {
+    let table = store.chunks_table().await?;
+    let paper_id_esc = params.paper_id.replace('\'', "''");
+    let filter = format!("paper_id = '{paper_id_esc}'");
+    let batches = table
+        .query()
+        .only_if(&filter)
+        .select(Select::columns(&[
+            "chapter_idx", "chapter_title", "section_idx", "section_title",
+        ]))
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+
+    type SectionKey2 = (u16, u16);
+    let mut sec_map: HashMap<SectionKey2, (String, String, usize)> = HashMap::new();
+    for batch in &batches {
+        for row in 0..batch.num_rows() {
+            let ch_idx = col_u16(batch, "chapter_idx", row)?;
+            let sec_idx = col_u16(batch, "section_idx", row)?;
+            let key = (ch_idx, sec_idx);
+            if let Some(entry) = sec_map.get_mut(&key) {
+                entry.2 += 1;
+            } else {
+                sec_map.insert(key, (
+                    col_str(batch, "chapter_title", row)?,
+                    col_str(batch, "section_title", row)?,
+                    1,
+                ));
+            }
+        }
+    }
+
+    let mut results: Vec<SectionListItem> = sec_map
+        .into_iter()
+        .map(|((chapter_idx, section_idx), (chapter_title, section_title, chunk_count))| {
+            SectionListItem { chapter_idx, chapter_title, section_idx, section_title, chunk_count }
+        })
+        .collect();
+    results.sort_by_key(|r| (r.chapter_idx, r.section_idx));
+    Ok(results)
+}
+
+// ── Chapter-level queries ────────────────────────────────────────────────────
+
+/// Semantic search returning one result per matching chapter.
+pub async fn search_chapters(
+    store: &RagStore,
+    params: SearchChaptersParams,
+) -> Result<Vec<ChapterSearchResult>, RagError> {
+    let embedding = store.embed_query(&params.query).await?;
+    let table = store.chunks_table().await?;
+    let inner_limit = (params.limit as usize) * 15;
+
+    let mut fb = FilterBuilder::new();
+    if let Some(ids) = params.paper_ids.as_deref() {
+        fb = fb.paper_ids(ids);
+    }
+    fb = fb.year_range(params.filter_year_min, params.filter_year_max);
+    if let Some(venue) = &params.filter_venue {
+        fb = fb.eq_str("venue", venue);
+    }
+    if let Some(tags) = params.filter_tags.as_deref() {
+        fb = fb.tags_any(tags);
+    }
+
+    let mut query_builder = table.query().nearest_to(embedding)?;
+    query_builder = query_builder.limit(inner_limit);
+    if let Some(filter) = fb.build() {
+        query_builder = query_builder.only_if(filter);
+    }
+
+    let batches = query_builder
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+
+    type ChapterKey = (String, u16);
+    struct ChapterEntry {
+        paper_title: String,
+        chapter_title: String,
+        best_score: f32,
+        section_set: std::collections::HashSet<u16>,
+        chunk_count: usize,
+        top_chunk: String,
+    }
+    let mut ch_map: HashMap<ChapterKey, ChapterEntry> = HashMap::new();
+    for batch in &batches {
+        let has_distance = batch.column_by_name("_distance").is_some();
+        for row in 0..batch.num_rows() {
+            let score = if has_distance { col_f32(batch, "_distance", row)? } else { 0.0 };
+            let pid = col_str(batch, "paper_id", row)?;
+            let ch_idx = col_u16(batch, "chapter_idx", row)?;
+            let sec_idx = col_u16(batch, "section_idx", row)?;
+            let key = (pid, ch_idx);
+            let text = col_str(batch, "text", row)?;
+            if let Some(entry) = ch_map.get_mut(&key) {
+                entry.chunk_count += 1;
+                entry.section_set.insert(sec_idx);
+                if score < entry.best_score {
+                    entry.best_score = score;
+                    entry.top_chunk = truncate_at_sentence(&text, PREVIEW_MIN_CHARS);
+                }
+            } else {
+                let mut section_set = std::collections::HashSet::new();
+                section_set.insert(sec_idx);
+                ch_map.insert(key, ChapterEntry {
+                    paper_title: col_str(batch, "title", row)?,
+                    chapter_title: col_str(batch, "chapter_title", row)?,
+                    best_score: score,
+                    section_set,
+                    chunk_count: 1,
+                    top_chunk: truncate_at_sentence(&text, PREVIEW_MIN_CHARS),
+                });
+            }
+        }
+    }
+
+    let mut results: Vec<ChapterSearchResult> = ch_map
+        .into_iter()
+        .map(|((paper_id, chapter_idx), e)| ChapterSearchResult {
+            paper_id,
+            paper_title: e.paper_title,
+            chapter_idx,
+            chapter_title: e.chapter_title,
+            score: e.best_score,
+            section_count: e.section_set.len(),
+            chunk_count: e.chunk_count,
+            top_chunk: e.top_chunk,
+        })
+        .collect();
+    results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(params.limit as usize);
+    Ok(results)
+}
+
+/// List all chapters in a paper (chapter index, title, section count, chunk count).
+pub async fn list_chapters(
+    store: &RagStore,
+    params: ListChaptersParams,
+) -> Result<Vec<ChapterListItem>, RagError> {
+    let table = store.chunks_table().await?;
+    let paper_id_esc = params.paper_id.replace('\'', "''");
+    let filter = format!("paper_id = '{paper_id_esc}'");
+    let batches = table
+        .query()
+        .only_if(&filter)
+        .select(Select::columns(&["chapter_idx", "chapter_title", "section_idx"]))
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(RagError::LanceDb)?;
+
+    let mut ch_map: HashMap<u16, (String, std::collections::HashSet<u16>, usize)> = HashMap::new();
+    for batch in &batches {
+        for row in 0..batch.num_rows() {
+            let ch_idx = col_u16(batch, "chapter_idx", row)?;
+            let sec_idx = col_u16(batch, "section_idx", row)?;
+            if let Some(entry) = ch_map.get_mut(&ch_idx) {
+                entry.1.insert(sec_idx);
+                entry.2 += 1;
+            } else {
+                let mut sec_set = std::collections::HashSet::new();
+                sec_set.insert(sec_idx);
+                ch_map.insert(ch_idx, (col_str(batch, "chapter_title", row)?, sec_set, 1));
+            }
+        }
+    }
+
+    let mut results: Vec<ChapterListItem> = ch_map
+        .into_iter()
+        .map(|(chapter_idx, (chapter_title, sec_set, chunk_count))| ChapterListItem {
+            chapter_idx,
+            chapter_title,
+            section_count: sec_set.len(),
+            chunk_count,
+        })
+        .collect();
+    results.sort_by_key(|r| r.chapter_idx);
+    Ok(results)
 }
 
 #[cfg(test)]

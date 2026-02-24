@@ -1181,9 +1181,9 @@ pub struct SelectionRemoveToolParams {
 
 // ── RAG tool params ──────────────────────────────────────────────────────────
 
-/// Parameters for the `rag_search` tool.
+/// Parameters for the `rag_chunk_search` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct SearchToolParams {
+pub struct RagChunkSearchParams {
     /// Natural language search query.
     pub query: String,
     /// Scope to papers in this named selection.
@@ -1208,9 +1208,9 @@ pub struct SearchToolParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_search_figures` tool.
+/// Parameters for the `rag_figure_search` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct SearchFiguresToolParams {
+pub struct RagFigureSearchParams {
     /// Natural language description of the figure, table, or diagram to find.
     pub query: String,
     /// Scope to papers in this named selection.
@@ -1223,16 +1223,16 @@ pub struct SearchFiguresToolParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_get_chunk` tool.
+/// Parameters for the `rag_chunk_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GetChunkToolParams {
+pub struct RagChunkGetParams {
     /// Chunk ID (e.g. "10.1145/abc/ch1/s2/p3" or "YFACFA8C/ch1/s0/p0").
     pub chunk_id: String,
 }
 
-/// Parameters for the `rag_get_section` tool.
+/// Parameters for the `rag_section_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GetSectionToolParams {
+pub struct RagSectionGetParams {
     /// Paper: DOI, item key, or title search.
     pub paper_id: String,
     /// Chapter index (1-based).
@@ -1241,32 +1241,32 @@ pub struct GetSectionToolParams {
     pub section_idx: u16,
 }
 
-/// Parameters for the `rag_get_chapter` tool.
+/// Parameters for the `rag_chapter_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GetChapterToolParams {
+pub struct RagChapterGetParams {
     /// Paper: DOI, item key, or title search.
     pub paper_id: String,
     /// Chapter index (1-based).
     pub chapter_idx: u16,
 }
 
-/// Parameters for the `rag_get_figure` tool.
+/// Parameters for the `rag_figure_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GetFigureToolParams {
+pub struct RagFigureGetParams {
     /// Figure ID (e.g. "YFACFA8C/fig3").
     pub figure_id: String,
 }
 
-/// Parameters for the `rag_get_paper_outline` tool.
+/// Parameters for the `rag_work_outline` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct GetPaperOutlineToolParams {
+pub struct RagWorkOutlineParams {
     /// Paper: DOI, item key, or title search.
     pub paper_id: String,
 }
 
-/// Parameters for the `rag_list_papers` tool.
+/// Parameters for the `rag_work_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct ListPapersToolParams {
+pub struct RagWorkListParams {
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
     /// Minimum publication year.
@@ -1285,9 +1285,106 @@ pub struct ListPapersToolParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `rag_list_tags` tool.
+/// Parameters for the `rag_tag_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct ListTagsToolParams {
+pub struct RagTagListParams {
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
+}
+
+/// Parameters for the `rag_work_get` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RagWorkGetParams {
+    /// Paper: DOI, item key, or title search.
+    pub paper_id: String,
+}
+
+/// Parameters for the `rag_work_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RagWorkSearchParams {
+    /// Natural language search query.
+    pub query: String,
+    /// Scope to papers in this named selection.
+    pub selection: Option<String>,
+    /// Minimum publication year filter.
+    pub filter_year_min: Option<u16>,
+    /// Maximum publication year filter.
+    pub filter_year_max: Option<u16>,
+    /// Filter by venue name.
+    pub filter_venue: Option<String>,
+    /// Filter by tags (any match).
+    pub filter_tags: Option<Vec<String>>,
+    /// Maximum number of results (default 5).
+    pub limit: Option<u16>,
+}
+
+/// Parameters for the `rag_chunk_list` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RagChunkListParams {
+    /// Paper: DOI, item key, or title search.
+    pub paper_id: String,
+    /// Scope to a chapter (1-based).
+    pub chapter_idx: Option<u16>,
+    /// Scope to a section (1-based within chapter; requires chapter_idx).
+    pub section_idx: Option<u16>,
+    /// Maximum number of results (default 50).
+    pub limit: Option<u16>,
+}
+
+/// Parameters for the `rag_section_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RagSectionSearchParams {
+    /// Natural language search query.
+    pub query: String,
+    /// Scope to papers in this named selection.
+    pub selection: Option<String>,
+    /// Scope to a single paper by DOI, item key, or title search.
+    pub paper_id: Option<String>,
+    /// Scope to a chapter (requires paper_id).
+    pub chapter_idx: Option<u16>,
+    /// Minimum publication year filter.
+    pub filter_year_min: Option<u16>,
+    /// Maximum publication year filter.
+    pub filter_year_max: Option<u16>,
+    /// Filter by venue name.
+    pub filter_venue: Option<String>,
+    /// Filter by tags (any match).
+    pub filter_tags: Option<Vec<String>>,
+    /// Maximum number of results (default 5).
+    pub limit: Option<u16>,
+}
+
+/// Parameters for the `rag_section_list` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RagSectionListParams {
+    /// Paper: DOI, item key, or title search.
+    pub paper_id: String,
+}
+
+/// Parameters for the `rag_chapter_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RagChapterSearchParams {
+    /// Natural language search query.
+    pub query: String,
+    /// Scope to papers in this named selection.
+    pub selection: Option<String>,
+    /// Scope to a single paper by DOI, item key, or title search.
+    pub paper_id: Option<String>,
+    /// Minimum publication year filter.
+    pub filter_year_min: Option<u16>,
+    /// Maximum publication year filter.
+    pub filter_year_max: Option<u16>,
+    /// Filter by venue name.
+    pub filter_venue: Option<String>,
+    /// Filter by tags (any match).
+    pub filter_tags: Option<Vec<String>>,
+    /// Maximum number of results (default 5).
+    pub limit: Option<u16>,
+}
+
+/// Parameters for the `rag_chapter_list` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RagChapterListParams {
+    /// Paper: DOI, item key, or title search.
+    pub paper_id: String,
 }

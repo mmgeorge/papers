@@ -12,10 +12,12 @@ use serde::Serialize;
 
 use crate::params::{
     AutocompleteToolParams, AuthorListToolParams, DomainListToolParams, FieldListToolParams,
-    FindWorksToolParams, FunderListToolParams, GetToolParams, GetChapterToolParams,
-    GetChunkToolParams, GetFigureToolParams, GetPaperOutlineToolParams, GetSectionToolParams,
-    InstitutionListToolParams, ListPapersToolParams, ListTagsToolParams,
-    PublisherListToolParams, SearchFiguresToolParams, SearchToolParams,
+    FindWorksToolParams, FunderListToolParams, GetToolParams, RagChapterGetParams,
+    RagChapterListParams, RagChapterSearchParams, RagChunkGetParams, RagChunkListParams,
+    RagChunkSearchParams, RagFigureGetParams, RagFigureSearchParams,
+    RagSectionGetParams, RagSectionListParams, RagSectionSearchParams, RagTagListParams,
+    RagWorkGetParams, RagWorkListParams, RagWorkOutlineParams, RagWorkSearchParams,
+    InstitutionListToolParams, PublisherListToolParams,
     SelectionAddToolParams, SelectionCreateToolParams,
     SelectionDeleteToolParams, SelectionGetToolParams, SelectionListToolParams,
     SelectionRemoveToolParams, SourceListToolParams, SubfieldListToolParams, TopicListToolParams,
@@ -918,9 +920,9 @@ impl PapersMcp {
 
     /// Semantic search across indexed paper chunks. Scope with selection, paper, chapter, or section.
     /// Returns matched chunks with immediate neighbors (prev/next) for reading context.
-    /// Requires papers to be indexed first via `papers rag ingest`.
+    /// Requires papers to be indexed first via `papers rag work add`.
     #[tool]
-    pub async fn rag_search(&self, Parameters(p): Parameters<SearchToolParams>) -> Result<String, String> {
+    pub async fn rag_chunk_search(&self, Parameters(p): Parameters<RagChunkSearchParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured. Run: papers rag ingest <ITEM_KEY>".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
@@ -950,7 +952,7 @@ impl PapersMcp {
     /// Search for figures, tables, and diagrams by description.
     /// Use when the user asks about a specific visualization, comparison table, or diagram.
     #[tool]
-    pub async fn rag_search_figures(&self, Parameters(p): Parameters<SearchFiguresToolParams>) -> Result<String, String> {
+    pub async fn rag_figure_search(&self, Parameters(p): Parameters<RagFigureSearchParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured. Run: papers rag ingest <ITEM_KEY>".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
@@ -972,9 +974,9 @@ impl PapersMcp {
     }
 
     /// Retrieve a specific chunk by ID with its prev/next neighbors for sequential reading.
-    /// Use after rag_search to follow prev/next chunk references.
+    /// Use after rag_chunk_search to follow prev/next chunk references.
     #[tool]
-    pub async fn rag_get_chunk(&self, Parameters(p): Parameters<GetChunkToolParams>) -> Result<String, String> {
+    pub async fn rag_chunk_get(&self, Parameters(p): Parameters<RagChunkGetParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         json_result(papers_rag::query::get_chunk(rag, &p.chunk_id).await)
     }
@@ -982,7 +984,7 @@ impl PapersMcp {
     /// Fetch all chunks in a specific section in reading order.
     /// Use when you need complete section content after finding a relevant chunk.
     #[tool]
-    pub async fn rag_get_section(&self, Parameters(p): Parameters<GetSectionToolParams>) -> Result<String, String> {
+    pub async fn rag_section_get(&self, Parameters(p): Parameters<RagSectionGetParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
         json_result(papers_rag::query::get_section(rag, &paper_id, p.chapter_idx, p.section_idx).await)
@@ -991,7 +993,7 @@ impl PapersMcp {
     /// Fetch the full content of an entire chapter, grouped by section.
     /// Use when the user asks about a broad topic within a paper.
     #[tool]
-    pub async fn rag_get_chapter(&self, Parameters(p): Parameters<GetChapterToolParams>) -> Result<String, String> {
+    pub async fn rag_chapter_get(&self, Parameters(p): Parameters<RagChapterGetParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
         json_result(papers_rag::query::get_chapter(rag, &paper_id, p.chapter_idx).await)
@@ -1000,7 +1002,7 @@ impl PapersMcp {
     /// Retrieve full details for a figure by ID, including the image file path.
     /// Use when you need the image path to display it, or to see cross-references.
     #[tool]
-    pub async fn rag_get_figure(&self, Parameters(p): Parameters<GetFigureToolParams>) -> Result<String, String> {
+    pub async fn rag_figure_get(&self, Parameters(p): Parameters<RagFigureGetParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         json_result(papers_rag::query::get_figure(rag, &p.figure_id).await)
     }
@@ -1008,7 +1010,7 @@ impl PapersMcp {
     /// Get the table of contents for a paper (all chapters and sections with chunk counts).
     /// Use to understand paper structure before searching within it.
     #[tool]
-    pub async fn rag_get_paper_outline(&self, Parameters(p): Parameters<GetPaperOutlineToolParams>) -> Result<String, String> {
+    pub async fn rag_work_outline(&self, Parameters(p): Parameters<RagWorkOutlineParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
         json_result(papers_rag::query::get_paper_outline(rag, &paper_id).await)
@@ -1017,7 +1019,7 @@ impl PapersMcp {
     /// Browse indexed papers with optional metadata filters.
     /// Use when the user asks what papers are available, or to find a paper by metadata.
     #[tool]
-    pub async fn rag_list_papers(&self, Parameters(p): Parameters<ListPapersToolParams>) -> Result<String, String> {
+    pub async fn rag_work_list(&self, Parameters(p): Parameters<RagWorkListParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
@@ -1036,9 +1038,124 @@ impl PapersMcp {
         json_result(papers_rag::query::list_papers(rag, params).await)
     }
 
+    /// Get metadata for a single indexed work (title, authors, year, venue, tags, chunk/figure counts).
+    /// Use when you need to confirm a paper is indexed or check its metadata.
+    #[tool]
+    pub async fn rag_work_get(&self, Parameters(p): Parameters<RagWorkGetParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        json_result(papers_rag::query::get_work(rag, &paper_id).await)
+    }
+
+    /// Semantic search returning one result per matching work (paper).
+    /// Use to find which papers are most relevant to a topic before diving into sections or chunks.
+    #[tool]
+    pub async fn rag_work_search(&self, Parameters(p): Parameters<RagWorkSearchParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_ids = match p.selection.as_deref() {
+            Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
+            None => None,
+        };
+        let params = papers_rag::SearchWorksParams {
+            query: p.query,
+            paper_ids,
+            filter_year_min: p.filter_year_min,
+            filter_year_max: p.filter_year_max,
+            filter_venue: p.filter_venue,
+            filter_tags: p.filter_tags,
+            limit: p.limit.unwrap_or(5),
+        };
+        json_result(papers_rag::query::search_works(rag, params).await)
+    }
+
+    /// List chunks in a paper with optional chapter/section scope.
+    /// Use to browse the indexed content of a paper before reading individual chunks.
+    #[tool]
+    pub async fn rag_chunk_list(&self, Parameters(p): Parameters<RagChunkListParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        let params = papers_rag::ListChunksParams {
+            paper_id,
+            chapter_idx: p.chapter_idx,
+            section_idx: p.section_idx,
+            limit: p.limit.unwrap_or(50),
+        };
+        json_result(papers_rag::query::list_chunks(rag, params).await)
+    }
+
+    /// Semantic search returning one result per matching section.
+    /// Use to find which sections of which papers are most relevant before reading full section content.
+    #[tool]
+    pub async fn rag_section_search(&self, Parameters(p): Parameters<RagSectionSearchParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_ids = if let Some(sel) = p.selection.as_deref() {
+            Some(Self::resolve_selection_paper_ids(sel)?)
+        } else if let Some(pid) = p.paper_id {
+            let resolved = papers_rag::resolve_paper_id(rag, &pid).await.map_err(|e| e.to_string())?;
+            Some(vec![resolved])
+        } else {
+            None
+        };
+        let params = papers_rag::SearchSectionsParams {
+            query: p.query,
+            paper_ids,
+            chapter_idx: p.chapter_idx,
+            filter_year_min: p.filter_year_min,
+            filter_year_max: p.filter_year_max,
+            filter_venue: p.filter_venue,
+            filter_tags: p.filter_tags,
+            limit: p.limit.unwrap_or(5),
+        };
+        json_result(papers_rag::query::search_sections(rag, params).await)
+    }
+
+    /// List all sections in a paper as a flat table (chapter, section, chunk count).
+    /// Use to navigate paper structure before reading sections.
+    #[tool]
+    pub async fn rag_section_list(&self, Parameters(p): Parameters<RagSectionListParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        let params = papers_rag::ListSectionsParams { paper_id };
+        json_result(papers_rag::query::list_sections(rag, params).await)
+    }
+
+    /// Semantic search returning one result per matching chapter.
+    /// Use when you want a broad topic overview across papers at chapter granularity.
+    #[tool]
+    pub async fn rag_chapter_search(&self, Parameters(p): Parameters<RagChapterSearchParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_ids = if let Some(sel) = p.selection.as_deref() {
+            Some(Self::resolve_selection_paper_ids(sel)?)
+        } else if let Some(pid) = p.paper_id {
+            let resolved = papers_rag::resolve_paper_id(rag, &pid).await.map_err(|e| e.to_string())?;
+            Some(vec![resolved])
+        } else {
+            None
+        };
+        let params = papers_rag::SearchChaptersParams {
+            query: p.query,
+            paper_ids,
+            filter_year_min: p.filter_year_min,
+            filter_year_max: p.filter_year_max,
+            filter_venue: p.filter_venue,
+            filter_tags: p.filter_tags,
+            limit: p.limit.unwrap_or(5),
+        };
+        json_result(papers_rag::query::search_chapters(rag, params).await)
+    }
+
+    /// List all chapters in a paper (chapter index, title, section count, chunk count).
+    /// Use to navigate paper structure at chapter granularity.
+    #[tool]
+    pub async fn rag_chapter_list(&self, Parameters(p): Parameters<RagChapterListParams>) -> Result<String, String> {
+        let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
+        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        let params = papers_rag::ListChaptersParams { paper_id };
+        json_result(papers_rag::query::list_chapters(rag, params).await)
+    }
     /// List all tags and per-tag paper counts. Use to discover available filter categories.
     #[tool]
-    pub async fn rag_list_tags(&self, Parameters(p): Parameters<ListTagsToolParams>) -> Result<String, String> {
+    pub async fn rag_tag_list(&self, Parameters(p): Parameters<RagTagListParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
@@ -1306,16 +1423,16 @@ impl ServerHandler for PapersMcp {
                  which can download papers from Zotero, open-access repositories, \
                  or the OpenAlex content API.\n\n\
                  ## RAG workflow (indexed papers)\n\
-                 Papers ingested via `papers rag ingest` are searchable locally:\n\
-                 1. `rag_list_papers` — see what's indexed\n\
-                 2. `rag_get_paper_outline` — get structure (chapters/sections) before diving in\n\
-                 3. `rag_search` — semantic search across chunks; scope by paper, chapter, or section\n\
-                 4. `rag_search_figures` — find figures, tables, and diagrams by description. \
-                    Always use alongside `rag_search` when exploring a topic, \
+                 Papers ingested via `papers rag work add` are searchable locally:\n\
+                 1. `rag_work_list` — see what's indexed\n\
+                 2. `rag_work_outline` — get structure (chapters/sections) before diving in\n\
+                 3. `rag_chunk_search` — semantic search across chunks; scope by paper, chapter, or section\n\
+                 4. `rag_figure_search` — find figures, tables, and diagrams by description. \
+                    Always use alongside `rag_chunk_search` when exploring a topic, \
                     as text search won't surface visual content.\n\
-                 5. `rag_get_section` / `rag_get_chapter` — read full content after finding relevant chunks\n\
-                 6. `rag_get_figure` — get full details and local image path for a specific figure\n\
-                 7. `rag_get_chunk` — follow prev/next references for sequential reading"
+                 5. `rag_section_get` / `rag_chapter_get` — read full content after finding relevant chunks\n\
+                 6. `rag_figure_get` — get full details and local image path for a specific figure\n\
+                 7. `rag_chunk_get` — follow prev/next references for sequential reading"
                     .into(),
             ),
         }

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use crate::error::RagError;
@@ -37,7 +39,13 @@ impl Embedder {
     /// Blocking constructor — call from spawn_blocking.
     /// Downloads model weights on first run from the HF Hub cache.
     pub fn new() -> Result<Self, RagError> {
-        let mut opts = InitOptions::new(EmbeddingModel::EmbeddingGemma300M);
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("papers")
+            .join("fastembed");
+
+        let mut opts = InitOptions::new(EmbeddingModel::EmbeddingGemma300M)
+            .with_cache_dir(cache_dir);
 
         #[cfg(target_os = "windows")]
         {

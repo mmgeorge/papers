@@ -115,6 +115,45 @@ pub enum McpCommand {
 
 #[derive(Subcommand)]
 pub enum RagCommand {
+    /// Text chunks: search and retrieve indexed content
+    Chunk {
+        #[command(subcommand)]
+        cmd: RagChunkCommand,
+    },
+    /// Figures, tables, and diagrams
+    Figure {
+        #[command(subcommand)]
+        cmd: RagFigureCommand,
+    },
+    /// Indexed papers: list, add, search, and inspect
+    Work {
+        #[command(subcommand)]
+        cmd: RagWorkCommand,
+    },
+    /// Sections: read full section content in order
+    Section {
+        #[command(subcommand)]
+        cmd: RagSectionCommand,
+    },
+    /// Chapters: read full chapter content in order
+    Chapter {
+        #[command(subcommand)]
+        cmd: RagChapterCommand,
+    },
+    /// Tags across indexed papers
+    Tag {
+        #[command(subcommand)]
+        cmd: RagTagCommand,
+    },
+    /// Manage the on-disk embedding cache
+    Embed {
+        #[command(subcommand)]
+        cmd: RagEmbedCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RagChunkCommand {
     /// Semantic search over indexed paper chunks
     Search {
         /// Natural language search query
@@ -153,8 +192,37 @@ pub enum RagCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Retrieve a specific chunk by ID with neighboring context
+    Get {
+        /// Chunk ID (e.g. YFACFA8C/ch1/s2/p3)
+        chunk_id: String,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all chunks in a paper in reading order
+    List {
+        /// Paper: DOI, item key, or title search
+        paper_id: String,
+        /// Scope to a chapter (1-based)
+        #[arg(long)]
+        chapter_idx: Option<u16>,
+        /// Scope to a section (1-based within chapter; requires --chapter-idx)
+        #[arg(long)]
+        section_idx: Option<u16>,
+        /// Maximum number of results
+        #[arg(long, short = 'n', default_value = "50")]
+        limit: u16,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RagFigureCommand {
     /// Search for figures, tables, and diagrams
-    SearchFigures {
+    Search {
         /// Natural language description of the figure to find
         query: String,
         /// Scope to papers in a named selection
@@ -173,57 +241,20 @@ pub enum RagCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Retrieve a specific chunk by ID with neighboring context
-    GetChunk {
-        /// Chunk ID (e.g. YFACFA8C/ch1/s2/p3)
-        chunk_id: String,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Fetch all chunks in a section in reading order
-    GetSection {
-        /// Paper: DOI, item key, or title search
-        paper_id: String,
-        /// Chapter index (1-based)
-        #[arg(long)]
-        chapter_idx: u16,
-        /// Section index (1-based within chapter)
-        #[arg(long)]
-        section_idx: u16,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Fetch all chunks in a chapter in reading order
-    GetChapter {
-        /// Paper: DOI, item key, or title search
-        paper_id: String,
-        /// Chapter index (1-based)
-        #[arg(long)]
-        chapter_idx: u16,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// Get figure or table details by ID
-    GetFigure {
+    Get {
         /// Figure ID (e.g. YFACFA8C/fig3)
         figure_id: String,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// Show the table of contents for an indexed paper
-    Outline {
-        /// Paper: DOI, item key, or title search
-        paper_id: String,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
+}
+
+#[derive(Subcommand)]
+pub enum RagWorkCommand {
     /// List indexed papers with optional filters
-    ListPapers {
+    List {
         /// Scope to papers in a named selection
         #[arg(long)]
         selection: Option<String>,
@@ -252,19 +283,47 @@ pub enum RagCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List all tags across indexed papers with counts
-    ListTags {
-        /// Scope to papers in a named selection
-        #[arg(long)]
-        selection: Option<String>,
+    /// Get metadata for a single indexed paper (title, authors, year, chunk/figure counts)
+    Get {
+        /// Paper: DOI, item key, or title search
+        paper_id: String,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// Index a paper from local DataLab cache into the RAG database
-    Ingest {
-        /// Zotero item key (directory name under the DataLab cache)
-        item_key: String,
+    /// Semantic search returning one result per matching paper
+    Search {
+        /// Natural language search query
+        query: String,
+        /// Scope to papers in a named selection
+        #[arg(long)]
+        selection: Option<String>,
+        /// Minimum publication year
+        #[arg(long)]
+        year_min: Option<u16>,
+        /// Maximum publication year
+        #[arg(long)]
+        year_max: Option<u16>,
+        /// Filter by venue name
+        #[arg(long)]
+        venue: Option<String>,
+        /// Filter by tag (repeatable)
+        #[arg(long)]
+        tag: Option<Vec<String>>,
+        /// Maximum number of results
+        #[arg(long, short = 'n', default_value = "5")]
+        limit: u16,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Index a paper (or all papers) from local DataLab cache into the RAG database
+    Add {
+        /// Zotero item key (directory name under the DataLab cache); omit with --all
+        item_key: Option<String>,
+        /// Index all papers in the DataLab cache
+        #[arg(long)]
+        all: bool,
         /// Override paper_id (default: DOI from meta.json, else item_key)
         #[arg(long)]
         paper_id: Option<String>,
@@ -278,19 +337,149 @@ pub enum RagCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Index all papers in the DataLab cache
-    IngestAll {
-        /// Force re-index all papers
-        #[arg(long)]
-        force: bool,
+    /// Remove a paper from the RAG index (deletes all chunks and figures)
+    Remove {
+        /// Paper: DOI, item key, or title search
+        paper_id: String,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// Manage the on-disk embedding cache
-    Embed {
+    /// Show the table of contents for an indexed paper
+    Outline {
+        /// Paper: DOI, item key, or title search
+        paper_id: String,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// DataLab PDF extractions (cached markdown/JSON)
+    Extract {
         #[command(subcommand)]
-        cmd: RagEmbedCommand,
+        cmd: ZoteroExtractCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RagSectionCommand {
+    /// Semantic search returning one result per matching section
+    Search {
+        /// Natural language search query
+        query: String,
+        /// Scope to papers in a named selection
+        #[arg(long)]
+        selection: Option<String>,
+        /// Scope to a specific paper (DOI, item key, or title search)
+        #[arg(long)]
+        paper_id: Option<String>,
+        /// Scope to a chapter (1-based; requires --paper-id)
+        #[arg(long)]
+        chapter_idx: Option<u16>,
+        /// Minimum publication year
+        #[arg(long)]
+        year_min: Option<u16>,
+        /// Maximum publication year
+        #[arg(long)]
+        year_max: Option<u16>,
+        /// Filter by venue name
+        #[arg(long)]
+        venue: Option<String>,
+        /// Filter by tag (repeatable)
+        #[arg(long)]
+        tag: Option<Vec<String>>,
+        /// Maximum number of results
+        #[arg(long, short = 'n', default_value = "5")]
+        limit: u16,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all sections in a paper as a flat outline
+    List {
+        /// Paper: DOI, item key, or title search
+        paper_id: String,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch all chunks in a section in reading order
+    Get {
+        /// Paper: DOI, item key, or title search
+        paper_id: String,
+        /// Chapter index (1-based)
+        #[arg(long)]
+        chapter_idx: u16,
+        /// Section index (1-based within chapter)
+        #[arg(long)]
+        section_idx: u16,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RagChapterCommand {
+    /// Semantic search returning one result per matching chapter
+    Search {
+        /// Natural language search query
+        query: String,
+        /// Scope to papers in a named selection
+        #[arg(long)]
+        selection: Option<String>,
+        /// Scope to a specific paper (DOI, item key, or title search)
+        #[arg(long)]
+        paper_id: Option<String>,
+        /// Minimum publication year
+        #[arg(long)]
+        year_min: Option<u16>,
+        /// Maximum publication year
+        #[arg(long)]
+        year_max: Option<u16>,
+        /// Filter by venue name
+        #[arg(long)]
+        venue: Option<String>,
+        /// Filter by tag (repeatable)
+        #[arg(long)]
+        tag: Option<Vec<String>>,
+        /// Maximum number of results
+        #[arg(long, short = 'n', default_value = "5")]
+        limit: u16,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List all chapters in a paper as a flat outline
+    List {
+        /// Paper: DOI, item key, or title search
+        paper_id: String,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fetch all chunks in a chapter in reading order
+    Get {
+        /// Paper: DOI, item key, or title search
+        paper_id: String,
+        /// Chapter index (1-based)
+        #[arg(long)]
+        chapter_idx: u16,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RagTagCommand {
+    /// List all tags across indexed papers with counts
+    List {
+        /// Scope to papers in a named selection
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -957,11 +1146,6 @@ pub enum ZoteroCommand {
     Work {
         #[command(subcommand)]
         cmd: ZoteroWorkCommand,
-    },
-    /// DataLab PDF extractions (cached markdown/JSON)
-    Extract {
-        #[command(subcommand)]
-        cmd: ZoteroExtractCommand,
     },
     /// File attachments (PDFs, snapshots, links)
     Attachment {
@@ -1701,6 +1885,78 @@ mod tests {
                         cmd: RagEmbedCommand::Delete { model, .. },
                     },
             } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_chunk_search() {
+        let cli = parse(&["papers", "rag", "chunk", "search", "neural rendering"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Chunk { cmd: RagChunkCommand::Search { query, .. } },
+            } => assert_eq!(query, "neural rendering"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_chunk_get() {
+        let cli = parse(&["papers", "rag", "chunk", "get", "YFACFA8C/ch1/s2/p3"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Chunk { cmd: RagChunkCommand::Get { chunk_id, .. } },
+            } => assert_eq!(chunk_id, "YFACFA8C/ch1/s2/p3"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_work_list() {
+        let cli = parse(&["papers", "rag", "work", "list"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Work { cmd: RagWorkCommand::List { .. } },
+            } => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_work_add_single() {
+        let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { item_key, all, .. } },
+            } => {
+                assert_eq!(item_key.as_deref(), Some("YFACFA8C"));
+                assert!(!all);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_work_add_all() {
+        let cli = parse(&["papers", "rag", "work", "add", "--all"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { item_key, all, .. } },
+            } => {
+                assert!(item_key.is_none());
+                assert!(all);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_tag_list() {
+        let cli = parse(&["papers", "rag", "tag", "list"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Tag { cmd: RagTagCommand::List { .. } },
+            } => {}
             _ => panic!("wrong variant"),
         }
     }

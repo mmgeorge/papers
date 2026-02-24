@@ -152,17 +152,17 @@ Local semantic search over your papers using [LanceDB](https://github.com/lanced
 PDFs are sent to [Datalab Marker](https://www.datalab.to/) for vision-model OCR, which returns a structured JSON block tree alongside markdown. Each block (paragraph, equation, list, table, figure) becomes one chunk — no fixed-size splitting or overlap. Chunks and figure captions are embedded into 768-d vectors and stored in LanceDB. At query time, the query is embedded with the same model and matched via approximate nearest neighbor (ANN) search. Each result includes truncated previews of its neighboring chunks for surrounding context.
 
 ```sh
-papers rag ingest <work>                                 # Index a single paper
-papers rag ingest-all                                    # Index all cached extractions
-papers rag search "differentiable rendering" -n 5
-papers rag search-figures "neural radiance field architecture"
-papers rag get-chunk <chunk_id>
-papers rag get-section <paper_id> --chapter-idx 1 --section-idx 2
-papers rag get-chapter <paper_id> --chapter-idx 1
-papers rag get-figure <figure_id>
-papers rag outline <paper_id>
-papers rag list-papers [--selection <name>]
-papers rag list-tags
+papers rag paper ingest <work>                           # Index a single paper
+papers rag paper ingest --all                            # Index all cached extractions
+papers rag chunk search "differentiable rendering" -n 5
+papers rag figure search "neural radiance field architecture"
+papers rag chunk get <chunk_id>
+papers rag section get <paper_id> --chapter-idx 1 --section-idx 2
+papers rag chapter get <paper_id> --chapter-idx 1
+papers rag figure get <figure_id>
+papers rag paper outline <paper_id>
+papers rag paper list [--selection <name>]
+papers rag tag list
 ```
 
 ## Filter aliases

@@ -213,3 +213,141 @@ pub struct IngestStats {
     pub chunks_added: usize,
     pub figures_added: usize,
 }
+
+/// Input parameters for work-level semantic search.
+pub struct SearchWorksParams {
+    pub query: String,
+    pub paper_ids: Option<Vec<String>>,
+    pub filter_year_min: Option<u16>,
+    pub filter_year_max: Option<u16>,
+    pub filter_venue: Option<String>,
+    pub filter_tags: Option<Vec<String>>,
+    pub limit: u16,
+}
+
+/// Input parameters for listing chunks in a paper.
+pub struct ListChunksParams {
+    pub paper_id: String,
+    pub chapter_idx: Option<u16>,
+    pub section_idx: Option<u16>,
+    pub limit: u16,
+}
+
+/// Input parameters for section-level semantic search.
+pub struct SearchSectionsParams {
+    pub query: String,
+    pub paper_ids: Option<Vec<String>>,
+    pub chapter_idx: Option<u16>,
+    pub filter_year_min: Option<u16>,
+    pub filter_year_max: Option<u16>,
+    pub filter_venue: Option<String>,
+    pub filter_tags: Option<Vec<String>>,
+    pub limit: u16,
+}
+
+/// Input parameters for listing sections in a paper.
+pub struct ListSectionsParams {
+    pub paper_id: String,
+}
+
+/// Input parameters for chapter-level semantic search.
+pub struct SearchChaptersParams {
+    pub query: String,
+    pub paper_ids: Option<Vec<String>>,
+    pub filter_year_min: Option<u16>,
+    pub filter_year_max: Option<u16>,
+    pub filter_venue: Option<String>,
+    pub filter_tags: Option<Vec<String>>,
+    pub limit: u16,
+}
+
+/// Input parameters for listing chapters in a paper.
+pub struct ListChaptersParams {
+    pub paper_id: String,
+}
+
+/// Metadata for a single indexed work (paper).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkMetadata {
+    pub paper_id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub year: Option<u16>,
+    pub venue: Option<String>,
+    pub tags: Vec<String>,
+    pub chunk_count: usize,
+    pub figure_count: usize,
+}
+
+/// One entry in a work-level search result list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkSearchResult {
+    pub paper_id: String,
+    pub title: String,
+    pub authors: Vec<String>,
+    pub year: Option<u16>,
+    pub venue: Option<String>,
+    pub score: f32,
+    pub chunk_count: usize,
+    pub top_chunk: String,
+}
+
+/// One row in a chunk list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkListItem {
+    pub chunk_id: String,
+    pub chapter_idx: u16,
+    pub chapter_title: String,
+    pub section_idx: u16,
+    pub section_title: String,
+    pub chunk_idx: u16,
+    pub depth: String,
+    pub block_type: String,
+    pub text_preview: String,
+}
+
+/// One entry in a section-level search result list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionSearchResult {
+    pub paper_id: String,
+    pub paper_title: String,
+    pub chapter_idx: u16,
+    pub chapter_title: String,
+    pub section_idx: u16,
+    pub section_title: String,
+    pub score: f32,
+    pub chunk_count: usize,
+    pub top_chunk: String,
+}
+
+/// One row in a section list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionListItem {
+    pub chapter_idx: u16,
+    pub chapter_title: String,
+    pub section_idx: u16,
+    pub section_title: String,
+    pub chunk_count: usize,
+}
+
+/// One entry in a chapter-level search result list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChapterSearchResult {
+    pub paper_id: String,
+    pub paper_title: String,
+    pub chapter_idx: u16,
+    pub chapter_title: String,
+    pub score: f32,
+    pub section_count: usize,
+    pub chunk_count: usize,
+    pub top_chunk: String,
+}
+
+/// One row in a chapter list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChapterListItem {
+    pub chapter_idx: u16,
+    pub chapter_title: String,
+    pub section_count: usize,
+    pub chunk_count: usize,
+}

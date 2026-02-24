@@ -10,7 +10,7 @@ src/
   lib.rs       — module declarations
   main.rs      — entry point: create PapersMcp, serve on stdio
   server.rs    — PapersMcp struct + 54 tool methods + ServerHandler impl
-  params.rs    — 19 tool parameter structs (schemars + serde)
+  params.rs    — tool parameter structs (schemars + serde)
 tests/
   tools.rs     — wiremock integration tests for tool invocation
 ```
@@ -88,7 +88,7 @@ let params = ItemListParams { item_type: Some("note".into()), limit: p.limit, ..
 
 ### params.rs
 
-19 structs with `Deserialize` + `JsonSchema`:
+Structs with `Deserialize` + `JsonSchema`:
 - `WorkListToolParams`, `AuthorListToolParams`, etc. — entity list params with conversion methods
 - `GetToolParams` — required `id` + optional `select`
 - `AutocompleteToolParams` — required `q`
@@ -99,6 +99,8 @@ let params = ItemListParams { item_type: Some("note".into()), limit: p.limit, ..
 - `ZoteroCollectionListToolParams`, `ZoteroCollectionWorksToolParams`, `ZoteroCollectionNotesToolParams`
 - `ZoteroCollectionSubcollectionsToolParams`, `ZoteroCollectionTagsToolParams`
 - `ZoteroTagListToolParams`, `ZoteroKeyToolParams`, `ZoteroTagGetToolParams`, `ZoteroNoParamsToolParams`
+- RAG params: `RagChunkSearchParams`, `RagChunkGetParams`, `RagFigureSearchParams`, `RagFigureGetParams`,
+  `RagPaperListParams`, `RagPaperOutlineParams`, `RagSectionGetParams`, `RagChapterGetParams`, `RagTagListParams`
 
 ## How to update
 
