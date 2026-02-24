@@ -93,44 +93,6 @@ papers zotero collection list --top
 
 Entities: `work`, `extract`, `attachment`, `annotation`, `note`, `collection`, `tag`, `search`, `group`, `setting`, `deleted`, `permission`.
 
-## Extraction
-
-PDF extraction uses vision-model-based OCR via marker to produce clean markdown with LaTeX math and tables preserved. Extracted results (markdown, JSON, images) are cached locally and synced back to your Zotero library as attachments.
-
-Requires `DATALAB_API_KEY` ([datalab.to](https://www.datalab.to/)).
-
-```sh
-papers zotero work extract <work>                    # Extract a Zotero item (default: balanced)
-```
-
-Processing modes: `fast`, `balanced` (default), `accurate`.
-
-### Managing cached extractions
-
-```sh
-papers zotero extract list                               # List items with cached extractions
-papers zotero extract text <work>                        # Get markdown
-papers zotero extract json <work>                        # Get structured JSON
-papers zotero extract get <work>                         # Get extraction metadata
-papers zotero extract upload [--dry-run]                 # Upload local cache to Zotero
-papers zotero extract download [--dry-run]               # Download Zotero cache to local
-```
-
-Cache location: `~/.cache/papers/datalab/` (Linux/macOS) or `%APPDATA%\papers\datalab\` (Windows). Override with `PAPERS_DATALAB_CACHE_DIR`.
-
-### Using marker locally
-
-You can run [marker](https://github.com/datalab-to/marker) locally instead of using the Datalab API if you meet its [license requirements](https://github.com/datalab-to/marker?tab=readme-ov-file#commercial-usage). Place the output files in the cache directory:
-
-```
-~/.cache/papers/datalab/<item_key>/
-├── <item_key>.md
-├── <item_key>.json     # optional
-└── images/             # optional
-```
-
-The extraction will be picked up automatically from the local cache.
-
 ## DB
 
 Local semantic search over your papers using [LanceDB](https://github.com/lancedb/lancedb) and [Embedding Gemma 300M](https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX) (via [FastEmbed](https://github.com/Anush008/fastembed-rs) + [ONNX Runtime](https://onnxruntime.ai)). Hardware-accelerated with DirectML (Windows) and CoreML (macOS).
@@ -149,7 +111,7 @@ Local semantic search over your papers using [LanceDB](https://github.com/lanced
                                           └─────────────┘
 ```
 
-PDFs are sent to [Datalab Marker](https://www.datalab.to/) for vision-model OCR, which returns a structured JSON block tree alongside markdown. Each block (paragraph, equation, list, table, figure) becomes one chunk — no fixed-size splitting or overlap. Chunks and figure captions are embedded into 768-d vectors and stored in LanceDB. At query time, the query is embedded with the same model and matched via approximate nearest neighbor (ANN) search. Each result includes truncated previews of its neighboring chunks for surrounding context.
+PDF extraction uses [Datalab Marker](https://www.datalab.to/) for vision-model OCR, which returns a structured JSON block tree alongside markdown. Each block (paragraph, equation, list, table, figure) becomes one chunk — no fixed-size splitting or overlap. Chunks and figure captions are embedded into 768-d vectors and stored in LanceDB. At query time, the query is embedded with the same model and matched via approximate nearest neighbor (ANN) search. Each result includes truncated previews of its neighboring chunks for surrounding context.
 
 ```sh
 papers db work add <work>                                # Index a single paper
@@ -163,7 +125,21 @@ papers db figure get <figure_id>
 papers db work outline <paper_id>
 papers db work list [--selection <name>]
 papers db tag list
+
 ```
+
+### Using marker locally
+
+For extraction, you can run [marker](https://github.com/datalab-to/marker) locally instead of using the Datalab API if you meet its [license requirements](https://github.com/datalab-to/marker?tab=readme-ov-file#commercial-usage). Place the output files in the cache directory:
+
+```
+~/.cache/papers/datalab/<item_key>/
+├── <item_key>.md
+├── <item_key>.json     # optional
+└── images/             # optional
+```
+
+The extraction will be picked up automatically from the local cache.
 
 ## Filter aliases
 
