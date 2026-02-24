@@ -736,7 +736,7 @@ async fn upload_papers_zip(
 ///
 /// `zotero_id` is the Zotero parent item key (or OpenAlex short ID for non-Zotero sources)
 /// used as the on-disk cache ID. When `zotero` is `Some`, the DataLab result is also
-/// backed up to/restored from a `Papers.zip` attachment on the parent Zotero item.
+/// backed up to/restored from a `papers_extract_{key}.zip` attachment on the parent Zotero item.
 pub async fn do_extract(
     pdf_bytes: Vec<u8>,
     zotero_id: &str,
@@ -760,7 +760,7 @@ pub async fn do_extract(
             let md_path = dir.join(format!("{zotero_id}.md"));
             if let Ok(text) = std::fs::read_to_string(&md_path) {
                 *source = PdfSource::DataLab;
-                // Best-effort: upload to Zotero if no Papers.zip exists yet
+                // Best-effort: upload to Zotero if no papers_extract_*.zip exists yet
                 if let Some(zc) = zotero {
                     let zc = zc.clone();
                     let dir = dir.clone();
@@ -787,7 +787,7 @@ pub async fn do_extract(
             }
         }
 
-        // --- Zotero cache check (Papers.zip) ---
+        // --- Zotero cache check (papers_extract_*.zip) ---
         if let Some(zc) = zotero {
             if let Ok(Some(att_key)) = find_papers_zip_key(zc, zotero_id).await {
                 match zc.download_item_file(&att_key).await {
@@ -869,7 +869,7 @@ pub async fn do_extract(
             )
             .await;
 
-            // Best-effort: upload Papers.zip to Zotero (silently skip on 403)
+            // Best-effort: upload papers_extract_*.zip to Zotero (silently skip on 403)
             if let Some(zc) = zotero {
                 if let Err(e) = upload_papers_zip(zc, zotero_id, dir, zotero_id).await {
                     if !is_zotero_write_denied(&e) {

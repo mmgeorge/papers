@@ -147,10 +147,10 @@ Mock::given(method("GET")).and(path_regex(r"^/api/v1/marker/test-req-1$"))
 
 See `tests/text_cache.rs` → `setup_datalab_mock()` for the canonical helper.
 
-## Zotero sync (Papers.zip)
+## Zotero sync (papers_extract_{key}.zip)
 
 `do_extract` in `text.rs` backs up DataLab extraction results to Zotero as a
-`Papers.zip` attachment on the parent item. Key properties:
+`papers_extract_{key}.zip` attachment on the parent item. Key properties:
 - Upload failures are **best-effort**: errors are logged and swallowed, the
   extracted text is always returned.
 - 403 write-denied errors are silently ignored (read-only API key is fine).

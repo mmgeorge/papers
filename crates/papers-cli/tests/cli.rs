@@ -3148,3 +3148,565 @@ async fn test_rag_work_extract_resolves_title_then_reads_json() {
     let result = papers_core::text::datalab_cached_json(&resolved_key);
     assert_eq!(result.as_deref(), Some(expected_json));
 }
+
+// ── `rag work add` auto-extraction and two-way sync tests ─────────────────
+//
+// These tests exercise the new `rag work add` behavior introduced when
+// `zotero work extract` was merged in:
+//
+//   - Cache hit fast path: cached `.md` → ingest immediately, skip Zotero
+//   - Cache miss detection: `datalab_cached_markdown` returns None → extraction needed
+//   - Two-way sync A (local → Zotero): local `.md` cached, no papers_extract_*.zip in Zotero
+//       → `do_extract` spawns background upload to Zotero
+//   - Two-way sync B (local → Zotero skipped): local `.md` cached, papers_extract_*.zip exists
+//       → no upload triggered
+//   - Two-way sync C (Zotero → local): no local `.md`, Zotero has papers_extract_*.zip
+//       → `do_extract` downloads zip, restores local cache
+//   - Two-way sync D (fresh extraction → Zotero): full DataLab round-trip writes
+//       local cache and synchronously uploads papers_extract_*.zip to Zotero
+//   - DOI resolution: `smart_resolve_item_key` routes DOI queries correctly
+//   - `find_papers_zip_key` returns None / Some based on children response
+//   - `ingest_params_from_cache` falls back gracefully when meta.json is absent
+//
+// All tests reuse `extract_test_cache_base()` / `write_md_cache()` / `write_json_cache()`
+// so that `PAPERS_DATALAB_CACHE_DIR` is set consistently for the whole process.
+// Keys are exactly 8 uppercase-alphanumeric characters (Zotero key format).
+
+/// Build a minimal in-memory ZIP containing `{key}.md` with `md_content`.
+fn make_papers_zip(key: &str, md_content: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    use zip::write::SimpleFileOptions;
+
+    let buf = Vec::new();
+    let cursor = std::io::Cursor::new(buf);
+    let mut zw = zip::ZipWriter::new(cursor);
+    let opts = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    zw.start_file(format!("{key}.md"), opts).unwrap();
+    zw.write_all(md_content.as_bytes()).unwrap();
+    zw.finish().unwrap().into_inner()
+}
+
+// Per-test unique 8-char keys (uppercase alphanumeric = valid Zotero keys).
+const KEY_ADD_FAST:     &str = "ADDFAST1"; // cache hit → fast path
+const KEY_ADD_MISS:     &str = "ADDMISS1"; // cache miss → None
+const KEY_ADD_SYNC_A:   &str = "SYNCAL01"; // local→Zotero upload triggered
+const KEY_ADD_SYNC_B:   &str = "SYNCBL01"; // local→Zotero upload skipped
+const KEY_ADD_SYNC_C:   &str = "SYNCCL01"; // Zotero→local restore
+const KEY_ADD_SYNC_D:   &str = "SYNCDL01"; // DataLab→local→Zotero (sync upload)
+const KEY_ADD_DOI:      &str = "ADDDOI01"; // DOI resolution
+const KEY_FZIP_NONE:    &str = "FZIPNO01"; // find_papers_zip_key → None
+const KEY_FZIP_SOME:    &str = "FZIPSO01"; // find_papers_zip_key → Some
+const KEY_NO_META:      &str = "NOMETAXX"; // no meta.json fallback
+const KEY_MD_ONLY:      &str = "MDONLY01"; // md without json (omitted from --all)
+const KEY_WITH_JSON:    &str = "WITHJSN1"; // md + json (included in --all)
+
+/// Fast path: when the key is a valid Zotero key AND the local cache exists,
+/// `datalab_cached_markdown` returns the cached content immediately —
+/// no Zotero resolution required.
+#[test]
+fn test_rag_add_fast_path_cache_hit() {
+    let content = "# Fast Paper\n\nNo Zotero call needed.\n";
+    write_md_cache(KEY_ADD_FAST, content);
+
+    assert!(papers_core::zotero::looks_like_zotero_key(KEY_ADD_FAST),
+        "{KEY_ADD_FAST} must be a valid Zotero key for the fast path to trigger");
+    let result = papers_core::text::datalab_cached_markdown(KEY_ADD_FAST);
+    assert_eq!(result.as_deref(), Some(content),
+        "cache hit should return the pre-seeded markdown");
+}
+
+/// Cache miss: `datalab_cached_markdown` returns `None` for a key that has
+/// never been extracted — this is the signal that triggers auto-extraction in
+/// `rag work add`.
+#[test]
+fn test_rag_add_cache_miss_returns_none() {
+    extract_test_cache_base(); // ensure env var is set
+    // KEY_ADD_MISS has never been written to the test cache
+    let result = papers_core::text::datalab_cached_markdown(KEY_ADD_MISS);
+    assert!(result.is_none(), "uncached key must return None to signal extraction needed");
+}
+
+/// Two-way sync A — local → Zotero upload:
+///
+/// When `do_extract` finds a local `.md` cache hit but no `papers_extract_*.zip`
+/// child on the Zotero item, it spawns a background task that:
+///   1. Queries the item's children (to confirm no zip exists)
+///   2. Creates an `imported_file` attachment (`POST /users/test/items`)
+///   3. Registers + uploads the zip file (`POST /users/test/items/<att>/file`)
+///
+/// This test verifies that all three Zotero endpoints are reached after a
+/// short yield that lets the spawned task run to completion.
+#[tokio::test]
+async fn test_rag_add_sync_local_to_zotero_upload_triggered() {
+    write_md_cache(KEY_ADD_SYNC_A, "# Sync A Paper\n");
+
+    let mock = MockServer::start().await;
+
+    // Children: only a PDF attachment, no papers_extract_*.zip
+    let children_body =
+        r#"[{"key":"PDFATT01","version":1,"library":{"type":"user","id":1,"name":"test","links":{}},"links":{},"meta":{},"data":{"key":"PDFATT01","version":1,"itemType":"attachment","linkMode":"imported_file","filename":"paper.pdf","contentType":"application/pdf"}}]"#;
+    Mock::given(method("GET"))
+        .and(path(format!("/users/test/items/{KEY_ADD_SYNC_A}/children")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Total-Results", "1")
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(children_body),
+        )
+        .mount(&mock)
+        .await;
+
+    // Attachment create → returns new attachment key ZSYNCA01
+    let create_resp = r#"{"success":{"0":"ZSYNCA01"},"unchanged":{},"failed":{},"successful":{"0":{"key":"ZSYNCA01"}}}"#;
+    Mock::given(method("POST"))
+        .and(path("/users/test/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(create_resp))
+        .mount(&mock)
+        .await;
+
+    // File upload: register step — `exists: 1` short-circuits the S3 PUT
+    Mock::given(method("POST"))
+        .and(path("/users/test/items/ZSYNCA01/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"exists":1}"#))
+        .mount(&mock)
+        .await;
+
+    let zc = make_zotero_client(&mock);
+    // DataLab won't be called (local cache hit), but we point it at the mock
+    // server so any accidental call produces a clear 404 rather than a network error.
+    let dl = papers_datalab::DatalabClient::new("dummy-key").with_base_url(mock.uri());
+    let mut source = papers_core::text::PdfSource::ZoteroLocal {
+        path: "/tmp/dummy.pdf".into(),
+    };
+
+    let result = papers_core::text::do_extract(
+        vec![0u8; 4], // dummy bytes — cache hit path won't read them
+        KEY_ADD_SYNC_A,
+        Some(&zc),
+        Some((&dl, papers_core::text::ProcessingMode::Balanced)),
+        &mut source,
+    )
+    .await;
+
+    assert!(result.is_ok(), "do_extract should succeed on cache hit: {:?}", result);
+    assert_eq!(result.unwrap().trim(), "# Sync A Paper");
+
+    // Give the spawned background task time to complete.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let reqs = mock.received_requests().await.unwrap_or_default();
+    let children_hit = reqs.iter().any(|r| r.url.path().ends_with("/children"));
+    let create_hit   = reqs.iter().any(|r| {
+        r.method == wiremock::http::Method::POST && r.url.path() == "/users/test/items"
+    });
+    let file_hit     = reqs.iter().any(|r| r.url.path().ends_with("/ZSYNCA01/file"));
+
+    assert!(children_hit, "should query item children to detect existing papers_extract_*.zip");
+    assert!(create_hit,   "should POST to create a new attachment item");
+    assert!(file_hit,     "should POST to register/upload the zip file");
+}
+
+/// Two-way sync B — local → Zotero upload skipped:
+///
+/// When the local `.md` is cached and `papers_extract_*.zip` already exists as
+/// a child of the Zotero item, the background task must detect this and skip
+/// the upload entirely (no `POST /users/test/items` call).
+#[tokio::test]
+async fn test_rag_add_sync_local_to_zotero_upload_skipped_when_zip_exists() {
+    write_md_cache(KEY_ADD_SYNC_B, "# Sync B Paper\n");
+
+    let mock = MockServer::start().await;
+
+    // Children: papers_extract_*.zip IS present
+    let zip_filename = format!("papers_extract_{KEY_ADD_SYNC_B}.zip");
+    let children_body = format!(
+        r#"[{{"key":"ZIPATT02","version":1,"library":{{"type":"user","id":1,"name":"test","links":{{}}}},"links":{{}},"meta":{{}},"data":{{"key":"ZIPATT02","version":1,"itemType":"attachment","linkMode":"imported_file","filename":"{zip_filename}","contentType":"application/zip"}}}}]"#
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/users/test/items/{KEY_ADD_SYNC_B}/children")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Total-Results", "1")
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(&children_body),
+        )
+        .mount(&mock)
+        .await;
+
+    let zc = make_zotero_client(&mock);
+    let dl = papers_datalab::DatalabClient::new("dummy-key").with_base_url(mock.uri());
+    let mut source = papers_core::text::PdfSource::ZoteroLocal {
+        path: "/tmp/dummy.pdf".into(),
+    };
+
+    let result = papers_core::text::do_extract(
+        vec![0u8; 4],
+        KEY_ADD_SYNC_B,
+        Some(&zc),
+        Some((&dl, papers_core::text::ProcessingMode::Balanced)),
+        &mut source,
+    )
+    .await;
+
+    assert!(result.is_ok(), "cache hit should succeed: {:?}", result);
+
+    // Give the background task time to run (if it wrongly fires).
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let reqs = mock.received_requests().await.unwrap_or_default();
+    let post_create = reqs.iter().any(|r| {
+        r.method == wiremock::http::Method::POST && r.url.path() == "/users/test/items"
+    });
+    assert!(!post_create,
+        "upload must NOT be triggered when papers_extract_*.zip already exists in Zotero");
+}
+
+/// Two-way sync C — Zotero → local restore:
+///
+/// When no local `.md` exists but `papers_extract_*.zip` is present as a
+/// Zotero child attachment, `do_extract` should download the zip, unpack it
+/// into the local cache, and return the markdown from the restored file.
+#[tokio::test]
+async fn test_rag_add_sync_zotero_to_local_restore() {
+    extract_test_cache_base(); // ensure env var is set; no local cache for this key
+
+    let md_content = "# Restored From Zotero\n\nContent from zip.\n";
+    let zip_bytes = make_papers_zip(KEY_ADD_SYNC_C, md_content);
+
+    let mock = MockServer::start().await;
+
+    let zip_filename = format!("papers_extract_{KEY_ADD_SYNC_C}.zip");
+    let children_body = format!(
+        r#"[{{"key":"ZIPATT03","version":1,"library":{{"type":"user","id":1,"name":"test","links":{{}}}},"links":{{}},"meta":{{}},"data":{{"key":"ZIPATT03","version":1,"itemType":"attachment","linkMode":"imported_file","filename":"{zip_filename}","contentType":"application/zip"}}}}]"#
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/users/test/items/{KEY_ADD_SYNC_C}/children")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Total-Results", "1")
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(&children_body),
+        )
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/ZIPATT03/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+        .mount(&mock)
+        .await;
+
+    let zc = make_zotero_client(&mock);
+    let dl = papers_datalab::DatalabClient::new("dummy-key").with_base_url(mock.uri());
+    let mut source = papers_core::text::PdfSource::ZoteroLocal {
+        path: "/tmp/dummy.pdf".into(),
+    };
+
+    let result = papers_core::text::do_extract(
+        vec![0u8; 4],
+        KEY_ADD_SYNC_C,
+        Some(&zc),
+        Some((&dl, papers_core::text::ProcessingMode::Balanced)),
+        &mut source,
+    )
+    .await;
+
+    assert!(result.is_ok(), "restore from Zotero zip should succeed: {:?}", result);
+    let md = result.unwrap();
+    assert!(md.contains("Restored From Zotero"),
+        "returned markdown should come from the zip");
+
+    // The local cache file must have been written by the restore path.
+    let local_file = extract_test_cache_base()
+        .join(KEY_ADD_SYNC_C)
+        .join(format!("{KEY_ADD_SYNC_C}.md"));
+    assert!(local_file.exists(),
+        "restore should write local .md cache file at {local_file:?}");
+    assert_eq!(std::fs::read_to_string(&local_file).unwrap(), md_content);
+}
+
+/// Two-way sync D — DataLab extraction → local cache written → Zotero upload:
+///
+/// When neither local cache nor Zotero zip exists, `do_extract` calls DataLab,
+/// writes the local cache, and synchronously uploads `papers_extract_*.zip`
+/// to Zotero.  This test mocks both the DataLab Marker API and Zotero.
+#[tokio::test]
+async fn test_rag_add_sync_fresh_extraction_writes_local_and_zotero() {
+    // Ensure clean local state for this key.
+    let cache_dir = extract_test_cache_base().join(KEY_ADD_SYNC_D);
+    if cache_dir.exists() {
+        std::fs::remove_dir_all(&cache_dir).ok();
+    }
+
+    let mock = MockServer::start().await;
+
+    // ── Zotero mocks ──────────────────────────────────────────────────────
+
+    // Children: no papers_extract_*.zip (empty list)
+    Mock::given(method("GET"))
+        .and(path(format!("/users/test/items/{KEY_ADD_SYNC_D}/children")))
+        .respond_with(zotero_arr_empty())
+        .mount(&mock)
+        .await;
+
+    // Create attachment → returns ZIPATTD1
+    let create_resp = r#"{"success":{"0":"ZIPATTD1"},"unchanged":{},"failed":{},"successful":{"0":{"key":"ZIPATTD1"}}}"#;
+    Mock::given(method("POST"))
+        .and(path("/users/test/items"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(create_resp))
+        .mount(&mock)
+        .await;
+
+    // File upload register → exists=1 (short-circuits S3 PUT)
+    Mock::given(method("POST"))
+        .and(path("/users/test/items/ZIPATTD1/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"exists":1}"#))
+        .mount(&mock)
+        .await;
+
+    // ── DataLab mocks ─────────────────────────────────────────────────────
+
+    // POST /api/v1/marker → submit job
+    let submit_resp = r#"{"request_id":"req-syncd-001","request_check_url":"/api/v1/marker/req-syncd-001","success":true}"#;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/marker"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(submit_resp))
+        .mount(&mock)
+        .await;
+
+    // GET /api/v1/marker/req-syncd-001 → complete with markdown
+    let md_returned = "# Fresh Extraction Result\n\nDataLab produced this.\n";
+    let poll_resp = serde_json::json!({
+        "status": "complete",
+        "success": true,
+        "request_id": "req-syncd-001",
+        "markdown": md_returned,
+        "json": null,
+        "images": null,
+        "error": null
+    });
+    Mock::given(method("GET"))
+        .and(path("/api/v1/marker/req-syncd-001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&poll_resp))
+        .mount(&mock)
+        .await;
+
+    let zc = make_zotero_client(&mock);
+    let dl = papers_datalab::DatalabClient::new("dummy-key").with_base_url(mock.uri());
+    let mut source = papers_core::text::PdfSource::ZoteroLocal {
+        path: "/tmp/dummy.pdf".into(),
+    };
+
+    let result = papers_core::text::do_extract(
+        b"%PDF-1.4 test".to_vec(),
+        KEY_ADD_SYNC_D,
+        Some(&zc),
+        Some((&dl, papers_core::text::ProcessingMode::Balanced)),
+        &mut source,
+    )
+    .await;
+
+    assert!(result.is_ok(), "fresh extraction should succeed: {:?}", result);
+    assert_eq!(result.unwrap(), md_returned);
+
+    // Local cache file must have been written.
+    let local_md = cache_dir.join(format!("{KEY_ADD_SYNC_D}.md"));
+    assert!(local_md.exists(), "local .md cache file should exist after extraction");
+    assert_eq!(std::fs::read_to_string(&local_md).unwrap(), md_returned);
+
+    // Zotero upload must have been triggered (create + file register).
+    let reqs = mock.received_requests().await.unwrap_or_default();
+    let create_hit = reqs.iter().any(|r| {
+        r.method == wiremock::http::Method::POST && r.url.path() == "/users/test/items"
+    });
+    let file_hit = reqs.iter().any(|r| r.url.path().ends_with("/ZIPATTD1/file"));
+    assert!(create_hit,
+        "Zotero attachment create should be called after DataLab extraction");
+    assert!(file_hit,
+        "Zotero file upload should be called after DataLab extraction");
+}
+
+/// DOI resolution: `resolve_item_key` routes a full DOI URL through Zotero's
+/// item search (qmode=everything), returning the matched item key.
+/// In `rag work add`, this is the path taken when the user passes a DOI instead
+/// of an 8-char key.
+#[tokio::test]
+async fn test_rag_add_doi_resolution() {
+    let doi = "10.1145/1234567.1234568";
+    let mock = MockServer::start().await;
+
+    let body = format!(
+        r#"[{{"key":"{KEY_ADD_DOI}","version":1,"library":{{"type":"user","id":1,"name":"test","links":{{}}}},"links":{{}},"meta":{{}},"data":{{"key":"{KEY_ADD_DOI}","version":1,"itemType":"journalArticle","title":"DOI Paper","DOI":"{doi}"}}}}]"#
+    );
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/top"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Total-Results", "1")
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(&body),
+        )
+        .mount(&mock)
+        .await;
+
+    let zc = make_zotero_client(&mock);
+    let resolved =
+        papers_core::zotero::resolve_item_key(&zc, &format!("https://doi.org/{doi}"))
+            .await
+            .expect("DOI resolution should succeed");
+
+    assert_eq!(resolved, KEY_ADD_DOI, "DOI input should resolve to the Zotero item key");
+}
+
+/// `find_papers_zip_key` (exercised via `do_extract`) returns `None` when the
+/// item has no `papers_extract_*.zip` child attachment — causing `do_extract`
+/// to fall through to the DataLab path.
+///
+/// Verified by confirming the children endpoint was queried and that
+/// `do_extract` errors out (because DataLab is also unavailable in this test).
+#[tokio::test]
+async fn test_rag_add_find_papers_zip_key_returns_none_when_absent() {
+    extract_test_cache_base(); // ensure env var, no local cache for KEY_FZIP_NONE
+
+    let mock = MockServer::start().await;
+
+    // Children: only a PDF, no papers_extract_*.zip
+    let children_body =
+        r#"[{"key":"PDFONLY01","version":1,"library":{"type":"user","id":1,"name":"test","links":{}},"links":{},"meta":{},"data":{"key":"PDFONLY01","version":1,"itemType":"attachment","linkMode":"imported_file","filename":"paper.pdf","contentType":"application/pdf"}}]"#;
+    Mock::given(method("GET"))
+        .and(path(format!("/users/test/items/{KEY_FZIP_NONE}/children")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Total-Results", "1")
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(children_body),
+        )
+        .mount(&mock)
+        .await;
+
+    // DataLab unavailable → ensures we observe the children check, not a DataLab result
+    Mock::given(method("POST"))
+        .and(path("/api/v1/marker"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+        .mount(&mock)
+        .await;
+
+    let zc = make_zotero_client(&mock);
+    let dl = papers_datalab::DatalabClient::new("dummy-key").with_base_url(mock.uri());
+    let mut source = papers_core::text::PdfSource::ZoteroLocal {
+        path: "/tmp/dummy.pdf".into(),
+    };
+
+    let result = papers_core::text::do_extract(
+        b"%PDF test".to_vec(),
+        KEY_FZIP_NONE,
+        Some(&zc),
+        Some((&dl, papers_core::text::ProcessingMode::Balanced)),
+        &mut source,
+    )
+    .await;
+
+    // Result is Err because DataLab is unavailable and there is no local/Zotero cache
+    assert!(result.is_err(),
+        "should fail when no local cache, no Zotero zip, and DataLab unavailable");
+
+    // The important check: children endpoint was queried (find_papers_zip_key fired)
+    let reqs = mock.received_requests().await.unwrap_or_default();
+    let children_hit = reqs.iter().any(|r| {
+        r.url.path().ends_with(&format!("/{KEY_FZIP_NONE}/children"))
+    });
+    assert!(children_hit,
+        "children endpoint should be queried to check for papers_extract_*.zip");
+}
+
+/// `find_papers_zip_key` returns `Some(key)` when a `papers_extract_*.zip`
+/// child attachment exists — verified end-to-end by the Zotero→local restore
+/// path successfully returning the restored markdown.
+#[tokio::test]
+async fn test_rag_add_find_papers_zip_key_returns_some_when_present() {
+    extract_test_cache_base(); // ensure env var, no local cache for KEY_FZIP_SOME
+
+    let md_content = "# Found Zip Paper\n";
+    let zip_bytes = make_papers_zip(KEY_FZIP_SOME, md_content);
+
+    let mock = MockServer::start().await;
+
+    let zip_filename = format!("papers_extract_{KEY_FZIP_SOME}.zip");
+    let children_body = format!(
+        r#"[{{"key":"ZIPFND001","version":1,"library":{{"type":"user","id":1,"name":"test","links":{{}}}},"links":{{}},"meta":{{}},"data":{{"key":"ZIPFND001","version":1,"itemType":"attachment","linkMode":"imported_file","filename":"{zip_filename}","contentType":"application/zip"}}}}]"#
+    );
+    Mock::given(method("GET"))
+        .and(path(format!("/users/test/items/{KEY_FZIP_SOME}/children")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Total-Results", "1")
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(&children_body),
+        )
+        .mount(&mock)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/ZIPFND001/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(zip_bytes))
+        .mount(&mock)
+        .await;
+
+    let zc = make_zotero_client(&mock);
+    let dl = papers_datalab::DatalabClient::new("dummy-key").with_base_url(mock.uri());
+    let mut source = papers_core::text::PdfSource::ZoteroLocal { path: "/tmp/dummy.pdf".into() };
+
+    let result = papers_core::text::do_extract(
+        b"%PDF test".to_vec(),
+        KEY_FZIP_SOME,
+        Some(&zc),
+        Some((&dl, papers_core::text::ProcessingMode::Balanced)),
+        &mut source,
+    )
+    .await;
+
+    assert!(result.is_ok(), "should restore from Zotero zip: {:?}", result);
+    assert!(result.unwrap().contains("Found Zip Paper"),
+        "restored markdown should match zip contents");
+}
+
+/// `ingest_params_from_cache` succeeds even when `meta.json` is absent —
+/// it falls back to using the item key as both title and paper_id.
+/// This matches the production code path (meta is `Option`, not required).
+#[test]
+fn test_rag_add_ingest_params_from_cache_falls_back_without_meta() {
+    // Write only .md — no meta.json
+    write_md_cache(KEY_NO_META, "# No Meta Paper\n");
+
+    let result = papers_rag::ingest_params_from_cache(KEY_NO_META);
+    assert!(result.is_ok(),
+        "ingest_params_from_cache should succeed even without meta.json (falls back gracefully)");
+    let params = result.unwrap();
+    assert_eq!(params.title, KEY_NO_META,
+        "title should fall back to item key when meta.json is absent");
+    assert_eq!(params.paper_id, KEY_NO_META,
+        "paper_id should fall back to item key when meta.json is absent");
+}
+
+/// `list_cached_item_keys` only returns keys that have a `.json` extraction
+/// file — not bare `.md`-only entries.
+///
+/// This is the contract the `--all` path in `rag work add` relies on:
+/// only fully-extracted papers (with structured JSON) are batch-ingested.
+#[test]
+fn test_rag_add_list_cached_keys_requires_json_file() {
+    write_md_cache(KEY_MD_ONLY,   "# MD only\n");
+    write_md_cache(KEY_WITH_JSON, "# With JSON\n");
+    write_json_cache(KEY_WITH_JSON, r#"{"pages":[]}"#);
+
+    let keys = papers_rag::list_cached_item_keys();
+    assert!(
+        keys.contains(&KEY_WITH_JSON.to_string()),
+        "key with .json should appear in list_cached_item_keys"
+    );
+    assert!(
+        !keys.contains(&KEY_MD_ONLY.to_string()),
+        "key without .json must NOT appear (--all only ingests fully-extracted papers)"
+    );
+}

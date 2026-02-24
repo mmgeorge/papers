@@ -318,10 +318,12 @@ pub enum RagWorkCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Index a paper (or all papers) from local DataLab cache into the RAG database
+    /// Index a paper (or all papers) from local DataLab cache into the RAG database.
+    /// If the DataLab cache is missing for a paper, extraction runs automatically
+    /// via DataLab Marker API (requires DATALAB_API_KEY and a local Zotero PDF).
     Add {
-        /// Zotero item key (directory name under the DataLab cache); omit with --all
-        item_key: Option<String>,
+        /// Paper: item key (e.g. LF4MJWZK), DOI, or title search; omit with --all
+        work: Option<String>,
         /// Index all papers in the DataLab cache
         #[arg(long)]
         all: bool,
@@ -334,6 +336,12 @@ pub enum RagWorkCommand {
         /// Output raw JSON
         #[arg(long)]
         json: bool,
+        /// Quality level for DataLab extraction when cache is missing (ignored if already cached)
+        #[arg(long, short = 'm', default_value = "balanced")]
+        mode: AdvancedMode,
+        /// Re-run DataLab extraction even if a local cache already exists
+        #[arg(long)]
+        force_extract: bool,
     },
     /// Remove a paper from the RAG index (deletes all chunks and figures)
     Remove {
@@ -1380,15 +1388,6 @@ pub enum ZoteroWorkCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Extract full text from a work's PDF using DataLab Marker (requires DATALAB_API_KEY).
-    /// Results are cached locally; subsequent calls return instantly.
-    Extract {
-        /// Item key (e.g. LF4MJWZK) or a title/creator search string
-        key: String,
-        /// Quality level: fast, balanced (default), or accurate
-        #[arg(long, short = 'm', default_value = "balanced")]
-        mode: AdvancedMode,
-    },
     /// Get the CDN view URL for a work's primary PDF attachment
     ViewUrl {
         /// Item key (e.g. LF4MJWZK) or a title/creator search string
@@ -2041,9 +2040,9 @@ mod tests {
         let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C"]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { item_key, all, .. } },
+                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { work, all, .. } },
             } => {
-                assert_eq!(item_key.as_deref(), Some("YFACFA8C"));
+                assert_eq!(work.as_deref(), Some("YFACFA8C"));
                 assert!(!all);
             }
             _ => panic!("wrong variant"),
@@ -2055,10 +2054,51 @@ mod tests {
         let cli = parse(&["papers", "rag", "work", "add", "--all"]);
         match cli.entity {
             EntityCommand::Rag {
-                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { item_key, all, .. } },
+                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { work, all, .. } },
             } => {
-                assert!(item_key.is_none());
+                assert!(work.is_none());
                 assert!(all);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_work_add_with_mode() {
+        let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C", "-m", "accurate"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { work, mode, .. } },
+            } => {
+                assert_eq!(work.as_deref(), Some("YFACFA8C"));
+                assert!(matches!(mode, AdvancedMode::Accurate));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_work_add_force_extract() {
+        let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C", "--force-extract"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { work, force_extract, .. } },
+            } => {
+                assert_eq!(work.as_deref(), Some("YFACFA8C"));
+                assert!(force_extract);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rag_work_add_mode_default_balanced() {
+        let cli = parse(&["papers", "rag", "work", "add", "YFACFA8C"]);
+        match cli.entity {
+            EntityCommand::Rag {
+                cmd: RagCommand::Work { cmd: RagWorkCommand::Add { mode, .. } },
+            } => {
+                assert!(matches!(mode, AdvancedMode::Balanced));
             }
             _ => panic!("wrong variant"),
         }

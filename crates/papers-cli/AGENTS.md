@@ -17,9 +17,9 @@ tests/
 Imports only `papers::*` for OpenAlex — no direct dependency on `papers-openalex`.
 Imports `papers_zotero::ZoteroClient` directly for Zotero commands.
 
-## CLI commands (48 total)
+## CLI commands
 
-### OpenAlex commands (21)
+### OpenAlex commands
 ```
 papers work list   [-s <query>] [-f <filter>] [--sort <field>] [-n <per_page=10>]
                    [--page <n>] [--cursor <c>] [--sample <n>] [--seed <n>] [--json]
@@ -35,7 +35,7 @@ papers publisher list / get / autocomplete
 papers funder list / get / autocomplete
 ```
 
-### Zotero commands (27)
+### Zotero commands
 
 Requires `ZOTERO_USER_ID` and `ZOTERO_API_KEY` env vars. Exits with error if not set.
 
@@ -47,8 +47,6 @@ papers zotero work notes       <key> [-n <n>] [--json]
 papers zotero work attachments <key> [-n <n>] [--json]
 papers zotero work annotations <key> [--json]
 papers zotero work tags        <key> [-q <q>] [--json]
-papers zotero work extract     <key> [-m fast|balanced|accurate]
-
 papers zotero attachment list  [-s <q>] [--sort <f>] [-n <n>] [--json]
 papers zotero attachment get   <key> [--json]
 papers zotero attachment file  <key> -o <output-path>
@@ -83,11 +81,11 @@ papers zotero extract get      <key|doi|title>
 ```
 
 `extract list` shows all items that have a DataLab extraction in **either** the
-local cache or Zotero (`Papers.zip` backup), with two checkmarks per item:
+local cache or Zotero (`papers_extract_{key}.zip` backup), with two checkmarks per item:
 `[✓ local] [✓ zotero]`. Items with neither are omitted.
 
 `extract text` / `extract json` / `extract get` are **read-only** — they never
-invoke DataLab. Use `papers zotero work extract <key>` to actually run extraction.
+invoke DataLab. Use `papers rag work add <key>` to run extraction and index the paper.
 
 Default output is human-readable text. Add `--json` for raw JSON.
 Default `--per-page` is 10 (vs API default of 25).
@@ -147,7 +145,7 @@ Always run `target/debug/papers.exe` directly — never pass API keys on the com
 
 ```
 # correct
-target/debug/papers.exe zotero work extract U9PRIZJ7
+target/debug/papers.exe rag work add U9PRIZJ7
 
 # wrong — don't do this
 ZOTERO_API_KEY=$(powershell.exe -Command "...") target/debug/papers.exe ...

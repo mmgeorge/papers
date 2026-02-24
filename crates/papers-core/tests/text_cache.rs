@@ -147,7 +147,7 @@ async fn count_papers_zip(zotero: &ZoteroClient, parent_key: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Poll until `Papers.zip` appears under `parent_key` or `timeout_secs` elapses.
+/// Poll until `papers_extract_{key}.zip` appears under `parent_key` or `timeout_secs` elapses.
 async fn wait_for_papers_zip(
     zotero: &ZoteroClient,
     parent_key: &str,
@@ -237,9 +237,9 @@ async fn test_datalab_cache_miss_then_hit() {
 }
 
 /// Full two-way Zotero sync round-trip:
-///   1. Mocked DataLab → local cache + Papers.zip uploaded to Zotero
+///   1. Mocked DataLab → local cache + papers_extract_{key}.zip uploaded to Zotero
 ///   2. Delete local cache
-///   3. Restore from Zotero Papers.zip (no DataLab call)
+///   3. Restore from Zotero papers_extract_{key}.zip (no DataLab call)
 ///   4. Texts match
 ///
 /// Requires: ZOTERO_TEST_USER_ID and ZOTERO_TEST_API_KEY (dedicated test library
@@ -270,7 +270,7 @@ async fn test_zotero_sync_round_trip() {
         .join(&parent_key);
     let _ = std::fs::remove_dir_all(&cdir);
 
-    // --- First call: local miss + Zotero miss → mocked DataLab → upload Papers.zip ---
+    // --- First call: local miss + Zotero miss → mocked DataLab → upload papers_extract_*.zip ---
     let mut source = PdfSource::ZoteroLocal { path: "test".into() };
     let t0 = std::time::Instant::now();
     let text1 = do_extract(
@@ -287,13 +287,13 @@ async fn test_zotero_sync_round_trip() {
     assert!(!text1.is_empty(), "first call returned empty text");
     assert!(matches!(source, PdfSource::DataLab));
     assert!(cdir.join(format!("{parent_key}.md")).exists(), "local .md not written");
-    assert_eq!(count_papers_zip(&zotero, &parent_key).await, 1, "Papers.zip not uploaded");
+    assert_eq!(count_papers_zip(&zotero, &parent_key).await, 1, "papers_extract_*.zip not uploaded");
 
     // --- Delete local cache to force Zotero restore path ---
     std::fs::remove_dir_all(&cdir).expect("failed to remove cache dir");
     assert!(!cdir.exists());
 
-    // --- Second call: local miss → Zotero Papers.zip hit → no DataLab call ---
+    // --- Second call: local miss → Zotero papers_extract_*.zip hit → no DataLab call ---
     let mut source2 = PdfSource::ZoteroLocal { path: "test".into() };
     let t1 = std::time::Instant::now();
     let text2 = do_extract(
@@ -318,10 +318,10 @@ async fn test_zotero_sync_round_trip() {
     let _ = std::fs::remove_dir_all(&cdir);
 }
 
-/// Local cache exists but no Papers.zip in Zotero yet.
+/// Local cache exists but no papers_extract_{key}.zip in Zotero yet.
 ///
 /// `do_extract` should return from the local cache immediately, then the
-/// background task should upload a new Papers.zip attachment.
+/// background task should upload a new papers_extract_{key}.zip attachment.
 ///
 /// Requires ZOTERO_TEST_USER_ID / ZOTERO_TEST_API_KEY.
 #[tokio::test(flavor = "multi_thread")]
@@ -339,7 +339,7 @@ async fn test_local_cache_hit_uploads_papers_zip() {
     let (_server, dl) = setup_datalab_mock().await;
     let mode = ProcessingMode::Fast;
 
-    // No Papers.zip yet
+    // No papers_extract_*.zip yet
     assert_eq!(count_papers_zip(&zotero, &parent_key).await, 0);
 
     // Call do_extract — local cache hit, background upload spawned
@@ -355,19 +355,19 @@ async fn test_local_cache_hit_uploads_papers_zip() {
     // Should return from local cache immediately — no DataLab call
     assert!(elapsed < std::time::Duration::from_millis(500), "cache hit took too long: {elapsed:?}");
 
-    // Background task should upload Papers.zip — poll until it appears
+    // Background task should upload papers_extract_*.zip — poll until it appears
     let uploaded = wait_for_papers_zip(&zotero, &parent_key, 15).await;
-    assert!(uploaded, "Papers.zip not uploaded within 15s");
+    assert!(uploaded, "papers_extract_*.zip not uploaded within 15s");
     assert_eq!(count_papers_zip(&zotero, &parent_key).await, 1);
 
     let _ = std::fs::remove_dir_all(&cdir);
 }
 
-/// Both local cache and Papers.zip in Zotero already exist.
+/// Both local cache and papers_extract_{key}.zip in Zotero already exist.
 ///
 /// `do_extract` should return from the local cache immediately. The background
-/// task should find the existing Papers.zip and skip the upload — so the count
-/// must stay at exactly 1 (no duplicate attachment created).
+/// task should find the existing papers_extract_{key}.zip and skip the upload —
+/// so the count must stay at exactly 1 (no duplicate attachment created).
 ///
 /// Requires ZOTERO_TEST_USER_ID / ZOTERO_TEST_API_KEY.
 #[tokio::test(flavor = "multi_thread")]
@@ -385,18 +385,18 @@ async fn test_local_cache_and_papers_zip_both_exist() {
     let (_server, dl) = setup_datalab_mock().await;
     let mode = ProcessingMode::Fast;
 
-    // First call: local cache hit → background uploads Papers.zip
+    // First call: local cache hit → background uploads papers_extract_*.zip
     let mut source = PdfSource::ZoteroLocal { path: "test".into() };
     do_extract(vec![0u8], &parent_key, Some(&zotero), Some((&dl, mode.clone())), &mut source)
         .await
         .expect("first do_extract failed");
 
-    // Wait for the upload so we start the second call with Papers.zip present
+    // Wait for the upload so we start the second call with papers_extract_*.zip present
     let uploaded = wait_for_papers_zip(&zotero, &parent_key, 15).await;
-    assert!(uploaded, "Papers.zip not uploaded within 15s after first call");
+    assert!(uploaded, "papers_extract_*.zip not uploaded within 15s after first call");
     assert_eq!(count_papers_zip(&zotero, &parent_key).await, 1);
 
-    // Second call: both local cache and Papers.zip present
+    // Second call: both local cache and papers_extract_*.zip present
     let mut source2 = PdfSource::ZoteroLocal { path: "test".into() };
     let t0 = std::time::Instant::now();
     let text = do_extract(vec![0u8], &parent_key, Some(&zotero), Some((&dl, mode)), &mut source2)
@@ -413,7 +413,7 @@ async fn test_local_cache_and_papers_zip_both_exist() {
     assert_eq!(
         count_papers_zip(&zotero, &parent_key).await,
         1,
-        "Papers.zip was duplicated — background task should have skipped upload"
+        "papers_extract_*.zip was duplicated — background task should have skipped upload"
     );
 
     let _ = std::fs::remove_dir_all(&cdir);
