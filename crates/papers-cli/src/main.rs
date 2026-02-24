@@ -43,7 +43,7 @@ async fn optional_zotero() -> Result<Option<ZoteroClient>, papers_zotero::Zotero
 
 fn work_list_params(args: &cli::ListArgs, wf: &WorkFilterArgs) -> WorkListParams {
     WorkListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -72,7 +72,7 @@ fn work_list_params(args: &cli::ListArgs, wf: &WorkFilterArgs) -> WorkListParams
 
 fn author_list_params(args: &cli::ListArgs, af: &AuthorFilterArgs) -> AuthorListParams {
     AuthorListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -93,7 +93,7 @@ fn author_list_params(args: &cli::ListArgs, af: &AuthorFilterArgs) -> AuthorList
 
 fn source_list_params(args: &cli::ListArgs, sf: &SourceFilterArgs) -> SourceListParams {
     SourceListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -118,7 +118,7 @@ fn institution_list_params(
     inf: &InstitutionFilterArgs,
 ) -> InstitutionListParams {
     InstitutionListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -138,7 +138,7 @@ fn institution_list_params(
 
 fn topic_list_params(args: &cli::ListArgs, tf: &TopicFilterArgs) -> TopicListParams {
     TopicListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -158,7 +158,7 @@ fn topic_list_params(args: &cli::ListArgs, tf: &TopicFilterArgs) -> TopicListPar
 
 fn publisher_list_params(args: &cli::ListArgs, pf: &PublisherFilterArgs) -> PublisherListParams {
     PublisherListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -177,7 +177,7 @@ fn publisher_list_params(args: &cli::ListArgs, pf: &PublisherFilterArgs) -> Publ
 
 fn funder_list_params(args: &cli::ListArgs, ff: &FunderFilterArgs) -> FunderListParams {
     FunderListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -196,7 +196,7 @@ fn funder_list_params(args: &cli::ListArgs, ff: &FunderFilterArgs) -> FunderList
 
 fn domain_list_params(args: &cli::ListArgs, df: &DomainFilterArgs) -> DomainListParams {
     DomainListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -212,7 +212,7 @@ fn domain_list_params(args: &cli::ListArgs, df: &DomainFilterArgs) -> DomainList
 
 fn field_list_params(args: &cli::ListArgs, ff: &FieldFilterArgs) -> FieldListParams {
     FieldListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -229,7 +229,7 @@ fn field_list_params(args: &cli::ListArgs, ff: &FieldFilterArgs) -> FieldListPar
 
 fn subfield_list_params(args: &cli::ListArgs, sf: &SubfieldFilterArgs) -> SubfieldListParams {
     SubfieldListParams {
-        search: args.search.clone(),
+        search: None,
         filter: args.filter.clone(),
         sort: args.sort.clone(),
         per_page: Some(args.per_page),
@@ -366,6 +366,20 @@ async fn papers_main() {
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
+            WorkCommand::Search { query, args, work_filters } => {
+                let mut params = work_list_params(&args, &work_filters);
+                params.search = Some(query);
+                match papers_core::api::work_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_work_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
             WorkCommand::Get { id, json } => {
                 let zotero = optional_zotero()
                     .await
@@ -457,6 +471,20 @@ async fn papers_main() {
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
+            AuthorCommand::Search { query, args, filters } => {
+                let mut params = author_list_params(&args, &filters);
+                params.search = Some(query);
+                match papers_core::api::author_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_author_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
             AuthorCommand::Get { id, json } => {
                 match papers_core::api::author_get(&client, &id, &GetParams::default()).await {
                     Ok(author) => {
@@ -486,6 +514,20 @@ async fn papers_main() {
         EntityCommand::Source { cmd } => match cmd {
             SourceCommand::List { args, filters } => {
                 let params = source_list_params(&args, &filters);
+                match papers_core::api::source_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_source_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+            SourceCommand::Search { query, args, filters } => {
+                let mut params = source_list_params(&args, &filters);
+                params.search = Some(query);
                 match papers_core::api::source_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -537,6 +579,20 @@ async fn papers_main() {
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
+            InstitutionCommand::Search { query, args, filters } => {
+                let mut params = institution_list_params(&args, &filters);
+                params.search = Some(query);
+                match papers_core::api::institution_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_institution_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
             InstitutionCommand::Get { id, json } => {
                 match papers_core::api::institution_get(&client, &id, &GetParams::default()).await {
                     Ok(inst) => {
@@ -577,6 +633,20 @@ async fn papers_main() {
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
+            TopicCommand::Search { query, args, filters } => {
+                let mut params = topic_list_params(&args, &filters);
+                params.search = Some(query);
+                match papers_core::api::topic_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_topic_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
             TopicCommand::Get { id, json } => {
                 match papers_core::api::topic_get(&client, &id, &GetParams::default()).await {
                     Ok(topic) => {
@@ -594,6 +664,20 @@ async fn papers_main() {
         EntityCommand::Publisher { cmd } => match cmd {
             PublisherCommand::List { args, filters } => {
                 let params = publisher_list_params(&args, &filters);
+                match papers_core::api::publisher_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_publisher_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+            PublisherCommand::Search { query, args, filters } => {
+                let mut params = publisher_list_params(&args, &filters);
+                params.search = Some(query);
                 match papers_core::api::publisher_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -645,6 +729,20 @@ async fn papers_main() {
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
+            FunderCommand::Search { query, args, filters } => {
+                let mut params = funder_list_params(&args, &filters);
+                params.search = Some(query);
+                match papers_core::api::funder_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_funder_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
             FunderCommand::Get { id, json } => {
                 match papers_core::api::funder_get(&client, &id, &GetParams::default()).await {
                     Ok(funder) => {
@@ -685,6 +783,20 @@ async fn papers_main() {
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
+            DomainCommand::Search { query, args, filters } => {
+                let mut params = domain_list_params(&args, &filters);
+                params.search = Some(query);
+                match papers_core::api::domain_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_domain_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
             DomainCommand::Get { id, json } => {
                 match papers_core::api::domain_get(&client, &id, &GetParams::default()).await {
                     Ok(domain) => {
@@ -713,6 +825,20 @@ async fn papers_main() {
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
+            FieldCommand::Search { query, args, filters } => {
+                let mut params = field_list_params(&args, &filters);
+                params.search = Some(query);
+                match papers_core::api::field_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_field_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
             FieldCommand::Get { id, json } => {
                 match papers_core::api::field_get(&client, &id, &GetParams::default()).await {
                     Ok(field) => {
@@ -730,6 +856,20 @@ async fn papers_main() {
         EntityCommand::Subfield { cmd } => match cmd {
             SubfieldCommand::List { args, filters } => {
                 let params = subfield_list_params(&args, &filters);
+                match papers_core::api::subfield_list(&client, &params).await {
+                    Ok(resp) => {
+                        if args.json {
+                            print_json(&resp);
+                        } else {
+                            print!("{}", format::format_subfield_list(&resp));
+                        }
+                    }
+                    Err(e) => exit_err(&e.to_string()),
+                }
+            }
+            SubfieldCommand::Search { query, args, filters } => {
+                let mut params = subfield_list_params(&args, &filters);
+                params.search = Some(query);
                 match papers_core::api::subfield_list(&client, &params).await {
                     Ok(resp) => {
                         if args.json {
@@ -779,8 +919,6 @@ async fn papers_main() {
             match cmd {
                 ZoteroCommand::Work { cmd } => match cmd {
                     ZoteroWorkCommand::List {
-                        search,
-                        everything,
                         tag,
                         type_,
                         sort,
@@ -792,14 +930,45 @@ async fn papers_main() {
                     } => {
                         let params = ItemListParams {
                             item_type: type_,
-                            q: search,
-                            qmode: everything.then(|| "everything".to_string()),
                             tag,
                             sort,
                             direction,
                             limit: Some(limit),
                             start,
                             since,
+                            ..Default::default()
+                        };
+                        match zotero.list_top_items(&params).await {
+                            Ok(resp) => {
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_work_list(&resp));
+                                }
+                            }
+                            Err(e) => exit_err(&e.to_string()),
+                        }
+                    }
+                    ZoteroWorkCommand::Search {
+                        query,
+                        everything,
+                        tag,
+                        type_,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let params = ItemListParams {
+                            item_type: type_,
+                            q: Some(query),
+                            qmode: everything.then(|| "everything".to_string()),
+                            tag,
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
                             ..Default::default()
                         };
                         match zotero.list_top_items(&params).await {
@@ -1107,7 +1276,6 @@ async fn papers_main() {
 
                 ZoteroCommand::Attachment { cmd } => match cmd {
                     ZoteroAttachmentCommand::List {
-                        search,
                         sort,
                         direction,
                         limit,
@@ -1116,7 +1284,34 @@ async fn papers_main() {
                     } => {
                         let params = ItemListParams {
                             item_type: Some("attachment".into()),
-                            q: search,
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
+                            ..Default::default()
+                        };
+                        match zotero.list_items(&params).await {
+                            Ok(resp) => {
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_attachment_list(&resp));
+                                }
+                            }
+                            Err(e) => exit_err(&e.to_string()),
+                        }
+                    }
+                    ZoteroAttachmentCommand::Search {
+                        query,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let params = ItemListParams {
+                            item_type: Some("attachment".into()),
+                            q: Some(query),
                             sort,
                             direction,
                             limit: Some(limit),
@@ -1218,14 +1413,36 @@ async fn papers_main() {
 
                 ZoteroCommand::Note { cmd } => match cmd {
                     ZoteroNoteCommand::List {
-                        search,
                         limit,
                         start,
                         json,
                     } => {
                         let params = ItemListParams {
                             item_type: Some("note".into()),
-                            q: search,
+                            limit: Some(limit),
+                            start,
+                            ..Default::default()
+                        };
+                        match zotero.list_items(&params).await {
+                            Ok(resp) => {
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_note_list(&resp));
+                                }
+                            }
+                            Err(e) => exit_err(&e.to_string()),
+                        }
+                    }
+                    ZoteroNoteCommand::Search {
+                        query,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let params = ItemListParams {
+                            item_type: Some("note".into()),
+                            q: Some(query),
                             limit: Some(limit),
                             start,
                             ..Default::default()
@@ -1504,7 +1721,6 @@ async fn papers_main() {
 
                 ZoteroCommand::Tag { cmd } => match cmd {
                     ZoteroTagCommand::List {
-                        search,
                         sort,
                         direction,
                         limit,
@@ -1514,12 +1730,11 @@ async fn papers_main() {
                         json,
                     } => {
                         let params = TagListParams {
-                            q: search,
-                            qmode: Some("contains".to_string()),
                             sort,
                             direction,
                             limit: Some(limit),
                             start,
+                            ..Default::default()
                         };
                         let result = if trash {
                             zotero.list_trash_tags(&params).await
@@ -1529,6 +1744,33 @@ async fn papers_main() {
                             zotero.list_tags(&params).await
                         };
                         match result {
+                            Ok(resp) => {
+                                if json {
+                                    print_json(&resp);
+                                } else {
+                                    print!("{}", format::format_zotero_tag_list(&resp));
+                                }
+                            }
+                            Err(e) => exit_err(&e.to_string()),
+                        }
+                    }
+                    ZoteroTagCommand::Search {
+                        query,
+                        sort,
+                        direction,
+                        limit,
+                        start,
+                        json,
+                    } => {
+                        let params = TagListParams {
+                            q: Some(query),
+                            qmode: Some("contains".to_string()),
+                            sort,
+                            direction,
+                            limit: Some(limit),
+                            start,
+                        };
+                        match zotero.list_tags(&params).await {
                             Ok(resp) => {
                                 if json {
                                     print_json(&resp);
@@ -1677,7 +1919,7 @@ async fn handle_rag_command(cmd: RagCommand) {
     match cmd {
         RagCommand::Chunk { cmd } => match cmd {
             RagChunkCommand::Search {
-                query, selection, paper_id, chapter_idx, section_idx,
+                query, selection, work, chapter_idx, section_idx,
                 year_min, year_max, venue, tag, depth, limit, json,
             } => {
                 let rag = open_rag_store().await;
@@ -1688,7 +1930,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                     }).collect()),
                     Err(e) => exit_err(&e.to_string()),
                 },
-                None => match paper_id {
+                None => match work {
                     Some(id) => {
                         let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
                             Ok(r) => r,
@@ -1718,11 +1960,17 @@ async fn handle_rag_command(cmd: RagCommand) {
                 }
             }
 
-            RagChunkCommand::List { paper_id, chapter_idx, section_idx, limit, json } => {
+            RagChunkCommand::List { work, chapter_idx, section_idx, limit, json } => {
                 let rag = open_rag_store().await;
-                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
-                    Ok(r) => r,
-                    Err(e) => exit_err(&e.to_string()),
+                let paper_id = match work {
+                    Some(ref id) => {
+                        let resolved = match papers_rag::resolve_paper_id(&rag, id).await {
+                            Ok(r) => r,
+                            Err(e) => exit_err(&e.to_string()),
+                        };
+                        Some(resolved)
+                    }
+                    None => None,
                 };
                 let params = papers_rag::ListChunksParams { paper_id, chapter_idx, section_idx, limit };
                 match papers_rag::query::list_chunks(&rag, params).await {
@@ -1733,7 +1981,7 @@ async fn handle_rag_command(cmd: RagCommand) {
         },
 
         RagCommand::Figure { cmd } => match cmd {
-            RagFigureCommand::Search { query, selection, paper_id, figure_type, limit, json } => {
+            RagFigureCommand::Search { query, selection, work, figure_type, limit, json } => {
                 let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
@@ -1742,7 +1990,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                     }).collect()),
                     Err(e) => exit_err(&e.to_string()),
                 },
-                None => match paper_id {
+                None => match work {
                     Some(id) => {
                         let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
                             Ok(r) => r,
@@ -1829,7 +2077,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                 }
             }
 
-            RagWorkCommand::Add { item_key, all, paper_id, tag, force, json } => {
+            RagWorkCommand::Add { item_key, all, tag, force, json } => {
                 let rag = open_rag_store().await;
                 if all {
                     let keys = papers_rag::list_cached_item_keys();
@@ -1887,7 +2135,6 @@ async fn handle_rag_command(cmd: RagCommand) {
                         Ok(p) => p,
                         Err(e) => exit_err(&format!("Failed to read cache for {key}: {e}")),
                     };
-                    if let Some(pid) = paper_id { params.paper_id = pid; }
                     if let Some(tags) = tag { params.tags.extend(tags); }
                     params.force = force;
                     if !force && papers_rag::is_ingested(&rag, &params.paper_id).await {
@@ -1964,7 +2211,7 @@ async fn handle_rag_command(cmd: RagCommand) {
 
         RagCommand::Section { cmd } => match cmd {
             RagSectionCommand::Search {
-                query, selection, paper_id, chapter_idx, year_min, year_max, venue, tag, limit, json,
+                query, selection, work, chapter_idx, year_min, year_max, venue, tag, limit, json,
             } => {
                 let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
@@ -1974,7 +2221,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                     }).collect()),
                     Err(e) => exit_err(&e.to_string()),
                 },
-                None => match paper_id {
+                None => match work {
                     Some(id) => {
                         let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
                             Ok(r) => r,
@@ -1995,11 +2242,17 @@ async fn handle_rag_command(cmd: RagCommand) {
                 }
             }
 
-            RagSectionCommand::List { paper_id, json } => {
+            RagSectionCommand::List { work, json } => {
                 let rag = open_rag_store().await;
-                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
-                    Ok(r) => r,
-                    Err(e) => exit_err(&e.to_string()),
+                let paper_id = match work {
+                    Some(ref id) => {
+                        let resolved = match papers_rag::resolve_paper_id(&rag, id).await {
+                            Ok(r) => r,
+                            Err(e) => exit_err(&e.to_string()),
+                        };
+                        Some(resolved)
+                    }
+                    None => None,
                 };
                 match papers_rag::query::list_sections(&rag, papers_rag::ListSectionsParams { paper_id }).await {
                     Ok(results) => { if json { print_json(&results); } else { format_rag_section_list(&results); } }
@@ -2022,7 +2275,7 @@ async fn handle_rag_command(cmd: RagCommand) {
 
         RagCommand::Chapter { cmd } => match cmd {
             RagChapterCommand::Search {
-                query, selection, paper_id, year_min, year_max, venue, tag, limit, json,
+                query, selection, work, year_min, year_max, venue, tag, limit, json,
             } => {
                 let rag = open_rag_store().await;
             let paper_ids = match selection.as_deref() {
@@ -2032,7 +2285,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                     }).collect()),
                     Err(e) => exit_err(&e.to_string()),
                 },
-                None => match paper_id {
+                None => match work {
                     Some(id) => {
                         let resolved = match papers_rag::resolve_paper_id(&rag, &id).await {
                             Ok(r) => r,
@@ -2053,11 +2306,17 @@ async fn handle_rag_command(cmd: RagCommand) {
                 }
             }
 
-            RagChapterCommand::List { paper_id, json } => {
+            RagChapterCommand::List { work, json } => {
                 let rag = open_rag_store().await;
-                let paper_id = match papers_rag::resolve_paper_id(&rag, &paper_id).await {
-                    Ok(r) => r,
-                    Err(e) => exit_err(&e.to_string()),
+                let paper_id = match work {
+                    Some(ref id) => {
+                        let resolved = match papers_rag::resolve_paper_id(&rag, id).await {
+                            Ok(r) => r,
+                            Err(e) => exit_err(&e.to_string()),
+                        };
+                        Some(resolved)
+                    }
+                    None => None,
                 };
                 match papers_rag::query::list_chapters(&rag, papers_rag::ListChaptersParams { paper_id }).await {
                     Ok(results) => { if json { print_json(&results); } else { format_rag_chapter_list(&results); } }

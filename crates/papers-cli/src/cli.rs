@@ -163,11 +163,11 @@ pub enum RagChunkCommand {
         selection: Option<String>,
         /// Scope to a specific paper (DOI, item key, or title search)
         #[arg(long)]
-        paper_id: Option<String>,
-        /// Scope to a specific chapter (1-based; requires --paper-id)
+        work: Option<String>,
+        /// Scope to a specific chapter (1-based; requires --work)
         #[arg(long)]
         chapter_idx: Option<u16>,
-        /// Scope to a specific section (1-based; requires --paper-id and --chapter-idx)
+        /// Scope to a specific section (1-based; requires --work and --chapter-idx)
         #[arg(long)]
         section_idx: Option<u16>,
         /// Minimum publication year
@@ -200,10 +200,11 @@ pub enum RagChunkCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List all chunks in a paper in reading order
+    /// List all chunks in reading order (all papers, or scoped with --work)
     List {
-        /// Paper: DOI, item key, or title search
-        paper_id: String,
+        /// Scope to a specific paper (DOI, item key, or title search)
+        #[arg(long)]
+        work: Option<String>,
         /// Scope to a chapter (1-based)
         #[arg(long)]
         chapter_idx: Option<u16>,
@@ -230,7 +231,7 @@ pub enum RagFigureCommand {
         selection: Option<String>,
         /// Scope to a specific paper (DOI, item key, or title search)
         #[arg(long)]
-        paper_id: Option<String>,
+        work: Option<String>,
         /// Filter by type: "figure" or "table"
         #[arg(long)]
         figure_type: Option<String>,
@@ -324,9 +325,6 @@ pub enum RagWorkCommand {
         /// Index all papers in the DataLab cache
         #[arg(long)]
         all: bool,
-        /// Override paper_id (default: DOI from meta.json, else item_key)
-        #[arg(long)]
-        paper_id: Option<String>,
         /// Add tags to this paper (repeatable)
         #[arg(long)]
         tag: Option<Vec<String>>,
@@ -371,8 +369,8 @@ pub enum RagSectionCommand {
         selection: Option<String>,
         /// Scope to a specific paper (DOI, item key, or title search)
         #[arg(long)]
-        paper_id: Option<String>,
-        /// Scope to a chapter (1-based; requires --paper-id)
+        work: Option<String>,
+        /// Scope to a chapter (1-based; requires --work)
         #[arg(long)]
         chapter_idx: Option<u16>,
         /// Minimum publication year
@@ -394,10 +392,11 @@ pub enum RagSectionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List all sections in a paper as a flat outline
+    /// List all sections as a flat outline (all papers, or scoped with --work)
     List {
-        /// Paper: DOI, item key, or title search
-        paper_id: String,
+        /// Scope to a specific paper (DOI, item key, or title search)
+        #[arg(long)]
+        work: Option<String>,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
@@ -429,7 +428,7 @@ pub enum RagChapterCommand {
         selection: Option<String>,
         /// Scope to a specific paper (DOI, item key, or title search)
         #[arg(long)]
-        paper_id: Option<String>,
+        work: Option<String>,
         /// Minimum publication year
         #[arg(long)]
         year_min: Option<u16>,
@@ -449,10 +448,11 @@ pub enum RagChapterCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List all chapters in a paper as a flat outline
+    /// List all chapters as a flat outline (all papers, or scoped with --work)
     List {
-        /// Paper: DOI, item key, or title search
-        paper_id: String,
+        /// Scope to a specific paper (DOI, item key, or title search)
+        #[arg(long)]
+        work: Option<String>,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
@@ -542,10 +542,6 @@ pub enum SelectionCommand {
 /// Shared args for all list commands
 #[derive(Args, Clone)]
 pub struct ListArgs {
-    /// Full-text search query
-    #[arg(long, short = 's')]
-    pub search: Option<String>,
-
     /// Filter expression (comma-separated AND conditions, pipe for OR)
     #[arg(long, short = 'f')]
     pub filter: Option<String>,
@@ -837,11 +833,20 @@ pub struct SubfieldFilterArgs {
 
 #[derive(Subcommand)]
 pub enum WorkCommand {
-    /// List works with optional search/filter/sort
+    /// List works with optional filter/sort
     #[command(
         after_help = "Advanced filtering: https://docs.openalex.org/api-entities/works/filter-works"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        work_filters: WorkFilterArgs,
+    },
+    /// Full-text search for works (title, abstract, etc.)
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -881,11 +886,20 @@ pub enum WorkCommand {
 
 #[derive(Subcommand)]
 pub enum AuthorCommand {
-    /// List authors with optional search/filter/sort
+    /// List authors with optional filter/sort
     #[command(
         after_help = "Advanced filtering: https://docs.openalex.org/api-entities/authors/filter-authors"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: AuthorFilterArgs,
+    },
+    /// Full-text search for authors
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -907,11 +921,20 @@ pub enum AuthorCommand {
 
 #[derive(Subcommand)]
 pub enum SourceCommand {
-    /// List sources with optional search/filter/sort
+    /// List sources with optional filter/sort
     #[command(
         after_help = "Advanced filtering: https://docs.openalex.org/api-entities/sources/filter-sources"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: SourceFilterArgs,
+    },
+    /// Full-text search for sources
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -933,11 +956,20 @@ pub enum SourceCommand {
 
 #[derive(Subcommand)]
 pub enum InstitutionCommand {
-    /// List institutions with optional search/filter/sort
+    /// List institutions with optional filter/sort
     #[command(
         after_help = "Advanced filtering: https://docs.openalex.org/api-entities/institutions/filter-institutions"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: InstitutionFilterArgs,
+    },
+    /// Full-text search for institutions
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -959,11 +991,20 @@ pub enum InstitutionCommand {
 
 #[derive(Subcommand)]
 pub enum TopicCommand {
-    /// List topics with optional search/filter/sort
+    /// List topics with optional filter/sort
     #[command(
         after_help = "Advanced filtering: https://docs.openalex.org/api-entities/topics/filter-topics"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: TopicFilterArgs,
+    },
+    /// Full-text search for topics
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -979,11 +1020,20 @@ pub enum TopicCommand {
 
 #[derive(Subcommand)]
 pub enum PublisherCommand {
-    /// List publishers with optional search/filter/sort
+    /// List publishers with optional filter/sort
     #[command(
         after_help = "Advanced filtering: https://docs.openalex.org/api-entities/publishers/filter-publishers"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: PublisherFilterArgs,
+    },
+    /// Full-text search for publishers
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -1005,11 +1055,20 @@ pub enum PublisherCommand {
 
 #[derive(Subcommand)]
 pub enum FunderCommand {
-    /// List funders with optional search/filter/sort
+    /// List funders with optional filter/sort
     #[command(
         after_help = "Advanced filtering: https://docs.openalex.org/api-entities/funders/filter-funders"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: FunderFilterArgs,
+    },
+    /// Full-text search for funders
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -1031,11 +1090,20 @@ pub enum FunderCommand {
 
 #[derive(Subcommand)]
 pub enum DomainCommand {
-    /// List domains with optional search/filter/sort
+    /// List domains with optional filter/sort
     #[command(
         after_help = "Example filters: works_count:>100000000, display_name.search:physical\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: DomainFilterArgs,
+    },
+    /// Full-text search for domains
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -1051,11 +1119,20 @@ pub enum DomainCommand {
 
 #[derive(Subcommand)]
 pub enum FieldCommand {
-    /// List fields with optional search/filter/sort
+    /// List fields with optional filter/sort
     #[command(
         after_help = "Example filters: domain.id:domains/3, works_count:>1000000\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: FieldFilterArgs,
+    },
+    /// Full-text search for fields
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -1071,11 +1148,20 @@ pub enum FieldCommand {
 
 #[derive(Subcommand)]
 pub enum SubfieldCommand {
-    /// List subfields with optional search/filter/sort
+    /// List subfields with optional filter/sort
     #[command(
         after_help = "Example filters: field.id:fields/17, works_count:>100000\nFilter docs: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists"
     )]
     List {
+        #[command(flatten)]
+        args: ListArgs,
+        #[command(flatten)]
+        filters: SubfieldFilterArgs,
+    },
+    /// Full-text search for subfields
+    Search {
+        /// Search query
+        query: String,
         #[command(flatten)]
         args: ListArgs,
         #[command(flatten)]
@@ -1203,12 +1289,6 @@ pub enum ZoteroCommand {
 pub enum ZoteroWorkCommand {
     /// List bibliographic items (excludes notes, attachments, annotations)
     List {
-        /// Quick text search (title, creator, year)
-        #[arg(long, short = 's')]
-        search: Option<String>,
-        /// Expand search to all fields (default: title/creator/year only)
-        #[arg(long)]
-        everything: bool,
         /// Filter by tag; use || for OR, - prefix for NOT
         #[arg(long, short = 't')]
         tag: Option<String>,
@@ -1230,6 +1310,35 @@ pub enum ZoteroWorkCommand {
         /// Only items modified after this library version
         #[arg(long)]
         since: Option<u64>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search bibliographic items by title, creator, year, etc.
+    Search {
+        /// Search query (title, creator, year)
+        query: String,
+        /// Expand search to all fields
+        #[arg(long)]
+        everything: bool,
+        /// Filter by tag; use || for OR, - prefix for NOT
+        #[arg(long, short = 't')]
+        tag: Option<String>,
+        /// Filter by bibliographic type (e.g. journalArticle, book, conferencePaper)
+        #[arg(long = "type")]
+        type_: Option<String>,
+        /// Sort field
+        #[arg(long)]
+        sort: Option<String>,
+        /// Sort direction: asc or desc
+        #[arg(long)]
+        direction: Option<String>,
+        /// Results per page (1-100, default 25)
+        #[arg(long, short = 'n', default_value = "25")]
+        limit: u32,
+        /// Pagination offset (0-based)
+        #[arg(long)]
+        start: Option<u32>,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
@@ -1339,9 +1448,26 @@ pub enum ZoteroWorkCommand {
 pub enum ZoteroAttachmentCommand {
     /// List all attachment items in the library
     List {
-        /// Search by filename or title
-        #[arg(long, short = 's')]
-        search: Option<String>,
+        /// Sort field (dateAdded, dateModified, title, accessDate)
+        #[arg(long)]
+        sort: Option<String>,
+        /// Sort direction: asc or desc
+        #[arg(long)]
+        direction: Option<String>,
+        /// Results per page (1-100, default 25)
+        #[arg(long, short = 'n', default_value = "25")]
+        limit: u32,
+        /// Pagination offset (0-based)
+        #[arg(long)]
+        start: Option<u32>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search attachments by filename or title
+    Search {
+        /// Search query (filename or title)
+        query: String,
         /// Sort field (dateAdded, dateModified, title, accessDate)
         #[arg(long)]
         sort: Option<String>,
@@ -1409,9 +1535,20 @@ pub enum ZoteroAnnotationCommand {
 pub enum ZoteroNoteCommand {
     /// List all note items in the library
     List {
-        /// Search note content
-        #[arg(long, short = 's')]
-        search: Option<String>,
+        /// Results per page (1-100, default 25)
+        #[arg(long, short = 'n', default_value = "25")]
+        limit: u32,
+        /// Pagination offset (0-based)
+        #[arg(long)]
+        start: Option<u32>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search note items by content
+    Search {
+        /// Search query (note content)
+        query: String,
         /// Results per page (1-100, default 25)
         #[arg(long, short = 'n', default_value = "25")]
         limit: u32,
@@ -1592,9 +1729,6 @@ pub enum ZoteroCollectionCommand {
 pub enum ZoteroTagCommand {
     /// List tags from the global library tag index (with per-tag item counts)
     List {
-        /// Search tag names (substring match)
-        #[arg(long, short = 'q')]
-        search: Option<String>,
         /// Sort field
         #[arg(long)]
         sort: Option<String>,
@@ -1613,6 +1747,26 @@ pub enum ZoteroTagCommand {
         /// Only tags appearing on trashed items
         #[arg(long)]
         trash: bool,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search tags by name (substring match)
+    Search {
+        /// Tag name query (substring match)
+        query: String,
+        /// Sort field
+        #[arg(long)]
+        sort: Option<String>,
+        /// Sort direction: asc or desc
+        #[arg(long)]
+        direction: Option<String>,
+        /// Results per page (1-100, default 25)
+        #[arg(long, short = 'n', default_value = "25")]
+        limit: u32,
+        /// Pagination offset (0-based)
+        #[arg(long)]
+        start: Option<u32>,
         /// Output raw JSON
         #[arg(long)]
         json: bool,

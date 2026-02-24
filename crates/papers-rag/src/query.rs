@@ -1417,32 +1417,39 @@ pub async fn list_chunks(
     params: ListChunksParams,
 ) -> Result<Vec<ChunkListItem>, RagError> {
     let table = store.chunks_table().await?;
-    let mut fb = FilterBuilder::new().paper_ids(&[params.paper_id.clone()]);
+    let mut fb = FilterBuilder::new();
+    if let Some(ref pid) = params.paper_id {
+        fb = fb.paper_ids(&[pid.clone()]);
+    }
     if let Some(ch) = params.chapter_idx {
         fb = fb.chapter_idx(ch);
     }
     if let Some(sec) = params.section_idx {
         fb = fb.section_idx(sec);
     }
-    let filter = fb.build().unwrap();
 
-    let batches = table
+    let mut query = table
         .query()
-        .only_if(&filter)
         .select(Select::columns(&[
-            "chunk_id", "chapter_idx", "chapter_title", "section_idx", "section_title",
+            "paper_id", "chunk_id", "chapter_idx", "chapter_title", "section_idx", "section_title",
             "chunk_idx", "depth", "block_type", "text",
-        ]))
+        ]));
+    if let Some(filter) = fb.build() {
+        query = query.only_if(filter);
+    }
+
+    let batches = query
         .execute()
         .await?
         .try_collect::<Vec<_>>()
         .await
         .map_err(RagError::LanceDb)?;
 
-    let mut rows: Vec<(u16, u16, u16, &RecordBatch, usize)> = Vec::new();
+    let mut rows: Vec<(String, u16, u16, u16, &RecordBatch, usize)> = Vec::new();
     for batch in &batches {
         for row in 0..batch.num_rows() {
             rows.push((
+                col_str(batch, "paper_id", row)?,
                 col_u16(batch, "chapter_idx", row)?,
                 col_u16(batch, "section_idx", row)?,
                 col_u16(batch, "chunk_idx", row)?,
@@ -1451,11 +1458,13 @@ pub async fn list_chunks(
             ));
         }
     }
-    rows.sort_by_key(|(ch, sec, ci, _, _)| (*ch, *sec, *ci));
+    rows.sort_by(|(pa, cha, seca, cia, _, _), (pb, chb, secb, cib, _, _)| {
+        pa.cmp(pb).then(cha.cmp(chb)).then(seca.cmp(secb)).then(cia.cmp(cib))
+    });
 
     let limit = params.limit as usize;
     let mut results = Vec::new();
-    for (_, _, _, batch, row) in rows {
+    for (_, _, _, _, batch, row) in rows {
         results.push(ChunkListItem {
             chunk_id: col_str(batch, "chunk_id", row)?,
             chapter_idx: col_u16(batch, "chapter_idx", row)?,
@@ -1576,14 +1585,16 @@ pub async fn list_sections(
     params: ListSectionsParams,
 ) -> Result<Vec<SectionListItem>, RagError> {
     let table = store.chunks_table().await?;
-    let paper_id_esc = params.paper_id.replace('\'', "''");
-    let filter = format!("paper_id = '{paper_id_esc}'");
-    let batches = table
+    let mut query = table
         .query()
-        .only_if(&filter)
         .select(Select::columns(&[
             "chapter_idx", "chapter_title", "section_idx", "section_title",
-        ]))
+        ]));
+    if let Some(ref pid) = params.paper_id {
+        let paper_id_esc = pid.replace('\'', "''");
+        query = query.only_if(format!("paper_id = '{paper_id_esc}'"));
+    }
+    let batches = query
         .execute()
         .await?
         .try_collect::<Vec<_>>()
@@ -1720,12 +1731,14 @@ pub async fn list_chapters(
     params: ListChaptersParams,
 ) -> Result<Vec<ChapterListItem>, RagError> {
     let table = store.chunks_table().await?;
-    let paper_id_esc = params.paper_id.replace('\'', "''");
-    let filter = format!("paper_id = '{paper_id_esc}'");
-    let batches = table
+    let mut query = table
         .query()
-        .only_if(&filter)
-        .select(Select::columns(&["chapter_idx", "chapter_title", "section_idx"]))
+        .select(Select::columns(&["chapter_idx", "chapter_title", "section_idx"]));
+    if let Some(ref pid) = params.paper_id {
+        let paper_id_esc = pid.replace('\'', "''");
+        query = query.only_if(format!("paper_id = '{paper_id_esc}'"));
+    }
+    let batches = query
         .execute()
         .await?
         .try_collect::<Vec<_>>()

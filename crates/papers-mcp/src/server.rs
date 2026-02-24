@@ -11,23 +11,28 @@ use rmcp::{Peer, ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
 
 use crate::params::{
-    AutocompleteToolParams, AuthorListToolParams, DomainListToolParams, FieldListToolParams,
-    FindWorksToolParams, FunderListToolParams, GetToolParams, RagChapterGetParams,
-    RagChapterListParams, RagChapterSearchParams, RagChunkGetParams, RagChunkListParams,
-    RagChunkSearchParams, RagFigureGetParams, RagFigureSearchParams,
+    AutocompleteToolParams, AuthorListToolParams, AuthorSearchToolParams,
+    DomainListToolParams, DomainSearchToolParams, FieldListToolParams, FieldSearchToolParams,
+    FindWorksToolParams, FunderListToolParams, FunderSearchToolParams, GetToolParams,
+    InstitutionListToolParams, InstitutionSearchToolParams, PublisherListToolParams, PublisherSearchToolParams,
+    RagChapterGetParams, RagChapterListParams, RagChapterSearchParams,
+    RagChunkGetParams, RagChunkListParams, RagChunkSearchParams,
+    RagFigureGetParams, RagFigureSearchParams,
     RagSectionGetParams, RagSectionListParams, RagSectionSearchParams, RagTagListParams,
     RagWorkGetParams, RagWorkListParams, RagWorkOutlineParams, RagWorkSearchParams,
-    InstitutionListToolParams, PublisherListToolParams,
     SelectionAddToolParams, SelectionCreateToolParams,
     SelectionDeleteToolParams, SelectionGetToolParams, SelectionListToolParams,
-    SelectionRemoveToolParams, SourceListToolParams, SubfieldListToolParams, TopicListToolParams,
-    WorkListToolParams, WorkTextToolParams,
-    ZoteroAnnotationListToolParams, ZoteroAttachmentListToolParams, ZoteroCollectionListToolParams,
-    ZoteroCollectionNotesToolParams, ZoteroCollectionSubcollectionsToolParams,
-    ZoteroCollectionTagsToolParams, ZoteroCollectionWorksToolParams, ZoteroDeletedListToolParams,
-    ZoteroKeyToolParams, ZoteroNoParamsToolParams, ZoteroNoteListToolParams,
-    ZoteroSettingGetToolParams, ZoteroTagGetToolParams, ZoteroTagListToolParams,
-    ZoteroWorkChildrenToolParams, ZoteroWorkListToolParams, ZoteroWorkTagsToolParams,
+    SelectionRemoveToolParams, SourceListToolParams, SourceSearchToolParams,
+    SubfieldListToolParams, SubfieldSearchToolParams, TopicListToolParams, TopicSearchToolParams,
+    WorkListToolParams, WorkSearchToolParams, WorkTextToolParams,
+    ZoteroAnnotationListToolParams, ZoteroAttachmentListToolParams, ZoteroAttachmentSearchToolParams,
+    ZoteroCollectionListToolParams, ZoteroCollectionNotesToolParams,
+    ZoteroCollectionSubcollectionsToolParams, ZoteroCollectionTagsToolParams,
+    ZoteroCollectionWorksToolParams, ZoteroDeletedListToolParams,
+    ZoteroKeyToolParams, ZoteroNoParamsToolParams,
+    ZoteroNoteListToolParams, ZoteroNoteSearchToolParams,
+    ZoteroSettingGetToolParams, ZoteroTagGetToolParams, ZoteroTagListToolParams, ZoteroTagSearchToolParams,
+    ZoteroWorkChildrenToolParams, ZoteroWorkListToolParams, ZoteroWorkSearchToolParams, ZoteroWorkTagsToolParams,
 };
 
 #[derive(Clone)]
@@ -254,6 +259,87 @@ impl PapersMcp {
         json_result(papers_core::api::subfield_list(&self.client, &params.into_entity_params()).await)
     }
 
+    // ── Search tools ─────────────────────────────────────────────────────
+
+    /// Full-text search for scholarly works by title, abstract, and fulltext. 240M+ records.
+    /// Accepts shorthand filter aliases (author, topic, year, etc.) that resolve to OpenAlex filter expressions.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/works/filter-works
+    #[tool]
+    pub async fn work_search(&self, Parameters(params): Parameters<WorkSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::work_list(&self.client, &params.into_work_list_params()).await)
+    }
+
+    /// Full-text search for author profiles by name. 110M+ records.
+    /// Accepts shorthand filter aliases (institution, country, citations, etc.) that resolve to OpenAlex filter expressions.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/authors/filter-authors
+    #[tool]
+    pub async fn author_search(&self, Parameters(params): Parameters<AuthorSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::author_list(&self.client, &params.into_entity_params()).await)
+    }
+
+    /// Full-text search for publishing venues (journals, repositories, conferences) by name.
+    /// Accepts shorthand filter aliases (publisher, country, type, open, etc.) that resolve to OpenAlex filter expressions.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/sources/filter-sources
+    #[tool]
+    pub async fn source_search(&self, Parameters(params): Parameters<SourceSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::source_list(&self.client, &params.into_entity_params()).await)
+    }
+
+    /// Full-text search for research institutions and organizations by name.
+    /// Accepts shorthand filter aliases (country, continent, type, etc.) that resolve to OpenAlex filter expressions.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/institutions/filter-institutions
+    #[tool]
+    pub async fn institution_search(&self, Parameters(params): Parameters<InstitutionSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::institution_list(&self.client, &params.into_entity_params()).await)
+    }
+
+    /// Full-text search for research topics by name (3-level hierarchy: domain > field > subfield > topic).
+    /// Accepts shorthand filter aliases (domain, field, subfield, etc.) that resolve to OpenAlex filter expressions.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/topics/filter-topics
+    #[tool]
+    pub async fn topic_search(&self, Parameters(params): Parameters<TopicSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::topic_list(&self.client, &params.into_entity_params()).await)
+    }
+
+    /// Full-text search for publishing organizations by name (e.g. Elsevier, Springer Nature).
+    /// Accepts shorthand filter aliases (country, continent, citations, works) that resolve to OpenAlex filter expressions.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/publishers/filter-publishers
+    #[tool]
+    pub async fn publisher_search(&self, Parameters(params): Parameters<PublisherSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::publisher_list(&self.client, &params.into_entity_params()).await)
+    }
+
+    /// Full-text search for funding organizations by name (e.g. NIH, NSF, ERC).
+    /// Accepts shorthand filter aliases (country, continent, citations, works) that resolve to OpenAlex filter expressions.
+    /// Advanced filtering: https://docs.openalex.org/api-entities/funders/filter-funders
+    #[tool]
+    pub async fn funder_search(&self, Parameters(params): Parameters<FunderSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::funder_list(&self.client, &params.into_entity_params()).await)
+    }
+
+    /// Full-text search for research domains by name (broadest level of topic hierarchy). 4 domains total.
+    /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
+    #[tool]
+    pub async fn domain_search(&self, Parameters(params): Parameters<DomainSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::domain_list(&self.client, &params.into_entity_params()).await)
+    }
+
+    /// Full-text search for academic fields by name (second level of topic hierarchy). 26 fields total.
+    /// Accepts shorthand filter aliases (domain, works) that resolve to OpenAlex filter expressions.
+    /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
+    #[tool]
+    pub async fn field_search(&self, Parameters(params): Parameters<FieldSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::field_list(&self.client, &params.into_entity_params()).await)
+    }
+
+    /// Full-text search for research subfields by name (third level of topic hierarchy). ~252 subfields total.
+    /// Accepts shorthand filter aliases (domain, field, works) that resolve to OpenAlex filter expressions.
+    /// Filtering: https://docs.openalex.org/how-to-use-the-api/get-lists-of-entities/filter-entity-lists
+    #[tool]
+    pub async fn subfield_search(&self, Parameters(params): Parameters<SubfieldSearchToolParams>) -> Result<String, String> {
+        json_result(papers_core::api::subfield_list(&self.client, &params.into_entity_params()).await)
+    }
+
     // ── Get tools ────────────────────────────────────────────────────────
 
     /// Get a single work by ID (OpenAlex ID, DOI, PMID, or PMCID).
@@ -393,11 +479,28 @@ impl PapersMcp {
         let z = self.require_zotero().await?;
         let params = papers_zotero::ItemListParams {
             item_type: p.item_type,
-            q: p.search,
-            qmode: p.everything.then(|| "everything".to_string()),
             tag: p.tag,
             item_key: p.item_key,
             since: p.since,
+            sort: p.sort,
+            direction: p.direction,
+            limit: p.limit,
+            start: p.start,
+            ..Default::default()
+        };
+        json_result(z.list_top_items(&params).await)
+    }
+
+    /// Full-text search for bibliographic items in your Zotero library (journalArticle, book, conferencePaper, etc.).
+    /// Excludes notes, attachments, and annotations. Requires ZOTERO_USER_ID and ZOTERO_API_KEY.
+    #[tool]
+    pub async fn zotero_work_search(&self, Parameters(p): Parameters<ZoteroWorkSearchToolParams>) -> Result<String, String> {
+        let z = self.require_zotero().await?;
+        let params = papers_zotero::ItemListParams {
+            item_type: p.item_type,
+            q: Some(p.query),
+            qmode: p.everything.then(|| "everything".to_string()),
+            tag: p.tag,
             sort: p.sort,
             direction: p.direction,
             limit: p.limit,
@@ -487,7 +590,16 @@ impl PapersMcp {
     #[tool]
     pub async fn zotero_attachment_list(&self, Parameters(p): Parameters<ZoteroAttachmentListToolParams>) -> Result<String, String> {
         let z = self.require_zotero().await?;
-        let params = papers_zotero::ItemListParams { item_type: Some("attachment".into()), q: p.search, sort: p.sort, direction: p.direction, limit: p.limit, start: p.start, ..Default::default() };
+        let params = papers_zotero::ItemListParams { item_type: Some("attachment".into()), sort: p.sort, direction: p.direction, limit: p.limit, start: p.start, ..Default::default() };
+        json_result(z.list_items(&params).await)
+    }
+
+    /// Search attachment items in the library (PDFs, snapshots, links) by filename or title.
+    /// Requires ZOTERO_USER_ID and ZOTERO_API_KEY.
+    #[tool]
+    pub async fn zotero_attachment_search(&self, Parameters(p): Parameters<ZoteroAttachmentSearchToolParams>) -> Result<String, String> {
+        let z = self.require_zotero().await?;
+        let params = papers_zotero::ItemListParams { item_type: Some("attachment".into()), q: Some(p.query), sort: p.sort, direction: p.direction, limit: p.limit, start: p.start, ..Default::default() };
         json_result(z.list_items(&params).await)
     }
 
@@ -521,7 +633,15 @@ impl PapersMcp {
     #[tool]
     pub async fn zotero_note_list(&self, Parameters(p): Parameters<ZoteroNoteListToolParams>) -> Result<String, String> {
         let z = self.require_zotero().await?;
-        let params = papers_zotero::ItemListParams { item_type: Some("note".into()), q: p.search, limit: p.limit, start: p.start, ..Default::default() };
+        let params = papers_zotero::ItemListParams { item_type: Some("note".into()), limit: p.limit, start: p.start, ..Default::default() };
+        json_result(z.list_items(&params).await)
+    }
+
+    /// Search note items in the library by content. Requires ZOTERO_USER_ID and ZOTERO_API_KEY.
+    #[tool]
+    pub async fn zotero_note_search(&self, Parameters(p): Parameters<ZoteroNoteSearchToolParams>) -> Result<String, String> {
+        let z = self.require_zotero().await?;
+        let params = papers_zotero::ItemListParams { item_type: Some("note".into()), q: Some(p.query), limit: p.limit, start: p.start, ..Default::default() };
         json_result(z.list_items(&params).await)
     }
 
@@ -641,13 +761,22 @@ impl PapersMcp {
     #[tool]
     pub async fn zotero_tag_list(&self, Parameters(p): Parameters<ZoteroTagListToolParams>) -> Result<String, String> {
         let z = self.require_zotero().await?;
-        let params = papers_zotero::TagListParams { q: p.search, qmode: Some("contains".to_string()), sort: p.sort, direction: p.direction, limit: p.limit, start: p.start };
+        let params = papers_zotero::TagListParams { sort: p.sort, direction: p.direction, limit: p.limit, start: p.start, ..Default::default() };
         let result = match p.scope.as_deref() {
             Some("trash") => z.list_trash_tags(&params).await,
             Some("top") => z.list_top_items_tags(&params).await,
             _ => z.list_tags(&params).await,
         };
         json_result(result)
+    }
+
+    /// Search tags in the global library tag index by name (substring match).
+    /// Requires ZOTERO_USER_ID and ZOTERO_API_KEY.
+    #[tool]
+    pub async fn zotero_tag_search(&self, Parameters(p): Parameters<ZoteroTagSearchToolParams>) -> Result<String, String> {
+        let z = self.require_zotero().await?;
+        let params = papers_zotero::TagListParams { q: Some(p.query), qmode: Some("contains".to_string()), sort: p.sort, direction: p.direction, limit: p.limit, start: p.start };
+        json_result(z.list_tags(&params).await)
     }
 
     /// Get a specific tag by name. Requires ZOTERO_USER_ID and ZOTERO_API_KEY.
@@ -926,7 +1055,7 @@ impl PapersMcp {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured. Run: papers rag ingest <ITEM_KEY>".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
-            None => match p.paper_id {
+            None => match p.work {
                 Some(id) => {
                     let resolved = papers_rag::resolve_paper_id(rag, &id).await.map_err(|e| e.to_string())?;
                     Some(vec![resolved])
@@ -956,7 +1085,7 @@ impl PapersMcp {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured. Run: papers rag ingest <ITEM_KEY>".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
-            None => match p.paper_id {
+            None => match p.work {
                 Some(id) => {
                     let resolved = papers_rag::resolve_paper_id(rag, &id).await.map_err(|e| e.to_string())?;
                     Some(vec![resolved])
@@ -1073,7 +1202,13 @@ impl PapersMcp {
     #[tool]
     pub async fn rag_chunk_list(&self, Parameters(p): Parameters<RagChunkListParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
-        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        let paper_id = match p.work {
+            Some(ref id) => {
+                let resolved = papers_rag::resolve_paper_id(rag, id).await.map_err(|e| e.to_string())?;
+                Some(resolved)
+            }
+            None => None,
+        };
         let params = papers_rag::ListChunksParams {
             paper_id,
             chapter_idx: p.chapter_idx,
@@ -1090,7 +1225,7 @@ impl PapersMcp {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         let paper_ids = if let Some(sel) = p.selection.as_deref() {
             Some(Self::resolve_selection_paper_ids(sel)?)
-        } else if let Some(pid) = p.paper_id {
+        } else if let Some(pid) = p.work {
             let resolved = papers_rag::resolve_paper_id(rag, &pid).await.map_err(|e| e.to_string())?;
             Some(vec![resolved])
         } else {
@@ -1114,7 +1249,13 @@ impl PapersMcp {
     #[tool]
     pub async fn rag_section_list(&self, Parameters(p): Parameters<RagSectionListParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
-        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        let paper_id = match p.work {
+            Some(ref id) => {
+                let resolved = papers_rag::resolve_paper_id(rag, id).await.map_err(|e| e.to_string())?;
+                Some(resolved)
+            }
+            None => None,
+        };
         let params = papers_rag::ListSectionsParams { paper_id };
         json_result(papers_rag::query::list_sections(rag, params).await)
     }
@@ -1126,7 +1267,7 @@ impl PapersMcp {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
         let paper_ids = if let Some(sel) = p.selection.as_deref() {
             Some(Self::resolve_selection_paper_ids(sel)?)
-        } else if let Some(pid) = p.paper_id {
+        } else if let Some(pid) = p.work {
             let resolved = papers_rag::resolve_paper_id(rag, &pid).await.map_err(|e| e.to_string())?;
             Some(vec![resolved])
         } else {
@@ -1149,7 +1290,13 @@ impl PapersMcp {
     #[tool]
     pub async fn rag_chapter_list(&self, Parameters(p): Parameters<RagChapterListParams>) -> Result<String, String> {
         let rag = self.rag.as_ref().ok_or_else(|| "RAG database not configured.".to_string())?;
-        let paper_id = papers_rag::resolve_paper_id(rag, &p.paper_id).await.map_err(|e| e.to_string())?;
+        let paper_id = match p.work {
+            Some(ref id) => {
+                let resolved = papers_rag::resolve_paper_id(rag, id).await.map_err(|e| e.to_string())?;
+                Some(resolved)
+            }
+            None => None,
+        };
         let params = papers_rag::ListChaptersParams { paper_id };
         json_result(papers_rag::query::list_chapters(rag, params).await)
     }

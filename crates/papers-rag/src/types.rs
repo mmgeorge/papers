@@ -227,7 +227,7 @@ pub struct SearchWorksParams {
 
 /// Input parameters for listing chunks in a paper.
 pub struct ListChunksParams {
-    pub paper_id: String,
+    pub paper_id: Option<String>,
     pub chapter_idx: Option<u16>,
     pub section_idx: Option<u16>,
     pub limit: u16,
@@ -247,7 +247,7 @@ pub struct SearchSectionsParams {
 
 /// Input parameters for listing sections in a paper.
 pub struct ListSectionsParams {
-    pub paper_id: String,
+    pub paper_id: Option<String>,
 }
 
 /// Input parameters for chapter-level semantic search.
@@ -263,7 +263,7 @@ pub struct SearchChaptersParams {
 
 /// Input parameters for listing chapters in a paper.
 pub struct ListChaptersParams {
-    pub paper_id: String,
+    pub paper_id: Option<String>,
 }
 
 /// Metadata for a single indexed work (paper).

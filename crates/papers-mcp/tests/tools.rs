@@ -263,11 +263,774 @@ async fn test_list_works_with_params() {
 
     let server = make_server(&mock).await;
     let params = serde_json::from_value(serde_json::json!({
-        "search": "machine learning",
+        "query": "machine learning",
         "per_page": 5
     }))
     .unwrap();
-    let result = server.work_list(Parameters(params)).await;
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+// ── Search tool tests ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_work_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "neural rendering"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "neural rendering"})).unwrap();
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_work_search_with_filter_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "path tracing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "path tracing",
+        "year": "2022-2024"
+    }))
+    .unwrap();
+    // year alias is converted to a filter expression, query becomes search
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_author_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param("search", "Turk"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "Turk"})).unwrap();
+    let result = server.author_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_source_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/sources"))
+        .and(query_param("search", "SIGGRAPH"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "SIGGRAPH"})).unwrap();
+    let result = server.source_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_institution_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/institutions"))
+        .and(query_param("search", "MIT"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "MIT"})).unwrap();
+    let result = server.institution_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_topic_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/topics"))
+        .and(query_param("search", "ray tracing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "ray tracing"})).unwrap();
+    let result = server.topic_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_publisher_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/publishers"))
+        .and(query_param("search", "ACM"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "ACM"})).unwrap();
+    let result = server.publisher_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_funder_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/funders"))
+        .and(query_param("search", "NSF"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "NSF"})).unwrap();
+    let result = server.funder_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_domain_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/domains"))
+        .and(query_param("search", "physical sciences"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "physical sciences"})).unwrap();
+    let result = server.domain_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_field_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fields"))
+        .and(query_param("search", "computer science"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "computer science"})).unwrap();
+    let result = server.field_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_subfield_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/subfields"))
+        .and(query_param("search", "artificial intelligence"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "artificial intelligence"})).unwrap();
+    let result = server.subfield_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+// ── Search filter passthrough and alias tests ────────────────────────
+
+#[tokio::test]
+async fn test_work_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "neural rendering"))
+        .and(query_param("filter", "type:article"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "neural rendering",
+        "filter": "type:article"
+    })).unwrap();
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_work_search_year_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "deep learning"))
+        .and(query_param("filter", "publication_year:2024"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "deep learning",
+        "year": "2024"
+    })).unwrap();
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_work_search_citations_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "transformers"))
+        .and(query_param("filter", "cited_by_count:>500"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "transformers",
+        "citations": ">500"
+    })).unwrap();
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_work_search_author_id_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "attention"))
+        .and(query_param("filter", "authorships.author.id:A5083138872"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "attention",
+        "author": "A5083138872"
+    })).unwrap();
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_work_search_topic_id_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "neural nets"))
+        .and(query_param("filter", "primary_topic.id:T10320"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "neural nets",
+        "topic": "T10320"
+    })).unwrap();
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_work_search_open_access_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/works"))
+        .and(query_param("search", "climate"))
+        .and(query_param("filter", "is_oa:true"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "climate",
+        "open": true
+    })).unwrap();
+    let result = server.work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_author_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param("search", "Turing"))
+        .and(query_param("filter", "works_count:>10"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "Turing",
+        "filter": "works_count:>10"
+    })).unwrap();
+    let result = server.author_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_author_search_institution_id_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param("search", "deep learning"))
+        .and(query_param("filter", "last_known_institutions.id:I136199984"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "deep learning",
+        "institution": "I136199984"
+    })).unwrap();
+    let result = server.author_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_author_search_country_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param("search", "computer vision"))
+        .and(query_param("filter", "last_known_institutions.country_code:US"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "computer vision",
+        "country": "US"
+    })).unwrap();
+    let result = server.author_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_author_search_citations_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/authors"))
+        .and(query_param("search", "NLP"))
+        .and(query_param("filter", "cited_by_count:>10000"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "NLP",
+        "citations": ">10000"
+    })).unwrap();
+    let result = server.author_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_source_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/sources"))
+        .and(query_param("search", "proceedings"))
+        .and(query_param("filter", "type:conference"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "proceedings",
+        "filter": "type:conference"
+    })).unwrap();
+    let result = server.source_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_source_search_type_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/sources"))
+        .and(query_param("search", "graphics"))
+        .and(query_param("filter", "type:journal"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "graphics",
+        "type": "journal"
+    })).unwrap();
+    let result = server.source_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_institution_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/institutions"))
+        .and(query_param("search", "tech"))
+        .and(query_param("filter", "type:education"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "tech",
+        "filter": "type:education"
+    })).unwrap();
+    let result = server.institution_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_institution_search_country_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/institutions"))
+        .and(query_param("search", "university"))
+        .and(query_param("filter", "country_code:GB"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "university",
+        "country": "GB"
+    })).unwrap();
+    let result = server.institution_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_topic_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/topics"))
+        .and(query_param("search", "rendering"))
+        .and(query_param("filter", "works_count:>1000"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "rendering",
+        "filter": "works_count:>1000"
+    })).unwrap();
+    let result = server.topic_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_topic_search_field_id_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/topics"))
+        .and(query_param("search", "vision"))
+        .and(query_param("filter", "field.id:fields/17"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "vision",
+        "field": "17"
+    })).unwrap();
+    let result = server.topic_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_publisher_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/publishers"))
+        .and(query_param("search", "press"))
+        .and(query_param("filter", "country_code:us"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "press",
+        "filter": "country_code:us"
+    })).unwrap();
+    let result = server.publisher_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_publisher_search_country_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/publishers"))
+        .and(query_param("search", "scientific"))
+        .and(query_param("filter", "country_codes:DE"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "scientific",
+        "country": "DE"
+    })).unwrap();
+    let result = server.publisher_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_funder_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/funders"))
+        .and(query_param("search", "national"))
+        .and(query_param("filter", "country_code:us"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "national",
+        "filter": "country_code:us"
+    })).unwrap();
+    let result = server.funder_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_funder_search_country_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/funders"))
+        .and(query_param("search", "research council"))
+        .and(query_param("filter", "country_code:GB"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "research council",
+        "country": "GB"
+    })).unwrap();
+    let result = server.funder_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_domain_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/domains"))
+        .and(query_param("search", "sciences"))
+        .and(query_param("filter", "works_count:>1000"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "sciences",
+        "filter": "works_count:>1000"
+    })).unwrap();
+    let result = server.domain_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_field_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fields"))
+        .and(query_param("search", "engineering"))
+        .and(query_param("filter", "works_count:>1000"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "engineering",
+        "filter": "works_count:>1000"
+    })).unwrap();
+    let result = server.field_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_field_search_domain_id_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/fields"))
+        .and(query_param("search", "science"))
+        .and(query_param("filter", "domain.id:domains/3"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "science",
+        "domain": "3"
+    })).unwrap();
+    let result = server.field_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_subfield_search_filter_passthrough() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/subfields"))
+        .and(query_param("search", "machine"))
+        .and(query_param("filter", "works_count:>500"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "machine",
+        "filter": "works_count:>500"
+    })).unwrap();
+    let result = server.subfield_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_subfield_search_field_id_alias() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/subfields"))
+        .and(query_param("search", "learning"))
+        .and(query_param("filter", "field.id:fields/17"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(minimal_list_json()))
+        .mount(&mock)
+        .await;
+    let server = make_server(&mock).await;
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "learning",
+        "field": "17"
+    })).unwrap();
+    let result = server.subfield_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+// ── Zotero search tests ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_zotero_work_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/top"))
+        .and(query_param("q", "neural rendering"))
+        .respond_with(zotero_array_response(&zotero_items_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"query": "neural rendering"})).unwrap();
+    let result = server.zotero_work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_zotero_work_search_no_qmode_by_default() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/top"))
+        .respond_with(zotero_array_response(&zotero_items_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"query": "test"})).unwrap();
+    server.zotero_work_search(Parameters(params)).await.unwrap();
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].url.query().unwrap_or("").contains("qmode"));
+}
+
+#[tokio::test]
+async fn test_zotero_work_search_with_item_type() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/top"))
+        .and(query_param("q", "rendering"))
+        .and(query_param("itemType", "journalArticle"))
+        .respond_with(zotero_array_response(&zotero_items_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "rendering",
+        "item_type": "journalArticle"
+    })).unwrap();
+    let result = server.zotero_work_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_zotero_attachment_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/items"))
+        .and(query_param("q", "paper.pdf"))
+        .respond_with(zotero_array_response(&zotero_attachments_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"query": "paper.pdf"})).unwrap();
+    let result = server.zotero_attachment_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_zotero_note_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/items"))
+        .and(query_param("q", "important finding"))
+        .respond_with(zotero_array_response(&zotero_items_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"query": "important finding"})).unwrap();
+    let result = server.zotero_note_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_zotero_tag_search() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/tags"))
+        .and(query_param("q", "Starred"))
+        .and(query_param("qmode", "contains"))
+        .respond_with(zotero_array_response(&zotero_tags_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"query": "Starred"})).unwrap();
+    let result = server.zotero_tag_search(Parameters(params)).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_zotero_tag_search_always_uses_contains() {
+    // zotero_tag_search always sends qmode=contains
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/users/test/tags"))
+        .and(query_param("qmode", "contains"))
+        .respond_with(zotero_array_response(&zotero_tags_body()))
+        .mount(&mock)
+        .await;
+    let server = make_zotero_server(&mock);
+    let params = serde_json::from_value(serde_json::json!({"query": "anything"})).unwrap();
+    let result = server.zotero_tag_search(Parameters(params)).await;
     assert!(result.is_ok());
 }
 
@@ -1841,11 +2604,11 @@ fn test_work_list_schema_includes_aliases() {
     let json = serde_json::to_value(&schema).unwrap();
     let props = json["properties"].as_object().unwrap();
 
-    // Standard list params
+    // Standard list params (no search on list)
     assert!(props.contains_key("filter"));
-    assert!(props.contains_key("search"));
     assert!(props.contains_key("sort"));
     assert!(props.contains_key("per_page"));
+    assert!(!props.contains_key("search"), "search should be absent from list; use work_search instead");
 
     // Alias params
     assert!(props.contains_key("author"), "missing author");
@@ -1857,6 +2620,22 @@ fn test_work_list_schema_includes_aliases() {
     assert!(props.contains_key("source"), "missing source");
     assert!(props.contains_key("year"), "missing year");
     assert!(props.contains_key("citations"), "missing citations");
+}
+
+#[test]
+fn test_work_search_schema_includes_query_and_aliases() {
+    use papers_mcp::params::WorkSearchToolParams;
+    let schema = schemars::schema_for!(WorkSearchToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("query"), "missing query");
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("sort"), "missing sort");
+    assert!(props.contains_key("per_page"), "missing per_page");
+    assert!(props.contains_key("author"), "missing author");
+    assert!(props.contains_key("topic"), "missing topic");
+    assert!(props.contains_key("year"), "missing year");
 }
 
 #[test]
@@ -1881,13 +2660,26 @@ fn test_author_list_schema() {
     let props = json["properties"].as_object().unwrap();
 
     assert!(props.contains_key("filter"), "missing filter");
-    assert!(props.contains_key("search"), "missing search");
+    assert!(!props.contains_key("search"), "search should be absent from list; use author_search instead");
     assert!(props.contains_key("institution"), "missing institution");
     assert!(props.contains_key("country"), "missing country");
     assert!(props.contains_key("continent"), "missing continent");
     assert!(props.contains_key("citations"), "missing citations");
     assert!(props.contains_key("works"), "missing works");
     assert!(props.contains_key("h_index"), "missing h_index");
+}
+
+#[test]
+fn test_author_search_schema() {
+    use papers_mcp::params::AuthorSearchToolParams;
+    let schema = schemars::schema_for!(AuthorSearchToolParams);
+    let json = serde_json::to_value(&schema).unwrap();
+    let props = json["properties"].as_object().unwrap();
+
+    assert!(props.contains_key("query"), "missing query");
+    assert!(props.contains_key("filter"), "missing filter");
+    assert!(props.contains_key("institution"), "missing institution");
+    assert!(props.contains_key("country"), "missing country");
 }
 
 #[test]
@@ -2065,16 +2857,18 @@ async fn test_zotero_work_list() {
 
 #[tokio::test]
 async fn test_zotero_work_list_everything_flag() {
+    // The `everything` flag is now on zotero_work_search, not zotero_work_list
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/users/test/items/top"))
+        .and(query_param("q", "neural rendering"))
         .and(query_param("qmode", "everything"))
         .respond_with(zotero_array_response(&zotero_items_body()))
         .mount(&mock)
         .await;
     let server = make_zotero_server(&mock);
-    let params = serde_json::from_value(serde_json::json!({"everything": true})).unwrap();
-    let result = server.zotero_work_list(Parameters(params)).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "neural rendering", "everything": true})).unwrap();
+    let result = server.zotero_work_search(Parameters(params)).await;
     assert!(result.is_ok());
 }
 
@@ -2096,12 +2890,11 @@ async fn test_zotero_work_list_no_qmode_by_default() {
 }
 
 #[tokio::test]
-async fn test_zotero_tag_list_always_uses_contains() {
-    // qmode=contains is always sent, even without a search string
+async fn test_zotero_tag_list_no_qmode() {
+    // zotero_tag_list no longer accepts a search query; it should not send qmode
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/users/test/tags"))
-        .and(query_param("qmode", "contains"))
         .respond_with(zotero_array_response(&zotero_tags_body()))
         .mount(&mock)
         .await;
@@ -2109,10 +2902,14 @@ async fn test_zotero_tag_list_always_uses_contains() {
     let params = serde_json::from_value(serde_json::json!({})).unwrap();
     let result = server.zotero_tag_list(Parameters(params)).await;
     assert!(result.is_ok());
+    let requests = mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(!requests[0].url.query().unwrap_or("").contains("qmode"));
 }
 
 #[tokio::test]
 async fn test_zotero_tag_list_search_with_contains() {
+    // search is now on zotero_tag_search which always uses qmode=contains
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/users/test/tags"))
@@ -2122,8 +2919,8 @@ async fn test_zotero_tag_list_search_with_contains() {
         .mount(&mock)
         .await;
     let server = make_zotero_server(&mock);
-    let params = serde_json::from_value(serde_json::json!({"search": "Star"})).unwrap();
-    let result = server.zotero_tag_list(Parameters(params)).await;
+    let params = serde_json::from_value(serde_json::json!({"query": "Star"})).unwrap();
+    let result = server.zotero_tag_search(Parameters(params)).await;
     assert!(result.is_ok());
 }
 

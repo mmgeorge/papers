@@ -50,8 +50,6 @@ impl ListToolParams {
 pub struct WorkListToolParams {
     /// Filter expression. Comma-separated AND conditions, pipe (`|`) for OR.
     pub filter: Option<String>,
-    /// Full-text search query. Searches title, abstract, and fulltext.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix. Example: `"cited_by_count:desc"`
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -103,7 +101,7 @@ impl WorkListToolParams {
     pub fn into_work_list_params(&self) -> papers_core::WorkListParams {
         papers_core::WorkListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -135,8 +133,6 @@ impl WorkListToolParams {
 pub struct AuthorListToolParams {
     /// Filter expression. Comma-separated AND conditions, pipe (`|`) for OR.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -174,7 +170,7 @@ impl AuthorListToolParams {
     pub fn into_entity_params(&self) -> papers_core::AuthorListParams {
         papers_core::AuthorListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -198,8 +194,6 @@ impl AuthorListToolParams {
 pub struct SourceListToolParams {
     /// Filter expression.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -236,7 +230,7 @@ impl SourceListToolParams {
     pub fn into_entity_params(&self) -> papers_core::SourceListParams {
         papers_core::SourceListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -261,8 +255,6 @@ impl SourceListToolParams {
 pub struct InstitutionListToolParams {
     /// Filter expression.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -295,7 +287,7 @@ impl InstitutionListToolParams {
     pub fn into_entity_params(&self) -> papers_core::InstitutionListParams {
         papers_core::InstitutionListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -318,8 +310,6 @@ impl InstitutionListToolParams {
 pub struct TopicListToolParams {
     /// Filter expression.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -352,7 +342,7 @@ impl TopicListToolParams {
     pub fn into_entity_params(&self) -> papers_core::TopicListParams {
         papers_core::TopicListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -375,8 +365,6 @@ impl TopicListToolParams {
 pub struct PublisherListToolParams {
     /// Filter expression.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -407,7 +395,7 @@ impl PublisherListToolParams {
     pub fn into_entity_params(&self) -> papers_core::PublisherListParams {
         papers_core::PublisherListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -429,8 +417,6 @@ impl PublisherListToolParams {
 pub struct FunderListToolParams {
     /// Filter expression.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -461,7 +447,7 @@ impl FunderListToolParams {
     pub fn into_entity_params(&self) -> papers_core::FunderListParams {
         papers_core::FunderListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -483,8 +469,6 @@ impl FunderListToolParams {
 pub struct DomainListToolParams {
     /// Filter expression.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -509,7 +493,7 @@ impl DomainListToolParams {
     pub fn into_entity_params(&self) -> papers_core::DomainListParams {
         papers_core::DomainListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -528,8 +512,6 @@ impl DomainListToolParams {
 pub struct FieldListToolParams {
     /// Filter expression.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -556,7 +538,7 @@ impl FieldListToolParams {
     pub fn into_entity_params(&self) -> papers_core::FieldListParams {
         papers_core::FieldListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -576,8 +558,6 @@ impl FieldListToolParams {
 pub struct SubfieldListToolParams {
     /// Filter expression.
     pub filter: Option<String>,
-    /// Full-text search query.
-    pub search: Option<String>,
     /// Sort field with optional `:desc` suffix.
     pub sort: Option<String>,
     /// Results per page (1-200, default 25).
@@ -606,7 +586,7 @@ impl SubfieldListToolParams {
     pub fn into_entity_params(&self) -> papers_core::SubfieldListParams {
         papers_core::SubfieldListParams {
             filter: self.filter.clone(),
-            search: self.search.clone(),
+            search: None,
             sort: self.sort.clone(),
             per_page: self.per_page,
             page: self.page,
@@ -615,6 +595,559 @@ impl SubfieldListToolParams {
             seed: self.seed,
             select: self.select.clone(),
             group_by: self.group_by.clone(),
+            domain: self.domain.clone(),
+            field: self.field.clone(),
+            works: self.works.clone(),
+        }
+    }
+}
+
+/// Parameters for the `work_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WorkSearchToolParams {
+    /// Full-text search query. Searches title, abstract, and fulltext.
+    pub query: String,
+    /// Filter expression. Comma-separated AND conditions, pipe (`|`) for OR.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix. Example: `"cited_by_count:desc"`
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination (max page * per_page <= 10,000).
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination. Use `"*"` for the first page.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include in the response.
+    pub select: Option<String>,
+    /// Filter by author name or OpenAlex author ID (e.g. "einstein", "Albert Einstein", or "A5108093963")
+    pub author: Option<String>,
+    /// Filter by topic name or OpenAlex topic ID (e.g. "deep learning", or "T10320")
+    pub topic: Option<String>,
+    /// Filter by domain name or ID (e.g. "physical sciences" or "3")
+    pub domain: Option<String>,
+    /// Filter by field name or ID (e.g. "computer science" or "17")
+    pub field: Option<String>,
+    /// Filter by subfield name or ID (e.g. "artificial intelligence" or "1702")
+    pub subfield: Option<String>,
+    /// Filter by publisher name or ID (e.g. "acm", "acm|ieee", or "P4310319798")
+    pub publisher: Option<String>,
+    /// Filter by source (journal/conference) name or ID (e.g. "siggraph" or "S131921510")
+    pub source: Option<String>,
+    /// Filter by institution name or ID (e.g. "mit" or "I136199984")
+    pub institution: Option<String>,
+    /// Filter by publication year (e.g. "2024", ">2008", "2008-2024")
+    pub year: Option<String>,
+    /// Filter by citation count (e.g. ">100", "10-50")
+    pub citations: Option<String>,
+    /// Filter by country code of author institutions (e.g. "US", "GB")
+    pub country: Option<String>,
+    /// Filter by continent of author institutions (e.g. "europe", "asia")
+    pub continent: Option<String>,
+    /// Filter by work type (e.g. "article", "preprint", "dataset")
+    pub r#type: Option<String>,
+    /// Filter for open access works only.
+    pub open: Option<bool>,
+}
+
+impl WorkSearchToolParams {
+    pub fn into_work_list_params(&self) -> papers_core::WorkListParams {
+        papers_core::WorkListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            author: self.author.clone(),
+            topic: self.topic.clone(),
+            domain: self.domain.clone(),
+            field: self.field.clone(),
+            subfield: self.subfield.clone(),
+            publisher: self.publisher.clone(),
+            source: self.source.clone(),
+            institution: self.institution.clone(),
+            year: self.year.clone(),
+            citations: self.citations.clone(),
+            country: self.country.clone(),
+            continent: self.continent.clone(),
+            r#type: self.r#type.clone(),
+            open: self.open,
+        }
+    }
+}
+
+/// Parameters for the `author_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct AuthorSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression. Comma-separated AND conditions, pipe (`|`) for OR.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by institution name or ID (e.g. "harvard", "mit", or "I136199984")
+    pub institution: Option<String>,
+    /// Filter by country code of last known institution (e.g. "US", "GB")
+    pub country: Option<String>,
+    /// Filter by continent of last known institution (e.g. "europe", "asia")
+    pub continent: Option<String>,
+    /// Filter by citation count (e.g. ">1000", "100-500")
+    pub citations: Option<String>,
+    /// Filter by works count (e.g. ">500", "100-200")
+    pub works: Option<String>,
+    /// Filter by h-index (e.g. ">50", "10-20")
+    pub h_index: Option<String>,
+}
+
+impl AuthorSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::AuthorListParams {
+        papers_core::AuthorListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            institution: self.institution.clone(),
+            country: self.country.clone(),
+            continent: self.continent.clone(),
+            citations: self.citations.clone(),
+            works: self.works.clone(),
+            h_index: self.h_index.clone(),
+        }
+    }
+}
+
+/// Parameters for the `source_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SourceSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by publisher name or ID (e.g. "springer", "P4310319798")
+    pub publisher: Option<String>,
+    /// Filter by country code (e.g. "US", "GB")
+    pub country: Option<String>,
+    /// Filter by continent (e.g. "europe")
+    pub continent: Option<String>,
+    /// Filter by source type (e.g. "journal", "repository", "conference")
+    pub r#type: Option<String>,
+    /// Filter for open access sources only.
+    pub open: Option<bool>,
+    /// Filter by citation count (e.g. ">10000")
+    pub citations: Option<String>,
+    /// Filter by works count (e.g. ">100000")
+    pub works: Option<String>,
+}
+
+impl SourceSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::SourceListParams {
+        papers_core::SourceListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            publisher: self.publisher.clone(),
+            country: self.country.clone(),
+            continent: self.continent.clone(),
+            r#type: self.r#type.clone(),
+            open: self.open,
+            citations: self.citations.clone(),
+            works: self.works.clone(),
+        }
+    }
+}
+
+/// Parameters for the `institution_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct InstitutionSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by country code (e.g. "US", "GB")
+    pub country: Option<String>,
+    /// Filter by continent (e.g. "europe", "asia")
+    pub continent: Option<String>,
+    /// Filter by institution type (e.g. "education", "healthcare", "company")
+    pub r#type: Option<String>,
+    /// Filter by citation count (e.g. ">100000")
+    pub citations: Option<String>,
+    /// Filter by works count (e.g. ">100000")
+    pub works: Option<String>,
+}
+
+impl InstitutionSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::InstitutionListParams {
+        papers_core::InstitutionListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            country: self.country.clone(),
+            continent: self.continent.clone(),
+            r#type: self.r#type.clone(),
+            citations: self.citations.clone(),
+            works: self.works.clone(),
+        }
+    }
+}
+
+/// Parameters for the `topic_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct TopicSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by domain name or ID (e.g. "life sciences", "3")
+    pub domain: Option<String>,
+    /// Filter by field name or ID (e.g. "computer science", "17")
+    pub field: Option<String>,
+    /// Filter by subfield name or ID (e.g. "artificial intelligence", "1702")
+    pub subfield: Option<String>,
+    /// Filter by citation count (e.g. ">1000")
+    pub citations: Option<String>,
+    /// Filter by works count (e.g. ">1000")
+    pub works: Option<String>,
+}
+
+impl TopicSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::TopicListParams {
+        papers_core::TopicListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            domain: self.domain.clone(),
+            field: self.field.clone(),
+            subfield: self.subfield.clone(),
+            citations: self.citations.clone(),
+            works: self.works.clone(),
+        }
+    }
+}
+
+/// Parameters for the `publisher_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PublisherSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by country code (e.g. "US", "GB")
+    pub country: Option<String>,
+    /// Filter by continent (e.g. "europe")
+    pub continent: Option<String>,
+    /// Filter by citation count (e.g. ">10000")
+    pub citations: Option<String>,
+    /// Filter by works count (e.g. ">1000000")
+    pub works: Option<String>,
+}
+
+impl PublisherSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::PublisherListParams {
+        papers_core::PublisherListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            country: self.country.clone(),
+            continent: self.continent.clone(),
+            citations: self.citations.clone(),
+            works: self.works.clone(),
+        }
+    }
+}
+
+/// Parameters for the `funder_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FunderSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by country code (e.g. "US", "GB")
+    pub country: Option<String>,
+    /// Filter by continent (e.g. "europe")
+    pub continent: Option<String>,
+    /// Filter by citation count (e.g. ">10000")
+    pub citations: Option<String>,
+    /// Filter by works count (e.g. ">100000")
+    pub works: Option<String>,
+}
+
+impl FunderSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::FunderListParams {
+        papers_core::FunderListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            country: self.country.clone(),
+            continent: self.continent.clone(),
+            citations: self.citations.clone(),
+            works: self.works.clone(),
+        }
+    }
+}
+
+/// Parameters for the `domain_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DomainSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by works count (e.g. ">100000000")
+    pub works: Option<String>,
+}
+
+impl DomainSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::DomainListParams {
+        papers_core::DomainListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            works: self.works.clone(),
+        }
+    }
+}
+
+/// Parameters for the `field_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct FieldSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by domain name or ID (e.g. "life sciences", "3")
+    pub domain: Option<String>,
+    /// Filter by works count (e.g. ">1000000")
+    pub works: Option<String>,
+}
+
+impl FieldSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::FieldListParams {
+        papers_core::FieldListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
+            domain: self.domain.clone(),
+            works: self.works.clone(),
+        }
+    }
+}
+
+/// Parameters for the `subfield_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SubfieldSearchToolParams {
+    /// Full-text search query.
+    pub query: String,
+    /// Filter expression.
+    pub filter: Option<String>,
+    /// Sort field with optional `:desc` suffix.
+    pub sort: Option<String>,
+    /// Results per page (1-200, default 25).
+    pub per_page: Option<u32>,
+    /// Page number for offset pagination.
+    pub page: Option<u32>,
+    /// Cursor for cursor-based pagination.
+    pub cursor: Option<String>,
+    /// Return a random sample of this many results.
+    pub sample: Option<u32>,
+    /// Seed for reproducible random sampling.
+    pub seed: Option<u32>,
+    /// Comma-separated list of fields to include.
+    pub select: Option<String>,
+    /// Filter by domain name or ID (e.g. "physical sciences", "3")
+    pub domain: Option<String>,
+    /// Filter by field name or ID (e.g. "computer science", "17")
+    pub field: Option<String>,
+    /// Filter by works count (e.g. ">1000000")
+    pub works: Option<String>,
+}
+
+impl SubfieldSearchToolParams {
+    pub fn into_entity_params(&self) -> papers_core::SubfieldListParams {
+        papers_core::SubfieldListParams {
+            filter: self.filter.clone(),
+            search: Some(self.query.clone()),
+            sort: self.sort.clone(),
+            per_page: self.per_page,
+            page: self.page,
+            cursor: self.cursor.clone(),
+            sample: self.sample,
+            seed: self.seed,
+            select: self.select.clone(),
+            group_by: None,
             domain: self.domain.clone(),
             field: self.field.clone(),
             works: self.works.clone(),
@@ -727,11 +1260,6 @@ where
 /// Parameters for the `zotero_work_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ZoteroWorkListToolParams {
-    /// Quick text search (title, creator, year).
-    pub search: Option<String>,
-    /// When true, expand search to all fields instead of title/creator/year only.
-    #[serde(default)]
-    pub everything: bool,
     /// Filter by tag name. `||` for OR, `-` prefix for NOT.
     pub tag: Option<String>,
     /// Narrow to a specific bibliographic type (e.g. `"journalArticle"`, `"book"`).
@@ -784,8 +1312,6 @@ pub struct ZoteroWorkTagsToolParams {
 /// Parameters for the `zotero_attachment_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ZoteroAttachmentListToolParams {
-    /// Search by filename or title.
-    pub search: Option<String>,
     /// Sort field: `dateAdded`, `dateModified`, `title`, `accessDate`.
     pub sort: Option<String>,
     /// Sort direction: `"asc"` or `"desc"`.
@@ -812,8 +1338,6 @@ pub struct ZoteroAnnotationListToolParams {
 /// Parameters for the `zotero_note_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ZoteroNoteListToolParams {
-    /// Search note content.
-    pub search: Option<String>,
     /// Results per page (1–100, default 25).
     #[serde(default, deserialize_with = "lax_optional_u32")]
     pub limit: Option<u32>,
@@ -917,8 +1441,6 @@ pub struct ZoteroCollectionTagsToolParams {
 /// Parameters for the `zotero_tag_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ZoteroTagListToolParams {
-    /// Filter tag names (substring match).
-    pub search: Option<String>,
     /// Sort field.
     pub sort: Option<String>,
     /// Sort direction: `"asc"` or `"desc"`.
@@ -931,6 +1453,77 @@ pub struct ZoteroTagListToolParams {
     pub start: Option<u32>,
     /// Scope: `"all"` (default) = global index, `"top"` = top-level items only, `"trash"` = trashed items.
     pub scope: Option<String>,
+}
+
+/// Parameters for the `zotero_work_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ZoteroWorkSearchToolParams {
+    /// Search query (title, creator, year).
+    pub query: String,
+    /// When true, expand search to all fields instead of title/creator/year only.
+    #[serde(default)]
+    pub everything: bool,
+    /// Filter by tag name. `||` for OR, `-` prefix for NOT.
+    pub tag: Option<String>,
+    /// Narrow to a specific bibliographic type (e.g. `"journalArticle"`, `"book"`).
+    pub item_type: Option<String>,
+    /// Sort field: `dateAdded`, `dateModified`, `title`, `creator`, `date`, etc.
+    pub sort: Option<String>,
+    /// Sort direction: `"asc"` or `"desc"`.
+    pub direction: Option<String>,
+    /// Results per page (1–100, default 25).
+    #[serde(default, deserialize_with = "lax_optional_u32")]
+    pub limit: Option<u32>,
+    /// Pagination offset (0-based).
+    #[serde(default, deserialize_with = "lax_optional_u32")]
+    pub start: Option<u32>,
+}
+
+/// Parameters for the `zotero_attachment_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ZoteroAttachmentSearchToolParams {
+    /// Search query (filename or title).
+    pub query: String,
+    /// Sort field: `dateAdded`, `dateModified`, `title`, `accessDate`.
+    pub sort: Option<String>,
+    /// Sort direction: `"asc"` or `"desc"`.
+    pub direction: Option<String>,
+    /// Results per page (1–100, default 25).
+    #[serde(default, deserialize_with = "lax_optional_u32")]
+    pub limit: Option<u32>,
+    /// Pagination offset (0-based).
+    #[serde(default, deserialize_with = "lax_optional_u32")]
+    pub start: Option<u32>,
+}
+
+/// Parameters for the `zotero_note_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ZoteroNoteSearchToolParams {
+    /// Search query (note content).
+    pub query: String,
+    /// Results per page (1–100, default 25).
+    #[serde(default, deserialize_with = "lax_optional_u32")]
+    pub limit: Option<u32>,
+    /// Pagination offset (0-based).
+    #[serde(default, deserialize_with = "lax_optional_u32")]
+    pub start: Option<u32>,
+}
+
+/// Parameters for the `zotero_tag_search` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ZoteroTagSearchToolParams {
+    /// Tag name query (substring match).
+    pub query: String,
+    /// Sort field.
+    pub sort: Option<String>,
+    /// Sort direction: `"asc"` or `"desc"`.
+    pub direction: Option<String>,
+    /// Results per page (1–100, default 25).
+    #[serde(default, deserialize_with = "lax_optional_u32")]
+    pub limit: Option<u32>,
+    /// Pagination offset (0-based).
+    #[serde(default, deserialize_with = "lax_optional_u32")]
+    pub start: Option<u32>,
 }
 
 /// Parameters for single-key Zotero endpoints.
@@ -1189,10 +1782,10 @@ pub struct RagChunkSearchParams {
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
     /// Scope to a single paper by DOI, item key, or title search.
-    pub paper_id: Option<String>,
-    /// Scope to a chapter (requires paper_id).
+    pub work: Option<String>,
+    /// Scope to a chapter (requires work).
     pub chapter_idx: Option<u16>,
-    /// Scope to a section (requires paper_id and chapter_idx).
+    /// Scope to a section (requires work and chapter_idx).
     pub section_idx: Option<u16>,
     /// Minimum publication year filter.
     pub filter_year_min: Option<u16>,
@@ -1216,7 +1809,7 @@ pub struct RagFigureSearchParams {
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
     /// Scope to a single paper by DOI, item key, or title search.
-    pub paper_id: Option<String>,
+    pub work: Option<String>,
     /// Filter by figure type: "figure" or "table".
     pub filter_figure_type: Option<String>,
     /// Maximum number of results (default 5).
@@ -1321,8 +1914,8 @@ pub struct RagWorkSearchParams {
 /// Parameters for the `rag_chunk_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RagChunkListParams {
-    /// Paper: DOI, item key, or title search.
-    pub paper_id: String,
+    /// Paper: DOI, item key, or title search (omit to list all papers).
+    pub work: Option<String>,
     /// Scope to a chapter (1-based).
     pub chapter_idx: Option<u16>,
     /// Scope to a section (1-based within chapter; requires chapter_idx).
@@ -1339,8 +1932,8 @@ pub struct RagSectionSearchParams {
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
     /// Scope to a single paper by DOI, item key, or title search.
-    pub paper_id: Option<String>,
-    /// Scope to a chapter (requires paper_id).
+    pub work: Option<String>,
+    /// Scope to a chapter (requires work).
     pub chapter_idx: Option<u16>,
     /// Minimum publication year filter.
     pub filter_year_min: Option<u16>,
@@ -1357,8 +1950,8 @@ pub struct RagSectionSearchParams {
 /// Parameters for the `rag_section_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RagSectionListParams {
-    /// Paper: DOI, item key, or title search.
-    pub paper_id: String,
+    /// Paper: DOI, item key, or title search (omit to list all papers).
+    pub work: Option<String>,
 }
 
 /// Parameters for the `rag_chapter_search` tool.
@@ -1369,7 +1962,7 @@ pub struct RagChapterSearchParams {
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
     /// Scope to a single paper by DOI, item key, or title search.
-    pub paper_id: Option<String>,
+    pub work: Option<String>,
     /// Minimum publication year filter.
     pub filter_year_min: Option<u16>,
     /// Maximum publication year filter.
@@ -1385,6 +1978,6 @@ pub struct RagChapterSearchParams {
 /// Parameters for the `rag_chapter_list` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RagChapterListParams {
-    /// Paper: DOI, item key, or title search.
-    pub paper_id: String,
+    /// Paper: DOI, item key, or title search (omit to list all papers).
+    pub work: Option<String>,
 }
