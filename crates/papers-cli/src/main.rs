@@ -11,7 +11,7 @@ use cli::{
     SourceCommand,
     SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand, TopicFilterArgs,
     WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand, ZoteroAttachmentCommand,
-    ZoteroCollectionCommand, ZoteroCommand, ZoteroDeletedCommand, ZoteroExtractCommand,
+    ZoteroCollectionCommand, ZoteroCommand, ZoteroDeletedCommand,
     ZoteroGroupCommand, ZoteroNoteCommand, ZoteroPermissionCommand, ZoteroSearchCommand,
     ZoteroSettingCommand, ZoteroTagCommand, ZoteroWorkCommand,
 };
@@ -2196,7 +2196,7 @@ async fn handle_rag_command(cmd: RagCommand) {
                 }
             }
 
-            RagWorkCommand::Extract { cmd } => {
+            RagWorkCommand::Extract { work, json } => {
                 let zotero = zotero_client().await.unwrap_or_else(|e| match e {
                     papers_zotero::ZoteroError::NotRunning { path } => exit_err(&format!(
                         "Zotero is installed ({path}) but the local API is not enabled.\n\
@@ -2205,7 +2205,23 @@ async fn handle_rag_command(cmd: RagCommand) {
                     )),
                     _ => exit_err("Zotero not configured. Set ZOTERO_USER_ID and ZOTERO_API_KEY."),
                 });
-                handle_extract_command(cmd, &zotero).await;
+                let key = smart_resolve_item_key(&zotero, &work).await
+                    .unwrap_or_else(|e| exit_err(&e));
+                if json {
+                    match papers_core::text::datalab_cached_json(&key) {
+                        Some(json_str) => print!("{json_str}"),
+                        None => exit_err(&format!(
+                            "No cached extraction for {key}. Run: papers zotero work extract {key}"
+                        )),
+                    }
+                } else {
+                    match papers_core::text::datalab_cached_markdown(&key) {
+                        Some(md) => print!("{md}"),
+                        None => exit_err(&format!(
+                            "No cached extraction for {key}. Run: papers zotero work extract {key}"
+                        )),
+                    }
+                }
             }
         },
 
@@ -2363,250 +2379,6 @@ async fn handle_rag_command(cmd: RagCommand) {
     }
 }
 
-async fn handle_extract_command(cmd: ZoteroExtractCommand, zotero: &papers_zotero::ZoteroClient) {
-    use papers_zotero::params::ItemListParams;
-    match cmd {
-        ZoteroExtractCommand::List { search, limit, json } => {
-            use std::collections::{HashMap, HashSet};
-            let local_keys: HashSet<String> =
-                papers_core::text::datalab_cached_item_keys().into_iter().collect();
-            let mut backed_up_keys: HashSet<String> = HashSet::new();
-            let att_params = ItemListParams {
-                item_type: Some("attachment".into()),
-                q: Some("papers_extract".into()),
-                limit: Some(100),
-                ..Default::default()
-            };
-            if let Ok(att_resp) = zotero.list_items(&att_params).await {
-                for item in &att_resp.items {
-                    if let Some(filename) = &item.data.filename {
-                        if let Some(key) = filename
-                            .strip_prefix("papers_extract_")
-                            .and_then(|s| s.strip_suffix(".zip"))
-                        {
-                            backed_up_keys.insert(key.to_string());
-                        }
-                    }
-                }
-            }
-            let mut all_keys: Vec<String> = local_keys.union(&backed_up_keys).cloned().collect();
-            all_keys.sort();
-            let filtered_keys: Vec<String> = if let Some(ref q) = search {
-                let search_params = ItemListParams {
-                    q: Some(q.clone()), limit: Some(limit), ..Default::default()
-                };
-                let search_resp = zotero.list_top_items(&search_params).await
-                    .unwrap_or_else(|e| exit_err(&e.to_string()));
-                let search_set: HashSet<String> =
-                    search_resp.items.into_iter().map(|i| i.key).collect();
-                all_keys.into_iter().filter(|k| search_set.contains(k)).collect()
-            } else {
-                all_keys.into_iter().take(limit as usize).collect()
-            };
-            let mut title_map: HashMap<String, String> = HashMap::new();
-            for chunk in filtered_keys.chunks(50) {
-                let batch_params = ItemListParams {
-                    item_key: Some(chunk.join(",")),
-                    limit: Some(chunk.len() as u32),
-                    ..Default::default()
-                };
-                if let Ok(resp) = zotero.list_items(&batch_params).await {
-                    for item in resp.items {
-                        title_map.insert(item.key, item.data.title.unwrap_or_default());
-                    }
-                }
-            }
-            let resolve_title = |key: &str| -> String {
-                if let Some(meta) = papers_core::text::read_extraction_meta(key) {
-                    if let Some(t) = meta.title { if !t.is_empty() { return t; } }
-                }
-                if let Some(t) = title_map.get(key) {
-                    return if t.is_empty() { "(no title)".to_string() } else { t.clone() };
-                }
-                if backed_up_keys.contains(key) { "(title unknown)".to_string() }
-                else { "(not in Zotero)".to_string() }
-            };
-            if json {
-                let items: Vec<_> = filtered_keys.iter().map(|k| {
-                    let remote_status = if backed_up_keys.contains(k) { "ok" }
-                        else if title_map.contains_key(k) { "no_backup" } else { "no_item" };
-                    serde_json::json!({
-                        "key": k, "title": resolve_title(k),
-                        "local": local_keys.contains(k),
-                        "remote": backed_up_keys.contains(k),
-                        "remote_status": remote_status,
-                    })
-                }).collect();
-                print_json(&items);
-            } else {
-                for key in &filtered_keys {
-                    let lmark = if local_keys.contains(key) { "\u{2713}" } else { "\u{2717}" };
-                    let remote_col = if backed_up_keys.contains(key) { "[\u{2713} remote]" }
-                        else if title_map.contains_key(key) { "[\u{2717} remote]" }
-                        else { "[\u{2717} remote *no item*]" };
-                    println!("{key}  [{lmark} local]  {remote_col}  {}", resolve_title(key));
-                }
-            }
-        }
-        ZoteroExtractCommand::Upload { dry_run } => {
-            use std::collections::HashSet;
-            let local_keys: HashSet<String> =
-                papers_core::text::datalab_cached_item_keys().into_iter().collect();
-            let backed_up_keys: HashSet<String> = {
-                let p = ItemListParams {
-                    item_type: Some("attachment".into()),
-                    q: Some("papers_extract".into()),
-                    limit: Some(100),
-                    ..Default::default()
-                };
-                match zotero.list_items(&p).await {
-                    Ok(r) => r.items.iter().filter_map(|i| {
-                        let f = i.data.filename.as_deref()?;
-                        Some(f.strip_prefix("papers_extract_")?.strip_suffix(".zip")?.to_string())
-                    }).collect(),
-                    Err(e) => exit_err(&e.to_string()),
-                }
-            };
-            let mut to_upload: Vec<String> =
-                local_keys.difference(&backed_up_keys).cloned().collect();
-            to_upload.sort();
-            if to_upload.is_empty() {
-                println!("All local extractions already backed up to Zotero.");
-            } else {
-                let mut item_exists: HashSet<String> = HashSet::new();
-                for chunk in to_upload.chunks(50) {
-                    let p = ItemListParams { item_key: Some(chunk.join(",")), ..Default::default() };
-                    if let Ok(resp) = zotero.list_top_items(&p).await {
-                        for item in resp.items { item_exists.insert(item.key); }
-                    }
-                }
-                let mut uploaded = 0usize;
-                for key in &to_upload {
-                    if !item_exists.contains(key) {
-                        if dry_run { println!("skipping: {key}  (item not in Zotero)"); }
-                        else { eprintln!("skipping: {key}  (item not in Zotero)"); }
-                        continue;
-                    }
-                    if dry_run { println!("would upload: {key}"); }
-                    else {
-                        eprint!("Uploading backup {key}... ");
-                        match papers_core::text::upload_extraction_to_zotero(zotero, key).await {
-                            Ok(()) => { eprintln!("ok"); uploaded += 1; }
-                            Err(e) => eprintln!("error: {e}"),
-                        }
-                    }
-                }
-                if !dry_run { eprintln!("Done. Uploaded {uploaded} extraction(s)."); }
-            }
-        }
-        ZoteroExtractCommand::Download { dry_run } => {
-            use std::collections::HashSet;
-            let local_keys: HashSet<String> =
-                papers_core::text::datalab_cached_item_keys().into_iter().collect();
-            let p = ItemListParams {
-                item_type: Some("attachment".into()),
-                q: Some("papers_extract".into()),
-                limit: Some(100),
-                ..Default::default()
-            };
-            let att_resp = zotero.list_items(&p).await
-                .unwrap_or_else(|e| exit_err(&e.to_string()));
-            let mut to_download: Vec<(String, String)> = att_resp.items.iter().filter_map(|i| {
-                let f = i.data.filename.as_deref()?;
-                let item_key = f.strip_prefix("papers_extract_")?.strip_suffix(".zip")?;
-                if local_keys.contains(item_key) { return None; }
-                Some((i.key.clone(), item_key.to_string()))
-            }).collect();
-            to_download.sort_by(|a, b| a.1.cmp(&b.1));
-            if to_download.is_empty() {
-                println!("All Zotero extractions already present locally.");
-            } else {
-                for (att_key, item_key) in &to_download {
-                    if dry_run { println!("would download: {item_key}"); }
-                    else {
-                        eprint!("Downloading {item_key}... ");
-                        match papers_core::text::download_extraction_from_zotero(
-                            zotero, att_key, item_key,
-                        ).await {
-                            Ok(()) => eprintln!("ok"),
-                            Err(e) => eprintln!("error: {e}"),
-                        }
-                    }
-                }
-                if !dry_run { eprintln!("Done. Downloaded {} extraction(s).", to_download.len()); }
-            }
-        }
-        other => {
-            #[derive(PartialEq)]
-            enum OutputKind { Text, Json, Get }
-            let (query, output_kind) = match other {
-                ZoteroExtractCommand::Text { query } => (query, OutputKind::Text),
-                ZoteroExtractCommand::Json { query } => (query, OutputKind::Json),
-                ZoteroExtractCommand::Get { query } => (query, OutputKind::Get),
-                ZoteroExtractCommand::List { .. } => unreachable!(),
-                ZoteroExtractCommand::Upload { .. } => unreachable!(),
-                ZoteroExtractCommand::Download { .. } => unreachable!(),
-            };
-            let key = smart_resolve_item_key(zotero, &query).await
-                .unwrap_or_else(|e| exit_err(&e));
-            match output_kind {
-                OutputKind::Text => match papers_core::text::datalab_cached_markdown(&key) {
-                    Some(md) => print!("{md}"),
-                    None => exit_err(&format!(
-                        "No cached extraction for {key}. Run: papers rag work extract text {key}"
-                    )),
-                },
-                OutputKind::Json => match papers_core::text::datalab_cached_json(&key) {
-                    Some(json_str) => print!("{json_str}"),
-                    None => exit_err(&format!(
-                        "No cached extraction for {key}. Run: papers rag work extract json {key}"
-                    )),
-                },
-                OutputKind::Get => {
-                    let local_dir = papers_core::text::datalab_cache_dir_path(&key);
-                    let local_ok = local_dir.as_ref()
-                        .map(|d| d.join(format!("{key}.md")).exists()).unwrap_or(false);
-                    let item_exists = zotero.get_item(&key).await.is_ok();
-                    let remote_col = if item_exists {
-                        let expected_zip = format!("papers_extract_{key}.zip");
-                        let backup_ok = match zotero.list_item_children(
-                            &key,
-                            &ItemListParams {
-                                item_type: Some("attachment".into()), ..Default::default()
-                            },
-                        ).await {
-                            Ok(children) => children.items.iter().any(|c| {
-                                c.data.filename.as_deref() == Some(&expected_zip)
-                                    && c.data.link_mode.as_deref() == Some("imported_file")
-                            }),
-                            Err(_) => false,
-                        };
-                        if backup_ok { "\u{2713}" } else { "\u{2717}" }
-                    } else { "\u{2717}  *no item*" };
-                    println!("{key}");
-                    match &local_dir {
-                        Some(dir) if local_ok => println!("  local:\u{2713}  {}", dir.display()),
-                        _ => println!("  local:\u{2717}"),
-                    }
-                    println!("  remote:{remote_col}");
-                    if let Some(meta) = papers_core::text::read_extraction_meta(&key) {
-                        if let Some(t) = meta.title { println!("  title: {t}"); }
-                        if let Some(authors) = meta.authors {
-                            println!("  authors: {}", authors.join(", "));
-                        }
-                        if let Some(et) = meta.extracted_at { println!("  extracted: {et}"); }
-                        if let Some(mode) = meta.processing_mode { println!("  mode: {mode}"); }
-                    }
-                    if !local_ok && remote_col == "\u{2717}" {
-                        eprintln!(
-                            "No extraction found. Run: papers rag work extract text {key}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
 
 fn format_rag_work_metadata(w: &papers_rag::WorkMetadata) {
     println!("{}", w.paper_id);

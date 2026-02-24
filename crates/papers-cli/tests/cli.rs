@@ -2980,3 +2980,171 @@ fn test_datalab_cached_markdown_miss() {
     let result = papers_core::text::datalab_cached_markdown("TSTMISSXX");
     assert!(result.is_none(), "unknown key should return None");
 }
+
+// ── `papers rag work extract` tests ──────────────────────────────────────
+//
+// These tests exercise the two user-visible behaviours of the simplified
+// `extract` command:
+//
+//   papers rag work extract <work>         → cached markdown text
+//   papers rag work extract <work> --json  → cached structured JSON
+//
+// All tests write files into an isolated test cache directory controlled by
+// the `PAPERS_DATALAB_CACHE_DIR` environment variable so they never touch the
+// real DataLab cache.  Each test uses a unique item key to avoid races when
+// tests run in parallel.
+
+static EXTRACT_TESTS_CACHE: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// Initialise the shared test-cache base directory once per process.
+///
+/// Sets `PAPERS_DATALAB_CACHE_DIR` to `<system-cache>/papers/extract_tests`
+/// so that every call to `datalab_cached_markdown` / `datalab_cached_json`
+/// looks there instead of the real DataLab cache.
+fn extract_test_cache_base() -> &'static std::path::PathBuf {
+    EXTRACT_TESTS_CACHE.get_or_init(|| {
+        let dir = dirs::cache_dir()
+            .expect("no system cache dir")
+            .join("papers")
+            .join("extract_tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Safety: tests run in a single process; the value is written exactly
+        // once before any test reads it, so there is no concurrent mutation.
+        unsafe { std::env::set_var("PAPERS_DATALAB_CACHE_DIR", &dir) };
+        dir
+    })
+}
+
+/// Write `{key}.md` into the test cache so that `datalab_cached_markdown`
+/// returns `Some(content)`.
+fn write_md_cache(key: &str, content: &str) {
+    let base = extract_test_cache_base();
+    let dir = base.join(key);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{key}.md")), content).unwrap();
+}
+
+/// Write `{key}.json` into the test cache so that `datalab_cached_json`
+/// returns `Some(content)`.
+fn write_json_cache(key: &str, content: &str) {
+    let base = extract_test_cache_base();
+    let dir = base.join(key);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{key}.json")), content).unwrap();
+}
+
+// Unique keys — one per test, so parallel runs never race on the same file.
+const KEY_EXT_MD_HIT:    &str = "EXMDHT01"; // has .md  → markdown returned
+const KEY_EXT_JSON_HIT:  &str = "EXJSHT01"; // has .json → JSON returned
+const KEY_EXT_JSON_MISS: &str = "EXJSMS01"; // no .json  → None
+const KEY_EXT_SRCH_MD:   &str = "EXSRMD01"; // resolved via title search → markdown
+const KEY_EXT_SRCH_JSON: &str = "EXSRJS01"; // resolved via title search → JSON
+
+/// `datalab_cached_markdown` returns the file contents when a `.md` file is
+/// present in the test cache.
+#[test]
+fn test_rag_work_extract_markdown_cache_hit() {
+    let expected = "# My Paper\n\nThis is the extracted text.\n";
+    write_md_cache(KEY_EXT_MD_HIT, expected);
+    let result = papers_core::text::datalab_cached_markdown(KEY_EXT_MD_HIT);
+    assert_eq!(result.as_deref(), Some(expected));
+}
+
+/// `datalab_cached_json` returns the file contents when a `.json` file is
+/// present in the test cache.
+#[test]
+fn test_rag_work_extract_json_cache_hit() {
+    let expected = r#"{"pages":[],"metadata":{"title":"My Paper"}}"#;
+    write_json_cache(KEY_EXT_JSON_HIT, expected);
+    let result = papers_core::text::datalab_cached_json(KEY_EXT_JSON_HIT);
+    assert_eq!(result.as_deref(), Some(expected));
+}
+
+/// `datalab_cached_json` returns `None` when no `.json` file exists for the
+/// key (only a `.md` file is present).
+#[test]
+fn test_rag_work_extract_json_cache_miss() {
+    // Write only the markdown file — no JSON counterpart.
+    write_md_cache(KEY_EXT_JSON_MISS, "# Paper without JSON\n");
+    let result = papers_core::text::datalab_cached_json(KEY_EXT_JSON_MISS);
+    assert!(result.is_none(), "should return None when .json is absent");
+}
+
+/// End-to-end: a title-search query resolves to a Zotero item key via the
+/// mock server, then `datalab_cached_markdown` returns the cached text.
+///
+/// Mirrors the `--json=false` (default) path of `papers rag work extract`.
+#[tokio::test]
+async fn test_rag_work_extract_resolves_title_then_reads_markdown() {
+    // Seed the cache so the resolved key has a markdown file.
+    let expected_md = "# GPU Paper\n\nContent here.\n";
+    write_md_cache(KEY_EXT_SRCH_MD, expected_md);
+
+    // Mock Zotero: title search → single result with KEY_EXT_SRCH_MD.
+    let mock = MockServer::start().await;
+    let body = format!(
+        r#"[{{"key":"{KEY_EXT_SRCH_MD}","version":1,"library":{{"type":"user","id":1,"name":"test","links":{{}}}},"links":{{}},"meta":{{}},"data":{{"key":"{KEY_EXT_SRCH_MD}","version":1,"itemType":"journalArticle","title":"GPU Paper"}}}}]"#
+    );
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/top"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Total-Results", "1")
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(&body),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_zotero_client(&mock);
+
+    // Resolve the title to a key (mirrors smart_resolve_item_key for non-key input).
+    let resolved_key = papers_core::zotero::resolve_item_key(&client, "GPU Paper")
+        .await
+        .expect("resolution should succeed");
+    assert_eq!(resolved_key, KEY_EXT_SRCH_MD);
+
+    // Read cached markdown for the resolved key (the --json=false path).
+    let result = papers_core::text::datalab_cached_markdown(&resolved_key);
+    assert_eq!(result.as_deref(), Some(expected_md));
+}
+
+/// End-to-end: a title-search query resolves to a Zotero item key via the
+/// mock server, then `datalab_cached_json` returns the cached JSON.
+///
+/// Mirrors the `--json` path of `papers rag work extract`.
+#[tokio::test]
+async fn test_rag_work_extract_resolves_title_then_reads_json() {
+    // Seed the cache so the resolved key has a JSON file.
+    let expected_json = r#"{"pages":[],"metadata":{"title":"GPU Paper"}}"#;
+    write_json_cache(KEY_EXT_SRCH_JSON, expected_json);
+
+    // Mock Zotero: title search → single result with KEY_EXT_SRCH_JSON.
+    let mock = MockServer::start().await;
+    let body = format!(
+        r#"[{{"key":"{KEY_EXT_SRCH_JSON}","version":1,"library":{{"type":"user","id":1,"name":"test","links":{{}}}},"links":{{}},"meta":{{}},"data":{{"key":"{KEY_EXT_SRCH_JSON}","version":1,"itemType":"journalArticle","title":"GPU Paper"}}}}]"#
+    );
+    Mock::given(method("GET"))
+        .and(path("/users/test/items/top"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Total-Results", "1")
+                .insert_header("Last-Modified-Version", "100")
+                .set_body_string(&body),
+        )
+        .mount(&mock)
+        .await;
+
+    let client = make_zotero_client(&mock);
+
+    // Resolve the title to a key.
+    let resolved_key = papers_core::zotero::resolve_item_key(&client, "GPU Paper")
+        .await
+        .expect("resolution should succeed");
+    assert_eq!(resolved_key, KEY_EXT_SRCH_JSON);
+
+    // Read cached JSON for the resolved key (the --json path).
+    let result = papers_core::text::datalab_cached_json(&resolved_key);
+    assert_eq!(result.as_deref(), Some(expected_json));
+}

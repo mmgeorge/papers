@@ -351,10 +351,13 @@ pub enum RagWorkCommand {
         #[arg(long)]
         json: bool,
     },
-    /// DataLab PDF extractions (cached markdown/JSON)
+    /// Print cached DataLab extraction (markdown by default; use --json for structured JSON)
     Extract {
-        #[command(subcommand)]
-        cmd: ZoteroExtractCommand,
+        /// Paper: item key (e.g. LF4MJWZK), DOI, or title search
+        work: String,
+        /// Output structured JSON instead of markdown
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1182,49 +1185,6 @@ pub enum SubfieldCommand {
 }
 
 // ── Zotero commands ────────────────────────────────────────────────────────
-
-#[derive(Subcommand)]
-pub enum ZoteroExtractCommand {
-    /// List Zotero items with optional search, showing which have cached extractions
-    List {
-        /// Quick text search (title, creator, year)
-        #[arg(long, short = 's')]
-        search: Option<String>,
-        /// Results per page (1-100, default 25)
-        #[arg(long, short = 'n', default_value = "25")]
-        limit: u32,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Print cached markdown for a paper (must already be extracted)
-    Text {
-        /// Item key (e.g. LF4MJWZK), DOI, or title search
-        query: String,
-    },
-    /// Print cached structured JSON for a paper (must already be extracted)
-    Json {
-        /// Item key (e.g. LF4MJWZK), DOI, or title search
-        query: String,
-    },
-    /// Print the local cache directory path for a paper's extraction
-    Get {
-        /// Item key (e.g. LF4MJWZK), DOI, or title search
-        query: String,
-    },
-    /// Upload all locally-cached extractions that are missing from Zotero
-    Upload {
-        /// Show what would be uploaded without actually uploading
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Download all Zotero-backed extractions that are missing from local cache
-    Download {
-        /// Show what would be downloaded without actually downloading
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
 
 #[derive(Subcommand)]
 pub enum ZoteroCommand {
