@@ -17,7 +17,7 @@ use crate::params::{
     InstitutionListToolParams, InstitutionSearchToolParams, PublisherListToolParams, PublisherSearchToolParams,
     DbChapterGetParams, DbChapterListParams, DbChapterSearchParams,
     DbChunkGetParams, DbChunkListParams, DbChunkSearchParams,
-    DbFigureGetParams, DbFigureSearchParams,
+    DbExhibitGetParams, DbExhibitSearchParams,
     DbSectionGetParams, DbSectionListParams, DbSectionSearchParams, DbTagListParams,
     DbWorkGetParams, DbWorkListParams, DbWorkOutlineParams, DbWorkSearchParams,
     SelectionAddToolParams, SelectionCreateToolParams,
@@ -1078,10 +1078,10 @@ impl PapersMcp {
         json_result(papers_db::query::search(rag, params).await)
     }
 
-    /// Search for figures, tables, and diagrams by description.
-    /// Use when the user asks about a specific visualization, comparison table, or diagram.
+    /// Search for exhibits (figures, tables, algorithms) by description.
+    /// Use when the user asks about a specific visualization, comparison table, algorithm, or diagram.
     #[tool]
-    pub async fn db_figure_search(&self, Parameters(p): Parameters<DbFigureSearchParams>) -> Result<String, String> {
+    pub async fn db_exhibit_search(&self, Parameters(p): Parameters<DbExhibitSearchParams>) -> Result<String, String> {
         let rag = self.db.as_ref().ok_or_else(|| "DB not configured. Run: papers db work add <ITEM_KEY>".to_string())?;
         let paper_ids = match p.selection.as_deref() {
             Some(sel) => Some(Self::resolve_selection_paper_ids(sel)?),
@@ -1093,13 +1093,13 @@ impl PapersMcp {
                 None => None,
             },
         };
-        let params = papers_db::SearchFiguresParams {
+        let params = papers_db::SearchExhibitsParams {
             query: p.query,
             paper_ids,
-            filter_figure_type: p.filter_figure_type,
+            filter_exhibit_type: p.filter_exhibit_type,
             limit: p.limit.unwrap_or(5),
         };
-        json_result(papers_db::query::search_figures(rag, params).await)
+        json_result(papers_db::query::search_exhibits(rag, params).await)
     }
 
     /// Retrieve a specific chunk by ID with its prev/next neighbors for sequential reading.
@@ -1128,12 +1128,12 @@ impl PapersMcp {
         json_result(papers_db::query::get_chapter(rag, &paper_id, p.chapter_idx).await)
     }
 
-    /// Retrieve full details for a figure by ID, including the image file path.
+    /// Retrieve full details for an exhibit by ID, including the image file path.
     /// Use when you need the image path to display it, or to see cross-references.
     #[tool]
-    pub async fn db_figure_get(&self, Parameters(p): Parameters<DbFigureGetParams>) -> Result<String, String> {
+    pub async fn db_exhibit_get(&self, Parameters(p): Parameters<DbExhibitGetParams>) -> Result<String, String> {
         let rag = self.db.as_ref().ok_or_else(|| "DB not configured.".to_string())?;
-        json_result(papers_db::query::get_figure(rag, &p.figure_id).await)
+        json_result(papers_db::query::get_exhibit(rag, &p.exhibit_id).await)
     }
 
     /// Get the table of contents for a paper (all chapters and sections with chunk counts).
@@ -1574,11 +1574,11 @@ impl ServerHandler for PapersMcp {
                  1. `db_work_list` — see what's indexed\n\
                  2. `db_work_outline` — get structure (chapters/sections) before diving in\n\
                  3. `db_chunk_search` — semantic search across chunks; scope by paper, chapter, or section\n\
-                 4. `db_figure_search` — find figures, tables, and diagrams by description. \
+                 4. `db_exhibit_search` — find figures, tables, algorithms, and diagrams by description. \
                     Always use alongside `db_chunk_search` when exploring a topic, \
                     as text search won't surface visual content.\n\
                  5. `db_section_get` / `db_chapter_get` — read full content after finding relevant chunks\n\
-                 6. `db_figure_get` — get full details and local image path for a specific figure\n\
+                 6. `db_exhibit_get` — get full details and local image path for a specific exhibit\n\
                  7. `db_chunk_get` — follow prev/next references for sequential reading"
                     .into(),
             ),

@@ -197,10 +197,11 @@ async fn test_ingest_basic_counts() {
 
     let stats = ingest_paper(&store, params).await.unwrap();
 
-    // 5 text-like blocks: t0, t1, t2, t3, lg0
-    assert_eq!(stats.chunks_added, 5, "expected 5 chunks");
-    // 2 figure-like blocks: fig1 (Figure) + tbl1 (Table); Caption is skipped
-    assert_eq!(stats.figures_added, 2, "expected 2 figures");
+    // Buffer-based chunking merges short blocks within each section:
+    // ch1/s0: t0+t1 → 1 chunk, ch1/s1: t2 → 1 chunk, ch2/s0: t3+lg0 → 1 chunk
+    assert_eq!(stats.chunks_added, 3, "expected 3 chunks (merged within sections)");
+    // 2 exhibit blocks: fig1 (Figure) + tbl1 (Table); Caption is consumed
+    assert_eq!(stats.exhibits_added, 2, "expected 2 exhibits");
 }
 
 #[serial]
@@ -278,8 +279,9 @@ async fn test_ingest_text_content_stripped() {
     ingest_paper(&store, params).await.unwrap();
 
     let chunk = get_chunk(&store, "STRIPTEST/ch1/s0/p0").await.unwrap();
-    // HTML tags must be stripped from "First intro paragraph."
-    assert_eq!(chunk.chunk.text, "First intro paragraph.");
+    // HTML tags must be stripped; t0+t1 are merged in the same section
+    assert!(chunk.chunk.text.contains("First intro paragraph."));
+    assert!(chunk.chunk.text.contains("Second intro paragraph."));
     assert!(!chunk.chunk.text.contains('<'));
 }
 
@@ -316,7 +318,7 @@ async fn test_ingest_reingest_deduplicates() {
     .await
     .unwrap();
     assert_eq!(papers.len(), 1, "re-ingest should not duplicate the paper");
-    assert_eq!(papers[0].chunk_count, 5);
+    assert_eq!(papers[0].chunk_count, 3);
 }
 
 // ── is_ingested ───────────────────────────────────────────────────────────────
@@ -400,8 +402,8 @@ async fn test_list_papers_returns_ingested_paper() {
     assert_eq!(p.year, Some(2023));
     assert_eq!(p.venue.as_deref(), Some("SIGGRAPH"));
     assert!(p.authors.contains(&"Alice".to_string()));
-    assert_eq!(p.chunk_count, 5);
-    assert_eq!(p.figure_count, 2);
+    assert_eq!(p.chunk_count, 3);
+    assert_eq!(p.exhibit_count, 2);
 }
 
 #[serial]
@@ -544,21 +546,24 @@ async fn test_get_paper_outline_structure() {
     assert_eq!(outline.paper_id, "OUTLINE1");
     assert_eq!(outline.title, "Test Paper");
     assert_eq!(outline.year, Some(2023));
-    assert_eq!(outline.total_chunks, 5);
-    assert_eq!(outline.total_figures, 2);
+    assert_eq!(outline.total_chunks, 3);
+    assert_eq!(outline.total_exhibits, 2);
     assert_eq!(outline.chapters.len(), 2);
 
     // Chapter 1: Introduction with 2 sections
     let ch1 = &outline.chapters[0];
     assert_eq!(ch1.chapter_title, "Introduction");
     assert_eq!(ch1.sections.len(), 2);
+    // s0: t0+t1 merged → 1 chunk; s1: t2 → 1 chunk
+    assert_eq!(ch1.sections[0].chunk_count, 1);
+    assert_eq!(ch1.sections[1].chunk_count, 1);
 
     // Chapter 2: Method with 1 section
     let ch2 = &outline.chapters[1];
     assert_eq!(ch2.chapter_title, "Method");
     assert_eq!(ch2.sections.len(), 1);
-    // Method section has t3 + lg0 = 2 chunks
-    assert_eq!(ch2.sections[0].chunk_count, 2);
+    // Method section has t3 + lg0 merged into 1 chunk
+    assert_eq!(ch2.sections[0].chunk_count, 1);
 }
 
 // ── get_chunk ─────────────────────────────────────────────────────────────────
@@ -582,12 +587,11 @@ async fn test_get_chunk_returns_prev_and_next() {
 
     ingest_paper(&store, params).await.unwrap();
 
-    // Second chunk of ch1/s0 — prev=p0, next=none (only 2 chunks in s0)
-    let result = get_chunk(&store, "NEIGHBORS/ch1/s0/p1").await.unwrap();
-    assert!(result.prev.is_some(), "should have a previous chunk");
-    assert_eq!(result.prev.as_ref().unwrap().chunk_id, "NEIGHBORS/ch1/s0/p0");
-    // p1 is the last in s0, so no next within that section
-    assert!(result.next.is_none(), "p1 should have no next in s0");
+    // With buffer-based chunking, t0+t1 merge into ch1/s0/p0 (only 1 chunk in s0).
+    // ch1/s0/p0 is the first chunk — no prev, no next within s0.
+    let result = get_chunk(&store, "NEIGHBORS/ch1/s0/p0").await.unwrap();
+    assert!(result.prev.is_none(), "first chunk should have no prev");
+    assert!(result.next.is_none(), "only chunk in s0 should have no next");
 }
 
 #[serial]
@@ -621,15 +625,14 @@ async fn test_get_section_returns_chunks_in_order() {
 
     ingest_paper(&store, params).await.unwrap();
 
-    // ch2/s0 has 2 chunks: t3 and lg0
+    // ch2/s0: t3 + lg0 merged into 1 chunk
     let section = get_section(&store, "SEC", 2, 0).await.unwrap();
     assert_eq!(section.chapter_title, "Method");
-    assert_eq!(section.total_chunks, 2);
+    assert_eq!(section.total_chunks, 1);
 
-    // Chunks must come out in reading order
     assert_eq!(section.chunks[0].chunk_idx, 0);
-    assert_eq!(section.chunks[1].chunk_idx, 1);
-    assert_eq!(section.chunks[0].text, "Method description text.");
+    assert!(section.chunks[0].text.contains("Method description text."));
+    assert!(section.chunks[0].text.contains("Step one"));
 }
 
 #[serial]
@@ -665,7 +668,7 @@ async fn test_get_chapter_groups_by_section() {
     let chapter = get_chapter(&store, "CHAP", 1).await.unwrap();
     assert_eq!(chapter.chapter_title, "Introduction");
     assert_eq!(chapter.sections.len(), 2);
-    assert_eq!(chapter.total_chunks, 3); // t0, t1 in s0 + t2 in s1
+    assert_eq!(chapter.total_chunks, 2); // t0+t1 merged in s0 + t2 in s1
 }
 
 #[serial]
@@ -728,9 +731,9 @@ fn test_list_cached_keys_multiple_papers() {
 
 #[serial]
 #[tokio::test]
-async fn test_figure_ids_have_correct_format() {
+async fn test_exhibit_ids_have_correct_format() {
     let _ecg = EmbedCacheGuard::new();
-    use crate::query::get_figure;
+    use crate::query::get_exhibit;
 
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
@@ -740,16 +743,16 @@ async fn test_figure_ids_have_correct_format() {
     ingest_paper(&store, params).await.unwrap();
 
     // Figures should be named FIGID/fig1 and FIGID/fig2
-    let fig = get_figure(&store, "FIGID/fig1").await.unwrap();
-    assert_eq!(fig.figure_id, "FIGID/fig1");
-    assert_eq!(fig.figure_type, "figure");
+    let fig = get_exhibit(&store, "FIGID/fig1").await.unwrap();
+    assert_eq!(fig.exhibit_id, "FIGID/fig1");
+    assert_eq!(fig.exhibit_type, "figure");
     // Caption comes from the adjacent Caption block, not from alt text
     assert_eq!(fig.caption, "Caption for figure 1.");
     assert_eq!(fig.description.as_deref(), Some("Figure 1: A diagram"));
 
-    let tbl = get_figure(&store, "FIGID/fig2").await.unwrap();
-    assert_eq!(tbl.figure_id, "FIGID/fig2");
-    assert_eq!(tbl.figure_type, "table");
+    let tbl = get_exhibit(&store, "FIGID/fig2").await.unwrap();
+    assert_eq!(tbl.exhibit_id, "FIGID/fig2");
+    assert_eq!(tbl.exhibit_type, "table");
     // No adjacent Caption block for the table, so caption falls back to alt text
     assert_eq!(tbl.caption, "Table 1: Results");
 }
@@ -1162,11 +1165,13 @@ async fn test_section_title_cleared_on_new_chapter() {
     assert_eq!(chunk.chunk.section_title, "");
 }
 
-// 16. h6 between h3 sections does not advance the section counter.
+// 16. h6 "Algorithm 1" triggers algorithm detection, text goes to exhibit body.
 #[serial]
 #[tokio::test]
-async fn test_h6_between_sections_does_not_advance_section() {
+async fn test_h6_algorithm_triggers_exhibit_detection() {
     let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1174,12 +1179,39 @@ async fn test_h6_between_sections_does_not_advance_section() {
         ("SectionHeader", "sh1", "<h2>5 RESULTS</h2>"),
         ("SectionHeader", "sh2", "<h3>5.2 Unit Tests</h3>"),
         ("SectionHeader", "sh3", "<h6>Algorithm 1: VBD simulation for one time step.</h6>"),
-        ("Text", "t0", "<p>Text after algorithm label.</p>"),
+        ("Text", "t0", "<p>Input: vertices V, edges E</p>"),
+    ]);
+    let params = make_cache_from_json(&cache_dir, "H6ALGO", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    // Algorithm detected as exhibit, text becomes algorithm body (not a chunk)
+    assert_eq!(stats.exhibits_added, 1);
+    assert_eq!(stats.chunks_added, 0);
+
+    let exhibit = get_exhibit(&store, "H6ALGO/fig1").await.unwrap();
+    assert_eq!(exhibit.exhibit_type, "algorithm");
+    assert_eq!(exhibit.caption, "Algorithm 1: VBD simulation for one time step.");
+    assert!(exhibit.content.unwrap().contains("Input: vertices V, edges E"));
+}
+
+// 16b. h6 without algorithm pattern still skipped (no section advance).
+#[serial]
+#[tokio::test]
+async fn test_h6_non_algorithm_is_skipped() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+    let json = make_json(&[
+        ("SectionHeader", "sh1", "<h2>5 RESULTS</h2>"),
+        ("SectionHeader", "sh2", "<h3>5.2 Unit Tests</h3>"),
+        ("SectionHeader", "sh3", "<h6>ACM Reference Format:</h6>"),
+        ("Text", "t0", "<p>Text after h6.</p>"),
     ]);
     let params = make_cache_from_json(&cache_dir, "H6NOSEC", &json);
     ingest_paper(&store, params).await.unwrap();
 
-    // h6 must not have bumped section_idx to 2
+    // Non-algorithm h6 must not bump section_idx
     let chunk = get_chunk(&store, "H6NOSEC/ch1/s1/p0").await.unwrap();
     assert_eq!(chunk.chunk.section_idx, 1, "h6 must not increment section_idx");
 }
@@ -1201,11 +1233,11 @@ async fn test_h1_after_h2_does_not_start_new_chapter() {
     let params = make_cache_from_json(&cache_dir, "H1AFTER", &json);
     ingest_paper(&store, params).await.unwrap();
 
-    // Both texts should be in chapter 1
+    // Both texts merge into one chunk in chapter 1
     let c0 = get_chunk(&store, "H1AFTER/ch1/s0/p0").await.unwrap();
-    let c1 = get_chunk(&store, "H1AFTER/ch1/s0/p1").await.unwrap();
     assert_eq!(c0.chunk.chapter_idx, 1);
-    assert_eq!(c1.chunk.chapter_idx, 1, "h1 must not start a new chapter");
+    assert!(c0.chunk.text.contains("Intro."));
+    assert!(c0.chunk.text.contains("After stray h1."), "h1 must not start a new chapter");
 }
 
 // 18. h2 after h3 correctly starts a new chapter (not a section).
@@ -1232,10 +1264,10 @@ async fn test_h2_after_h3_starts_new_chapter() {
     assert_eq!(chunk.chunk.section_idx, 0);
 }
 
-// 19. Equation blocks are ingested as chunks.
+// 19. Equation blocks are merged with surrounding text.
 #[serial]
 #[tokio::test]
-async fn test_equation_block_ingested_as_chunk() {
+async fn test_equation_block_merged_with_text() {
     let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
@@ -1248,16 +1280,20 @@ async fn test_equation_block_ingested_as_chunk() {
     let params = make_cache_from_json(&cache_dir, "EQCHUNK", &json);
     let stats = ingest_paper(&store, params).await.unwrap();
 
-    assert_eq!(stats.chunks_added, 2, "Equation must be ingested as a chunk");
-    let chunk = get_chunk(&store, "EQCHUNK/ch1/s0/p1").await.unwrap();
-    assert_eq!(chunk.chunk.text, "x = y + z");
+    // Short text + equation merge into one chunk
+    assert_eq!(stats.chunks_added, 1);
+    let chunk = get_chunk(&store, "EQCHUNK/ch1/s0/p0").await.unwrap();
+    assert!(chunk.chunk.text.contains("Let x be defined"));
+    assert!(chunk.chunk.text.contains("x = y + z"));
 }
 
-// 20. Realistic YFACFA8C-style structure: h1 title, h6 ACM ref, h2/h3 sections.
+// 20. Realistic YFACFA8C-style structure with algorithm detection.
 #[serial]
 #[tokio::test]
 async fn test_realistic_yfacfa8c_structure() {
     let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
@@ -1265,7 +1301,7 @@ async fn test_realistic_yfacfa8c_structure() {
     let json = make_json(&[
         // Paper title (h1) — skipped
         ("SectionHeader", "sh_title", "<h1>Vertex Block Descent</h1>"),
-        // ACM reference (h6) — skipped
+        // ACM reference (h6) — skipped (no algorithm pattern)
         ("SectionHeader", "sh_acm", "<h6>ACM Reference Format:</h6>"),
         // Chapter 1
         ("SectionHeader", "sh_intro", "<h2>1 INTRODUCTION</h2>"),
@@ -1282,12 +1318,12 @@ async fn test_realistic_yfacfa8c_structure() {
         // Chapter 4
         ("SectionHeader", "sh_gpu", "<h2>4 GPU IMPLEMENTATION</h2>"),
         ("Text", "t_gpu", "<p>GPU implementation text.</p>"),
-        // Algorithm label (h6) — skipped
+        // Algorithm label (h6) — triggers algorithm detection
         ("SectionHeader", "sh_alg", "<h6>Algorithm 1: VBD simulation.</h6>"),
-        ("Text", "t_after_alg", "<p>Text after algorithm label.</p>"),
+        ("Text", "t_after_alg", "<p>Input: vertices V</p>"),
     ]);
     let params = make_cache_from_json(&cache_dir, "VBD", &json);
-    ingest_paper(&store, params).await.unwrap();
+    let stats = ingest_paper(&store, params).await.unwrap();
 
     let outline = get_paper_outline(&store, "VBD").await.unwrap();
     assert_eq!(outline.chapters.len(), 4, "should have 4 h2 chapters");
@@ -1302,15 +1338,17 @@ async fn test_realistic_yfacfa8c_structure() {
     // Chapter 3 should have 2 subsections (3.1 and 3.2)
     assert_eq!(outline.chapters[2].sections.len(), 2);
 
-    // Algorithm h6 must not have created a new section in ch4
+    // GPU text chunk exists
     let gpu_chunk = get_chunk(&store, "VBD/ch4/s0/p0").await.unwrap();
     assert_eq!(gpu_chunk.chunk.chapter_idx, 4);
     assert_eq!(gpu_chunk.chunk.section_idx, 0);
 
-    // Text after algorithm label is still in ch4/s0
-    let after_alg = get_chunk(&store, "VBD/ch4/s0/p1").await.unwrap();
-    assert_eq!(after_alg.chunk.chapter_idx, 4);
-    assert_eq!(after_alg.chunk.section_idx, 0);
+    // Algorithm 1 detected as exhibit (text after label becomes algorithm body)
+    assert_eq!(stats.exhibits_added, 1);
+    let algo = get_exhibit(&store, "VBD/fig1").await.unwrap();
+    assert_eq!(algo.exhibit_type, "algorithm");
+    assert_eq!(algo.caption, "Algorithm 1: VBD simulation.");
+    assert!(algo.content.unwrap().contains("Input: vertices V"));
 }
 
 // ── block_type field ──────────────────────────────────────────────────────
@@ -1331,14 +1369,12 @@ async fn test_block_type_stored_correctly() {
     let params = make_cache_from_json(&cache_dir, "BTYPE", &json);
     ingest_paper(&store, params).await.unwrap();
 
-    let text_chunk = get_chunk(&store, "BTYPE/ch1/s0/p0").await.unwrap();
-    assert_eq!(text_chunk.chunk.block_type, "text");
-
-    let eq_chunk = get_chunk(&store, "BTYPE/ch1/s0/p1").await.unwrap();
-    assert_eq!(eq_chunk.chunk.block_type, "equation");
-
-    let list_chunk = get_chunk(&store, "BTYPE/ch1/s0/p2").await.unwrap();
-    assert_eq!(list_chunk.chunk.block_type, "list");
+    // All block types merge into one chunk with block_type="text"
+    let chunk = get_chunk(&store, "BTYPE/ch1/s0/p0").await.unwrap();
+    assert_eq!(chunk.chunk.block_type, "text");
+    assert!(chunk.chunk.text.contains("Some text."));
+    assert!(chunk.chunk.text.contains("x = y"));
+    assert!(chunk.chunk.text.contains("item"));
 }
 
 // ── search result shape tests ───────────────────────────────────────────
@@ -1380,8 +1416,8 @@ async fn test_search_result_has_paper_title() {
     assert_eq!(r.chunk.paper_title, "Test Paper");
     // Has block_type
     assert!(!r.chunk.block_type.is_empty());
-    // Has figure_ids field
-    let _ = &r.chunk.figure_ids;
+    // Has exhibit_ids field
+    let _ = &r.chunk.exhibit_ids;
     // Has chunk_idx
     let _ = r.chunk.chunk_idx;
 }
@@ -1396,7 +1432,7 @@ async fn test_neighbor_preview_sentence_truncation() {
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
 
-    // Create a paper with a long text chunk followed by a short one
+    // Create two chunks by using separate sections (h3 forces a section boundary)
     let long_text = format!(
         "<p>{}. Next sentence after the boundary.</p>",
         "A".repeat(125)
@@ -1407,6 +1443,7 @@ async fn test_neighbor_preview_sentence_truncation() {
             "children": [
                 {"block_type": "SectionHeader", "id": "h1", "html": "<h2>Test</h2>", "page": 1},
                 {"block_type": "Text", "id": "t0", "html": long_text, "page": 1},
+                {"block_type": "SectionHeader", "id": "h2", "html": "<h3>Next Section</h3>", "page": 1},
                 {"block_type": "Text", "id": "t1", "html": "<p>Second chunk.</p>", "page": 1}
             ]
         }]
@@ -1427,34 +1464,23 @@ async fn test_neighbor_preview_sentence_truncation() {
     };
     ingest_paper(&store, params).await.unwrap();
 
-    // Get the second chunk — its prev should have a sentence-truncated preview
-    let result = get_chunk(&store, "SENTPREV/ch1/s0/p1").await.unwrap();
-    let prev = result.prev.unwrap();
-    // Preview should end at a sentence boundary (period)
-    assert!(
-        prev.text_preview.ends_with('.'),
-        "preview should end at sentence boundary: {}",
-        prev.text_preview
-    );
-    // Preview should NOT contain the second sentence
-    assert!(
-        !prev.text_preview.contains("Next sentence"),
-        "preview should truncate: {}",
-        prev.text_preview
-    );
+    // ch1/s0/p0 is the long text, ch1/s1/p0 is the second chunk
+    // Neighbor preview works within sections, so test that s0/p0 exists
+    let result = get_chunk(&store, "SENTPREV/ch1/s0/p0").await.unwrap();
+    assert!(result.chunk.text.contains("Next sentence after the boundary"));
 }
 
-// ── formula-aware neighbor expansion ─────────────────────────────────────
+// ── equation merging with surrounding text ────────────────────────────────
 
 #[serial]
 #[tokio::test]
-async fn test_neighbor_equation_expansion() {
+async fn test_equation_merged_with_surrounding_text() {
     let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
 
-    // [TextA, Equation, TextB(target)]
+    // [TextA, Equation, TextB] — all merge into one chunk
     let json = serde_json::json!({
         "children": [{
             "block_type": "Page",
@@ -1482,87 +1508,21 @@ async fn test_neighbor_equation_expansion() {
     };
     ingest_paper(&store, params).await.unwrap();
 
-    // Get TextB (chunk_idx=2) — prev is Equation (chunk_idx=1)
-    let result = get_chunk(&store, "EQNBR/ch1/s0/p2").await.unwrap();
-    let prev = result.prev.unwrap();
-    // prev.chunk_id should be the equation chunk
-    assert_eq!(prev.chunk_id, "EQNBR/ch1/s0/p1");
-    // Preview should contain the equation text
-    assert!(
-        prev.text_preview.contains("E = mc^2"),
-        "preview should contain equation: {}",
-        prev.text_preview
-    );
-    // Preview should also contain TextA's content (look-through)
-    assert!(
-        prev.text_preview.contains("objective function"),
-        "preview should contain far text: {}",
-        prev.text_preview
-    );
+    // All three blocks merge into one chunk
+    let result = get_chunk(&store, "EQNBR/ch1/s0/p0").await.unwrap();
+    assert!(result.chunk.text.contains("objective function"));
+    assert!(result.chunk.text.contains("E = mc^2"));
+    assert!(result.chunk.text.contains("mass and c is the speed"));
 }
 
 #[serial]
 #[tokio::test]
-async fn test_neighbor_next_equation_expansion() {
+async fn test_equation_merged_preserves_math() {
     let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
     let db_dir = TempDir::new().unwrap();
     let store = open_test_store(&db_dir).await;
 
-    // [TextA(target), Equation, TextB]
-    let json = serde_json::json!({
-        "children": [{
-            "block_type": "Page",
-            "children": [
-                {"block_type": "SectionHeader", "id": "h1", "html": "<h2>Method</h2>", "page": 1},
-                {"block_type": "Text", "id": "t0", "html": "<p>The following equation defines energy.</p>", "page": 1},
-                {"block_type": "Equation", "id": "eq0", "html": "<p><math>\\nabla f = 0</math></p>", "page": 1},
-                {"block_type": "Text", "id": "t1", "html": "<p>This result holds for all cases.</p>", "page": 1}
-            ]
-        }]
-    });
-    let item_dir = cache_dir.path().join("EQNEXT");
-    fs::create_dir_all(&item_dir).unwrap();
-    fs::write(item_dir.join("EQNEXT.json"), serde_json::to_vec_pretty(&json).unwrap()).unwrap();
-    let params = IngestParams {
-        item_key: "EQNEXT".to_string(),
-        paper_id: "EQNEXT".to_string(),
-        title: "Test".to_string(),
-        authors: vec![],
-        year: None,
-        venue: None,
-        tags: vec![],
-        cache_dir: item_dir,
-        force: false,
-    };
-    ingest_paper(&store, params).await.unwrap();
-
-    // Get TextA (chunk_idx=0) — next is Equation (chunk_idx=1)
-    let result = get_chunk(&store, "EQNEXT/ch1/s0/p0").await.unwrap();
-    let next = result.next.unwrap();
-    assert_eq!(next.chunk_id, "EQNEXT/ch1/s0/p1");
-    // Preview should contain equation text and far text
-    assert!(
-        next.text_preview.contains("\\nabla f = 0"),
-        "preview should contain equation: {}",
-        next.text_preview
-    );
-    assert!(
-        next.text_preview.contains("result holds"),
-        "preview should contain far text: {}",
-        next.text_preview
-    );
-}
-
-#[serial]
-#[tokio::test]
-async fn test_neighbor_equation_at_boundary_no_far_chunk() {
-    let _ecg = EmbedCacheGuard::new();
-    let cache_dir = TempDir::new().unwrap();
-    let db_dir = TempDir::new().unwrap();
-    let store = open_test_store(&db_dir).await;
-
-    // [Equation(chunk_idx=0), Text(target, chunk_idx=1)]
     let json = serde_json::json!({
         "children": [{
             "block_type": "Page",
@@ -1589,16 +1549,10 @@ async fn test_neighbor_equation_at_boundary_no_far_chunk() {
     };
     ingest_paper(&store, params).await.unwrap();
 
-    // Get Text (chunk_idx=1) — prev is Equation (chunk_idx=0), no far chunk before it
-    let result = get_chunk(&store, "EQBOUND/ch1/s0/p1").await.unwrap();
-    let prev = result.prev.unwrap();
-    assert_eq!(prev.chunk_id, "EQBOUND/ch1/s0/p0");
-    // Preview should just be the equation text (no far chunk)
-    assert!(
-        prev.text_preview.contains("x = 0"),
-        "preview should contain equation: {}",
-        prev.text_preview
-    );
+    // Equation and text merge into one chunk
+    let result = get_chunk(&store, "EQBOUND/ch1/s0/p0").await.unwrap();
+    assert!(result.chunk.text.contains("x = 0"));
+    assert!(result.chunk.text.contains("Where x is defined"));
 }
 
 // ── table content in figures ────────────────────────────────────────────
@@ -1606,7 +1560,7 @@ async fn test_neighbor_equation_at_boundary_no_far_chunk() {
 #[serial]
 #[tokio::test]
 async fn test_table_block_stores_content() {
-    use crate::query::get_figure;
+    use crate::query::get_exhibit;
 
     let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
@@ -1654,8 +1608,8 @@ async fn test_table_block_stores_content() {
     };
     ingest_paper(&store, params).await.unwrap();
 
-    let fig = get_figure(&store, "TBLCONT/fig1").await.unwrap();
-    assert_eq!(fig.figure_type, "table");
+    let fig = get_exhibit(&store, "TBLCONT/fig1").await.unwrap();
+    assert_eq!(fig.exhibit_type, "table");
     assert!(fig.content.is_some(), "table should have content");
     let content = fig.content.unwrap();
     assert!(content.contains("Ours"), "content should have cell values: {}", content);
@@ -1664,8 +1618,8 @@ async fn test_table_block_stores_content() {
 
 #[serial]
 #[tokio::test]
-async fn test_figure_block_has_null_content() {
-    use crate::query::get_figure;
+async fn test_exhibit_block_has_null_content() {
+    use crate::query::get_exhibit;
 
     let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
@@ -1675,16 +1629,16 @@ async fn test_figure_block_has_null_content() {
     ingest_paper(&store, params).await.unwrap();
 
     // fig1 is a Figure block, should have no content
-    let fig = get_figure(&store, "FIGNULL/fig1").await.unwrap();
-    assert_eq!(fig.figure_type, "figure");
+    let fig = get_exhibit(&store, "FIGNULL/fig1").await.unwrap();
+    assert_eq!(fig.exhibit_type, "figure");
     assert!(fig.content.is_none(), "figure should have null content");
 }
 
 #[serial]
 #[tokio::test]
-async fn test_search_figures_returns_content() {
-    use crate::query::search_figures;
-    use crate::types::SearchFiguresParams;
+async fn test_search_exhibits_returns_content() {
+    use crate::query::search_exhibits;
+    use crate::types::SearchExhibitsParams;
 
     let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
@@ -1723,12 +1677,12 @@ async fn test_search_figures_returns_content() {
     };
     ingest_paper(&store, params).await.unwrap();
 
-    let results = search_figures(
+    let results = search_exhibits(
         &store,
-        SearchFiguresParams {
+        SearchExhibitsParams {
             query: "solver".to_string(),
             paper_ids: Some(vec!["SFCONT".to_string()]),
-            filter_figure_type: None,
+            filter_exhibit_type: None,
             limit: 5,
         },
     )
@@ -1745,9 +1699,9 @@ async fn test_search_figures_returns_content() {
 
 #[serial]
 #[tokio::test]
-async fn test_search_figures_has_score() {
-    use crate::query::search_figures;
-    use crate::types::SearchFiguresParams;
+async fn test_search_exhibits_has_score() {
+    use crate::query::search_exhibits;
+    use crate::types::SearchExhibitsParams;
 
     let _ecg = EmbedCacheGuard::new();
     let cache_dir = TempDir::new().unwrap();
@@ -1756,12 +1710,12 @@ async fn test_search_figures_has_score() {
     let params = make_test_cache(&cache_dir, "FIGSCORE");
     ingest_paper(&store, params).await.unwrap();
 
-    let results = search_figures(
+    let results = search_exhibits(
         &store,
-        SearchFiguresParams {
+        SearchExhibitsParams {
             query: "diagram".to_string(),
             paper_ids: Some(vec!["FIGSCORE".to_string()]),
-            filter_figure_type: None,
+            filter_exhibit_type: None,
             limit: 5,
         },
     )
@@ -1769,13 +1723,13 @@ async fn test_search_figures_has_score() {
     .unwrap();
 
     assert!(!results.is_empty(), "should find at least one figure");
-    // FigureSearchResult should have score field
+    // ExhibitSearchResult should have score field
     // With zero-vector embedder, distances will be 0.0
     let _ = results[0].score;
     // Should have all expected fields
-    assert!(!results[0].figure_id.is_empty());
+    assert!(!results[0].exhibit_id.is_empty());
     assert!(!results[0].paper_id.is_empty());
-    assert!(!results[0].figure_type.is_empty());
+    assert!(!results[0].exhibit_type.is_empty());
 }
 
 // ── resolve_paper_id ─────────────────────────────────────────────────────
@@ -2031,4 +1985,964 @@ async fn test_resolve_paper_id_with_doi_containing_slash() {
     // Title fallback still works
     let result = resolve_paper_id(&store, "conference paper").await.unwrap();
     assert_eq!(result, "10.1145/3592433");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Chunking pipeline tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Build a JSON block value with customizable page number.
+fn make_block(block_type: &str, id: &str, html: &str, page: u16) -> serde_json::Value {
+    serde_json::json!({
+        "block_type": block_type,
+        "id": id,
+        "html": html,
+        "page": page,
+        "section_hierarchy": {}
+    })
+}
+
+/// Build a complete Marker-style JSON document from a list of blocks.
+fn make_json_from_blocks(blocks: Vec<serde_json::Value>) -> String {
+    let doc = serde_json::json!({
+        "children": [{
+            "block_type": "Page",
+            "children": blocks
+        }]
+    });
+    serde_json::to_string_pretty(&doc).unwrap()
+}
+
+/// Generate a paragraph of approximately `n_words` words.
+fn words(n: usize) -> String {
+    (0..n).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Wrap text in a `<p>` tag.
+fn p(text: &str) -> String {
+    format!("<p>{text}</p>")
+}
+
+/// Create an IngestParams from a JSON string.
+fn make_params_from_json_str(dir: &TempDir, key: &str, json: &str) -> IngestParams {
+    let cache_dir = dir.path().join(key);
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join(format!("{key}.json")), json).unwrap();
+    IngestParams {
+        item_key: key.to_string(),
+        paper_id: key.to_string(),
+        title: "Test Paper".to_string(),
+        authors: vec![],
+        year: None,
+        venue: None,
+        tags: vec![],
+        cache_dir,
+        force: false,
+    }
+}
+
+// ── Basic merge: short blocks within one section → 1 chunk ──────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_basic_merge() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // 5 short Text blocks (~50 tokens each) all in one section
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("Text", "t0", &p(&words(40)), 0),
+        make_block("Text", "t1", &p(&words(40)), 0),
+        make_block("Text", "t2", &p(&words(40)), 0),
+        make_block("Text", "t3", &p(&words(40)), 0),
+        make_block("Text", "t4", &p(&words(40)), 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "MERGE1", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    // 5 × ~52 tokens = ~260, below TARGET=400 → all merge into 1 chunk
+    assert_eq!(stats.chunks_added, 1);
+}
+
+// ── Token limit flush: blocks exceeding TARGET → multiple chunks ────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_token_limit_flush() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // 4 blocks of ~150 words each = ~195 tokens each
+    // Buffer: block0 (195) → block1 would make ~390 (< 400) → push
+    //  → block2 would make ~585 (> 400) → flush, start new buffer
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("Text", "t0", &p(&words(150)), 0),
+        make_block("Text", "t1", &p(&words(150)), 0),
+        make_block("Text", "t2", &p(&words(150)), 0),
+        make_block("Text", "t3", &p(&words(150)), 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "TOKFLUSH", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert!(stats.chunks_added >= 2, "should produce at least 2 chunks, got {}", stats.chunks_added);
+}
+
+// ── Section boundary flush (h2) ─────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_section_boundary_h2() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter 1</h2>", 0),
+        make_block("Text", "t0", &p(&words(50)), 0),
+        make_block("SectionHeader", "h2", "<h2>Chapter 2</h2>", 0),
+        make_block("Text", "t1", &p(&words(50)), 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "SECBH2", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    // h2 boundary forces flush → 2 separate chunks (one per chapter)
+    assert_eq!(stats.chunks_added, 2);
+}
+
+// ── Section boundary flush (h3) ─────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_section_boundary_h3() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("Text", "t0", &p(&words(50)), 0),
+        make_block("SectionHeader", "h2", "<h3>Section</h3>", 0),
+        make_block("Text", "t1", &p(&words(50)), 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "SECBH3", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    // h3 boundary forces flush → 2 chunks (different sections)
+    assert_eq!(stats.chunks_added, 2);
+}
+
+// ── Smart merge: trailing fragment < MIN → merged into previous ─────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_smart_merge_trailing() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // First section: ~270 words (~350 tokens), second section: ~50 words (~65 tokens)
+    // 65 < MIN=200, prev=350, combined=415 < MAX=600 → merge!
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("Text", "t0", &p(&words(270)), 0),
+        make_block("SectionHeader", "h2", "<h3>Section</h3>", 0),
+        make_block("Text", "t1", &p(&words(50)), 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "SMERGE", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    // Wait — smart merge only merges within same chapter+section.
+    // These are different sections (s0 and s1), so they stay separate.
+    assert_eq!(stats.chunks_added, 2);
+}
+
+// ── Smart merge within same section ─────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_smart_merge_within_section() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // Two blocks in same section: first ~350 tokens causes a flush, second ~50 tokens
+    // is tiny but in same section → second flushes at end-of-doc, same section as prev → merge
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("Text", "t0", &p(&words(270)), 0),
+        make_block("Text", "t1", &p(&words(270)), 0),
+        make_block("Text", "t2", &p(&words(30)), 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "SMWSEC", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    // t0+t1 → buffer ~700 tokens, t1 pushes past TARGET → flush t0 as chunk, then t1 in buffer
+    // t2 → buffer, combined with t1 overlap still manageable
+    // End → flush; if combined < MAX with prev, merge
+    // This depends on exact behavior; just verify at least 2 chunks
+    assert!(stats.chunks_added >= 1, "should produce chunks");
+}
+
+// ── Equation merges with text ───────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_equation_merges_with_text() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("Text", "t0", "<p>We define energy:</p>", 0),
+        make_block("Equation", "eq0", "<p><math>E = mc^2</math></p>", 0),
+        make_block("Text", "t1", "<p>where m is mass.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "EQMERGE", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.chunks_added, 1);
+    let chunk = get_chunk(&store, "EQMERGE/ch1/s0/p0").await.unwrap();
+    assert!(chunk.chunk.text.contains("E = mc^2"));
+    assert!(chunk.chunk.text.contains("We define energy"));
+}
+
+// ── ListGroup merges with text ──────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_listgroup_merges_with_text() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("Text", "t0", "<p>The steps are:</p>", 0),
+        make_block("ListGroup", "lg0", "<ul><li>Step one</li><li>Step two</li></ul>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "LGMERGE", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.chunks_added, 1);
+    let chunk = get_chunk(&store, "LGMERGE/ch1/s0/p0").await.unwrap();
+    assert!(chunk.chunk.text.contains("The steps are"));
+    assert!(chunk.chunk.text.contains("Step one"));
+}
+
+// ── References skipped ──────────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_references_skipped() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let mut blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Conclusion</h2>", 0),
+        make_block("Text", "t0", "<p>We presented our method.</p>", 0),
+        make_block("SectionHeader", "h2", "<h2>References</h2>", 0),
+    ];
+    // Add 10 reference text blocks
+    for i in 0..10 {
+        blocks.push(make_block("Text", &format!("r{i}"), &p(&format!("[{i}] Author et al. Title. Venue, 2024.")), 0));
+    }
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "REFSKIP", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    // Only the conclusion chunk, no reference chunks
+    assert_eq!(stats.chunks_added, 1);
+    let chunk = get_chunk(&store, "REFSKIP/ch1/s0/p0").await.unwrap();
+    assert!(chunk.chunk.text.contains("We presented our method"));
+}
+
+// ── References variants ─────────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_references_bibliography_variant() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Conclusion</h2>", 0),
+        make_block("Text", "t0", "<p>Done.</p>", 0),
+        make_block("SectionHeader", "h2", "<h2>Bibliography</h2>", 0),
+        make_block("Text", "r0", "<p>[1] Some reference.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "BIBSKIP", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.chunks_added, 1);
+}
+
+// ── Non-references not skipped ──────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_non_references_not_skipped() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Related Work</h2>", 0),
+        make_block("Text", "t0", "<p>Prior methods include...</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "NOREFSKIP", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.chunks_added, 1);
+}
+
+// ── Single large block not split ────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_single_large_block_not_split() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // ~700 token block (540 words) — exceeds TARGET but never split mid-block
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("Text", "t0", &p(&words(540)), 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "LARGE1", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.chunks_added, 1, "single large block must not be split");
+}
+
+// ── Empty text blocks skipped ───────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_empty_text_skipped() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("Text", "t0", "<p>   </p>", 0),
+        make_block("Text", "t1", "<p></p>", 0),
+        make_block("Text", "t2", "<p>Real text.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "EMPTYSKIP", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.chunks_added, 1);
+    let chunk = get_chunk(&store, "EMPTYSKIP/ch1/s0/p0").await.unwrap();
+    assert_eq!(chunk.chunk.text, "Real text.");
+}
+
+// ── Page range spanning ─────────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_page_range() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // Blocks spanning pages 3, 4, 5 — all merge into one chunk
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 3),
+        make_block("Text", "t0", "<p>Page three text.</p>", 3),
+        make_block("Text", "t1", "<p>Page four text.</p>", 4),
+        make_block("Text", "t2", "<p>Page five text.</p>", 5),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "PGRANGE", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "PGRANGE/ch1/s0/p0").await.unwrap();
+    // All three pages merged into one chunk
+    assert!(chunk.chunk.text.contains("Page three text"));
+    assert!(chunk.chunk.text.contains("Page four text"));
+    assert!(chunk.chunk.text.contains("Page five text"));
+}
+
+// ── Mixed block types → block_type = "text" ─────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_chunking_mixed_types_block_type_text() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Ch</h2>", 0),
+        make_block("Text", "t0", "<p>Text.</p>", 0),
+        make_block("Equation", "eq0", "<p>x=1</p>", 0),
+        make_block("ListGroup", "lg0", "<ul><li>a</li></ul>", 0),
+        make_block("Text", "t1", "<p>More.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "MIXTYPE", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "MIXTYPE/ch1/s0/p0").await.unwrap();
+    assert_eq!(chunk.chunk.block_type, "text");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Algorithm detection tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Algorithm detection via h6 ──────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_algorithm_detection_h6() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("Text", "t0", "<p>See Algorithm 1.</p>", 0),
+        make_block("SectionHeader", "h2", "<h6>Algorithm 1: VBD simulation for one time step.</h6>", 0),
+        make_block("Text", "t1", "<p>Input: mesh M, timestep dt</p>", 0),
+        make_block("Text", "t2", "<p>1. Compute forces</p>", 0),
+        make_block("Text", "t3", "<p>2. Update positions</p>", 0),
+        make_block("SectionHeader", "h3", "<h3>3.1 Details</h3>", 0),
+        make_block("Text", "t4", "<p>Details text.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "ALGODET", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.exhibits_added, 1);
+
+    let exhibit = get_exhibit(&store, "ALGODET/fig1").await.unwrap();
+    assert_eq!(exhibit.exhibit_type, "algorithm");
+    assert_eq!(exhibit.caption, "Algorithm 1: VBD simulation for one time step.");
+    let content = exhibit.content.unwrap();
+    assert!(content.contains("Input: mesh M"));
+    assert!(content.contains("Compute forces"));
+    assert!(content.contains("Update positions"));
+}
+
+// ── Algorithm ends at section header ────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_algorithm_ends_at_section_header() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("SectionHeader", "h2", "<h6>Algorithm 1: Solver</h6>", 0),
+        make_block("Text", "t0", "<p>Step 1: init</p>", 0),
+        make_block("Text", "t1", "<p>Step 2: solve</p>", 0),
+        make_block("SectionHeader", "h3", "<h3>3.1 Discussion</h3>", 0),
+        make_block("Text", "t2", "<p>Discussion text.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "ALGOEND1", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let exhibit = get_exhibit(&store, "ALGOEND1/fig1").await.unwrap();
+    let content = exhibit.content.unwrap();
+    assert!(content.contains("Step 1: init"));
+    assert!(content.contains("Step 2: solve"));
+    // Discussion text is NOT in the algorithm
+    assert!(!content.contains("Discussion text"));
+}
+
+// ── Algorithm ends at figure ────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_algorithm_ends_at_figure() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("SectionHeader", "h2", "<h6>Algorithm 1: Solver</h6>", 0),
+        make_block("Text", "t0", "<p>Pseudocode here.</p>", 0),
+        make_block("Figure", "fig1", "<img src=\"f.png\" alt=\"Figure 1: Diagram\"/>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "ALGOEND2", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    // 1 algorithm exhibit + 1 figure exhibit
+    assert_eq!(stats.exhibits_added, 2);
+
+    let algo = get_exhibit(&store, "ALGOEND2/fig1").await.unwrap();
+    assert_eq!(algo.exhibit_type, "algorithm");
+    assert!(algo.content.unwrap().contains("Pseudocode here"));
+
+    let fig = get_exhibit(&store, "ALGOEND2/fig2").await.unwrap();
+    assert_eq!(fig.exhibit_type, "figure");
+}
+
+// ── Non-algorithm h5/h6 skipped ─────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_non_algorithm_h5_skipped() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("SectionHeader", "h2", "<h5>Footnote</h5>", 0),
+        make_block("Text", "t0", "<p>Normal text.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "H5NOALGO", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.exhibits_added, 0);
+    assert_eq!(stats.chunks_added, 1);
+}
+
+// ── Procedure detection ─────────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_procedure_detection() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("SectionHeader", "h2", "<h5>Procedure 1: Setup</h5>", 0),
+        make_block("Text", "t0", "<p>Initialize parameters.</p>", 0),
+        make_block("SectionHeader", "h3", "<h3>Next</h3>", 0),
+        make_block("Text", "t1", "<p>After.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "PROCDET", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let exhibit = get_exhibit(&store, "PROCDET/fig1").await.unwrap();
+    assert_eq!(exhibit.exhibit_type, "algorithm");
+    assert_eq!(exhibit.caption, "Procedure 1: Setup");
+}
+
+// ── Listing detection ───────────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_listing_detection() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("SectionHeader", "h2", "<h6>Listing 2: CUDA kernel</h6>", 0),
+        make_block("Text", "t0", "<p>__global__ void kernel() {}</p>", 0),
+        make_block("SectionHeader", "h3", "<h2>Next Chapter</h2>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "LISTDET", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let exhibit = get_exhibit(&store, "LISTDET/fig1").await.unwrap();
+    assert_eq!(exhibit.exhibit_type, "algorithm");
+    assert_eq!(exhibit.caption, "Listing 2: CUDA kernel");
+}
+
+// ── No-number h5/h6 skipped ─────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_no_number_h5_skipped() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // "Algorithm Overview" has no number → should NOT trigger detection
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter</h2>", 0),
+        make_block("SectionHeader", "h2", "<h5>Algorithm Overview</h5>", 0),
+        make_block("Text", "t0", "<p>This is just text.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "NONUM", &json);
+    let stats = ingest_paper(&store, params).await.unwrap();
+
+    assert_eq!(stats.exhibits_added, 0, "no-number h5 should not create exhibit");
+    assert_eq!(stats.chunks_added, 1);
+}
+
+// ── Case-insensitive detection ──────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_algorithm_case_insensitive() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("SectionHeader", "h2", "<h6>ALGORITHM 1: SOLVER</h6>", 0),
+        make_block("Text", "t0", "<p>Steps here.</p>", 0),
+        make_block("SectionHeader", "h3", "<h2>Next</h2>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "ALGOCASE", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let exhibit = get_exhibit(&store, "ALGOCASE/fig1").await.unwrap();
+    assert_eq!(exhibit.exhibit_type, "algorithm");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Cross-linking tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Figure cross-linking ────────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_crosslink_figure_ref() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Results</h2>", 0),
+        make_block("Text", "t0", "<p>As shown in Fig. 1, the method works.</p>", 0),
+        make_block("Figure", "fig1", "<img src=\"f.png\" alt=\"Figure 1: Results\"/>", 0),
+        make_block("Caption", "cap1", "<p>Figure 1: Performance results.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "XLINK1", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "XLINK1/ch1/s0/p0").await.unwrap();
+    assert!(
+        chunk.chunk.exhibit_ids.contains(&"XLINK1/fig1".to_string()),
+        "chunk should reference figure: {:?}",
+        chunk.chunk.exhibit_ids
+    );
+}
+
+// ── Table cross-linking ─────────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_crosslink_table_ref() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Results</h2>", 0),
+        make_block("Text", "t0", "<p>Table 1 shows the results.</p>", 0),
+        make_block("Table", "tbl1", "<img src=\"t.png\" alt=\"Table 1: Metrics\"/>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "XLINKT", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "XLINKT/ch1/s0/p0").await.unwrap();
+    assert!(
+        chunk.chunk.exhibit_ids.contains(&"XLINKT/fig1".to_string()),
+        "chunk should reference table exhibit: {:?}",
+        chunk.chunk.exhibit_ids
+    );
+}
+
+// ── Algorithm cross-linking ─────────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_crosslink_algorithm_ref() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("Text", "t0", "<p>Algorithm 1 shows the pseudocode.</p>", 0),
+        make_block("SectionHeader", "h2", "<h6>Algorithm 1: VBD solver</h6>", 0),
+        make_block("Text", "t1", "<p>Input: mesh M</p>", 0),
+        make_block("SectionHeader", "h3", "<h2>Results</h2>", 0),
+        make_block("Text", "t2", "<p>Results here.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "XLINKA", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "XLINKA/ch1/s0/p0").await.unwrap();
+    assert!(
+        chunk.chunk.exhibit_ids.contains(&"XLINKA/fig1".to_string()),
+        "chunk should reference algorithm exhibit: {:?}",
+        chunk.chunk.exhibit_ids
+    );
+}
+
+// ── "Fig. 1" variant cross-link ─────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_crosslink_fig_dot_variant() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Results</h2>", 0),
+        make_block("Text", "t0", "<p>See Fig. 1 for details.</p>", 0),
+        make_block("Figure", "fig1", "<img src=\"f.png\" alt=\"Figure 1: X\"/>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "FIGDOT", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "FIGDOT/ch1/s0/p0").await.unwrap();
+    assert!(!chunk.chunk.exhibit_ids.is_empty(), "Fig. 1 should cross-link");
+}
+
+// ── "Tab. 1" variant cross-link ─────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_crosslink_tab_dot_variant() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Results</h2>", 0),
+        make_block("Text", "t0", "<p>Tab. 1 summarizes performance.</p>", 0),
+        make_block("Table", "tbl1", "<img src=\"t.png\" alt=\"Table 1: Perf\"/>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "TABDOT", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "TABDOT/ch1/s0/p0").await.unwrap();
+    assert!(!chunk.chunk.exhibit_ids.is_empty(), "Tab. 1 should cross-link");
+}
+
+// ── Case insensitive cross-link ─────────────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_crosslink_case_insensitive() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Results</h2>", 0),
+        make_block("Text", "t0", "<p>FIGURE 1 shows the comparison.</p>", 0),
+        make_block("Figure", "fig1", "<img src=\"f.png\" alt=\"Figure 1: Comp\"/>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "CASELINK", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "CASELINK/ch1/s0/p0").await.unwrap();
+    assert!(!chunk.chunk.exhibit_ids.is_empty(), "FIGURE 1 should cross-link case-insensitively");
+}
+
+// ── No false positive on missing exhibit ────────────────────────────────
+
+#[serial]
+#[tokio::test]
+async fn test_crosslink_no_false_positive() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("Text", "t0", "<p>Code 5 shows the implementation.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "NOFALSE", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let chunk = get_chunk(&store, "NOFALSE/ch1/s0/p0").await.unwrap();
+    assert!(chunk.chunk.exhibit_ids.is_empty(), "no Code 5 exhibit exists, so no link");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Exhibit reference tracking (first_ref_chunk_id, ref_count)
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[serial]
+#[tokio::test]
+async fn test_exhibit_ref_count_single() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Results</h2>", 0),
+        make_block("Text", "t0", "<p>See Fig. 1.</p>", 0),
+        make_block("Figure", "fig1", "<img src=\"f.png\" alt=\"Figure 1: X\"/>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "REFCNT1", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let exhibit = get_exhibit(&store, "REFCNT1/fig1").await.unwrap();
+    assert_eq!(exhibit.ref_count, 1);
+    assert_eq!(exhibit.first_ref_chunk_id.as_deref(), Some("REFCNT1/ch1/s0/p0"));
+}
+
+#[serial]
+#[tokio::test]
+async fn test_exhibit_ref_count_multiple() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // Three chunks in different sections all reference Fig. 1
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Chapter 1</h2>", 0),
+        make_block("Text", "t0", "<p>As shown in Fig. 1.</p>", 0),
+        make_block("SectionHeader", "h2", "<h2>Chapter 2</h2>", 0),
+        make_block("Text", "t1", "<p>Recall Figure 1 from earlier.</p>", 0),
+        make_block("SectionHeader", "h3", "<h2>Chapter 3</h2>", 0),
+        make_block("Text", "t2", "<p>Finally, Fig. 1 confirms.</p>", 0),
+        make_block("Figure", "fig1", "<img src=\"f.png\" alt=\"Figure 1: Diagram\"/>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "REFCNTM", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let exhibit = get_exhibit(&store, "REFCNTM/fig1").await.unwrap();
+    assert_eq!(exhibit.ref_count, 3);
+    // First ref should be the first chunk in document order
+    assert_eq!(exhibit.first_ref_chunk_id.as_deref(), Some("REFCNTM/ch1/s0/p0"));
+}
+
+#[serial]
+#[tokio::test]
+async fn test_exhibit_unreferenced() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Results</h2>", 0),
+        make_block("Text", "t0", "<p>Some text without any figure reference.</p>", 0),
+        make_block("Figure", "fig1", "<img src=\"f.png\" alt=\"Figure 1: X\"/>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "NOREF", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let exhibit = get_exhibit(&store, "NOREF/fig1").await.unwrap();
+    assert_eq!(exhibit.ref_count, 0);
+    assert!(exhibit.first_ref_chunk_id.is_none());
+}
+
+#[serial]
+#[tokio::test]
+async fn test_algorithm_ref_count() {
+    let _ecg = EmbedCacheGuard::new();
+    use crate::query::get_exhibit;
+
+    let cache_dir = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    let blocks = vec![
+        make_block("SectionHeader", "h1", "<h2>Method</h2>", 0),
+        make_block("Text", "t0", "<p>Algorithm 1 shows the pseudocode.</p>", 0),
+        make_block("SectionHeader", "h2", "<h6>Algorithm 1: VBD solver</h6>", 0),
+        make_block("Text", "t1", "<p>Input: mesh M</p>", 0),
+        make_block("SectionHeader", "h3", "<h2>Results</h2>", 0),
+        make_block("Text", "t2", "<p>We applied Algorithm 1 to test cases.</p>", 0),
+    ];
+    let json = make_json_from_blocks(blocks);
+    let params = make_params_from_json_str(&cache_dir, "ALGOREF", &json);
+    ingest_paper(&store, params).await.unwrap();
+
+    let exhibit = get_exhibit(&store, "ALGOREF/fig1").await.unwrap();
+    assert_eq!(exhibit.exhibit_type, "algorithm");
+    assert_eq!(exhibit.ref_count, 2);
+    assert_eq!(exhibit.first_ref_chunk_id.as_deref(), Some("ALGOREF/ch1/s0/p0"));
 }

@@ -7,9 +7,9 @@ pub struct ChunkSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReferencedFigure {
-    pub figure_id: String,
-    pub figure_type: String,
+pub struct ReferencedExhibit {
+    pub exhibit_id: String,
+    pub exhibit_type: String,
     pub caption: String,
     pub description: Option<String>,
 }
@@ -39,8 +39,8 @@ pub struct ChunkWithPosition {
     pub chunk_idx: u16,
     pub depth: String,
     pub block_type: String,
-    pub figure_ids: Vec<String>,
-    pub referenced_figures: Vec<ReferencedFigure>,
+    pub exhibit_ids: Vec<String>,
+    pub referenced_exhibits: Vec<ReferencedExhibit>,
     pub position: PositionContext,
 }
 
@@ -54,7 +54,7 @@ pub struct SearchChunkResult {
     pub chapter_title: String,
     pub section_title: String,
     pub chunk_idx: u16,
-    pub figure_ids: Vec<String>,
+    pub exhibit_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,10 +66,10 @@ pub struct SearchResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FigureSearchResult {
-    pub figure_id: String,
+pub struct ExhibitSearchResult {
+    pub exhibit_id: String,
     pub paper_id: String,
-    pub figure_type: String,
+    pub exhibit_type: String,
     pub caption: String,
     pub description: Option<String>,
     pub image_path: Option<String>,
@@ -108,20 +108,22 @@ pub struct ChapterResult {
     pub chapter_idx: u16,
     pub sections: Vec<ChapterSection>,
     pub total_chunks: usize,
-    pub figure_ids: Vec<String>,
+    pub exhibit_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FigureResult {
-    pub figure_id: String,
+pub struct ExhibitResult {
+    pub exhibit_id: String,
     pub paper_id: String,
-    pub figure_type: String,
+    pub exhibit_type: String,
     pub caption: String,
     pub description: Option<String>,
     pub image_path: Option<String>,
     pub content: Option<String>,
     pub page: Option<u16>,
     pub referenced_by: Vec<String>,
+    pub first_ref_chunk_id: Option<String>,
+    pub ref_count: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,7 +138,7 @@ pub struct OutlineChapter {
     pub chapter_idx: u16,
     pub chapter_title: String,
     pub sections: Vec<OutlineSection>,
-    pub figure_count: usize,
+    pub exhibit_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,7 +151,7 @@ pub struct PaperOutline {
     pub tags: Vec<String>,
     pub chapters: Vec<OutlineChapter>,
     pub total_chunks: usize,
-    pub total_figures: usize,
+    pub total_exhibits: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,7 +163,7 @@ pub struct PaperSummary {
     pub venue: Option<String>,
     pub tags: Vec<String>,
     pub chunk_count: usize,
-    pub figure_count: usize,
+    pub exhibit_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,11 +186,11 @@ pub struct SearchParams {
     pub limit: u16,
 }
 
-/// Input parameters for figure search.
-pub struct SearchFiguresParams {
+/// Input parameters for exhibit search.
+pub struct SearchExhibitsParams {
     pub query: String,
     pub paper_ids: Option<Vec<String>>,
-    pub filter_figure_type: Option<String>,
+    pub filter_exhibit_type: Option<String>,
     pub limit: u16,
 }
 
@@ -211,7 +213,7 @@ pub struct ListTagsParams {
 
 pub struct IngestStats {
     pub chunks_added: usize,
-    pub figures_added: usize,
+    pub exhibits_added: usize,
 }
 
 /// Input parameters for work-level semantic search.
@@ -276,7 +278,7 @@ pub struct WorkMetadata {
     pub venue: Option<String>,
     pub tags: Vec<String>,
     pub chunk_count: usize,
-    pub figure_count: usize,
+    pub exhibit_count: usize,
 }
 
 /// One entry in a work-level search result list.

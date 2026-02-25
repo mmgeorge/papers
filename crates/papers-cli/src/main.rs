@@ -7,7 +7,7 @@ use cli::{
     DomainCommand, DomainFilterArgs, EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand,
     FunderFilterArgs, InstitutionCommand, InstitutionFilterArgs, McpCommand, PublisherCommand,
     PublisherFilterArgs, DbChapterCommand, DbChunkCommand, DbCommand, DbEmbedCommand,
-    DbFigureCommand, DbSectionCommand, DbTagCommand, DbWorkCommand, SelectionCommand,
+    DbExhibitCommand, DbSectionCommand, DbTagCommand, DbWorkCommand, SelectionCommand,
     SourceCommand,
     SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand, TopicFilterArgs,
     WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand, ZoteroAttachmentCommand,
@@ -1931,8 +1931,8 @@ async fn handle_db_command(cmd: DbCommand) {
             }
         },
 
-        DbCommand::Figure { cmd } => match cmd {
-            DbFigureCommand::Search { query, selection, work, figure_type, limit, json } => {
+        DbCommand::Exhibit { cmd } => match cmd {
+            DbExhibitCommand::Search { query, selection, work, exhibit_type, limit, json } => {
                 let rag = open_db_store().await;
             let paper_ids = match selection.as_deref() {
                 Some(sel) => match papers_core::selection::load_selection(sel) {
@@ -1952,19 +1952,19 @@ async fn handle_db_command(cmd: DbCommand) {
                     None => None,
                 },
             };
-                let params = papers_db::SearchFiguresParams {
-                    query, paper_ids, filter_figure_type: figure_type, limit,
+                let params = papers_db::SearchExhibitsParams {
+                    query, paper_ids, filter_exhibit_type: exhibit_type, limit,
                 };
-                match papers_db::query::search_figures(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_db_figures(&results); } }
+                match papers_db::query::search_exhibits(&rag, params).await {
+                    Ok(results) => { if json { print_json(&results); } else { format_db_exhibits(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
 
-            DbFigureCommand::Get { figure_id, json } => {
+            DbExhibitCommand::Get { exhibit_id, json } => {
                 let rag = open_db_store().await;
-                match papers_db::query::get_figure(&rag, &figure_id).await {
-                    Ok(result) => { if json { print_json(&result); } else { format_db_figure(&result); } }
+                match papers_db::query::get_exhibit(&rag, &exhibit_id).await {
+                    Ok(result) => { if json { print_json(&result); } else { format_db_exhibit(&result); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
@@ -2041,7 +2041,7 @@ async fn handle_db_command(cmd: DbCommand) {
                         return;
                     }
                     let mut total_chunks = 0usize;
-                    let mut total_figures = 0usize;
+                    let mut total_exhibits = 0usize;
                     let mut ingested = 0usize;
                     let mut failed = 0usize;
                     if force_extract && !keys.is_empty() {
@@ -2068,9 +2068,9 @@ async fn handle_db_command(cmd: DbCommand) {
                         match papers_db::ingest_paper(&rag, params).await {
                             Ok(stats) => {
                                 total_chunks += stats.chunks_added;
-                                total_figures += stats.figures_added;
+                                total_exhibits += stats.exhibits_added;
                                 ingested += 1;
-                                if !json { println!("{} chunks, {} figures", stats.chunks_added, stats.figures_added); }
+                                if !json { println!("{} chunks, {} exhibits", stats.chunks_added, stats.exhibits_added); }
                             }
                             Err(e) => {
                                 failed += 1;
@@ -2081,11 +2081,11 @@ async fn handle_db_command(cmd: DbCommand) {
                     if json {
                         print_json(&serde_json::json!({
                             "ingested": ingested, "failed": failed,
-                            "total_chunks": total_chunks, "total_figures": total_figures,
+                            "total_chunks": total_chunks, "total_exhibits": total_exhibits,
                         }));
                     } else {
-                        println!("Ingested {} papers: {} chunks, {} figures ({} failed)",
-                            ingested, total_chunks, total_figures, failed);
+                        println!("Ingested {} papers: {} chunks, {} exhibits ({} failed)",
+                            ingested, total_chunks, total_exhibits, failed);
                     }
                 } else {
                     let input = match item_key {
@@ -2146,12 +2146,12 @@ async fn handle_db_command(cmd: DbCommand) {
                             if json {
                                 print_json(&serde_json::json!({
                                     "chunks_added": stats.chunks_added,
-                                    "figures_added": stats.figures_added,
+                                    "exhibits_added": stats.exhibits_added,
                                     "item_key": key,
                                 }));
                             } else {
-                                println!("Ingested {} chunks and {} figures for {}",
-                                    stats.chunks_added, stats.figures_added, key);
+                                println!("Ingested {} chunks and {} exhibits for {}",
+                                    stats.chunks_added, stats.exhibits_added, key);
                             }
                         }
                         Err(e) => exit_err(&e.to_string()),
@@ -2380,7 +2380,7 @@ fn format_db_work_metadata(w: &papers_db::WorkMetadata) {
     if let Some(y) = w.year { println!("  year: {y}"); }
     if let Some(v) = &w.venue { println!("  venue: {v}"); }
     if !w.tags.is_empty() { println!("  tags: {}", w.tags.join(", ")); }
-    println!("  chunks: {}  figures: {}", w.chunk_count, w.figure_count);
+    println!("  chunks: {}  exhibits: {}", w.chunk_count, w.exhibit_count);
 }
 
 fn format_db_work_search(results: &[papers_db::WorkSearchResult]) {
@@ -2624,18 +2624,18 @@ fn format_db_search(results: &[papers_db::SearchResult]) {
     }
 }
 
-fn format_db_figures(results: &[papers_db::FigureSearchResult]) {
+fn format_db_exhibits(results: &[papers_db::ExhibitSearchResult]) {
     if results.is_empty() {
-        println!("No figures found.");
+        println!("No exhibits found.");
         return;
     }
     for f in results {
         println!(
             "{:.2}  {}  {}  [{}]  (page {})",
             f.score,
-            f.figure_id,
+            f.exhibit_id,
             f.paper_id,
-            f.figure_type,
+            f.exhibit_type,
             f.page.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
         );
         println!("  Caption: {}", f.caption);
@@ -2696,8 +2696,8 @@ fn format_db_chapter(r: &papers_db::ChapterResult) {
     }
 }
 
-fn format_db_figure(f: &papers_db::FigureResult) {
-    println!("{} [{}]", f.figure_id, f.figure_type);
+fn format_db_exhibit(f: &papers_db::ExhibitResult) {
+    println!("{} [{}]", f.exhibit_id, f.exhibit_type);
     println!("  Paper: {}", f.paper_id);
     println!("  Caption: {}", f.caption);
     if let Some(img) = &f.image_path {
@@ -2739,8 +2739,8 @@ fn format_db_outline(r: &papers_db::PaperOutline) {
         }
     }
     println!(
-        "Total: {} chunks, {} figures",
-        r.total_chunks, r.total_figures
+        "Total: {} chunks, {} exhibits",
+        r.total_chunks, r.total_exhibits
     );
 }
 

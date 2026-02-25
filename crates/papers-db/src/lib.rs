@@ -1,3 +1,4 @@
+pub mod config;
 pub mod embed_cache;
 pub mod error;
 pub mod ingest;
@@ -17,7 +18,7 @@ pub use ingest::{
 };
 pub use query::resolve_paper_id;
 #[cfg(any(test, feature = "bench"))]
-pub use query::{search_figures_with_embedding, search_with_embedding};
+pub use query::{search_exhibits_with_embedding, search_with_embedding};
 pub use store::DbStore;
 pub use types::*;
 

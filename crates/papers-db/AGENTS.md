@@ -11,14 +11,15 @@ semantic search over indexed papers.
 ```
 src/
   lib.rs          — pub mod declarations, re-exports, default_embed_cache()
+  config.rs       — chunking constants (MIN/TARGET/MAX tokens, overlap, patterns)
   embed.rs        — Embedder wrapper (EmbeddingGemma300M, fake for tests)
   embed_cache.rs  — EmbedCache: persistent f32 binary cache per (model, item_key)
   error.rs        — DbError enum (LanceDb, Embed, Arrow, Cache, Io, Json, …)
   ingest.rs       — parse_paper_blocks, ingest_paper, cache_paper_embeddings
-  query.rs        — search, search_figures, get_chunk, get_section, list_papers, …
-  schema.rs       — Arrow schemas for chunks + figures tables; EMBED_DIM = 768
+  query.rs        — search, search_exhibits, get_chunk, get_section, list_papers, …
+  schema.rs       — Arrow schemas for chunks + exhibits tables; EMBED_DIM = 768
   store.rs        — DbStore: LanceDB connection + Arc<Mutex<Embedder>>
-  types.rs        — IngestStats, SearchParams, SearchResult, FigureResult, …
+  types.rs        — IngestStats, SearchParams, SearchResult, ExhibitResult, …
   filter.rs       — LanceDB filter string builders
   tests.rs        — integration tests (tokio, open_for_test)
 ```
@@ -31,7 +32,11 @@ src/
 DataLab JSON (cache_dir/<key>/<key>.json)
     │
     ▼ parse_paper_blocks()
-Vec<ChunkRecord> + Vec<FigureRecord>
+Vec<ChunkRecord> + Vec<ExhibitRecord>
+    │  ├── ChunkBuffer accumulates Text/Equation/ListGroup blocks
+    │  ├── Section boundaries (h2/h3/h4) flush buffer
+    │  ├── Algorithm detection on h5/h6 headers → ExhibitRecord
+    │  └── Cross-linking: regex matches exhibit refs in chunk text
     │
     ▼ check EmbedCache (embed_cache_base() / model / item_key)
     ├── hit  ──→ load Vec<Vec<f32>> from embeddings.bin  (no GPU)
@@ -40,14 +45,132 @@ Vec<ChunkRecord> + Vec<FigureRecord>
                       ▼ EmbedCache::save()
                  manifest.json + embeddings.bin (written once, overwrite=false)
     │
-    ▼ build_chunks_batch() / build_figures_batch()
+    ▼ build_chunks_batch() / build_exhibits_batch()
 Arrow RecordBatch
     │
-    ▼ LanceDB papers_chunks / papers_figures tables
+    ▼ LanceDB papers_chunks / papers_exhibits tables
 ```
 
-Figure captions are embedded fresh each ingest and are **not** persisted in the
-embedding cache — only text chunks are cached.
+Exhibit captions (including algorithm content) are embedded fresh each ingest
+and are **not** persisted in the embedding cache — only text chunks are cached.
+
+---
+
+## Chunking strategy
+
+Chunks are produced by buffer-based accumulation of whole blocks, never
+splitting a single paragraph/equation/list mid-text.
+
+### Constants (config.rs)
+
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `MIN_CHUNK_TOKENS` | 200 | Fragments below this at section boundaries get merged into previous chunk |
+| `TARGET_CHUNK_TOKENS` | 400 | Buffer flushes when next block would exceed this |
+| `MAX_CHUNK_TOKENS` | 600 | Smart merge blocked if combined chunk would exceed this |
+| `OVERLAP_SENTENCES` | 2 | Trailing sentences carried on token-limit flush |
+| `TOKEN_ESTIMATE_MULTIPLIER` | 1.3 | Words × multiplier = estimated tokens |
+
+### Token estimation
+
+`estimate_tokens(text)` = `ceil(word_count × 1.3)`. A rough heuristic; accurate
+enough for English academic text with embedding-gemma-300m.
+
+### Accumulation rules
+
+1. **Text/Equation/ListGroup** → push whole block into buffer
+2. Before pushing, check `would_overflow`: if next block would push past TARGET:
+   - Buffer non-empty → flush with overlap, start fresh buffer
+   - Buffer empty → push anyway (oversized single block, never split)
+3. **Section boundaries** (h2/h3/h4) → smart merge flush (no overlap)
+4. **End-of-doc** → smart merge flush
+
+### Smart merge at section boundaries
+
+When flushing at a section boundary or end-of-doc, if the flushed content is
+below MIN_CHUNK_TOKENS:
+- If a previous chunk exists **in the same chapter and section**, and combined
+  size ≤ MAX_CHUNK_TOKENS → merge into previous
+- Otherwise → emit as standalone chunk
+
+This prevents orphan fragments that embed poorly, while never merging across
+chapter or section boundaries.
+
+### Overlap
+
+On token-limit flush (not section boundaries): the last 2 sentences of the
+flushed chunk are carried into the new buffer. Sentence boundaries are detected
+by `. ` followed by an uppercase letter.
+
+### References section skip
+
+When an h2 title matches "References" or "Bibliography" (case-insensitive
+substring), all subsequent text blocks are skipped.
+
+### Embedding text prefix
+
+For embedding (not stored in the `text` field), each chunk gets a prefix:
+`"Paper Title — Chapter Title — Section Title\n\n"` prepended to improve
+retrieval relevance.
+
+---
+
+## Algorithm detection
+
+Algorithms are detected from h5/h6 SectionHeader blocks and stored as
+ExhibitRecords with `exhibit_type = "algorithm"`.
+
+### Detection pattern
+
+Regex: `(?i)^(?:Algorithm|Procedure|Pseudocode|Listing|Code)\s+\d+`
+
+Requires a number after the keyword to avoid false positives on generic headers
+like "Code Availability" or "Algorithm Overview".
+
+### Accumulation
+
+1. When h5/h6 header matches the pattern:
+   - Flush current text buffer
+   - Enter algorithm accumulation mode
+2. Following Text blocks are accumulated into algorithm body
+3. Algorithm mode exits on:
+   - Any SectionHeader (any level)
+   - Figure/Table/Picture block
+   - End of document
+4. On exit: emit ExhibitRecord with `exhibit_type = "algorithm"`,
+   `caption` = header text, `content` = accumulated pseudocode
+
+---
+
+## Cross-linking patterns
+
+After parsing, a post-processing pass scans chunk text for exhibit references
+and populates `exhibit_ids` on chunks and `ref_count`/`first_ref_chunk_id` on
+exhibits.
+
+### Caption → exhibit_id map
+
+Built from exhibit captions using:
+`(?i)(Figure|Fig|Table|Tab|Algorithm|Alg|Procedure|Pseudocode|Listing|Code)\s*\.?\s+(\d+)`
+
+`normalize_exhibit_kind()` maps variants to canonical types:
+- `Figure`, `Fig` → `"figure"`
+- `Table`, `Tab` → `"table"`
+- `Algorithm`, `Alg`, `Procedure`, `Pseudocode`, `Listing`, `Code` → `"algorithm"`
+
+### Text reference regexes
+
+| Type | Pattern | Matches |
+|------|---------|---------|
+| Figure | `(?i)(?:Figures?\|Figs?)\.?\s+(\d+)` | Fig. 1, Figure 1, Figs. 1 |
+| Table | `(?i)(?:Tables?\|Tabs?)\.?\s+(\d+)` | Table 1, Tab. 1 |
+| Algorithm | `(?i)(?:Algorithms?\|Algs?\|Procedures?\|...)\.?\s+(\d+)` | Algorithm 1, Alg. 1, etc. |
+
+### Exhibit reference tracking
+
+During the chunk scan, a `HashMap<String, (Option<String>, u16)>` maps
+`exhibit_id → (first_ref_chunk_id, ref_count)`. After scanning all chunks,
+these values are written back onto the ExhibitRecords.
 
 ---
 
@@ -87,11 +210,23 @@ or unreadable, the fallback is `"embedding-gemma-300m"`.
 | `cache_dir` | `PathBuf` | Path to `{datalab_cache}/{item_key}/` |
 | `force` | `bool` | Bypass embed cache and LanceDB skip-check |
 
+### `ExhibitRecord`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `exhibit_id` | `String` | `{paper_id}/fig{n}` |
+| `exhibit_type` | `String` | `"figure"`, `"table"`, or `"algorithm"` |
+| `caption` | `String` | Caption text or algorithm title |
+| `description` | `Option<String>` | Alt text from img tag |
+| `content` | `Option<String>` | Markdown table or algorithm pseudocode |
+| `first_ref_chunk_id` | `Option<String>` | First text chunk referencing this exhibit |
+| `ref_count` | `u16` | Total number of text chunks referencing this exhibit |
+
 ### Search result types
 
 `search()` returns slim `SearchResult` with `SearchChunkResult` (no
-`authors`/`year`/`venue`/`position`/`referenced_figures` — use `get_chunk` for
-full details).  `search_figures()` returns `FigureSearchResult` with a `score`
+`authors`/`year`/`venue`/`position`/`referenced_exhibits` — use `get_chunk` for
+full details).  `search_exhibits()` returns `ExhibitSearchResult` with a `score`
 field.
 
 Neighbor previews (`ChunkSummary`) use sentence-aware truncation (120–300
@@ -144,33 +279,35 @@ vectors without loading any model weights.
 | `section_idx` | UInt16 | |
 | `chunk_idx` | UInt16 | within-section index |
 | `depth` | Utf8 | always "paragraph" |
-| `block_type` | Utf8 | "text", "equation", or "list" |
+| `block_type` | Utf8 | always "text" (merged chunks) |
 | `text` | Utf8 | |
-| `page_start` | UInt16 | nullable |
-| `page_end` | UInt16 | nullable |
+| `page_start` | UInt16 | nullable, first page of merged blocks |
+| `page_end` | UInt16 | nullable, last page of merged blocks |
 | `title` | Utf8 | paper title |
 | `authors` | List<Utf8> | |
 | `year` | UInt16 | nullable |
 | `venue` | Utf8 | nullable |
 | `tags` | List<Utf8> | |
-| `figure_ids` | List<Utf8> | associated figures |
+| `exhibit_ids` | List<Utf8> | referenced exhibits (figures, tables, algorithms) |
 
-### `papers_figures`
+### `papers_exhibits`
 
-| Column | Type |
-|--------|------|
-| `figure_id` | Utf8 (`{paper_id}/fig{n}`) |
-| `paper_id` | Utf8 |
-| `vector` | FixedSizeList<Float32>[768] |
-| `figure_type` | Utf8 ("figure" or "table") |
-| `caption` | Utf8 |
-| `description` | Utf8 |
-| `image_path` | Utf8 nullable |
-| `content` | Utf8 nullable (markdown table for Table blocks) |
-| `page` | UInt16 nullable |
-| `chapter_idx` | UInt16 |
-| `section_idx` | UInt16 |
-| (paper metadata) | … same as chunks |
+| Column | Type | Notes |
+|--------|------|-------|
+| `exhibit_id` | Utf8 | `{paper_id}/fig{n}` |
+| `paper_id` | Utf8 | |
+| `vector` | FixedSizeList<Float32>[768] | embedding of caption (+content for algorithms) |
+| `exhibit_type` | Utf8 | `"figure"`, `"table"`, or `"algorithm"` |
+| `caption` | Utf8 | |
+| `description` | Utf8 | nullable |
+| `image_path` | Utf8 | nullable |
+| `content` | Utf8 | nullable (markdown table or algorithm pseudocode) |
+| `page` | UInt16 | nullable |
+| `chapter_idx` | UInt16 | |
+| `section_idx` | UInt16 | |
+| `first_ref_chunk_id` | Utf8 | nullable, chunk_id of first referencing text chunk |
+| `ref_count` | UInt16 | total text chunks referencing this exhibit |
+| (paper metadata) | … | same as chunks |
 
 ---
 
@@ -224,7 +361,7 @@ query path only — no real embedding model is loaded (uses `open_for_test` with
 | Benchmark | What it measures |
 |-----------|-----------------|
 | `search/chunks/{N}` | Vector search + batched neighbor fetching, N rows |
-| `search_figures/figures/{N}` | Vector search on figures table, N rows |
+| `search_exhibits/exhibits/{N}` | Vector search on exhibits table, N rows |
 
 Parameterized over table sizes: 100, 500, 1000 rows.
 
@@ -244,7 +381,7 @@ On startup the version is read via `table.schema().metadata`, and only
 migrations with a version number greater than the stored version are applied.
 After all pending migrations run, the version is bumped.
 
-`CHUNK_MIGRATIONS` and `FIGURE_MIGRATIONS` are `&[(u32, &str, &str)]` arrays of
+`CHUNK_MIGRATIONS` and `EXHIBIT_MIGRATIONS` are `&[(u32, &str, &str)]` arrays of
 `(version, column_name, default_sql_expression)`. Each migration adds a column
 via `table.add_columns()`. If the column already exists (e.g. the table was
 created with the latest schema but the version metadata was missing), the
@@ -258,18 +395,18 @@ reading rows.
 
 Each table tracks its own version independently via Arrow schema metadata:
 - `CURRENT_CHUNKS_VERSION` must equal the highest version in `CHUNK_MIGRATIONS`
-- `CURRENT_FIGURES_VERSION` must equal the highest version in `FIGURE_MIGRATIONS`
+- `CURRENT_EXHIBITS_VERSION` must equal the highest version in `EXHIBIT_MIGRATIONS`
 
-`migrate_chunks_table()` and `migrate_figures_table()` run automatically on
+`migrate_chunks_table()` and `migrate_exhibits_table()` run automatically on
 every `DbStore::open()` call.
 
 ### How to add a new column
 
-1. Bump `CURRENT_CHUNKS_VERSION` or `CURRENT_FIGURES_VERSION` in `store.rs`
+1. Bump `CURRENT_CHUNKS_VERSION` or `CURRENT_EXHIBITS_VERSION` in `store.rs`
 2. Add a `(new_version, column_name, default_expr)` entry to `CHUNK_MIGRATIONS`
-   or `FIGURE_MIGRATIONS` — use `CAST(NULL AS string)` for nullable strings,
+   or `EXHIBIT_MIGRATIONS` — use `CAST(NULL AS string)` for nullable strings,
    never bare `NULL`
-3. Add the column to `schema.rs` (`chunks_schema()` or `figures_schema()`)
+3. Add the column to `schema.rs` (`chunks_schema()` or `exhibits_schema()`)
 4. Add the column to the ingest path (`ChunkRecord`, `build_chunks_batch()`, etc.)
 5. Update `ChunkData` / `chunk_from_row()` in `query.rs` to read the new column
 6. Update `AGENTS.md` table schemas

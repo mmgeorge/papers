@@ -50,16 +50,16 @@ pub fn chunks_schema() -> Arc<Schema> {
         Field::new("year", DataType::UInt16, true),
         Field::new("venue", DataType::Utf8, true),
         string_list_field("tags"),
-        string_list_field("figure_ids"),
+        string_list_field("exhibit_ids"),
     ]))
 }
 
-pub fn figures_schema() -> Arc<Schema> {
+pub fn exhibits_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
-        Field::new("figure_id", DataType::Utf8, false),
+        Field::new("exhibit_id", DataType::Utf8, false),
         Field::new("paper_id", DataType::Utf8, false),
         vector_field(),
-        Field::new("figure_type", DataType::Utf8, false),
+        Field::new("exhibit_type", DataType::Utf8, false),
         Field::new("caption", DataType::Utf8, false),
         Field::new("description", DataType::Utf8, true),
         Field::new("image_path", DataType::Utf8, true),
@@ -72,5 +72,7 @@ pub fn figures_schema() -> Arc<Schema> {
         Field::new("year", DataType::UInt16, true),
         Field::new("venue", DataType::Utf8, true),
         string_list_field_nullable("tags"),
+        Field::new("first_ref_chunk_id", DataType::Utf8, true),
+        Field::new("ref_count", DataType::UInt16, false),
     ]))
 }

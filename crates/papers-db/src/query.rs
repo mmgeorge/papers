@@ -11,10 +11,10 @@ use crate::filter::{validate_scope, FilterBuilder};
 use crate::store::DbStore;
 use crate::types::{
     ChapterListItem, ChapterResult, ChapterSearchResult, ChapterSection, ChunkListItem, ChunkResult,
-    ChunkSummary, ChunkWithPosition, FigureResult, FigureSearchResult, ListChaptersParams,
+    ChunkSummary, ChunkWithPosition, ExhibitResult, ExhibitSearchResult, ListChaptersParams,
     ListChunksParams, ListPapersParams, ListSectionsParams, ListTagsParams, OutlineChapter,
-    OutlineSection, PaperOutline, PaperSummary, PositionContext, ReferencedFigure,
-    SearchChaptersParams, SearchChunkResult, SearchFiguresParams, SearchParams, SearchResult,
+    OutlineSection, PaperOutline, PaperSummary, PositionContext, ReferencedExhibit,
+    SearchChaptersParams, SearchChunkResult, SearchExhibitsParams, SearchParams, SearchResult,
     SearchSectionsParams, SearchWorksParams, SectionListItem, SectionResult, SectionSearchResult,
     TagSummary, WorkMetadata, WorkSearchResult,
 };
@@ -115,7 +115,7 @@ fn chunk_from_row(batch: &RecordBatch, row: usize) -> Result<ChunkData, DbError>
         chunk_idx: col_u16(batch, "chunk_idx", row)?,
         depth: col_str(batch, "depth", row)?,
         block_type: col_str(batch, "block_type", row)?,
-        figure_ids: col_str_list(batch, "figure_ids", row)?,
+        exhibit_ids: col_str_list(batch, "exhibit_ids", row)?,
     })
 }
 
@@ -134,7 +134,7 @@ struct ChunkData {
     chunk_idx: u16,
     depth: String,
     block_type: String,
-    figure_ids: Vec<String>,
+    exhibit_ids: Vec<String>,
 }
 
 // ── Shared async helpers ────────────────────────────────────────────────────
@@ -350,25 +350,25 @@ async fn fetch_neighbors(
     ))
 }
 
-async fn resolve_figures(
-    figures_table: &lancedb::Table,
-    figure_ids: &[String],
-) -> Result<Vec<ReferencedFigure>, DbError> {
-    if figure_ids.is_empty() {
+async fn resolve_exhibits(
+    exhibits_table: &lancedb::Table,
+    exhibit_ids: &[String],
+) -> Result<Vec<ReferencedExhibit>, DbError> {
+    if exhibit_ids.is_empty() {
         return Ok(vec![]);
     }
-    let id_list = figure_ids
+    let id_list = exhibit_ids
         .iter()
         .map(|id| format!("'{}'", id.replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(", ");
-    let filter = format!("figure_id IN ({id_list})");
-    let batches = figures_table
+    let filter = format!("exhibit_id IN ({id_list})");
+    let batches = exhibits_table
         .query()
         .only_if(&filter)
         .select(Select::columns(&[
-            "figure_id",
-            "figure_type",
+            "exhibit_id",
+            "exhibit_type",
             "caption",
             "description",
         ]))
@@ -381,9 +381,9 @@ async fn resolve_figures(
     let mut results = Vec::new();
     for batch in &batches {
         for row in 0..batch.num_rows() {
-            results.push(ReferencedFigure {
-                figure_id: col_str(batch, "figure_id", row)?,
-                figure_type: col_str(batch, "figure_type", row)?,
+            results.push(ReferencedExhibit {
+                exhibit_id: col_str(batch, "exhibit_id", row)?,
+                exhibit_type: col_str(batch, "exhibit_type", row)?,
                 caption: col_str(batch, "caption", row)?,
                 description: col_str_opt(batch, "description", row)?,
             });
@@ -468,7 +468,7 @@ async fn build_chunk_with_position(
     data: ChunkData,
 ) -> Result<ChunkWithPosition, DbError> {
     let chunks_table = store.chunks_table().await?;
-    let figures_table = store.figures_table().await?;
+    let exhibits_table = store.exhibits_table().await?;
     let pos = position_context(
         &chunks_table,
         &data.paper_id,
@@ -477,7 +477,7 @@ async fn build_chunk_with_position(
         data.chunk_idx,
     )
     .await?;
-    let referenced_figures = resolve_figures(&figures_table, &data.figure_ids).await?;
+    let referenced_exhibits = resolve_exhibits(&exhibits_table, &data.exhibit_ids).await?;
     Ok(ChunkWithPosition {
         chunk_id: data.chunk_id,
         paper_id: data.paper_id,
@@ -493,8 +493,8 @@ async fn build_chunk_with_position(
         chunk_idx: data.chunk_idx,
         depth: data.depth,
         block_type: data.block_type,
-        figure_ids: data.figure_ids,
-        referenced_figures,
+        exhibit_ids: data.exhibit_ids,
+        referenced_exhibits,
         position: pos,
     })
 }
@@ -699,7 +699,7 @@ async fn search_with_embedding_inner(
             chapter_title: data.chapter_title,
             section_title: data.section_title,
             chunk_idx: data.chunk_idx,
-            figure_ids: data.figure_ids,
+            exhibit_ids: data.exhibit_ids,
         };
         results.push(SearchResult {
             chunk,
@@ -711,38 +711,38 @@ async fn search_with_embedding_inner(
     Ok(results)
 }
 
-/// Search for figures/tables by description.
-pub async fn search_figures(
+/// Search for exhibits (figures, tables, algorithms) by description.
+pub async fn search_exhibits(
     store: &DbStore,
-    params: SearchFiguresParams,
-) -> Result<Vec<FigureSearchResult>, DbError> {
+    params: SearchExhibitsParams,
+) -> Result<Vec<ExhibitSearchResult>, DbError> {
     let embedding = store.embed_query(&params.query).await?;
-    search_figures_with_embedding_inner(store, params, &embedding).await
+    search_exhibits_with_embedding_inner(store, params, &embedding).await
 }
 
-/// Search figures with a pre-computed embedding vector (for benchmarks).
+/// Search exhibits with a pre-computed embedding vector (for benchmarks).
 #[cfg(any(test, feature = "bench"))]
-pub async fn search_figures_with_embedding(
+pub async fn search_exhibits_with_embedding(
     store: &DbStore,
-    params: SearchFiguresParams,
+    params: SearchExhibitsParams,
     embedding: &[f32],
-) -> Result<Vec<FigureSearchResult>, DbError> {
-    search_figures_with_embedding_inner(store, params, embedding).await
+) -> Result<Vec<ExhibitSearchResult>, DbError> {
+    search_exhibits_with_embedding_inner(store, params, embedding).await
 }
 
-async fn search_figures_with_embedding_inner(
+async fn search_exhibits_with_embedding_inner(
     store: &DbStore,
-    params: SearchFiguresParams,
+    params: SearchExhibitsParams,
     embedding: &[f32],
-) -> Result<Vec<FigureSearchResult>, DbError> {
-    let table = store.figures_table().await?;
+) -> Result<Vec<ExhibitSearchResult>, DbError> {
+    let table = store.exhibits_table().await?;
 
     let mut fb = FilterBuilder::new();
     if let Some(ids) = params.paper_ids.as_deref() {
         fb = fb.paper_ids(ids);
     }
-    if let Some(ft) = &params.filter_figure_type {
-        fb = fb.eq_str("figure_type", ft);
+    if let Some(ft) = &params.filter_exhibit_type {
+        fb = fb.eq_str("exhibit_type", ft);
     }
 
     let mut query_builder = table.query().nearest_to(embedding)?;
@@ -767,10 +767,10 @@ async fn search_figures_with_embedding_inner(
             } else {
                 0.0
             };
-            results.push(FigureSearchResult {
-                figure_id: col_str(batch, "figure_id", row)?,
+            results.push(ExhibitSearchResult {
+                exhibit_id: col_str(batch, "exhibit_id", row)?,
                 paper_id: col_str(batch, "paper_id", row)?,
-                figure_type: col_str(batch, "figure_type", row)?,
+                exhibit_type: col_str(batch, "exhibit_type", row)?,
                 caption: col_str(batch, "caption", row)?,
                 description: col_str_opt(batch, "description", row)?,
                 image_path: col_str_opt(batch, "image_path", row)?,
@@ -898,7 +898,7 @@ pub async fn get_chapter(
     rows.sort_by_key(|(sec, ch, _, _)| (*sec, *ch));
 
     let mut chapter_title = String::new();
-    let mut all_figure_ids: Vec<String> = Vec::new();
+    let mut all_exhibit_ids: Vec<String> = Vec::new();
     let mut sections: Vec<ChapterSection> = Vec::new();
     let mut current_section_idx: Option<u16> = None;
     let mut current_section_title = String::new();
@@ -909,9 +909,9 @@ pub async fn get_chapter(
         if chapter_title.is_empty() {
             chapter_title = data.chapter_title.clone();
         }
-        for fid in &data.figure_ids {
-            if !all_figure_ids.contains(fid) {
-                all_figure_ids.push(fid.clone());
+        for eid in &data.exhibit_ids {
+            if !all_exhibit_ids.contains(eid) {
+                all_exhibit_ids.push(eid.clone());
             }
         }
 
@@ -944,15 +944,15 @@ pub async fn get_chapter(
         chapter_idx,
         sections,
         total_chunks,
-        figure_ids: all_figure_ids,
+        exhibit_ids: all_exhibit_ids,
     })
 }
 
-/// Retrieve a figure by ID.
-pub async fn get_figure(store: &DbStore, figure_id: &str) -> Result<FigureResult, DbError> {
-    let table = store.figures_table().await?;
-    let escaped = figure_id.replace('\'', "''");
-    let filter = format!("figure_id = '{escaped}'");
+/// Retrieve an exhibit by ID.
+pub async fn get_exhibit(store: &DbStore, exhibit_id: &str) -> Result<ExhibitResult, DbError> {
+    let table = store.exhibits_table().await?;
+    let escaped = exhibit_id.replace('\'', "''");
+    let filter = format!("exhibit_id = '{escaped}'");
     let batches = table
         .query()
         .only_if(&filter)
@@ -965,20 +965,22 @@ pub async fn get_figure(store: &DbStore, figure_id: &str) -> Result<FigureResult
 
     if total_rows(&batches) == 0 {
         return Err(DbError::NotFound(format!(
-            "figure not found: {figure_id}"
+            "exhibit not found: {exhibit_id}"
         )));
     }
     let batch = &batches[0];
-    Ok(FigureResult {
-        figure_id: col_str(batch, "figure_id", 0)?,
+    Ok(ExhibitResult {
+        exhibit_id: col_str(batch, "exhibit_id", 0)?,
         paper_id: col_str(batch, "paper_id", 0)?,
-        figure_type: col_str(batch, "figure_type", 0)?,
+        exhibit_type: col_str(batch, "exhibit_type", 0)?,
         caption: col_str(batch, "caption", 0)?,
         description: col_str_opt(batch, "description", 0)?,
         image_path: col_str_opt(batch, "image_path", 0)?,
         content: col_str_opt(batch, "content", 0)?,
         page: col_u16_opt(batch, "page", 0)?,
         referenced_by: vec![],
+        first_ref_chunk_id: col_str_opt(batch, "first_ref_chunk_id", 0)?,
+        ref_count: col_u16(batch, "ref_count", 0)?,
     })
 }
 
@@ -988,7 +990,7 @@ pub async fn get_paper_outline(
     paper_id: &str,
 ) -> Result<PaperOutline, DbError> {
     let table = store.chunks_table().await?;
-    let figures_table = store.figures_table().await?;
+    let exhibits_table = store.exhibits_table().await?;
     let paper_id_esc = paper_id.replace('\'', "''");
 
     let batches = table
@@ -1047,24 +1049,24 @@ pub async fn get_paper_outline(
         }
     }
 
-    // Count figures
-    let fig_batches = figures_table
+    // Count exhibits
+    let exhibit_batches = exhibits_table
         .query()
         .only_if(&format!("paper_id = '{paper_id_esc}'"))
-        .select(Select::columns(&["figure_id", "chapter_idx"]))
+        .select(Select::columns(&["exhibit_id", "chapter_idx"]))
         .execute()
         .await?
         .try_collect::<Vec<_>>()
         .await
         .map_err(|e| DbError::LanceDb(e))?;
-    let total_figures = total_rows(&fig_batches);
+    let total_exhibits = total_rows(&exhibit_batches);
 
-    // Count figures per chapter
-    let mut fig_per_chapter: HashMap<u16, usize> = HashMap::new();
-    for batch in &fig_batches {
+    // Count exhibits per chapter
+    let mut exhibit_per_chapter: HashMap<u16, usize> = HashMap::new();
+    for batch in &exhibit_batches {
         for row in 0..batch.num_rows() {
             let ch_idx = col_u16(batch, "chapter_idx", row)?;
-            *fig_per_chapter.entry(ch_idx).or_insert(0) += 1;
+            *exhibit_per_chapter.entry(ch_idx).or_insert(0) += 1;
         }
     }
 
@@ -1092,7 +1094,7 @@ pub async fn get_paper_outline(
                 chapter_idx: ch_idx,
                 chapter_title: ch_title,
                 sections,
-                figure_count: *fig_per_chapter.get(&ch_idx).unwrap_or(&0),
+                exhibit_count: *exhibit_per_chapter.get(&ch_idx).unwrap_or(&0),
             }
         })
         .collect();
@@ -1106,7 +1108,7 @@ pub async fn get_paper_outline(
         tags,
         chapters,
         total_chunks,
-        total_figures,
+        total_exhibits,
     })
 }
 
@@ -1116,7 +1118,7 @@ pub async fn list_papers(
     params: ListPapersParams,
 ) -> Result<Vec<PaperSummary>, DbError> {
     let table = store.chunks_table().await?;
-    let figures_table = store.figures_table().await?;
+    let exhibits_table = store.exhibits_table().await?;
 
     let mut fb = FilterBuilder::new();
     if let Some(ids) = params.paper_ids.as_deref() {
@@ -1160,7 +1162,7 @@ pub async fn list_papers(
                     venue: col_str_opt(batch, "venue", row)?,
                     tags: col_str_list(batch, "tags", row)?,
                     chunk_count: 0,
-                    figure_count: 0,
+                    exhibit_count: 0,
                 });
             }
             paper_map.get_mut(&pid).unwrap().chunk_count += 1;
@@ -1178,8 +1180,8 @@ pub async fn list_papers(
         });
     }
 
-    // Count figures per paper
-    let fig_batches = figures_table
+    // Count exhibits per paper
+    let exhibit_batches = exhibits_table
         .query()
         .select(Select::columns(&["paper_id"]))
         .execute()
@@ -1187,11 +1189,11 @@ pub async fn list_papers(
         .try_collect::<Vec<_>>()
         .await
         .map_err(|e| DbError::LanceDb(e))?;
-    for batch in &fig_batches {
+    for batch in &exhibit_batches {
         for row in 0..batch.num_rows() {
             let pid = col_str(batch, "paper_id", row)?;
             if let Some(entry) = paper_map.get_mut(&pid) {
-                entry.figure_count += 1;
+                entry.exhibit_count += 1;
             }
         }
     }
@@ -1261,7 +1263,7 @@ pub async fn list_tags(
 /// Get metadata for a single work (paper).
 pub async fn get_work(store: &DbStore, paper_id: &str) -> Result<WorkMetadata, DbError> {
     let table = store.chunks_table().await?;
-    let figures_table = store.figures_table().await?;
+    let exhibits_table = store.exhibits_table().await?;
     let paper_id_esc = paper_id.replace('\'', "''");
     let filter = format!("paper_id = '{paper_id_esc}'");
     let batches = table
@@ -1287,16 +1289,16 @@ pub async fn get_work(store: &DbStore, paper_id: &str) -> Result<WorkMetadata, D
     let venue = col_str_opt(batch, "venue", 0)?;
     let tags = col_str_list(batch, "tags", 0)?;
 
-    let fig_batches = figures_table
+    let exhibit_batches = exhibits_table
         .query()
         .only_if(&filter)
-        .select(Select::columns(&["figure_id"]))
+        .select(Select::columns(&["exhibit_id"]))
         .execute()
         .await?
         .try_collect::<Vec<_>>()
         .await
         .map_err(DbError::LanceDb)?;
-    let figure_count = total_rows(&fig_batches);
+    let exhibit_count = total_rows(&exhibit_batches);
 
     Ok(WorkMetadata {
         paper_id: paper_id.to_string(),
@@ -1306,7 +1308,7 @@ pub async fn get_work(store: &DbStore, paper_id: &str) -> Result<WorkMetadata, D
         venue,
         tags,
         chunk_count,
-        figure_count,
+        exhibit_count,
     })
 }
 
@@ -1398,14 +1400,14 @@ pub async fn search_works(
     Ok(results)
 }
 
-/// Delete all chunks and figures for a paper from the index.
+/// Delete all chunks and exhibits for a paper from the index.
 pub async fn remove_work(store: &DbStore, paper_id: &str) -> Result<(), DbError> {
     let paper_id_esc = paper_id.replace('\'', "''");
     let filter = format!("paper_id = '{paper_id_esc}'");
     let chunks_table = store.chunks_table().await?;
     chunks_table.delete(&filter).await.map_err(DbError::LanceDb)?;
-    let figures_table = store.figures_table().await?;
-    figures_table.delete(&filter).await.map_err(DbError::LanceDb)?;
+    let exhibits_table = store.exhibits_table().await?;
+    exhibits_table.delete(&filter).await.map_err(DbError::LanceDb)?;
     Ok(())
 }
 

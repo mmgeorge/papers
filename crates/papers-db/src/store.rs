@@ -7,7 +7,7 @@ use tokio::sync::OnceCell;
 
 use crate::embed::Embedder;
 use crate::error::DbError;
-use crate::schema::{chunks_schema, figures_schema};
+use crate::schema::{chunks_schema, exhibits_schema};
 
 pub struct DbStore {
     pub(crate) db: Connection,
@@ -24,14 +24,13 @@ impl DbStore {
         // Create tables if they don't exist; migrate schemas if needed
         let chunks = ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         migrate_chunks_table(&chunks).await?;
-        let figures = ensure_table(&db, "papers_figures", figures_schema()).await?;
-        migrate_figures_table(&figures).await?;
+        let exhibits = ensure_table(&db, "papers_exhibits", exhibits_schema()).await?;
+        migrate_exhibits_table(&exhibits).await?;
 
         let store = Self {
             db,
             embedder: OnceCell::new(),
         };
-        store.ensure_indexes().await;
         Ok(store)
     }
 
@@ -76,8 +75,8 @@ impl DbStore {
         let db = lancedb::connect(path).execute().await?;
         let chunks = ensure_table(&db, "papers_chunks", chunks_schema()).await?;
         migrate_chunks_table(&chunks).await?;
-        let figures = ensure_table(&db, "papers_figures", figures_schema()).await?;
-        migrate_figures_table(&figures).await?;
+        let exhibits = ensure_table(&db, "papers_exhibits", exhibits_schema()).await?;
+        migrate_exhibits_table(&exhibits).await?;
         let embedder = OnceCell::new();
         embedder
             .set(Arc::new(Mutex::new(Embedder::fake())))
@@ -93,9 +92,9 @@ impl DbStore {
             .map_err(Into::into)
     }
 
-    pub async fn figures_table(&self) -> Result<Table, DbError> {
+    pub async fn exhibits_table(&self) -> Result<Table, DbError> {
         self.db
-            .open_table("papers_figures")
+            .open_table("papers_exhibits")
             .execute()
             .await
             .map_err(Into::into)
@@ -105,7 +104,7 @@ impl DbStore {
     /// Uses `Index::Auto` which selects IVF-PQ for vector columns.
     /// Logs and continues on failure (e.g. empty tables or < 256 rows).
     pub async fn ensure_indexes(&self) {
-        for table_name in &["papers_chunks", "papers_figures"] {
+        for table_name in &["papers_chunks", "papers_exhibits"] {
             let table = match self.db.open_table(*table_name).execute().await {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -118,9 +117,9 @@ impl DbStore {
                 Ok(_) => {
                     eprintln!("  vector index created for {table_name}");
                 }
-                Err(e) => {
+                Err(_) => {
                     // Expected for empty tables or tables with few rows
-                    eprintln!("  vector index skipped for {table_name}: {e}");
+                    eprintln!("  vector index skipped for {table_name}: too few rows");
                 }
             }
         }
@@ -262,25 +261,25 @@ async fn migrate_chunks_table(table: &Table) -> Result<(), DbError> {
     Ok(())
 }
 
-/// Current schema version for the figures table.
-const CURRENT_FIGURES_VERSION: u32 = 1;
+/// Current schema version for the exhibits table.
+const CURRENT_EXHIBITS_VERSION: u32 = 1;
 
-/// Versioned schema migrations for the figures table.
-const FIGURE_MIGRATIONS: &[(u32, &str, &str)] = &[
+/// Versioned schema migrations for the exhibits table.
+const EXHIBIT_MIGRATIONS: &[(u32, &str, &str)] = &[
     (1, "content", "CAST(NULL AS string)"),
 ];
 
-/// Apply pending schema migrations to the figures table.
-async fn migrate_figures_table(table: &Table) -> Result<(), DbError> {
+/// Apply pending schema migrations to the exhibits table.
+async fn migrate_exhibits_table(table: &Table) -> Result<(), DbError> {
     use lancedb::table::NewColumnTransform;
 
     let current = read_schema_version(table).await?;
-    if current >= CURRENT_FIGURES_VERSION {
+    if current >= CURRENT_EXHIBITS_VERSION {
         return Ok(());
     }
 
     let mut applied = 0u32;
-    for &(ver, col, default_expr) in FIGURE_MIGRATIONS {
+    for &(ver, col, default_expr) in EXHIBIT_MIGRATIONS {
         if ver <= current {
             continue;
         }
@@ -292,7 +291,7 @@ async fn migrate_figures_table(table: &Table) -> Result<(), DbError> {
             .await
         {
             Ok(_) => {
-                eprintln!("  migrated figures v{ver}: added column '{col}'");
+                eprintln!("  migrated exhibits v{ver}: added column '{col}'");
                 applied += 1;
             }
             Err(_) => {
@@ -301,10 +300,10 @@ async fn migrate_figures_table(table: &Table) -> Result<(), DbError> {
         }
     }
 
-    write_schema_version(table, CURRENT_FIGURES_VERSION).await?;
+    write_schema_version(table, CURRENT_EXHIBITS_VERSION).await?;
     if applied > 0 {
         eprintln!(
-            "  figures schema version: {current} → {CURRENT_FIGURES_VERSION} ({applied} migration(s))"
+            "  exhibits schema version: {current} → {CURRENT_EXHIBITS_VERSION} ({applied} migration(s))"
         );
     }
     Ok(())
@@ -373,7 +372,7 @@ mod tests {
                 Arc::new(UInt16Array::from(vec![None::<u16>])),        // year
                 Arc::new(StringArray::from(vec![None::<&str>])),       // venue
                 Arc::new(empty_string_list_array()) as Arc<dyn Array>, // tags
-                Arc::new(empty_string_list_array()) as Arc<dyn Array>, // figure_ids
+                Arc::new(empty_string_list_array()) as Arc<dyn Array>, // exhibit_ids
             ],
         )
         .unwrap();
@@ -543,11 +542,11 @@ mod tests {
         assert_eq!(v, CURRENT_CHUNKS_VERSION);
     }
 
-    // ── Figures migration tests ──────────────────────────────────────────
+    // ── Exhibits migration tests ──────────────────────────────────────────
 
-    /// Build the v0 figures schema (before content was added).
-    fn figures_schema_v0() -> Arc<Schema> {
-        let fields: Vec<Field> = figures_schema()
+    /// Build the v0 exhibits schema (before content was added).
+    fn exhibits_schema_v0() -> Arc<Schema> {
+        let fields: Vec<Field> = exhibits_schema()
             .fields()
             .iter()
             .filter(|f| f.name() != "content")
@@ -559,13 +558,13 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_migrate_figures_v0_to_v1_adds_content() {
+    async fn test_migrate_exhibits_v0_to_v1_adds_content() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
         let db = lancedb::connect(&db_path).execute().await.unwrap();
 
-        // Create figures table with v0 schema (no content)
-        let table = ensure_table(&db, "papers_figures", figures_schema_v0())
+        // Create exhibits table with v0 schema (no content)
+        let table = ensure_table(&db, "papers_exhibits", exhibits_schema_v0())
             .await
             .unwrap();
 
@@ -573,12 +572,12 @@ mod tests {
         assert_eq!(v, 0);
 
         // Run migration
-        migrate_figures_table(&table).await.unwrap();
+        migrate_exhibits_table(&table).await.unwrap();
 
         // Re-open to see updated schema
-        let table = db.open_table("papers_figures").execute().await.unwrap();
+        let table = db.open_table("papers_exhibits").execute().await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
-        assert_eq!(v, CURRENT_FIGURES_VERSION);
+        assert_eq!(v, CURRENT_EXHIBITS_VERSION);
 
         let schema = table.schema().await.unwrap();
         assert!(
@@ -589,45 +588,45 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_figures_migration_idempotent() {
+    async fn test_exhibits_migration_idempotent() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
         let db = lancedb::connect(&db_path).execute().await.unwrap();
 
-        let table = ensure_table(&db, "papers_figures", figures_schema()).await.unwrap();
-        migrate_figures_table(&table).await.unwrap();
+        let table = ensure_table(&db, "papers_exhibits", exhibits_schema()).await.unwrap();
+        migrate_exhibits_table(&table).await.unwrap();
 
-        let table = db.open_table("papers_figures").execute().await.unwrap();
+        let table = db.open_table("papers_exhibits").execute().await.unwrap();
         let v1 = read_schema_version(&table).await.unwrap();
-        assert_eq!(v1, CURRENT_FIGURES_VERSION);
+        assert_eq!(v1, CURRENT_EXHIBITS_VERSION);
 
         // Second migration should be a no-op
-        migrate_figures_table(&table).await.unwrap();
+        migrate_exhibits_table(&table).await.unwrap();
         let v2 = read_schema_version(&table).await.unwrap();
-        assert_eq!(v2, CURRENT_FIGURES_VERSION);
+        assert_eq!(v2, CURRENT_EXHIBITS_VERSION);
     }
 
     #[tokio::test]
     #[serial]
-    async fn test_figures_version_stamped_on_fresh_db() {
+    async fn test_exhibits_version_stamped_on_fresh_db() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
         let db = lancedb::connect(&db_path).execute().await.unwrap();
 
-        let table = ensure_table(&db, "papers_figures", figures_schema()).await.unwrap();
+        let table = ensure_table(&db, "papers_exhibits", exhibits_schema()).await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
         assert_eq!(v, 0);
 
-        migrate_figures_table(&table).await.unwrap();
+        migrate_exhibits_table(&table).await.unwrap();
 
-        let table = db.open_table("papers_figures").execute().await.unwrap();
+        let table = db.open_table("papers_exhibits").execute().await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
-        assert_eq!(v, CURRENT_FIGURES_VERSION);
+        assert_eq!(v, CURRENT_EXHIBITS_VERSION);
     }
 
     #[tokio::test]
     #[serial]
-    async fn test_chunks_version_unchanged_after_figures_migration() {
+    async fn test_chunks_version_unchanged_after_exhibits_migration() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
         let store = DbStore::open_for_test(&db_path).await.unwrap();
@@ -636,9 +635,9 @@ mod tests {
         let chunks_v = read_schema_version(&chunks_table).await.unwrap();
         assert_eq!(chunks_v, CURRENT_CHUNKS_VERSION);
 
-        let figures_table = store.figures_table().await.unwrap();
-        let figures_v = read_schema_version(&figures_table).await.unwrap();
-        assert_eq!(figures_v, CURRENT_FIGURES_VERSION);
+        let exhibits_table = store.exhibits_table().await.unwrap();
+        let exhibits_v = read_schema_version(&exhibits_table).await.unwrap();
+        assert_eq!(exhibits_v, CURRENT_EXHIBITS_VERSION);
 
         // Versions are independent
         assert_eq!(chunks_v, CURRENT_CHUNKS_VERSION);
@@ -646,12 +645,12 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_open_for_test_stamps_figures_version() {
+    async fn test_open_for_test_stamps_exhibits_version() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db_path = tmp.path().join("test.lance").to_string_lossy().into_owned();
         let store = DbStore::open_for_test(&db_path).await.unwrap();
-        let table = store.figures_table().await.unwrap();
+        let table = store.exhibits_table().await.unwrap();
         let v = read_schema_version(&table).await.unwrap();
-        assert_eq!(v, CURRENT_FIGURES_VERSION);
+        assert_eq!(v, CURRENT_EXHIBITS_VERSION);
     }
 }

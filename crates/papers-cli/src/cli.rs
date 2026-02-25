@@ -120,10 +120,10 @@ pub enum DbCommand {
         #[command(subcommand)]
         cmd: DbChunkCommand,
     },
-    /// Figures, tables, and diagrams
-    Figure {
+    /// Exhibits: figures, tables, algorithms, and diagrams
+    Exhibit {
         #[command(subcommand)]
-        cmd: DbFigureCommand,
+        cmd: DbExhibitCommand,
     },
     /// Indexed papers: list, add, search, and inspect
     Work {
@@ -221,10 +221,10 @@ pub enum DbChunkCommand {
 }
 
 #[derive(Subcommand)]
-pub enum DbFigureCommand {
-    /// Search for figures, tables, and diagrams
+pub enum DbExhibitCommand {
+    /// Search for exhibits (figures, tables, algorithms)
     Search {
-        /// Natural language description of the figure to find
+        /// Natural language description of the exhibit to find
         query: String,
         /// Scope to papers in a named selection
         #[arg(long)]
@@ -232,9 +232,9 @@ pub enum DbFigureCommand {
         /// Scope to a specific paper (DOI, item key, or title search)
         #[arg(long)]
         work: Option<String>,
-        /// Filter by type: "figure" or "table"
+        /// Filter by type: "figure", "table", or "algorithm"
         #[arg(long)]
-        figure_type: Option<String>,
+        exhibit_type: Option<String>,
         /// Maximum number of results
         #[arg(long, short = 'n', default_value = "5")]
         limit: u16,
@@ -242,10 +242,10 @@ pub enum DbFigureCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Get figure or table details by ID
+    /// Get exhibit details by ID
     Get {
-        /// Figure ID (e.g. YFACFA8C/fig3)
-        figure_id: String,
+        /// Exhibit ID (e.g. YFACFA8C/fig3)
+        exhibit_id: String,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
@@ -284,7 +284,7 @@ pub enum DbWorkCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Get metadata for a single indexed paper (title, authors, year, chunk/figure counts)
+    /// Get metadata for a single indexed paper (title, authors, year, chunk/exhibit counts)
     Get {
         /// Paper: DOI, item key, or title search
         paper_id: String,
@@ -343,7 +343,7 @@ pub enum DbWorkCommand {
         #[arg(long)]
         force_extract: bool,
     },
-    /// Remove a paper from the RAG index (deletes all chunks and figures)
+    /// Remove a paper from the RAG index (deletes all chunks and exhibits)
     Remove {
         /// Paper: DOI, item key, or title search
         paper_id: String,

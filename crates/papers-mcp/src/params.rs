@@ -1801,17 +1801,17 @@ pub struct DbChunkSearchParams {
     pub limit: Option<u16>,
 }
 
-/// Parameters for the `db_figure_search` tool.
+/// Parameters for the `db_exhibit_search` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct DbFigureSearchParams {
-    /// Natural language description of the figure, table, or diagram to find.
+pub struct DbExhibitSearchParams {
+    /// Natural language description of the figure, table, algorithm, or diagram to find.
     pub query: String,
     /// Scope to papers in this named selection.
     pub selection: Option<String>,
     /// Scope to a single paper by DOI, item key, or title search.
     pub work: Option<String>,
-    /// Filter by figure type: "figure" or "table".
-    pub filter_figure_type: Option<String>,
+    /// Filter by exhibit type: "figure", "table", or "algorithm".
+    pub filter_exhibit_type: Option<String>,
     /// Maximum number of results (default 5).
     pub limit: Option<u16>,
 }
@@ -1843,11 +1843,11 @@ pub struct DbChapterGetParams {
     pub chapter_idx: u16,
 }
 
-/// Parameters for the `db_figure_get` tool.
+/// Parameters for the `db_exhibit_get` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct DbFigureGetParams {
-    /// Figure ID (e.g. "YFACFA8C/fig3").
-    pub figure_id: String,
+pub struct DbExhibitGetParams {
+    /// Exhibit ID (e.g. "YFACFA8C/fig3").
+    pub exhibit_id: String,
 }
 
 /// Parameters for the `db_work_outline` tool.
