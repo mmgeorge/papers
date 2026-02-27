@@ -112,6 +112,7 @@ fn list_counts_match_entries() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     save_selection(&Selection { name: "zero".into(), entries: vec![] }).unwrap();
     save_selection(&Selection {
@@ -211,6 +212,7 @@ fn get_lists_all_entries() {
             year: Some(2020 + i),
             issn: None,
             isbn: None,
+        work_type: None,
         })
         .collect();
     save_selection(&Selection { name: "mysel".into(), entries: entries.clone() }).unwrap();
@@ -645,6 +647,7 @@ fn entry_matches_doi_normalized() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     assert!(entry_matches_doi(&entry, "10.1234/foo"));
     assert!(entry_matches_doi(&entry, "https://doi.org/10.1234/foo"));
@@ -666,6 +669,7 @@ fn entry_matches_remove_title_case_insensitive() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     assert!(entry_matches_remove_input(&entry, "attention"));
     assert!(entry_matches_remove_input(&entry, "ATTENTION IS ALL"));
@@ -683,6 +687,7 @@ fn entry_matches_remove_oa_full_url() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     assert!(entry_matches_remove_input(&entry, "https://openalex.org/W99999"));
     assert!(entry_matches_remove_input(&entry, "W99999"));
@@ -703,6 +708,7 @@ fn save_load_roundtrip_all_fields() {
         year: Some(2017),
         issn: Some(vec!["0028-0836".into()]),
         isbn: Some(vec!["978-3-16-148410-0".into()]),
+        work_type: None,
     };
     let sel = Selection { name: "roundtrip".into(), entries: vec![entry] };
     save_selection(&sel).unwrap();
@@ -793,6 +799,7 @@ fn remove_by_zotero_key() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     let mut sel = Selection { name: "r".into(), entries: vec![entry] };
     save_selection(&sel).unwrap();
@@ -816,6 +823,7 @@ fn remove_by_doi() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     let mut sel = Selection { name: "s".into(), entries: vec![entry] };
     save_selection(&sel).unwrap();
@@ -839,6 +847,7 @@ fn remove_by_openalex_id() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     let mut sel = Selection { name: "u".into(), entries: vec![entry] };
     save_selection(&sel).unwrap();
@@ -862,6 +871,7 @@ fn remove_nonexistent_item() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     let sel = Selection { name: "v".into(), entries: vec![entry] };
     save_selection(&sel).unwrap();
@@ -887,6 +897,7 @@ fn remove_from_explicit_selection() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     // Create two selections; only "other" has the entry
     save_selection(&Selection { name: "active".into(), entries: vec![] }).unwrap();
@@ -917,6 +928,7 @@ fn remove_by_title_substring_partial() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     let entry2 = SelectionEntry {
         zotero_key: None,
@@ -927,6 +939,7 @@ fn remove_by_title_substring_partial() {
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
     let mut sel = Selection { name: "multi".into(), entries: vec![entry1, entry2] };
     save_selection(&sel).unwrap();
@@ -938,4 +951,382 @@ fn remove_by_title_substring_partial() {
     let loaded = load_selection("multi").unwrap();
     assert_eq!(loaded.entries.len(), 1);
     assert_eq!(loaded.entries[0].openalex_id.as_deref(), Some("W2"));
+}
+
+// ── work_type field ─────────────────────────────────────────────────────────
+
+fn make_work_with_type(id: &str, oa_type: &str) -> papers_openalex::Work {
+    serde_json::from_value(serde_json::json!({
+        "id": format!("https://openalex.org/{id}"),
+        "type": oa_type
+    }))
+    .expect("valid work json")
+}
+
+fn make_work_with_crossref_type(id: &str, oa_type: &str, crossref: &str) -> papers_openalex::Work {
+    serde_json::from_value(serde_json::json!({
+        "id": format!("https://openalex.org/{id}"),
+        "type": oa_type,
+        "type_crossref": crossref
+    }))
+    .expect("valid work json")
+}
+
+#[test]
+fn fill_from_oa_work_captures_type() {
+    let work = make_work_with_type("W1", "preprint");
+    let mut entry = SelectionEntry {
+        zotero_key: None,
+        openalex_id: None,
+        doi: None,
+        title: None,
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+    fill_from_oa_work(&mut entry, &work);
+    assert_eq!(entry.work_type.as_deref(), Some("preprint"));
+}
+
+#[test]
+fn fill_from_oa_work_prefers_crossref_type() {
+    // type_crossref is more granular; should be preferred over type
+    let work = make_work_with_crossref_type("W2", "article", "proceedings-article");
+    let mut entry = SelectionEntry {
+        zotero_key: None,
+        openalex_id: None,
+        doi: None,
+        title: None,
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+    fill_from_oa_work(&mut entry, &work);
+    assert_eq!(entry.work_type.as_deref(), Some("proceedings-article"));
+}
+
+#[test]
+fn fill_from_oa_work_does_not_overwrite_existing_work_type() {
+    let work = make_work_with_type("W3", "book");
+    let mut entry = SelectionEntry {
+        zotero_key: None,
+        openalex_id: None,
+        doi: None,
+        title: None,
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: Some("preprint".into()), // already set
+    };
+    fill_from_oa_work(&mut entry, &work);
+    // Should not overwrite existing value
+    assert_eq!(entry.work_type.as_deref(), Some("preprint"));
+}
+
+#[test]
+fn openalex_type_to_zotero_article() {
+    assert_eq!(openalex_type_to_zotero("article"), "journalArticle");
+    assert_eq!(openalex_type_to_zotero("journal-article"), "journalArticle");
+    assert_eq!(openalex_type_to_zotero("review"), "journalArticle");
+}
+
+#[test]
+fn openalex_type_to_zotero_preprint() {
+    assert_eq!(openalex_type_to_zotero("preprint"), "preprint");
+    assert_eq!(openalex_type_to_zotero("posted-content"), "preprint");
+}
+
+#[test]
+fn openalex_type_to_zotero_book() {
+    assert_eq!(openalex_type_to_zotero("book"), "book");
+    assert_eq!(openalex_type_to_zotero("book-chapter"), "bookSection");
+    assert_eq!(openalex_type_to_zotero("book-section"), "bookSection");
+}
+
+#[test]
+fn openalex_type_to_zotero_dissertation() {
+    assert_eq!(openalex_type_to_zotero("dissertation"), "thesis");
+    assert_eq!(openalex_type_to_zotero("thesis"), "thesis");
+}
+
+#[test]
+fn openalex_type_to_zotero_conference() {
+    assert_eq!(openalex_type_to_zotero("proceedings-article"), "conferencePaper");
+    assert_eq!(openalex_type_to_zotero("conference-paper"), "conferencePaper");
+}
+
+#[test]
+fn openalex_type_to_zotero_unknown_defaults_to_document() {
+    assert_eq!(openalex_type_to_zotero("unknown-type"), "document");
+    assert_eq!(openalex_type_to_zotero(""), "document");
+    assert_eq!(openalex_type_to_zotero("dataset"), "document");
+}
+
+#[test]
+#[serial]
+fn roundtrip_with_work_type() {
+    let (_dir, _) = isolated_dir();
+    let entry = SelectionEntry {
+        zotero_key: None,
+        openalex_id: Some("W100".into()),
+        doi: Some("10.100/test".into()),
+        title: Some("Type Test Paper".into()),
+        authors: None,
+        year: Some(2024),
+        issn: None,
+        isbn: None,
+        work_type: Some("proceedings-article".into()),
+    };
+    let sel = Selection { name: "type-test".into(), entries: vec![entry] };
+    save_selection(&sel).unwrap();
+    let loaded = load_selection("type-test").unwrap();
+    assert_eq!(
+        loaded.entries[0].work_type.as_deref(),
+        Some("proceedings-article")
+    );
+}
+
+#[test]
+#[serial]
+fn roundtrip_work_type_none_omitted_from_json() {
+    // work_type: None should be omitted from serialized JSON (skip_serializing_if)
+    let (_dir, data_path) = isolated_dir();
+    let entry = SelectionEntry {
+        zotero_key: None,
+        openalex_id: Some("W200".into()),
+        doi: None,
+        title: Some("No Type Paper".into()),
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+    let sel = Selection { name: "no-type".into(), entries: vec![entry] };
+    save_selection(&sel).unwrap();
+    let json_path = data_path.join("papers/selections/no-type.json");
+    let json = std::fs::read_to_string(json_path).unwrap();
+    // work_type: None should be omitted from the file
+    assert!(!json.contains("work_type"));
+    // But loading still works (defaults to None)
+    let loaded = load_selection("no-type").unwrap();
+    assert!(loaded.entries[0].work_type.is_none());
+}
+
+// ── selection rename (library-level) ───────────────────────────────────────
+
+#[test]
+#[serial]
+fn rename_changes_file_and_updates_state() {
+    let (_dir, data_path) = isolated_dir();
+    let entry = SelectionEntry {
+        zotero_key: Some("LF4MJWZK".into()),
+        openalex_id: None,
+        doi: None,
+        title: Some("Rename Test".into()),
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+    save_selection(&Selection { name: "old-name".into(), entries: vec![entry] }).unwrap();
+    save_state(&SelectionState { active: Some("old-name".into()) }).unwrap();
+
+    // Perform rename: save under new name, copy entries, delete old, update state
+    let old_sel = load_selection("old-name").unwrap();
+    let new_sel = Selection { name: "new-name".into(), entries: old_sel.entries };
+    save_selection(&new_sel).unwrap();
+    delete_selection("old-name").unwrap();
+    save_state(&SelectionState { active: Some("new-name".into()) }).unwrap();
+
+    let old_file = data_path.join("papers/selections/old-name.json");
+    let new_file = data_path.join("papers/selections/new-name.json");
+    assert!(!old_file.exists(), "old file should be gone");
+    assert!(new_file.exists(), "new file should exist");
+    assert_eq!(active_selection_name().as_deref(), Some("new-name"));
+    // entries are preserved
+    let loaded = load_selection("new-name").unwrap();
+    assert_eq!(loaded.entries.len(), 1);
+    assert_eq!(loaded.entries[0].zotero_key.as_deref(), Some("LF4MJWZK"));
+}
+
+#[test]
+#[serial]
+fn rename_to_existing_name_detected_by_caller() {
+    let (_dir, _) = isolated_dir();
+    save_selection(&Selection { name: "alpha".into(), entries: vec![] }).unwrap();
+    save_selection(&Selection { name: "beta".into(), entries: vec![] }).unwrap();
+
+    // Caller checks: if load_selection(new_name).is_ok() → refuse
+    let conflict = load_selection("beta").is_ok();
+    assert!(conflict, "should detect existing name before renaming");
+}
+
+#[test]
+fn rename_invalid_new_name_caught_by_validate_name() {
+    let err = validate_name("bad name").unwrap_err();
+    assert!(matches!(err, SelectionError::InvalidName(_)));
+    let err2 = validate_name("bad/name").unwrap_err();
+    assert!(matches!(err2, SelectionError::InvalidName(_)));
+}
+
+// ── selection merge (library-level) ────────────────────────────────────────
+
+#[test]
+#[serial]
+fn merge_adds_new_entries() {
+    let (_dir, _) = isolated_dir();
+    let e1 = SelectionEntry {
+        zotero_key: None,
+        openalex_id: Some("W1".into()),
+        doi: None,
+        title: Some("Paper One".into()),
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+    let e2 = SelectionEntry {
+        zotero_key: None,
+        openalex_id: Some("W2".into()),
+        doi: None,
+        title: Some("Paper Two".into()),
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+
+    let mut target = Selection { name: "target".into(), entries: vec![e1.clone()] };
+    let source = Selection { name: "source".into(), entries: vec![e2.clone()] };
+    save_selection(&target).unwrap();
+    save_selection(&source).unwrap();
+
+    // Merge: add entries from source that aren't already in target
+    for entry in &source.entries {
+        let already = target.entries.iter().any(|e| {
+            entry.openalex_id.as_deref().map(|id| entry_matches_openalex(e, id)).unwrap_or(false)
+                || entry.doi.as_deref().map(|d| entry_matches_doi(e, d)).unwrap_or(false)
+        });
+        if !already {
+            target.entries.push(entry.clone());
+        }
+    }
+    save_selection(&target).unwrap();
+
+    let loaded = load_selection("target").unwrap();
+    assert_eq!(loaded.entries.len(), 2);
+}
+
+#[test]
+#[serial]
+fn merge_deduplicates_by_openalex_id() {
+    let (_dir, _) = isolated_dir();
+    let e = SelectionEntry {
+        zotero_key: None,
+        openalex_id: Some("W999".into()),
+        doi: None,
+        title: Some("Same Paper".into()),
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+    let mut target = Selection { name: "t".into(), entries: vec![e.clone()] };
+    let source = Selection { name: "s".into(), entries: vec![e.clone()] };
+    save_selection(&target).unwrap();
+    save_selection(&source).unwrap();
+
+    for entry in &source.entries {
+        let already = target.entries.iter().any(|t| {
+            entry.openalex_id.as_deref().map(|id| entry_matches_openalex(t, id)).unwrap_or(false)
+        });
+        if !already {
+            target.entries.push(entry.clone());
+        }
+    }
+    save_selection(&target).unwrap();
+
+    assert_eq!(load_selection("t").unwrap().entries.len(), 1);
+}
+
+#[test]
+#[serial]
+fn merge_deduplicates_by_doi() {
+    let (_dir, _) = isolated_dir();
+    let e = SelectionEntry {
+        zotero_key: None,
+        openalex_id: None,
+        doi: Some("10.1234/dup".into()),
+        title: Some("DOI Dup".into()),
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+    let mut target = Selection { name: "td".into(), entries: vec![e.clone()] };
+    let source = Selection { name: "sd".into(), entries: vec![e.clone()] };
+    save_selection(&target).unwrap();
+    save_selection(&source).unwrap();
+
+    for entry in &source.entries {
+        let already = target.entries.iter().any(|t| {
+            entry.doi.as_deref().map(|d| entry_matches_doi(t, d)).unwrap_or(false)
+        });
+        if !already {
+            target.entries.push(entry.clone());
+        }
+    }
+    save_selection(&target).unwrap();
+
+    assert_eq!(load_selection("td").unwrap().entries.len(), 1);
+}
+
+#[test]
+#[serial]
+fn merge_preserves_source_selection() {
+    let (_dir, _) = isolated_dir();
+    let e = SelectionEntry {
+        zotero_key: None,
+        openalex_id: Some("W555".into()),
+        doi: None,
+        title: Some("Preserved Paper".into()),
+        authors: None,
+        year: None,
+        issn: None,
+        isbn: None,
+        work_type: None,
+    };
+    let mut target = Selection { name: "main".into(), entries: vec![] };
+    let source = Selection { name: "side".into(), entries: vec![e.clone()] };
+    save_selection(&target).unwrap();
+    save_selection(&source).unwrap();
+
+    for entry in &source.entries {
+        target.entries.push(entry.clone());
+    }
+    save_selection(&target).unwrap();
+    // Source should still exist unchanged
+    let src = load_selection("side").unwrap();
+    assert_eq!(src.entries.len(), 1);
+    assert_eq!(src.entries[0].openalex_id.as_deref(), Some("W555"));
+}
+
+#[test]
+#[serial]
+fn merge_nonexistent_source_errors() {
+    let (_dir, _) = isolated_dir();
+    save_selection(&Selection { name: "target".into(), entries: vec![] }).unwrap();
+    let err = load_selection("nonexistent-source").unwrap_err();
+    assert!(matches!(err, SelectionError::NotFound(_)));
 }

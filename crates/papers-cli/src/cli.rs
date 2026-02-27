@@ -502,8 +502,8 @@ pub enum SelectionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Show selection info and items; activate it (defaults to active selection)
-    Get {
+    /// Activate a selection and print a one-line summary
+    Set {
         /// Selection name or 1-based index (omit to use active selection)
         name: Option<String>,
         /// Output raw JSON
@@ -537,10 +537,115 @@ pub enum SelectionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a paper from a selection
+    /// Remove a paper from a selection (accepts 1-based index from `status`)
     Remove {
-        /// Paper identifier: Zotero key, DOI, OpenAlex ID, or title
+        /// Paper identifier: Zotero key, DOI, OpenAlex ID, title, or 1-based index
         paper: String,
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Per-paper status: Zotero, PDF, extracted, DB
+    Status {
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download open-access PDFs for entries missing a PDF
+    Find {
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Open DOI URLs in browser for papers without OA PDF
+        #[arg(long)]
+        open: bool,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sync selection to Zotero (create items, upload PDFs, upload extractions, add to collection)
+    Sync {
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Batch DB operations on the active selection
+    Db {
+        #[command(subcommand)]
+        cmd: SelectionDbCommand,
+    },
+    /// Zotero collection operations on the active selection
+    Collection {
+        #[command(subcommand)]
+        cmd: SelectionCollectionCommand,
+    },
+    /// Merge another selection's entries into the active selection
+    Merge {
+        /// Source selection name or 1-based index
+        source: String,
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rename the active selection
+    Rename {
+        /// New selection name (alphanumeric, - and _ only)
+        new_name: String,
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SelectionDbCommand {
+    /// Batch ingest all selection entries into the DB
+    Add {
+        /// Skip entries without extraction cache instead of erroring
+        #[arg(long)]
+        allow_skip: bool,
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Batch remove all selection entries from the DB
+    Remove {
+        /// Target selection name or index (default: active selection)
+        #[arg(long)]
+        selection: Option<String>,
+        /// Output raw JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SelectionCollectionCommand {
+    /// Import a Zotero collection into the active selection
+    Add {
+        /// Zotero collection key (8 chars) or name search
+        collection: String,
         /// Target selection name or index (default: active selection)
         #[arg(long)]
         selection: Option<String>,

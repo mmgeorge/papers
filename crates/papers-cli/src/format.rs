@@ -1406,40 +1406,6 @@ pub fn format_selection_list(items: &[SelectionListItem]) -> String {
     out
 }
 
-pub fn format_selection_get(sel: &papers_core::selection::Selection, is_active: bool) -> String {
-    let active = if is_active { " (active)" } else { "" };
-    let mut out = format!("Selection: {}{}\n", sel.name, active);
-    out.push_str(&format!("Items: {}\n", sel.entries.len()));
-    if sel.entries.is_empty() {
-        out.push_str("\n(empty — add papers with: papers selection add <paper>)\n");
-        return out;
-    }
-    out.push('\n');
-    for (i, entry) in sel.entries.iter().enumerate() {
-        let title = entry.title.as_deref().unwrap_or("(untitled)");
-        let year = entry.year.map_or(String::new(), |y| format!(" ({y})"));
-        out.push_str(&format!("  {:>2}  {}{}\n", i + 1, title, year));
-        if let Some(authors) = &entry.authors {
-            if !authors.is_empty() {
-                out.push_str(&format!("       {}\n", authors.join(" · ")));
-            }
-        }
-        let mut ids = Vec::new();
-        if let Some(k) = &entry.zotero_key {
-            ids.push(format!("Zotero: {k}"));
-        }
-        if let Some(oa) = &entry.openalex_id {
-            ids.push(format!("OA: {oa}"));
-        }
-        if let Some(doi) = &entry.doi {
-            ids.push(format!("DOI: {doi}"));
-        }
-        if !ids.is_empty() {
-            out.push_str(&format!("       {}\n", ids.join("  ")));
-        }
-    }
-    out
-}
 
 pub fn format_selection_create(name: &str) -> String {
     format!("Created selection {name:?} (now active)\n")
@@ -1463,4 +1429,213 @@ pub fn format_selection_add(
 
 pub fn format_selection_remove(title: &str, selection_name: &str) -> String {
     format!("Removed {title:?} from selection {selection_name:?}\n")
+}
+
+pub fn format_selection_set(sel_name: &str, total: usize, in_db: usize, has_pdf: usize) -> String {
+    format!(
+        "Selection set to {sel_name:?}: {total} work{}, {in_db} in DB, {has_pdf} has_pdf\n",
+        if total == 1 { "" } else { "s" }
+    )
+}
+
+pub struct SelectionStatusEntry {
+    pub index: usize,
+    pub title: String,
+    pub year: Option<u32>,
+    pub authors: Vec<String>,
+    pub doi: Option<String>,
+    pub zotero: bool,
+    pub pdf: Option<bool>,   // None = unknown (Zotero unavailable)
+    pub extracted: bool,
+    pub in_db: bool,
+}
+
+pub fn format_selection_status(sel_name: &str, entries: &[SelectionStatusEntry]) -> String {
+    let mut out = format!(
+        "Selection {sel_name:?} — {} work{}\n",
+        entries.len(),
+        if entries.len() == 1 { "" } else { "s" }
+    );
+    if entries.is_empty() {
+        out.push_str("\n(empty)\n");
+        return out;
+    }
+    for e in entries {
+        out.push('\n');
+        let year = e.year.map_or(String::new(), |y| format!(" ({y})"));
+        out.push_str(&format!("  {:>2}  {}{}\n", e.index, e.title, year));
+        if !e.authors.is_empty() {
+            let author_str = if e.authors.len() > 3 {
+                format!("{} et al.", e.authors[0])
+            } else {
+                e.authors.join(" · ")
+            };
+            if let Some(doi) = &e.doi {
+                out.push_str(&format!("     {} · DOI: {}\n", author_str, doi));
+            } else {
+                out.push_str(&format!("     {}\n", author_str));
+            }
+        } else if let Some(doi) = &e.doi {
+            out.push_str(&format!("     DOI: {}\n", doi));
+        }
+        let zotero_str = if e.zotero { "yes" } else { "no " };
+        let pdf_str = match e.pdf {
+            Some(true) => "yes",
+            Some(false) => "no ",
+            None => "?  ",
+        };
+        let extracted_str = if e.extracted { "yes" } else { "no " };
+        let db_str = if e.in_db { "yes" } else { "no " };
+        out.push_str(&format!(
+            "     Zotero: {}  PDF: {}  Extracted: {}  DB: {}\n",
+            zotero_str, pdf_str, extracted_str, db_str
+        ));
+    }
+    out
+}
+
+pub fn format_selection_find(
+    sel_name: &str,
+    downloaded: &[(String, String)],  // (doi, title)
+    not_found: &[(String, String)],   // (doi, title)
+    skipped: usize,
+) -> String {
+    let mut out = format!("Find PDFs for selection {sel_name:?}\n\n");
+    if downloaded.is_empty() && not_found.is_empty() {
+        out.push_str("  No entries needed PDF download");
+        if skipped > 0 {
+            out.push_str(&format!(" ({skipped} skipped)"));
+        }
+        out.push('\n');
+        return out;
+    }
+    for (doi, title) in downloaded {
+        out.push_str(&format!("  [downloaded]  {title} (DOI: {doi})\n"));
+    }
+    for (doi, title) in not_found {
+        out.push_str(&format!("  [not found]   {title} (DOI: {doi})\n"));
+    }
+    if skipped > 0 {
+        out.push_str(&format!("\n  {skipped} entr{} skipped (no DOI or already has PDF)\n",
+            if skipped == 1 { "y" } else { "ies" }));
+    }
+    out
+}
+
+pub fn format_selection_sync_plan(
+    sel_name: &str,
+    collection_warning: Option<&str>,
+    actions: &[SyncAction],
+) -> String {
+    let mut out = format!("Sync plan for {sel_name:?}:\n");
+    if let Some(warning) = collection_warning {
+        out.push_str(&format!("**WARNING: {}**\n", warning));
+    }
+    out.push('\n');
+    if actions.is_empty() {
+        out.push_str("  Nothing to do — selection is fully synced.\n");
+        return out;
+    }
+    for action in actions {
+        match action {
+            SyncAction::CreateItem { doi_or_id, title, item_type } => {
+                out.push_str(&format!(
+                    "  [create-item]    {}: {:?} → create as {}\n",
+                    doi_or_id, title, item_type
+                ));
+            }
+            SyncAction::UploadPdf { zotero_key, title } => {
+                out.push_str(&format!(
+                    "  [upload-pdf]     {}: {:?} → upload cached PDF\n",
+                    zotero_key, title
+                ));
+            }
+            SyncAction::UploadExtract { zotero_key, title } => {
+                out.push_str(&format!(
+                    "  [upload-extract] {}: {:?} → upload extraction ZIP\n",
+                    zotero_key, title
+                ));
+            }
+            SyncAction::AddToCollection { keys, coll_name } => {
+                out.push_str(&format!(
+                    "  [add-to-coll]    {} → add {} item{} to collection {:?}\n",
+                    keys.join(", "),
+                    keys.len(),
+                    if keys.len() == 1 { "" } else { "s" },
+                    coll_name
+                ));
+            }
+        }
+    }
+    out.push_str(&format!("\n{} change{}. Proceed? [y/N] ", actions.len(),
+        if actions.len() == 1 { "" } else { "s" }));
+    out
+}
+
+pub enum SyncAction {
+    CreateItem { doi_or_id: String, title: String, item_type: String },
+    UploadPdf { zotero_key: String, title: String },
+    UploadExtract { zotero_key: String, title: String },
+    AddToCollection { keys: Vec<String>, coll_name: String },
+}
+
+pub fn format_selection_db_add(sel_name: &str, added: usize, skipped: usize, errors: usize) -> String {
+    let mut out = format!("DB add for selection {sel_name:?}: {added} ingested");
+    if skipped > 0 {
+        out.push_str(&format!(", {skipped} skipped"));
+    }
+    if errors > 0 {
+        out.push_str(&format!(", {errors} errors"));
+    }
+    out.push('\n');
+    out
+}
+
+pub fn format_selection_db_remove(sel_name: &str, removed: usize, not_found: usize) -> String {
+    let mut out = format!("DB remove for selection {sel_name:?}: {removed} removed");
+    if not_found > 0 {
+        out.push_str(&format!(", {not_found} not in DB"));
+    }
+    out.push('\n');
+    out
+}
+
+pub fn format_selection_collection_add(
+    sel_name: &str,
+    coll_name: &str,
+    added: usize,
+    skipped: usize,
+) -> String {
+    let entry_word = if added == 1 { "y" } else { "ies" };
+    let mut out = format!(
+        "Imported {added} new entr{entry_word} from collection {coll_name:?} into selection {sel_name:?}"
+    );
+    if skipped > 0 {
+        let s = if skipped == 1 { "" } else { "s" };
+        out.push_str(&format!(" ({skipped} duplicate{s} skipped)"));
+    }
+    out.push('\n');
+    out
+}
+
+pub fn format_selection_merge(
+    target: &str,
+    source: &str,
+    added: usize,
+    skipped: usize,
+) -> String {
+    let entry_word = if added == 1 { "y" } else { "ies" };
+    let mut out = format!(
+        "Merged {added} new entr{entry_word} from {source:?} into {target:?}"
+    );
+    if skipped > 0 {
+        let s = if skipped == 1 { "" } else { "s" };
+        out.push_str(&format!(" ({skipped} duplicate{s} skipped)"));
+    }
+    out.push('\n');
+    out
+}
+
+pub fn format_selection_rename(old_name: &str, new_name: &str) -> String {
+    format!("Renamed {old_name:?} → {new_name:?}\n")
 }

@@ -7,7 +7,7 @@ use std::fs;
 use tempfile::TempDir;
 use serial_test::serial;
 
-use crate::ingest::{IngestParams, ingest_paper, is_ingested, list_cached_item_keys};
+use crate::ingest::{IngestParams, ingest_paper, ingest_params_from_cache, is_ingested, list_cached_item_keys};
 use crate::query::{
     get_chapter, get_chunk, get_paper_outline, get_section, list_papers, list_tags,
 };
@@ -2945,4 +2945,172 @@ async fn test_algorithm_ref_count() {
     assert_eq!(exhibit.exhibit_type, "algorithm");
     assert_eq!(exhibit.ref_count, 2);
     assert_eq!(exhibit.first_ref_chunk_id.as_deref(), Some("ALGOREF/ch1/s0/p0"));
+}
+
+// ── selection db add / remove ─────────────────────────────────────────────────
+//
+// These tests exercise `ingest_params_from_cache` + `ingest_paper` together
+// (the path used by `selection db add`) and `remove_work` (used by
+// `selection db remove`), against a temp DataLab cache and a temp LanceDB store.
+
+/// Write a minimal DataLab extraction cache for `item_key` under `cache_root`.
+/// Creates:
+///   {cache_root}/{item_key}/{item_key}.json   ← Marker JSON
+///   {cache_root}/{item_key}/meta.json         ← ExtractionMeta JSON
+fn make_full_cache(cache_root: &std::path::Path, item_key: &str) {
+    let dir = cache_root.join(item_key);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{item_key}.json")), minimal_marker_json()).unwrap();
+    let meta = serde_json::json!({
+        "item_key": item_key,
+        "title": format!("Selection DB Test Paper {item_key}"),
+        "authors": ["Alice", "Bob"],
+        "doi": format!("10.9999/{item_key}"),
+        "date": "2023-01-01"
+    });
+    fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
+}
+
+#[serial]
+#[tokio::test]
+async fn selection_db_add_ingests_via_cache() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_root = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    unsafe { std::env::set_var("PAPERS_DATALAB_CACHE_DIR", cache_root.path()) };
+    make_full_cache(cache_root.path(), "SELDB001");
+
+    let params = ingest_params_from_cache("SELDB001").expect("cache should be readable");
+    let store = open_test_store(&db_dir).await;
+    ingest_paper(&store, params).await.unwrap();
+
+    assert!(is_ingested(&store, "10.9999/SELDB001").await);
+
+    unsafe { std::env::remove_var("PAPERS_DATALAB_CACHE_DIR") };
+}
+
+#[serial]
+#[tokio::test]
+async fn selection_db_add_ingests_multiple_entries() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_root = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    unsafe { std::env::set_var("PAPERS_DATALAB_CACHE_DIR", cache_root.path()) };
+    for key in &["SELDB010", "SELDB011", "SELDB012"] {
+        make_full_cache(cache_root.path(), key);
+    }
+
+    let store = open_test_store(&db_dir).await;
+    for key in &["SELDB010", "SELDB011", "SELDB012"] {
+        let params = ingest_params_from_cache(key).unwrap();
+        ingest_paper(&store, params).await.unwrap();
+    }
+
+    assert!(is_ingested(&store, "10.9999/SELDB010").await);
+    assert!(is_ingested(&store, "10.9999/SELDB011").await);
+    assert!(is_ingested(&store, "10.9999/SELDB012").await);
+
+    unsafe { std::env::remove_var("PAPERS_DATALAB_CACHE_DIR") };
+}
+
+#[serial]
+#[tokio::test]
+async fn selection_db_add_skips_already_ingested() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_root = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    unsafe { std::env::set_var("PAPERS_DATALAB_CACHE_DIR", cache_root.path()) };
+    make_full_cache(cache_root.path(), "SELDB020");
+
+    let store = open_test_store(&db_dir).await;
+    let params1 = ingest_params_from_cache("SELDB020").unwrap();
+    ingest_paper(&store, params1).await.unwrap();
+
+    // Second ingest (without force=true) should still succeed and leave paper ingested
+    let params2 = ingest_params_from_cache("SELDB020").unwrap();
+    assert!(!params2.force, "force should be false by default");
+    ingest_paper(&store, params2).await.unwrap();
+
+    assert!(is_ingested(&store, "10.9999/SELDB020").await);
+
+    unsafe { std::env::remove_var("PAPERS_DATALAB_CACHE_DIR") };
+}
+
+#[serial]
+#[tokio::test]
+async fn selection_db_add_errors_on_missing_cache() {
+    let cache_root = TempDir::new().unwrap();
+    unsafe { std::env::set_var("PAPERS_DATALAB_CACHE_DIR", cache_root.path()) };
+
+    // No cache directory created for this key
+    let result = ingest_params_from_cache("SELDB_MISSING");
+    assert!(
+        result.is_err(),
+        "should error when cache directory does not exist"
+    );
+
+    unsafe { std::env::remove_var("PAPERS_DATALAB_CACHE_DIR") };
+}
+
+#[serial]
+#[tokio::test]
+async fn selection_db_remove_removes_paper() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_root = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    unsafe { std::env::set_var("PAPERS_DATALAB_CACHE_DIR", cache_root.path()) };
+    make_full_cache(cache_root.path(), "SELDBR01");
+
+    let store = open_test_store(&db_dir).await;
+    let params = ingest_params_from_cache("SELDBR01").unwrap();
+    ingest_paper(&store, params).await.unwrap();
+
+    assert!(is_ingested(&store, "10.9999/SELDBR01").await);
+
+    crate::query::remove_work(&store, "10.9999/SELDBR01").await.unwrap();
+    assert!(!is_ingested(&store, "10.9999/SELDBR01").await);
+
+    unsafe { std::env::remove_var("PAPERS_DATALAB_CACHE_DIR") };
+}
+
+#[serial]
+#[tokio::test]
+async fn selection_db_remove_all_entries() {
+    let _ecg = EmbedCacheGuard::new();
+    let cache_root = TempDir::new().unwrap();
+    let db_dir = TempDir::new().unwrap();
+
+    unsafe { std::env::set_var("PAPERS_DATALAB_CACHE_DIR", cache_root.path()) };
+    for key in &["SELDBR10", "SELDBR11"] {
+        make_full_cache(cache_root.path(), key);
+    }
+
+    let store = open_test_store(&db_dir).await;
+    for key in &["SELDBR10", "SELDBR11"] {
+        let params = ingest_params_from_cache(key).unwrap();
+        ingest_paper(&store, params).await.unwrap();
+    }
+
+    crate::query::remove_work(&store, "10.9999/SELDBR10").await.unwrap();
+    crate::query::remove_work(&store, "10.9999/SELDBR11").await.unwrap();
+
+    assert!(!is_ingested(&store, "10.9999/SELDBR10").await);
+    assert!(!is_ingested(&store, "10.9999/SELDBR11").await);
+
+    unsafe { std::env::remove_var("PAPERS_DATALAB_CACHE_DIR") };
+}
+
+#[serial]
+#[tokio::test]
+async fn selection_db_remove_tolerates_not_ingested() {
+    let db_dir = TempDir::new().unwrap();
+    let store = open_test_store(&db_dir).await;
+
+    // Paper never ingested — remove_work should not error
+    let result = crate::query::remove_work(&store, "10.9999/NEVER_INGESTED").await;
+    assert!(result.is_ok(), "remove_work on non-existent paper should succeed");
 }

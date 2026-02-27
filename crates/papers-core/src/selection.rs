@@ -43,6 +43,10 @@ pub struct SelectionEntry {
     pub year: Option<u32>,
     pub issn: Option<Vec<String>>,
     pub isbn: Option<Vec<String>>,
+    /// OpenAlex work type (e.g. "article", "preprint", "book").
+    /// Used by `selection sync` to create Zotero items with the correct itemType.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_type: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -306,6 +310,7 @@ pub async fn resolve_paper(
         year: None,
         issn: None,
         isbn: None,
+        work_type: None,
     };
 
     let is_zotero_key = crate::zotero::looks_like_zotero_key(input);
@@ -313,7 +318,7 @@ pub async fn resolve_paper(
     let is_oa_id = looks_like_openalex_work_id(input);
 
     // Step 2: Attempt Zotero resolution
-    if let Some(z) = zotero {
+    if let Some(z) = zotero.as_ref() {
         if is_zotero_key {
             if let Ok(item) = z.get_item(input).await {
                 entry.zotero_key = Some(item.key.clone());
@@ -423,7 +428,7 @@ async fn resolve_via_openalex(
     }
 }
 
-fn fill_from_zotero_item(entry: &mut SelectionEntry, item: &papers_zotero::Item) {
+pub fn fill_from_zotero_item(entry: &mut SelectionEntry, item: &papers_zotero::Item) {
     if entry.title.is_none() {
         entry.title = item.data.title.clone();
     }
@@ -478,7 +483,7 @@ fn fill_from_zotero_item(entry: &mut SelectionEntry, item: &papers_zotero::Item)
     }
 }
 
-fn fill_from_oa_work(entry: &mut SelectionEntry, work: &papers_openalex::Work) {
+pub fn fill_from_oa_work(entry: &mut SelectionEntry, work: &papers_openalex::Work) {
     if entry.openalex_id.is_none() {
         let id = work
             .id
@@ -517,5 +522,34 @@ fn fill_from_oa_work(entry: &mut SelectionEntry, work: &papers_openalex::Work) {
             .as_ref()
             .and_then(|l| l.source.as_ref())
             .and_then(|s| s.issn.clone());
+    }
+    if entry.work_type.is_none() {
+        // Prefer type_crossref for more granular mapping (e.g. proceedings-article),
+        // fall back to type.
+        entry.work_type = work
+            .type_crossref
+            .clone()
+            .or_else(|| work.r#type.clone());
+    }
+}
+
+/// Map an OpenAlex/Crossref work type to a Zotero itemType string.
+///
+/// Checks `type_crossref` first (more granular), then falls back to `type`.
+pub fn openalex_type_to_zotero(oa_type: &str) -> &'static str {
+    match oa_type {
+        "article" | "journal-article" | "review" | "review-article" | "editorial" => {
+            "journalArticle"
+        }
+        "preprint" | "posted-content" => "preprint",
+        "book" => "book",
+        "book-chapter" | "book-section" => "bookSection",
+        "dissertation" | "thesis" => "thesis",
+        "dataset" => "document",
+        "letter" => "letter",
+        "report" | "report-component" => "report",
+        "standard" => "standard",
+        "proceedings-article" | "proceedings" | "conference-paper" => "conferencePaper",
+        _ => "document",
     }
 }

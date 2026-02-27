@@ -8,6 +8,7 @@ use cli::{
     FunderFilterArgs, InstitutionCommand, InstitutionFilterArgs, McpCommand, PublisherCommand,
     PublisherFilterArgs, DbChapterCommand, DbChunkCommand, DbCommand, DbEmbedCommand,
     DbExhibitCommand, DbSectionCommand, DbTagCommand, DbWorkCommand, SelectionCommand,
+    SelectionCollectionCommand, SelectionDbCommand,
     SourceCommand,
     SourceFilterArgs, SubfieldCommand, SubfieldFilterArgs, TopicCommand, TopicFilterArgs,
     WorkCommand, WorkFilterArgs, ZoteroAnnotationCommand, ZoteroAttachmentCommand,
@@ -2774,11 +2775,49 @@ fn format_db_tags(tags: &[papers_db::TagSummary]) {
     }
 }
 
+/// Resolve a selection name from an Option<String>, using active selection as fallback.
+fn resolve_sel_name(
+    sel: Option<String>,
+    active_sel: &dyn Fn() -> Option<String>,
+) -> String {
+    use papers_core::selection::resolve_selection;
+    match sel {
+        Some(s) => match resolve_selection(&s) {
+            Ok(n) => n,
+            Err(e) => exit_err(&e.to_string()),
+        },
+        None => match active_sel() {
+            Some(n) => n,
+            None => exit_err("no active selection; use --selection or activate one first"),
+        },
+    }
+}
+
+/// Check whether an entry has a PDF in the Zotero library.
+/// Returns None if Zotero is unavailable; Some(bool) if it can be determined.
+async fn entry_has_zotero_pdf(
+    zotero: Option<&papers_zotero::ZoteroClient>,
+    zotero_key: &str,
+) -> Option<bool> {
+    let zc = zotero?;
+    let children = zc
+        .list_item_children(zotero_key, &papers_zotero::ItemListParams::default())
+        .await
+        .ok()?;
+    Some(children.items.iter().any(|child| {
+        child.data.content_type.as_deref() == Some("application/pdf")
+            && matches!(
+                child.data.link_mode.as_deref(),
+                Some("imported_file" | "imported_url")
+            )
+    }))
+}
+
 async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient) {
     use papers_core::selection::{
         Selection, active_selection_name, delete_selection, entry_matches_remove_input,
-        list_selection_names, load_selection, load_state, resolve_paper, resolve_selection,
-        save_selection, save_state, validate_name,
+        fill_from_zotero_item, list_selection_names, load_selection, load_state, resolve_paper,
+        resolve_selection, save_selection, save_state, validate_name,
     };
 
     match cmd {
@@ -2814,7 +2853,7 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             }
         }
 
-        SelectionCommand::Get { name, json } => {
+        SelectionCommand::Set { name, json } => {
             let sel_name = match name {
                 Some(n) => match resolve_selection(&n) {
                     Ok(n) => n,
@@ -2830,15 +2869,47 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             let mut state = load_state();
             state.active = Some(sel_name.clone());
             let _ = save_state(&state);
-            let is_active = true;
+
+            let total = sel.entries.len();
+            // Count PDFs (fast, local only)
+            let has_pdf = sel.entries.iter().filter(|e| {
+                e.zotero_key.as_deref().map(|k| papers_core::text::datalab_cached_markdown(k).is_some()).unwrap_or(false)
+                    || e.doi.as_deref().map(papers_core::text::doi_pdf_cached).unwrap_or(false)
+            }).count();
+            // Count in DB (best-effort)
+            let in_db = if let Ok(store) = papers_db::DbStore::open(&papers_db::DbStore::default_path()).await {
+                let mut count = 0usize;
+                for e in &sel.entries {
+                    let ids: Vec<&str> = [
+                        e.zotero_key.as_deref(),
+                        e.doi.as_deref(),
+                        e.openalex_id.as_deref(),
+                    ].into_iter().flatten().collect();
+                    let mut found = false;
+                    for id in ids {
+                        if papers_db::is_ingested(&store, id).await {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        count += 1;
+                    }
+                }
+                count
+            } else {
+                0
+            };
+
             if json {
                 print_json(&serde_json::json!({
                     "name": sel.name,
-                    "is_active": is_active,
-                    "entries": sel.entries,
+                    "total": total,
+                    "in_db": in_db,
+                    "has_pdf": has_pdf,
                 }));
             } else {
-                print!("{}", format::format_selection_get(&sel, is_active));
+                print!("{}", format::format_selection_set(&sel_name, total, in_db, has_pdf));
             }
         }
 
@@ -2895,16 +2966,7 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             selection,
             json,
         } => {
-            let sel_name = match selection {
-                Some(s) => match resolve_selection(&s) {
-                    Ok(n) => n,
-                    Err(e) => exit_err(&e.to_string()),
-                },
-                None => match active_selection_name() {
-                    Some(n) => n,
-                    None => exit_err("no active selection; use --selection or create one first"),
-                },
-            };
+            let sel_name = resolve_sel_name(selection, &active_selection_name);
             // For selection add, Zotero is optional — treat all errors as "not available"
             let zotero = optional_zotero().await.unwrap_or(None);
             let entry = match resolve_paper(&paper, client, zotero.as_ref()).await {
@@ -2951,38 +3013,703 @@ async fn handle_selection_command(cmd: SelectionCommand, client: &OpenAlexClient
             selection,
             json,
         } => {
-            let sel_name = match selection {
-                Some(s) => match resolve_selection(&s) {
-                    Ok(n) => n,
-                    Err(e) => exit_err(&e.to_string()),
-                },
-                None => match active_selection_name() {
-                    Some(n) => n,
-                    None => exit_err("no active selection; use --selection or create one first"),
-                },
-            };
+            let sel_name = resolve_sel_name(selection, &active_selection_name);
             let mut sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
             let before = sel.entries.len();
-            let removed_entry = sel
-                .entries
-                .iter()
-                .find(|e| entry_matches_remove_input(e, &paper))
-                .cloned();
-            sel.entries
-                .retain(|e| !entry_matches_remove_input(e, &paper));
-            if sel.entries.len() == before {
+
+            // Try 1-based index first
+            let removed_entry = if let Ok(idx) = paper.parse::<usize>() {
+                if idx == 0 || idx > sel.entries.len() {
+                    exit_err(&format!("index {idx} out of range (selection has {} entr{})",
+                        sel.entries.len(),
+                        if sel.entries.len() == 1 { "y" } else { "ies" }));
+                }
+                let entry = sel.entries.remove(idx - 1);
+                Some(entry)
+            } else {
+                let entry = sel
+                    .entries
+                    .iter()
+                    .find(|e| entry_matches_remove_input(e, &paper))
+                    .cloned();
+                sel.entries
+                    .retain(|e| !entry_matches_remove_input(e, &paper));
+                entry
+            };
+
+            if sel.entries.len() == before && removed_entry.is_none() {
                 exit_err("item not found in selection");
             }
             if let Err(e) = save_selection(&sel) {
                 exit_err(&e.to_string());
             }
             let title = removed_entry
-                .and_then(|e| e.title)
-                .unwrap_or_else(|| paper.clone());
+                .as_ref()
+                .and_then(|e| e.title.as_deref())
+                .unwrap_or(&paper)
+                .to_string();
             if json {
                 print_json(&serde_json::json!({ "removed": title, "selection": sel_name }));
             } else {
                 print!("{}", format::format_selection_remove(&title, &sel_name));
+            }
+        }
+
+        SelectionCommand::Status { selection, json } => {
+            let sel_name = resolve_sel_name(selection, &active_selection_name);
+            let sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let zotero = optional_zotero().await.unwrap_or(None);
+            let rag = papers_db::DbStore::open(&papers_db::DbStore::default_path()).await.ok();
+
+            let mut status_entries = Vec::new();
+            for (i, entry) in sel.entries.iter().enumerate() {
+                let has_zotero = entry.zotero_key.is_some();
+                let pdf = if let Some(key) = &entry.zotero_key {
+                    entry_has_zotero_pdf(zotero.as_ref(), key).await
+                } else {
+                    // Check local DOI PDF cache
+                    entry.doi.as_deref().map(papers_core::text::doi_pdf_cached)
+                };
+                let extracted = entry.zotero_key.as_deref()
+                    .map(|k| papers_core::text::datalab_cached_markdown(k).is_some())
+                    .unwrap_or(false);
+                let in_db = if let Some(store) = &rag {
+                    let ids: Vec<&str> = [
+                        entry.zotero_key.as_deref(),
+                        entry.doi.as_deref(),
+                        entry.openalex_id.as_deref(),
+                    ].into_iter().flatten().collect();
+                    let mut found = false;
+                    for id in ids {
+                        if papers_db::is_ingested(store, id).await {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                } else {
+                    false
+                };
+                status_entries.push(format::SelectionStatusEntry {
+                    index: i + 1,
+                    title: entry.title.clone().unwrap_or_else(|| "(untitled)".to_string()),
+                    year: entry.year,
+                    authors: entry.authors.clone().unwrap_or_default(),
+                    doi: entry.doi.clone(),
+                    zotero: has_zotero,
+                    pdf,
+                    extracted,
+                    in_db,
+                });
+            }
+
+            if json {
+                let v: Vec<_> = status_entries.iter().map(|e| serde_json::json!({
+                    "index": e.index,
+                    "title": e.title,
+                    "year": e.year,
+                    "zotero": e.zotero,
+                    "pdf": e.pdf,
+                    "extracted": e.extracted,
+                    "in_db": e.in_db,
+                })).collect();
+                print_json(&v);
+            } else {
+                print!("{}", format::format_selection_status(&sel_name, &status_entries));
+            }
+        }
+
+        SelectionCommand::Find { selection, open, json } => {
+            let sel_name = resolve_sel_name(selection, &active_selection_name);
+            let sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let zotero = optional_zotero().await.unwrap_or(None);
+            let http = reqwest::Client::new();
+
+            let mut downloaded: Vec<(String, String)> = Vec::new();
+            let mut not_found: Vec<(String, String)> = Vec::new();
+            let mut skipped = 0usize;
+
+            for entry in &sel.entries {
+                let doi = match &entry.doi {
+                    Some(d) => d.clone(),
+                    None => { skipped += 1; continue; }
+                };
+                // Check if already has PDF in Zotero or local cache
+                let already_has = if let Some(key) = &entry.zotero_key {
+                    entry_has_zotero_pdf(zotero.as_ref(), key).await.unwrap_or(false)
+                } else {
+                    false
+                } || papers_core::text::doi_pdf_cached(&doi);
+                if already_has {
+                    skipped += 1;
+                    continue;
+                }
+
+                // Fetch work from OpenAlex
+                let oa_id = format!("doi:{doi}");
+                let work = match client.get_work(&oa_id, &papers_core::GetParams::default()).await {
+                    Ok(w) => w,
+                    Err(_) => {
+                        not_found.push((doi.clone(), entry.title.clone().unwrap_or_else(|| doi.clone())));
+                        continue;
+                    }
+                };
+
+                match papers_core::text::try_download_open_access_pdf(&http, &work).await {
+                    Ok(Some((bytes, _source))) => {
+                        // Save to DOI cache
+                        if let Some(cache_dir) = papers_core::text::doi_pdf_cache_dir(&doi) {
+                            let _ = std::fs::create_dir_all(&cache_dir);
+                            let safe_doi = doi.replace('/', "_");
+                            let pdf_path = cache_dir.join(format!("{safe_doi}.pdf"));
+                            if std::fs::write(&pdf_path, &bytes).is_ok() {
+                                let title = entry.title.clone().unwrap_or_else(|| doi.clone());
+                                downloaded.push((doi.clone(), title));
+                            } else {
+                                not_found.push((doi.clone(), entry.title.clone().unwrap_or_else(|| doi.clone())));
+                            }
+                        } else {
+                            not_found.push((doi.clone(), entry.title.clone().unwrap_or_else(|| doi.clone())));
+                        }
+                    }
+                    Ok(None) => {
+                        not_found.push((doi.clone(), entry.title.clone().unwrap_or_else(|| doi.clone())));
+                    }
+                    Err(_) => {
+                        not_found.push((doi.clone(), entry.title.clone().unwrap_or_else(|| doi.clone())));
+                    }
+                }
+            }
+
+            if json {
+                print_json(&serde_json::json!({
+                    "downloaded": downloaded.iter().map(|(d, t)| serde_json::json!({"doi": d, "title": t})).collect::<Vec<_>>(),
+                    "not_found": not_found.iter().map(|(d, t)| serde_json::json!({"doi": d, "title": t})).collect::<Vec<_>>(),
+                    "skipped": skipped,
+                }));
+            } else {
+                print!("{}", format::format_selection_find(&sel_name, &downloaded, &not_found, skipped));
+                if open && !not_found.is_empty() {
+                    println!("\nOpen {} DOI link{} in browser? [y/N] ",
+                        not_found.len(),
+                        if not_found.len() == 1 { "" } else { "s" });
+                    let mut input = String::new();
+                    if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y") {
+                        for (doi, _) in &not_found {
+                            let url = format!("https://doi.org/{doi}");
+                            let _ = open::that(&url);
+                        }
+                    }
+                }
+            }
+        }
+
+        SelectionCommand::Sync { selection, yes, json } => {
+            let sel_name = resolve_sel_name(selection, &active_selection_name);
+            let mut sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let zotero = match zotero_client().await {
+                Ok(z) => z,
+                Err(e) => exit_err(&format!("Zotero unavailable: {e}")),
+            };
+
+            // Find or note existing collection
+            let coll_params = papers_zotero::CollectionListParams::default();
+            let collections = zotero.list_collections(&coll_params).await.unwrap_or_else(|e| {
+                exit_err(&format!("Failed to list Zotero collections: {e}"))
+            });
+            let existing_coll = collections.items.iter()
+                .find(|c| c.data.name.eq_ignore_ascii_case(&sel_name))
+                .cloned();
+            let collection_warning = if existing_coll.is_some() {
+                Some(format!(
+                    "Collection {:?} already exists — items will be added to it",
+                    sel_name
+                ))
+            } else {
+                None
+            };
+
+            // Build sync plan
+            let mut actions: Vec<format::SyncAction> = Vec::new();
+            // Track which entries need Zotero items created
+            let mut needs_item: Vec<usize> = Vec::new(); // indices into sel.entries
+
+            for (idx, entry) in sel.entries.iter().enumerate() {
+                if entry.zotero_key.is_none() {
+                    let doi_or_id = entry.doi.clone()
+                        .or_else(|| entry.openalex_id.clone())
+                        .unwrap_or_else(|| "(unknown)".to_string());
+                    let title = entry.title.clone().unwrap_or_else(|| "(untitled)".to_string());
+                    let item_type = entry.work_type.as_deref()
+                        .map(papers_core::selection::openalex_type_to_zotero)
+                        .unwrap_or("document")
+                        .to_string();
+                    actions.push(format::SyncAction::CreateItem { doi_or_id, title, item_type });
+                    needs_item.push(idx);
+                }
+                if let Some(key) = &entry.zotero_key {
+                    let doi = entry.doi.as_deref().unwrap_or("");
+                    let has_cached_pdf = papers_core::text::doi_pdf_cached(doi);
+                    if has_cached_pdf {
+                        let has_pdf = entry_has_zotero_pdf(Some(&zotero), key).await.unwrap_or(false);
+                        if !has_pdf {
+                            actions.push(format::SyncAction::UploadPdf {
+                                zotero_key: key.clone(),
+                                title: entry.title.clone().unwrap_or_else(|| key.clone()),
+                            });
+                        }
+                    }
+                    if papers_core::text::datalab_cached_markdown(key).is_some() {
+                        let has_extract = papers_core::text::find_papers_zip_key(&zotero, key)
+                            .await
+                            .unwrap_or(None)
+                            .is_some();
+                        if !has_extract {
+                            actions.push(format::SyncAction::UploadExtract {
+                                zotero_key: key.clone(),
+                                title: entry.title.clone().unwrap_or_else(|| key.clone()),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Add-to-collection action for all entries with zotero_key
+            let coll_keys: Vec<String> = sel.entries.iter()
+                .filter_map(|e| e.zotero_key.clone())
+                .collect();
+            if !coll_keys.is_empty() || !needs_item.is_empty() {
+                actions.push(format::SyncAction::AddToCollection {
+                    keys: coll_keys.clone(),
+                    coll_name: sel_name.clone(),
+                });
+            }
+
+            if json {
+                // In JSON mode, just output the plan
+                let plan: Vec<serde_json::Value> = actions.iter().map(|a| match a {
+                    format::SyncAction::CreateItem { doi_or_id, title, item_type } => serde_json::json!({"action": "create-item", "id": doi_or_id, "title": title, "item_type": item_type}),
+                    format::SyncAction::UploadPdf { zotero_key, title } => serde_json::json!({"action": "upload-pdf", "key": zotero_key, "title": title}),
+                    format::SyncAction::UploadExtract { zotero_key, title } => serde_json::json!({"action": "upload-extract", "key": zotero_key, "title": title}),
+                    format::SyncAction::AddToCollection { keys, coll_name } => serde_json::json!({"action": "add-to-collection", "keys": keys, "collection": coll_name}),
+                }).collect();
+                print_json(&plan);
+                return;
+            }
+
+            let plan_text = format::format_selection_sync_plan(
+                &sel_name,
+                collection_warning.as_deref(),
+                &actions,
+            );
+            print!("{}", plan_text);
+
+            if actions.is_empty() {
+                return;
+            }
+
+            // Confirm
+            if !yes {
+                let mut input = String::new();
+                let _ = std::io::stdin().read_line(&mut input);
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return;
+                }
+            }
+
+            // Execute plan
+            // 1. Create/find collection
+            let coll_key = if let Some(c) = existing_coll {
+                c.key.clone()
+            } else {
+                let resp = zotero.create_collections(vec![
+                    serde_json::json!({"name": sel_name})
+                ]).await.unwrap_or_else(|e| exit_err(&format!("Failed to create collection: {e}")));
+                resp.successful.values().next()
+                    .and_then(|v| v.get("key").and_then(|k| k.as_str()).map(String::from))
+                    .unwrap_or_else(|| exit_err("Failed to get new collection key"))
+            };
+
+            // 2. Create items for entries without zotero_key
+            for idx in needs_item {
+                let entry = &sel.entries[idx];
+                let item_type = entry.work_type.as_deref()
+                    .map(papers_core::selection::openalex_type_to_zotero)
+                    .unwrap_or("document");
+                let mut item_data = serde_json::json!({
+                    "itemType": item_type,
+                    "title": entry.title.as_deref().unwrap_or(""),
+                    "collections": [coll_key],
+                });
+                if let Some(doi) = &entry.doi {
+                    item_data["DOI"] = serde_json::Value::String(doi.clone());
+                }
+                if let Some(year) = entry.year {
+                    item_data["date"] = serde_json::Value::String(year.to_string());
+                }
+                if let Some(authors) = &entry.authors {
+                    let creators: Vec<serde_json::Value> = authors.iter().map(|a| {
+                        let parts: Vec<&str> = a.splitn(2, ' ').collect();
+                        if parts.len() == 2 {
+                            serde_json::json!({"creatorType": "author", "firstName": parts[0], "lastName": parts[1]})
+                        } else {
+                            serde_json::json!({"creatorType": "author", "name": a})
+                        }
+                    }).collect();
+                    item_data["creators"] = serde_json::Value::Array(creators);
+                }
+                match zotero.create_items(vec![item_data]).await {
+                    Ok(resp) => {
+                        if let Some(new_key) = resp.successful.values().next()
+                            .and_then(|v| v.get("key").and_then(|k| k.as_str()).map(String::from))
+                        {
+                            sel.entries[idx].zotero_key = Some(new_key.clone());
+                            println!("  Created Zotero item {new_key}");
+                        }
+                    }
+                    Err(e) => eprintln!("  Failed to create item: {e}"),
+                }
+            }
+
+            // 3. Upload PDFs and extractions
+            for entry in &sel.entries {
+                let key = match &entry.zotero_key {
+                    Some(k) => k.clone(),
+                    None => continue,
+                };
+                // Upload PDF if cached
+                if let Some(doi) = &entry.doi {
+                    if papers_core::text::doi_pdf_cached(doi) {
+                        if let Some(cache_dir) = papers_core::text::doi_pdf_cache_dir(doi) {
+                            let safe_doi = doi.replace('/', "_");
+                            let pdf_path = cache_dir.join(format!("{safe_doi}.pdf"));
+                            if pdf_path.exists() {
+                                if let Ok(bytes) = std::fs::read(&pdf_path) {
+                                    let filename = format!("{safe_doi}.pdf");
+                                    match zotero.create_imported_attachment(&key, &filename, "application/pdf").await {
+                                        Ok(att_key) => {
+                                            match zotero.upload_attachment_file(&att_key, &filename, bytes).await {
+                                                Ok(_) => println!("  Uploaded PDF for {key}"),
+                                                Err(e) => eprintln!("  Failed to upload PDF for {key}: {e}"),
+                                            }
+                                        }
+                                        Err(e) => eprintln!("  Failed to create PDF attachment for {key}: {e}"),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Upload extraction
+                if papers_core::text::datalab_cached_markdown(&key).is_some() {
+                    if let Err(e) = papers_core::text::upload_extraction_to_zotero(&zotero, &key).await {
+                        eprintln!("  Failed to upload extraction for {key}: {e}");
+                    } else {
+                        println!("  Uploaded extraction for {key}");
+                    }
+                }
+            }
+
+            // 4. Add all items to collection
+            for entry in &sel.entries {
+                if let Some(key) = &entry.zotero_key {
+                    // Get current version
+                    if let Ok(item) = zotero.get_item(key).await {
+                        let mut colls: Vec<String> = item.data.collections.clone();
+                        if !colls.contains(&coll_key) {
+                            colls.push(coll_key.clone());
+                            let patch = serde_json::json!({"collections": colls});
+                            if let Err(e) = zotero.patch_item(key, item.version, patch).await {
+                                eprintln!("  Failed to add {key} to collection: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Save updated selection (new zotero_keys)
+            let _ = save_selection(&sel);
+            println!("\nSync complete.");
+        }
+
+        SelectionCommand::Db { cmd } => match cmd {
+            SelectionDbCommand::Add { allow_skip, selection, json } => {
+                let sel_name = resolve_sel_name(selection, &active_selection_name);
+                let sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+                let store = open_db_store().await;
+                let mut added = 0usize;
+                let mut skipped = 0usize;
+                let mut errors = 0usize;
+
+                for entry in &sel.entries {
+                    let key = match &entry.zotero_key {
+                        Some(k) => k.clone(),
+                        None => {
+                            if allow_skip {
+                                skipped += 1;
+                                continue;
+                            }
+                            eprintln!("  Error: entry {:?} has no Zotero key; run `selection find` + `selection sync` first",
+                                entry.title.as_deref().unwrap_or("(untitled)"));
+                            errors += 1;
+                            continue;
+                        }
+                    };
+
+                    match papers_db::ingest_params_from_cache(&key) {
+                        Ok(params) => {
+                            match papers_db::ingest_paper(&store, params).await {
+                                Ok(_) => { added += 1; }
+                                Err(e) => {
+                                    eprintln!("  Error ingesting {key}: {e}");
+                                    errors += 1;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if allow_skip {
+                                skipped += 1;
+                                if !json {
+                                    eprintln!("  Skipping {key}: no extraction cache (run `selection find` + `selection sync` first)");
+                                }
+                            } else {
+                                eprintln!("  Error: no extraction cache for {key}; run `selection find` + `selection sync` first");
+                                errors += 1;
+                            }
+                        }
+                    }
+                }
+
+                if json {
+                    print_json(&serde_json::json!({"added": added, "skipped": skipped, "errors": errors}));
+                } else {
+                    print!("{}", format::format_selection_db_add(&sel_name, added, skipped, errors));
+                }
+            }
+
+            SelectionDbCommand::Remove { selection, json } => {
+                let sel_name = resolve_sel_name(selection, &active_selection_name);
+                let sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+                let store = open_db_store().await;
+                let mut removed = 0usize;
+                let mut not_found = 0usize;
+
+                for entry in &sel.entries {
+                    let ids: Vec<String> = [
+                        entry.zotero_key.as_deref(),
+                        entry.doi.as_deref(),
+                        entry.openalex_id.as_deref(),
+                    ].into_iter().flatten().map(String::from).collect();
+
+                    let mut found_id: Option<String> = None;
+                    for id in &ids {
+                        match papers_db::resolve_paper_id(&store, id).await {
+                            Ok(paper_id) => { found_id = Some(paper_id); break; }
+                            Err(_) => continue,
+                        }
+                    }
+
+                    if let Some(paper_id) = found_id {
+                        match papers_db::query::remove_work(&store, &paper_id).await {
+                            Ok(_) => { removed += 1; }
+                            Err(e) => eprintln!("  Error removing {paper_id}: {e}"),
+                        }
+                    } else {
+                        not_found += 1;
+                    }
+                }
+
+                if json {
+                    print_json(&serde_json::json!({"removed": removed, "not_found": not_found}));
+                } else {
+                    print!("{}", format::format_selection_db_remove(&sel_name, removed, not_found));
+                }
+            }
+        }
+
+        SelectionCommand::Collection { cmd } => match cmd {
+            SelectionCollectionCommand::Add { collection, selection, json } => {
+                let sel_name = resolve_sel_name(selection, &active_selection_name);
+                let mut sel = load_selection(&sel_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+                let zotero = match zotero_client().await {
+                    Ok(z) => z,
+                    Err(e) => exit_err(&format!("Zotero unavailable: {e}")),
+                };
+
+                // Resolve collection: try as 8-char key first, then search by name
+                let coll_key = if collection.len() == 8 && collection.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    collection.to_uppercase()
+                } else {
+                    // Fetch all collections and find by name
+                    let mut found_key: Option<String> = None;
+                    let mut start = 0u32;
+                    loop {
+                        let params = papers_zotero::CollectionListParams {
+                            limit: Some(100),
+                            start: Some(start),
+                            ..Default::default()
+                        };
+                        let resp = zotero.list_collections(&params).await
+                            .unwrap_or_else(|e| exit_err(&format!("Failed to list collections: {e}")));
+                        for c in &resp.items {
+                            if c.data.name.eq_ignore_ascii_case(&collection) {
+                                found_key = Some(c.key.clone());
+                                break;
+                            }
+                        }
+                        if found_key.is_some() || resp.items.len() < 100 {
+                            break;
+                        }
+                        start += 100;
+                    }
+                    found_key.unwrap_or_else(|| exit_err(&format!("Collection {collection:?} not found in Zotero")))
+                };
+
+                // Resolve actual collection name from Zotero
+                let coll_name = if let Ok(c) = zotero.get_collection(&coll_key).await {
+                    c.data.name.clone()
+                } else {
+                    collection.clone()
+                };
+
+                // Paginate all items from the collection
+                let mut new_entries = Vec::new();
+                let mut start = 0u32;
+                loop {
+                    let params = papers_zotero::ItemListParams {
+                        limit: Some(100),
+                        start: Some(start),
+                        ..Default::default()
+                    };
+                    let resp = zotero.list_collection_top_items(&coll_key, &params).await
+                        .unwrap_or_else(|e| exit_err(&format!("Failed to list collection items: {e}")));
+                    if resp.items.is_empty() {
+                        break;
+                    }
+                    for item in &resp.items {
+                        let mut entry = papers_core::selection::SelectionEntry {
+                            zotero_key: Some(item.key.clone()),
+                            openalex_id: None,
+                            doi: None,
+                            title: None,
+                            authors: None,
+                            year: None,
+                            issn: None,
+                            isbn: None,
+                            work_type: None,
+                        };
+                        fill_from_zotero_item(&mut entry, item);
+                        new_entries.push(entry);
+                    }
+                    if resp.items.len() < 100 {
+                        break;
+                    }
+                    start += 100;
+                }
+
+                // Deduplicate
+                let mut added = 0usize;
+                let mut dupes = 0usize;
+                for entry in new_entries {
+                    let is_dup = sel.entries.iter().any(|e| {
+                        entry.zotero_key.as_deref()
+                            .map(|k| papers_core::selection::entry_matches_key(e, k))
+                            .unwrap_or(false)
+                            || entry.doi.as_deref()
+                                .map(|d| papers_core::selection::entry_matches_doi(e, d))
+                                .unwrap_or(false)
+                    });
+                    if !is_dup {
+                        sel.entries.push(entry);
+                        added += 1;
+                    } else {
+                        dupes += 1;
+                    }
+                }
+                if let Err(e) = save_selection(&sel) {
+                    exit_err(&e.to_string());
+                }
+
+                if json {
+                    print_json(&serde_json::json!({"added": added, "duplicates": dupes}));
+                } else {
+                    print!("{}", format::format_selection_collection_add(&sel_name, &coll_name, added, dupes));
+                }
+            }
+        }
+
+        SelectionCommand::Merge { source, selection, json } => {
+            let target_name = resolve_sel_name(selection, &active_selection_name);
+            let source_name = match resolve_selection(&source) {
+                Ok(n) => n,
+                Err(e) => exit_err(&e.to_string()),
+            };
+            if source_name == target_name {
+                exit_err("source and target selection are the same");
+            }
+            let source_sel = load_selection(&source_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+            let mut target_sel = load_selection(&target_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+
+            let mut added = 0usize;
+            let mut dupes = 0usize;
+            for entry in &source_sel.entries {
+                let is_dup = target_sel.entries.iter().any(|e| {
+                    entry.zotero_key.as_deref()
+                        .map(|k| papers_core::selection::entry_matches_key(e, k))
+                        .unwrap_or(false)
+                        || entry.openalex_id.as_deref()
+                            .map(|id| papers_core::selection::entry_matches_openalex(e, id))
+                            .unwrap_or(false)
+                        || entry.doi.as_deref()
+                            .map(|d| papers_core::selection::entry_matches_doi(e, d))
+                            .unwrap_or(false)
+                });
+                if !is_dup {
+                    target_sel.entries.push(entry.clone());
+                    added += 1;
+                } else {
+                    dupes += 1;
+                }
+            }
+            if let Err(e) = save_selection(&target_sel) {
+                exit_err(&e.to_string());
+            }
+
+            if json {
+                print_json(&serde_json::json!({"added": added, "duplicates": dupes, "source": source_name, "target": target_name}));
+            } else {
+                print!("{}", format::format_selection_merge(&target_name, &source_name, added, dupes));
+            }
+        }
+
+        SelectionCommand::Rename { new_name, selection, json } => {
+            let old_name = resolve_sel_name(selection, &active_selection_name);
+            if let Err(e) = validate_name(&new_name) {
+                exit_err(&e.to_string());
+            }
+            if load_selection(&new_name).is_ok() {
+                exit_err(&format!("selection {new_name:?} already exists"));
+            }
+            let mut sel = load_selection(&old_name).unwrap_or_else(|e| exit_err(&e.to_string()));
+            sel.name = new_name.clone();
+            if let Err(e) = save_selection(&sel) {
+                exit_err(&e.to_string());
+            }
+            if let Err(e) = delete_selection(&old_name) {
+                exit_err(&e.to_string());
+            }
+            // Update state if this was the active selection
+            let mut state = load_state();
+            if state.active.as_deref() == Some(&old_name) {
+                state.active = Some(new_name.clone());
+                let _ = save_state(&state);
+            }
+
+            if json {
+                print_json(&serde_json::json!({"old_name": old_name, "new_name": new_name}));
+            } else {
+                print!("{}", format::format_selection_rename(&old_name, &new_name));
             }
         }
     }

@@ -201,6 +201,67 @@ pub fn datalab_cache_dir_path(cache_id: &str) -> Option<std::path::PathBuf> {
     datalab_cache_dir(cache_id)
 }
 
+/// Return the directory where the open-access PDF for `doi` would be cached.
+///
+/// Uses `PAPERS_DATALAB_CACHE_DIR` override when set, otherwise
+/// `{cache_dir}/papers/doi/{sanitized_doi}/`.
+/// Slashes in the DOI are replaced with `_` to form a valid directory name.
+pub fn doi_pdf_cache_dir(doi: &str) -> Option<PathBuf> {
+    // Strip any doi: / https://doi.org/ prefix first
+    let bare = doi
+        .strip_prefix("https://doi.org/")
+        .or_else(|| doi.strip_prefix("http://doi.org/"))
+        .or_else(|| doi.strip_prefix("doi:"))
+        .unwrap_or(doi);
+    let safe = bare.replace('/', "_");
+    if let Ok(base) = std::env::var("PAPERS_DATALAB_CACHE_DIR") {
+        return Some(PathBuf::from(base).join("doi").join(safe));
+    }
+    dirs::cache_dir().map(|d| d.join("papers").join("doi").join(safe))
+}
+
+/// Return `true` if a PDF file exists in the DOI cache for `doi`.
+pub fn doi_pdf_cached(doi: &str) -> bool {
+    let dir = match doi_pdf_cache_dir(doi) {
+        Some(d) => d,
+        None => return false,
+    };
+    if !dir.is_dir() {
+        return false;
+    }
+    std::fs::read_dir(&dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|e| {
+            e.ok()
+                .map(|e| {
+                    e.path()
+                        .extension()
+                        .and_then(|x| x.to_str())
+                        .map(|x| x.eq_ignore_ascii_case("pdf"))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+}
+
+/// Try to download an open-access PDF for `work` from direct URLs or OpenAlex
+/// Content API, without Zotero involvement.
+///
+/// Returns `Ok(Some((bytes, source)))` if a PDF was found, `Ok(None)` if none
+/// of the known OA locations yielded a PDF, or an error on network failure.
+pub async fn try_download_open_access_pdf(
+    http: &reqwest::Client,
+    work: &Work,
+) -> Result<Option<(Vec<u8>, PdfSource)>, WorkTextError> {
+    let urls = collect_pdf_urls(work);
+    if let Some(result) = try_direct_urls(http, &urls).await? {
+        return Ok(Some(result));
+    }
+    try_openalex_content(http, work).await
+}
+
 /// Metadata written alongside each DataLab extraction cache entry as `meta.json`.
 ///
 /// All fields except `item_key` are `Option` so that the struct can be read
@@ -627,7 +688,7 @@ fn papers_extract_filename(parent_key: &str) -> String {
 }
 
 /// Find the attachment key of the `papers_extract_{parent_key}.zip` child on `parent_key`.
-async fn find_papers_zip_key(
+pub async fn find_papers_zip_key(
     zc: &ZoteroClient,
     parent_key: &str,
 ) -> Result<Option<String>, WorkTextError> {
