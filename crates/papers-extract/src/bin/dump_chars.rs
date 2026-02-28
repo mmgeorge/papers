@@ -83,6 +83,27 @@ fn main() {
                 "  STX at char {}: bbox=[{:.2}, {:.2}, {:.2}, {:.2}] context: \"{}\"",
                 i, c.bbox[0], c.bbox[1], c.bbox[2], c.bbox[3], context
             );
+            // Show detailed bbox + space_threshold for chars around the STX
+            let detail_start = i.saturating_sub(3);
+            let detail_end = (i + 4).min(chars.len());
+            for k in detail_start..detail_end {
+                let ch = &chars[k];
+                let dc = if ch.codepoint.is_control() {
+                    format!("U+{:04X}", ch.codepoint as u32)
+                } else {
+                    format!("'{}'", ch.codepoint)
+                };
+                let w = ch.bbox[2] - ch.bbox[0];
+                let gap = if k > detail_start {
+                    ch.bbox[0] - chars[k - 1].bbox[2]
+                } else {
+                    0.0
+                };
+                println!(
+                    "    [{:>4}] {:>6} left={:.2} right={:.2} bottom={:.2} top={:.2} w={:.2} gap={:.2} space_thr={:.2}",
+                    k, dc, ch.bbox[0], ch.bbox[2], ch.bbox[1], ch.bbox[3], w, gap, ch.space_threshold
+                );
+            }
         }
     }
     if stx_count == 0 {

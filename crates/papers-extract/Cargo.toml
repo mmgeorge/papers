@@ -8,6 +8,14 @@ description = "Local PDF extraction pipeline using ONNX models for layout detect
 name = "papers-extract"
 path = "src/main.rs"
 
+[[bin]]
+name = "dump_chars"
+path = "src/bin/dump_chars.rs"
+
+[[bin]]
+name = "find_gaps"
+path = "src/bin/find_gaps.rs"
+
 [dependencies]
 clap = { workspace = true }
 oar-ocr = "0.6"

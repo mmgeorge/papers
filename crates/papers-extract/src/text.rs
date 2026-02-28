@@ -3,6 +3,13 @@ use crate::pdf::PdfChar;
 /// pdfium replaces line-end hyphens with U+0002 (STX) and flags them as
 /// FPDFTEXT_CHAR_HYPHEN. This sentinel signals that the word was split
 /// across lines and should be joined directly (without space or newline).
+///
+/// The STX char retains the original hyphen glyph's bounding box, so it
+/// groups with the preceding text during Y-proximity line grouping. In the
+/// simple case the continuation ("tering") is on the very next line, but
+/// inline formula elements can land on an intermediate Y band, pushing the
+/// continuation to a non-adjacent line. See [`assemble_text`] for how this
+/// is handled.
 const PDFIUM_HYPHEN_MARKER: char = '\u{0002}';
 
 /// An inline formula to be spliced into text at its spatial position.
@@ -204,11 +211,35 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
     lines
 }
 
-/// Assemble lines of elements into text with paragraph breaks.
+/// Assemble lines of elements into flowing text with paragraph detection.
 ///
-/// Pdfium already embeds space characters at word boundaries, so we just
-/// concatenate codepoints and filter control characters. Paragraph breaks
-/// are detected from line spacing.
+/// Each pair of consecutive lines is joined with one of three separators:
+///
+/// - **Paragraph break** (`\n\n`) — when line spacing exceeds 1.5× the median.
+/// - **Reflow space** (` `) — normal same-paragraph line break.
+/// - **Dehyphenation** (no separator) — when the line contains a
+///   [`PDFIUM_HYPHEN_MARKER`] (U+0002), indicating the word was split by a
+///   line-end hyphen (e.g. "encoun-\ntering" → "encountering").
+///
+/// # Non-adjacent line dehyphenation
+///
+/// The STX marker groups with the preceding text by Y-proximity, but the
+/// word continuation can land on a **non-adjacent** line when inline formula
+/// elements sit at an intermediate Y position. For example, in a TeX paper
+/// the word "acceleration" split as "ac-" / "celeration" across two
+/// typographic lines might produce three grouped lines:
+///
+/// ```text
+/// line 0: "...estimated ac"  (has STX)
+/// line 1: [formula glyph at intermediate Y]
+/// line 2: "celeration term..."
+/// ```
+///
+/// Without propagation, line 0 joins directly with line 1 (correct), but
+/// line 1 joins with line 2 via a reflow space, producing "ac celeration"
+/// instead of "acceleration". To fix this, `pending_dehyphen` propagates
+/// the "join directly" intent through intervening lines until the
+/// continuation is reached.
 fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
     if lines.is_empty() {
         return String::new();
@@ -234,6 +265,8 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
     let para_threshold = median_spacing * 1.5;
 
     let mut result = String::new();
+    // Propagates dehyphenation across non-adjacent lines — see doc comment.
+    let mut pending_dehyphen = false;
 
     for (line_idx, line) in lines.iter().enumerate() {
         let line_text = build_line_text(line);
@@ -250,10 +283,15 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
                 && line_spacings[line_idx] > para_threshold
             {
                 result.push_str("\n\n"); // paragraph break
-            } else if !has_hyphen_marker {
+                pending_dehyphen = false;
+            } else if has_hyphen_marker || pending_dehyphen {
+                // Dehyphenate: join directly with the next line (no separator).
+                // Propagate forward if this line has its own STX marker, in case
+                // the continuation is on a non-adjacent line.
+                pending_dehyphen = has_hyphen_marker;
+            } else {
                 result.push(' '); // reflow: join with space
             }
-            // else: dehyphenate: join directly (no separator)
         } else if has_hyphen_marker {
             // Last line of this region ends with a split word.
             // Append STX sentinel so the output assembler can join
@@ -684,6 +722,49 @@ mod tests {
         let bbox = [50.0, 50.0, 600.0, 300.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert_eq!(text, "the system");
+    }
+
+    #[test]
+    fn test_dehyphenation_across_intermediate_line() {
+        // Regression test for non-adjacent line dehyphenation.
+        //
+        // In real TeX PDFs, inline formula glyphs (e.g. from $a_{\mathrm{ext}}$)
+        // can sit at a slightly different Y than the surrounding text. After
+        // Y-proximity grouping this creates an intermediate line between the
+        // STX-marked line and the continuation:
+        //
+        //   line 0 (y=100): "...estimated ac"  [has STX]
+        //   line 1 (y=108): [formula glyph]
+        //   line 2 (y=130): "celeration term..."
+        //
+        // Without pending_dehyphen propagation, line 1→2 gets a reflow space,
+        // producing "ac celeration" instead of "acceleration".
+        let mut chars = Vec::new();
+        // Line 0 at y=100: "encoun" + STX marker
+        for (i, c) in "encoun".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // STX marker (pdfium's hyphen replacement)
+        chars.push(make_char_image_space('\u{0002}', 163.0, 100.0, 3.0, 12.0, PAGE_H));
+        // Line 1 at y=108: intermediate element (formula glyph on different Y band)
+        chars.push(make_char_image_space('~', 200.0, 108.0, 5.0, 8.0, PAGE_H));
+        // Line 2 at y=130: "tering" continuation
+        for (i, c) in "tering".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        // The intermediate '~' is joined directly (no spaces around it),
+        // producing "encoun~tering" — the key point is NO space before "tering".
+        assert!(
+            !text.contains(" tering"),
+            "Should not insert space before continuation: {text:?}"
+        );
+        assert!(
+            text.contains("tering"),
+            "Should contain the continuation: {text:?}"
+        );
     }
 
     #[test]
