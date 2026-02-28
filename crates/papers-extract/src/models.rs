@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use oar_ocr::core::config::OrtExecutionProvider;
 use oar_ocr::core::config::OrtSessionConfig;
-use oar_ocr::oarocr::structure::{OARStructure, OARStructureBuilder};
+use oar_ocr::predictors::{FormulaRecognitionPredictor, TableStructureRecognitionPredictor};
 
 use crate::error::ExtractError;
 use crate::Quality;
@@ -202,50 +202,32 @@ fn platform_execution_providers() -> Vec<OrtExecutionProvider> {
     providers
 }
 
-/// Build the OARStructure pipeline from model paths and quality mode.
-pub fn build_structure(
+/// Build a standalone formula recognition predictor.
+pub fn build_formula_predictor(
     paths: &ModelPaths,
     quality: Quality,
-) -> Result<OARStructure, ExtractError> {
+) -> Result<FormulaRecognitionPredictor, ExtractError> {
     let config = ort_config();
+    let name = match quality {
+        Quality::Fast => "PP-FormulaNet_plus-S",
+        Quality::Quality => "PP-FormulaNet_plus-L",
+    };
+    FormulaRecognitionPredictor::builder()
+        .model_name(name)
+        .tokenizer_path(&paths.formula_tokenizer)
+        .with_ort_config(config)
+        .build(&paths.formula)
+        .map_err(|e| ExtractError::Model(format!("Failed to build formula predictor: {e}")))
+}
 
-    let mut builder = OARStructureBuilder::new(&paths.layout)
-        .ort_session(config)
-        .layout_model_name("pp_doclayoutv3")
-        .table_structure_dict_path(&paths.table_dict);
-
-    match quality {
-        Quality::Fast => {
-            builder = builder
-                .with_wireless_table_structure(&paths.slanet_plus)
-                .wireless_table_structure_model_name("SLANet_plus")
-                .with_formula_recognition(
-                    &paths.formula,
-                    &paths.formula_tokenizer,
-                    "pp_formulanet",
-                );
-        }
-        Quality::Quality => {
-            if let Some(ref classifier) = paths.table_classifier {
-                builder = builder.with_table_classification(classifier);
-            }
-            if let Some(ref wired) = paths.slanext_wired {
-                builder = builder
-                    .with_wired_table_structure(wired)
-                    .wired_table_structure_model_name("SLANeXt_wired");
-            }
-            builder = builder
-                .with_wireless_table_structure(&paths.slanet_plus)
-                .wireless_table_structure_model_name("SLANet_plus")
-                .with_formula_recognition(
-                    &paths.formula,
-                    &paths.formula_tokenizer,
-                    "pp_formulanet",
-                );
-        }
-    }
-
-    builder
-        .build()
-        .map_err(|e| ExtractError::Model(format!("Failed to build OARStructure: {e}")))
+/// Build a standalone table structure recognition predictor.
+pub fn build_table_predictor(
+    paths: &ModelPaths,
+) -> Result<TableStructureRecognitionPredictor, ExtractError> {
+    let config = ort_config();
+    TableStructureRecognitionPredictor::builder()
+        .dict_path(&paths.table_dict)
+        .with_ort_config(config)
+        .build(&paths.slanet_plus)
+        .map_err(|e| ExtractError::Model(format!("Failed to build table predictor: {e}")))
 }

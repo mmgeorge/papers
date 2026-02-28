@@ -20,10 +20,11 @@ PDF Input
   │     ├── Extract characters with bboxes (pdfium text layer)
   │     ├── Layout detection (PP-DocLayoutV3 via direct ort — LayoutDetector)
   │     │     → 25 region classes + reading order (model output column 6)
-  │     ├── Table/formula recognition (oar-ocr OARStructure — tables + formulas only)
+  │     ├── For DisplayFormula regions:
+  │     │     crop image → FormulaRecognitionPredictor.predict() → LaTeX
+  │     ├── For Table regions:
+  │     │     crop image → TableStructureRecognitionPredictor.predict() → HTML tokens
   │     ├── Text extraction (match pdfium chars to detected regions, Y-axis converted)
-  │     ├── Table HTML (IoU-matched from oar-ocr TableResult)
-  │     ├── Formula LaTeX (IoU-matched from oar-ocr FormulaResult)
   │     ├── Figure/chart crop (from rendered image)
   │     └── Caption association (proximity-based)
   │
@@ -39,8 +40,8 @@ PDF Input
 | `types.rs` | `ExtractionResult`, `Page`, `Region`, `RegionKind` (23 variants), `Metadata` |
 | `error.rs` | `ExtractError` enum |
 | `layout.rs` | `LayoutDetector` — direct ONNX inference on PP-DocLayoutV3, `DetectedRegion` |
-| `pipeline.rs` | `Pipeline` struct — owns pdfium + LayoutDetector + OARStructure, orchestrates per-page processing |
-| `models.rs` | Model download from GitHub releases, OARStructure + LayoutDetector builders, execution provider config |
+| `pipeline.rs` | `Pipeline` struct — owns pdfium + LayoutDetector + FormulaRecognitionPredictor + TableStructureRecognitionPredictor, orchestrates per-page processing |
+| `models.rs` | Model download from GitHub releases, predictor + LayoutDetector builders, execution provider config |
 | `pdf.rs` | `PdfChar`, `load_pdfium()`, `render_page()`, `extract_page_chars()` |
 | `text.rs` | Match pdfium characters to layout regions, reconstruct text with word/paragraph detection. Converts PdfChar Y-up coords to image Y-down space. |
 | `figure.rs` | Crop visual regions, associate captions by proximity |
@@ -74,7 +75,7 @@ Content routing by kind:
 
 ## Dependencies
 
-- `oar-ocr` 0.6 — ONNX inference for table and formula recognition (layout detection bypassed)
+- `oar-ocr` 0.6 — Standalone FormulaRecognitionPredictor and TableStructureRecognitionPredictor for crop-based recognition
 - `pdfium-render` 0.8 — PDF loading, rendering, text extraction (requires pdfium binary)
 - `ort` 2.0.0-rc.11 — Direct ONNX inference for layout detection + DirectML (Windows) / CoreML (macOS) execution providers
 - `ndarray` 0.17 — Tensor construction for ort model inputs/outputs

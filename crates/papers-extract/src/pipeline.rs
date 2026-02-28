@@ -1,9 +1,9 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
 use image::DynamicImage;
-use oar_ocr::domain::structure::{FormulaResult, StructureResult, TableResult};
-use oar_ocr::oarocr::structure::OARStructure;
+use oar_ocr::predictors::{FormulaRecognitionPredictor, TableStructureRecognitionPredictor};
 use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
@@ -21,7 +21,8 @@ use crate::ExtractOptions;
 pub struct Pipeline {
     pdfium: Pdfium,
     layout: LayoutDetector,
-    structure: OARStructure,
+    formula: FormulaRecognitionPredictor,
+    table: TableStructureRecognitionPredictor,
     options: PipelineOptions,
 }
 
@@ -46,12 +47,14 @@ impl Pipeline {
 
         let paths = models::ensure_models(options.quality, &cache_dir)?;
         let layout = models::build_layout_detector(&paths.layout)?;
-        let structure = models::build_structure(&paths, options.quality)?;
+        let formula = models::build_formula_predictor(&paths, options.quality)?;
+        let table = models::build_table_predictor(&paths)?;
 
         Ok(Self {
             pdfium,
             layout,
-            structure,
+            formula,
+            table,
             options: PipelineOptions {
                 dpi: options.dpi,
                 confidence_threshold: options.confidence_threshold,
@@ -170,17 +173,105 @@ impl Pipeline {
             .layout
             .detect(&page_image, self.options.confidence_threshold)?;
 
-        // Run oar-ocr for table/formula recognition only
-        let rgb_image = page_image.to_rgb8();
-        let structure_result = self
-            .structure
-            .predict_image(rgb_image)
-            .map_err(|e| ExtractError::Layout(format!("Structure prediction failed: {e}")))?;
+        let scale = self.options.dpi as f32 / 72.0;
 
-        // Build regions from layout detection + oar-ocr table/formula results
+        // Crop formula regions and run batched recognition
+        let formula_entries: Vec<(usize, DynamicImage)> = detected
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.kind == RegionKind::DisplayFormula)
+            .map(|(i, d)| {
+                let bbox_pt = [
+                    d.bbox_px[0] / scale,
+                    d.bbox_px[1] / scale,
+                    d.bbox_px[2] / scale,
+                    d.bbox_px[3] / scale,
+                ];
+                (
+                    i,
+                    figure::crop_region(
+                        &page_image,
+                        bbox_pt,
+                        width_pt,
+                        height_pt,
+                        self.options.dpi,
+                    ),
+                )
+            })
+            .collect();
+
+        let formula_latex: HashMap<usize, String> = if !formula_entries.is_empty() {
+            let crops: Vec<image::RgbImage> =
+                formula_entries.iter().map(|(_, img)| img.to_rgb8()).collect();
+            let results = self
+                .formula
+                .predict(crops)
+                .map_err(|e| ExtractError::Layout(format!("Formula prediction failed: {e}")))?;
+            formula_entries
+                .iter()
+                .enumerate()
+                .filter_map(|(batch_idx, (det_idx, _))| {
+                    results
+                        .formulas
+                        .get(batch_idx)
+                        .map(|latex| (*det_idx, latex.clone()))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // Crop table regions and run batched recognition
+        let table_entries: Vec<(usize, DynamicImage)> = detected
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.kind == RegionKind::Table)
+            .map(|(i, d)| {
+                let bbox_pt = [
+                    d.bbox_px[0] / scale,
+                    d.bbox_px[1] / scale,
+                    d.bbox_px[2] / scale,
+                    d.bbox_px[3] / scale,
+                ];
+                (
+                    i,
+                    figure::crop_region(
+                        &page_image,
+                        bbox_pt,
+                        width_pt,
+                        height_pt,
+                        self.options.dpi,
+                    ),
+                )
+            })
+            .collect();
+
+        let table_html: HashMap<usize, String> = if !table_entries.is_empty() {
+            let crops: Vec<image::RgbImage> =
+                table_entries.iter().map(|(_, img)| img.to_rgb8()).collect();
+            let results = self
+                .table
+                .predict(crops)
+                .map_err(|e| ExtractError::Layout(format!("Table prediction failed: {e}")))?;
+            table_entries
+                .iter()
+                .enumerate()
+                .filter_map(|(batch_idx, (det_idx, _))| {
+                    results
+                        .structures
+                        .get(batch_idx)
+                        .map(|tokens| (*det_idx, tokens.join("")))
+                })
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        // Build regions from layout detection + formula/table results
         let mut regions = self.build_regions(
             &detected,
-            &structure_result,
+            &formula_latex,
+            &table_html,
             &chars,
             &page_image,
             page_idx,
@@ -212,11 +303,12 @@ impl Pipeline {
     }
 
     /// Convert DetectedRegion values (from direct ONNX) into our Region types,
-    /// augmented with table HTML and formula LaTeX from oar-ocr.
+    /// augmented with table HTML and formula LaTeX from crop-based prediction.
     fn build_regions(
         &self,
         detected: &[DetectedRegion],
-        structure: &StructureResult,
+        formula_latex: &HashMap<usize, String>,
+        table_html: &HashMap<usize, String>,
         chars: &[PdfChar],
         page_image: &DynamicImage,
         page_idx: u32,
@@ -259,29 +351,17 @@ impl Pipeline {
                 region.text = Some(text::extract_region_text(chars, bbox, page_height_pt));
             }
 
-            // Match tables by IoU (using pixel coords)
-            if kind == RegionKind::Table {
-                let elem_coords = (
-                    det.bbox_px[0],
-                    det.bbox_px[1],
-                    det.bbox_px[2],
-                    det.bbox_px[3],
-                );
-                if let Some(table) = find_matching_table(&structure.tables, elem_coords) {
-                    region.html = table.html_structure.clone();
+            // Populate formula LaTeX from crop-based prediction
+            if kind == RegionKind::DisplayFormula {
+                if let Some(latex) = formula_latex.get(&idx) {
+                    region.latex = Some(latex.clone());
                 }
             }
 
-            // Match formulas by IoU (using pixel coords)
-            if kind == RegionKind::DisplayFormula {
-                let elem_coords = (
-                    det.bbox_px[0],
-                    det.bbox_px[1],
-                    det.bbox_px[2],
-                    det.bbox_px[3],
-                );
-                if let Some(formula) = find_matching_formula(&structure.formulas, elem_coords) {
-                    region.latex = Some(formula.latex.clone());
+            // Populate table HTML from crop-based prediction
+            if kind == RegionKind::Table {
+                if let Some(html) = table_html.get(&idx) {
+                    region.html = Some(html.clone());
                 }
             }
 
@@ -304,114 +384,5 @@ impl Pipeline {
         }
 
         Ok(regions)
-    }
-}
-
-/// Find a TableResult whose bbox overlaps with the given element coordinates (pixels).
-fn find_matching_table<'a>(
-    tables: &'a [TableResult],
-    elem: (f32, f32, f32, f32),
-) -> Option<&'a TableResult> {
-    let (ex1, ey1, ex2, ey2) = elem;
-
-    tables
-        .iter()
-        .max_by(|a, b| {
-            let iou_a = compute_iou_with_table(ex1, ey1, ex2, ey2, a);
-            let iou_b = compute_iou_with_table(ex1, ey1, ex2, ey2, b);
-            iou_a
-                .partial_cmp(&iou_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .filter(|t| compute_iou_with_table(ex1, ey1, ex2, ey2, t) > 0.3)
-}
-
-/// Find a FormulaResult whose bbox overlaps with the given element coordinates (pixels).
-fn find_matching_formula<'a>(
-    formulas: &'a [FormulaResult],
-    elem: (f32, f32, f32, f32),
-) -> Option<&'a FormulaResult> {
-    let (ex1, ey1, ex2, ey2) = elem;
-
-    formulas
-        .iter()
-        .max_by(|a, b| {
-            let iou_a = compute_iou_with_formula(ex1, ey1, ex2, ey2, a);
-            let iou_b = compute_iou_with_formula(ex1, ey1, ex2, ey2, b);
-            iou_a
-                .partial_cmp(&iou_b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .filter(|f| compute_iou_with_formula(ex1, ey1, ex2, ey2, f) > 0.3)
-}
-
-/// Compute IoU between an element bbox and a TableResult bbox.
-fn compute_iou_with_table(
-    ex1: f32,
-    ey1: f32,
-    ex2: f32,
-    ey2: f32,
-    table: &TableResult,
-) -> f32 {
-    compute_iou(
-        ex1,
-        ey1,
-        ex2,
-        ey2,
-        table.bbox.x_min() as f32,
-        table.bbox.y_min() as f32,
-        table.bbox.x_max() as f32,
-        table.bbox.y_max() as f32,
-    )
-}
-
-/// Compute IoU between an element bbox and a FormulaResult bbox.
-fn compute_iou_with_formula(
-    ex1: f32,
-    ey1: f32,
-    ex2: f32,
-    ey2: f32,
-    formula: &FormulaResult,
-) -> f32 {
-    compute_iou(
-        ex1,
-        ey1,
-        ex2,
-        ey2,
-        formula.bbox.x_min() as f32,
-        formula.bbox.y_min() as f32,
-        formula.bbox.x_max() as f32,
-        formula.bbox.y_max() as f32,
-    )
-}
-
-/// Compute Intersection over Union between two axis-aligned bounding boxes.
-fn compute_iou(
-    ax1: f32,
-    ay1: f32,
-    ax2: f32,
-    ay2: f32,
-    bx1: f32,
-    by1: f32,
-    bx2: f32,
-    by2: f32,
-) -> f32 {
-    let inter_x1 = ax1.max(bx1);
-    let inter_y1 = ay1.max(by1);
-    let inter_x2 = ax2.min(bx2);
-    let inter_y2 = ay2.min(by2);
-
-    let inter_w = (inter_x2 - inter_x1).max(0.0);
-    let inter_h = (inter_y2 - inter_y1).max(0.0);
-    let inter_area = inter_w * inter_h;
-
-    let area_a = (ax2 - ax1) * (ay2 - ay1);
-    let area_b = (bx2 - bx1) * (by2 - by1);
-    let union = area_a + area_b - inter_area;
-
-    if union > 0.0 {
-        inter_area / union
-    } else {
-        0.0
     }
 }
