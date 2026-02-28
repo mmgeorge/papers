@@ -1,0 +1,106 @@
+use std::path::PathBuf;
+use std::process;
+
+use clap::{Parser, ValueEnum};
+use papers_extract::{ExtractOptions, Quality};
+
+#[derive(Parser)]
+#[command(
+    name = "papers-extract",
+    about = "Extract structured content from PDFs using local ONNX models",
+    term_width = 100
+)]
+struct Cli {
+    /// Path to the input PDF file
+    pdf: PathBuf,
+
+    /// Output directory (default: same directory as the PDF)
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// Quality mode for table and formula recognition
+    #[arg(long, short, default_value = "fast")]
+    quality: QualityArg,
+
+    /// DPI for page rendering
+    #[arg(long, default_value = "144")]
+    dpi: u32,
+
+    /// Layout detection confidence threshold (0.0–1.0)
+    #[arg(long, default_value = "0.3")]
+    confidence: f32,
+
+    /// Extract only this page (1-indexed)
+    #[arg(long, short = 'p')]
+    page: Option<u32>,
+
+    /// Skip image extraction
+    #[arg(long)]
+    no_images: bool,
+
+    /// Path to pdfium library (auto-detected if omitted)
+    #[arg(long)]
+    pdfium_path: Option<PathBuf>,
+
+    /// Directory for ONNX model cache
+    #[arg(long)]
+    model_cache_dir: Option<PathBuf>,
+
+    /// Write debug visualizations (annotated PNGs + debug PDF)
+    #[arg(long)]
+    debug: bool,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum QualityArg {
+    /// SLANet-Plus + FormulaNet-S (~379 MB)
+    Fast,
+    /// PP-LCNet classifier + SLANeXt-wired + FormulaNet-L (~1.18 GB)
+    Quality,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let output_dir = cli.output.unwrap_or_else(|| {
+        cli.pdf
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
+
+    let options = ExtractOptions {
+        dpi: cli.dpi,
+        confidence_threshold: cli.confidence,
+        extract_images: !cli.no_images,
+        quality: match cli.quality {
+            QualityArg::Fast => Quality::Fast,
+            QualityArg::Quality => Quality::Quality,
+        },
+        pdfium_path: cli.pdfium_path,
+        model_cache_dir: cli.model_cache_dir,
+        page: cli.page,
+        debug: cli.debug,
+    };
+
+    eprintln!(
+        "Extracting {} → {}",
+        cli.pdf.display(),
+        output_dir.display()
+    );
+
+    match papers_extract::extract(&cli.pdf, &output_dir, &options) {
+        Ok(result) => {
+            eprintln!(
+                "Done: {} pages, {} regions, {}ms",
+                result.metadata.page_count,
+                result.pages.iter().map(|p| p.regions.len()).sum::<usize>(),
+                result.metadata.extraction_time_ms,
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    }
+}

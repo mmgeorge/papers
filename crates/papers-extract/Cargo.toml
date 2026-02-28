@@ -1,0 +1,34 @@
+[package]
+name = "papers-extract"
+version.workspace = true
+edition.workspace = true
+description = "Local PDF extraction pipeline using ONNX models for layout detection, table recognition, and formula extraction"
+
+[[bin]]
+name = "papers-extract"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+oar-ocr = "0.6"
+pdfium-render = { version = "0.8", features = ["image_025"] }
+image = "0.25"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+tracing = "0.1"
+reqwest = { workspace = true, features = ["blocking"] }
+flate2 = "1"
+tar = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+oar-ocr = { version = "0.6", features = ["directml"] }
+ort = { version = "=2.0.0-rc.11", features = ["directml"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+oar-ocr = { version = "0.6", features = ["coreml"] }
+ort = { version = "=2.0.0-rc.11", features = ["coreml"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
