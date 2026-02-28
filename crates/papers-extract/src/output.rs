@@ -56,19 +56,86 @@ pub fn write_images(
 
 /// Render the full extraction result as Markdown.
 fn render_markdown(result: &ExtractionResult) -> String {
-    let mut md = String::new();
+    // Collect rendered sections with metadata for cross-region dehyphenation.
+    struct Section {
+        markdown: String,
+        is_text: bool,
+    }
+
+    let mut sections: Vec<Section> = Vec::new();
 
     for page in &result.pages {
         for region in &page.regions {
             let section = region_to_markdown(region);
-            if !section.is_empty() {
-                md.push_str(&section);
-                md.push_str("\n\n");
+            if section.is_empty() {
+                continue;
             }
+            let is_text = matches!(
+                region.kind,
+                RegionKind::Text
+                    | RegionKind::VerticalText
+                    | RegionKind::Abstract
+                    | RegionKind::SidebarText
+                    | RegionKind::References
+            );
+            sections.push(Section {
+                markdown: section,
+                is_text,
+            });
         }
     }
 
-    // Remove trailing whitespace
+    // Pre-pass: when a text section ends with STX (U+0002), the last word was
+    // split by a hyphen at a region boundary. Move the trailing word fragment
+    // from this section to the front of the next text section, joining the word.
+    // This handles intervening non-text regions (figures, formulas) correctly.
+    let mut i = 0;
+    while i < sections.len() {
+        if sections[i].is_text && sections[i].markdown.ends_with('\u{0002}') {
+            // Remove STX sentinel
+            sections[i].markdown.pop();
+
+            // Find the trailing word fragment (chars after the last space/newline)
+            let split_pos = sections[i]
+                .markdown
+                .rfind(|c: char| c == ' ' || c == '\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let fragment = sections[i].markdown[split_pos..].to_string();
+            sections[i].markdown.truncate(split_pos);
+
+            // Find the next text section and prepend the fragment
+            if !fragment.is_empty() {
+                let mut found = false;
+                for j in (i + 1)..sections.len() {
+                    if sections[j].is_text {
+                        sections[j].markdown.insert_str(0, &fragment);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    // No next text section found; put fragment back
+                    sections[i].markdown.push_str(&fragment);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Assemble with paragraph breaks between sections.
+    let mut md = String::new();
+    for sec in &sections {
+        let text = sec.markdown.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !md.is_empty() {
+            md.push_str("\n\n");
+        }
+        md.push_str(text);
+    }
+
     md.trim_end().to_string()
 }
 

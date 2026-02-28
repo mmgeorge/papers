@@ -56,6 +56,75 @@ fn main() {
         println!("... ({} more chars)", chars.len() - 200);
     }
 
+    // 2b. Scan ALL chars for STX (U+0002) — pdfium's hyphen marker
+    println!("\n=== STX (U+0002) HYPHEN MARKER SCAN ===");
+    let mut stx_count = 0;
+    for (i, c) in chars.iter().enumerate() {
+        if c.codepoint == '\u{0002}' {
+            stx_count += 1;
+            // Show context: 10 chars before and 10 after
+            let start = i.saturating_sub(10);
+            let end = (i + 11).min(chars.len());
+            let context: String = chars[start..end]
+                .iter()
+                .enumerate()
+                .map(|(j, ch)| {
+                    let abs = start + j;
+                    if abs == i {
+                        '|'  // mark the STX position
+                    } else if ch.codepoint.is_control() {
+                        '?'
+                    } else {
+                        ch.codepoint
+                    }
+                })
+                .collect();
+            println!(
+                "  STX at char {}: bbox=[{:.2}, {:.2}, {:.2}, {:.2}] context: \"{}\"",
+                i, c.bbox[0], c.bbox[1], c.bbox[2], c.bbox[3], context
+            );
+        }
+    }
+    if stx_count == 0 {
+        println!("  No STX markers found.");
+    } else {
+        println!("  Total: {} STX markers", stx_count);
+    }
+
+    // 2c. Also scan for control chars in general
+    println!("\n=== ALL CONTROL CHARS ===");
+    let mut ctrl_count = 0;
+    for (i, c) in chars.iter().enumerate() {
+        if c.codepoint.is_control() {
+            ctrl_count += 1;
+            let start = i.saturating_sub(5);
+            let end = (i + 6).min(chars.len());
+            let context: String = chars[start..end]
+                .iter()
+                .enumerate()
+                .map(|(j, ch)| {
+                    let abs = start + j;
+                    if abs == i {
+                        '|'
+                    } else if ch.codepoint.is_control() {
+                        '?'
+                    } else {
+                        ch.codepoint
+                    }
+                })
+                .collect();
+            println!(
+                "  U+{:04X} at char {}: bbox=[{:.2}, {:.2}, {:.2}, {:.2}] context: \"{}\"",
+                c.codepoint as u32, i, c.bbox[0], c.bbox[1], c.bbox[2], c.bbox[3], context
+            );
+        }
+    }
+    if ctrl_count == 0 {
+        println!("  No control chars found.");
+    } else {
+        println!("  Total: {} control chars", ctrl_count);
+    }
+
     // 3. Show gap analysis for first line
     println!("\n=== GAP ANALYSIS (first ~80 chars) ===");
     let first_line_chars: Vec<_> = chars.iter().take(80).collect();

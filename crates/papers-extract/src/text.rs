@@ -1,5 +1,10 @@
 use crate::pdf::PdfChar;
 
+/// pdfium replaces line-end hyphens with U+0002 (STX) and flags them as
+/// FPDFTEXT_CHAR_HYPHEN. This sentinel signals that the word was split
+/// across lines and should be joined directly (without space or newline).
+const PDFIUM_HYPHEN_MARKER: char = '\u{0002}';
+
 /// An inline formula to be spliced into text at its spatial position.
 pub struct InlineFormula {
     /// Bounding box in image-space PDF points [x1, y1, x2, y2] (Y-down, top-left origin).
@@ -234,17 +239,26 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
         let line_text = build_line_text(line);
         result.push_str(&line_text);
 
-        // Check if we need a paragraph break or just a newline
+        let has_hyphen_marker = line.iter().any(|e| matches!(
+            e, LineElement::Char(c) if c.codepoint == PDFIUM_HYPHEN_MARKER
+        ));
+
+        // Check if we need a paragraph break, reflow space, or dehyphenation join
         if line_idx < lines.len() - 1 {
-            if para_threshold > 0.0 && line_idx < line_spacings.len() {
-                if line_spacings[line_idx] > para_threshold {
-                    result.push_str("\n\n");
-                } else {
-                    result.push('\n');
-                }
-            } else {
-                result.push('\n');
+            if para_threshold > 0.0
+                && line_idx < line_spacings.len()
+                && line_spacings[line_idx] > para_threshold
+            {
+                result.push_str("\n\n"); // paragraph break
+            } else if !has_hyphen_marker {
+                result.push(' '); // reflow: join with space
             }
+            // else: dehyphenate: join directly (no separator)
+        } else if has_hyphen_marker {
+            // Last line of this region ends with a split word.
+            // Append STX sentinel so the output assembler can join
+            // this region's text directly with the next region.
+            result.push(PDFIUM_HYPHEN_MARKER);
         }
     }
 
@@ -417,9 +431,8 @@ mod tests {
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
-        assert!(text.contains("First"));
-        assert!(text.contains("Second"));
-        assert!(text.contains('\n'));
+        // Same-paragraph lines are reflowed with a space (not \n)
+        assert_eq!(text, "First Second");
     }
 
     #[test]
@@ -440,11 +453,11 @@ mod tests {
 
     #[test]
     fn test_control_chars_filtered() {
-        // Control characters like \r, \n, U+0002 should be stripped.
+        // Control characters like \r, \n should be stripped from line text.
         // B is placed tight to A (gap = 0.5pt < 1.5pt threshold) so no space inserted.
         let chars = vec![
             make_char_image_space('A', 100.0, 100.0, 10.0, 12.0, PAGE_H),
-            make_char_image_space('\u{0002}', 110.0, 100.0, 0.0, 12.0, PAGE_H),
+            make_char_image_space('\r', 110.0, 100.0, 0.0, 12.0, PAGE_H),
             make_char_image_space('B', 110.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
@@ -632,6 +645,45 @@ mod tests {
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn test_dehyphenation() {
+        // When a line ends with a STX marker (U+0002), pdfium is signaling a
+        // hyphenated word split. The lines should be joined directly.
+        let mut chars = Vec::new();
+        // Line 1: "encoun" + STX marker at y=100
+        for (i, c) in "encoun".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // STX marker at the end of line 1 (pdfium's hyphen replacement)
+        chars.push(make_char_image_space('\u{0002}', 163.0, 100.0, 3.0, 12.0, PAGE_H));
+        // Line 2: "tering" at y=130
+        for (i, c) in "tering".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        assert_eq!(text, "encountering");
+    }
+
+    #[test]
+    fn test_reflow_same_paragraph() {
+        // Same-paragraph lines without hyphenation should be joined with a space.
+        let mut chars = Vec::new();
+        // Line 1 at y=100
+        for (i, c) in "the".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // Line 2 at y=130
+        for (i, c) in "system".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        assert_eq!(text, "the system");
     }
 
     #[test]
