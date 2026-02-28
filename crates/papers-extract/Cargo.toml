@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 tracing = "0.1"
+ttf-parser = "0.25"
 reqwest = { workspace = true, features = ["blocking"] }
 flate2 = "1"
 tar = "0.4"

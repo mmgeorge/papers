@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use image::DynamicImage;
@@ -12,6 +13,19 @@ pub struct PdfChar {
     /// Bounding box in PDF points (72pt/inch): [x1, y1, x2, y2]
     /// where (x1, y1) is bottom-left and (x2, y2) is top-right.
     pub bbox: [f32; 4],
+    /// Pre-computed gap threshold for word boundary detection, in PDF points.
+    ///
+    /// When the horizontal gap between two consecutive characters exceeds this threshold,
+    /// a space character should be inserted between them. This replicates pdfium's own
+    /// space-insertion heuristic from `cpdf_textpage.cpp`:
+    ///
+    ///   threshold = font_size × font.GetCharWidthF(space_charcode) / 1000 / 2
+    ///
+    /// We compute this by extracting the embedded font data via `PdfFont::data()` and
+    /// parsing it with `ttf-parser` to get the exact space character advance width.
+    /// When font data is unavailable (non-embedded fonts), we fall back to an approximation
+    /// using `space_width_ratio = 0.3` (typical for Latin fonts where space ≈ 250–333 / 1000).
+    pub space_threshold: f32,
 }
 
 /// Render a page to an RGB image at the given DPI.
@@ -45,6 +59,10 @@ pub fn extract_page_chars(page: &PdfPage, page_idx: u32) -> Result<Vec<PdfChar>,
     let chars_collection = text.chars();
     let mut chars = Vec::new();
 
+    // Cache space_width_ratio per font name to avoid re-parsing font data for every character.
+    // Key: font name, Value: space_width / units_per_em ratio (typically 0.25–0.33 for Latin fonts).
+    let mut font_space_ratios: HashMap<String, f32> = HashMap::new();
+
     for i in 0..chars_collection.len() {
         let Ok(char_info) = chars_collection.get(i) else {
             continue;
@@ -52,6 +70,14 @@ pub fn extract_page_chars(page: &PdfPage, page_idx: u32) -> Result<Vec<PdfChar>,
 
         if let Some(c) = char_info.unicode_char() {
             if let Ok(rect) = char_info.loose_bounds() {
+                let font_size = char_info.scaled_font_size().value;
+
+                // Look up or compute the space width ratio for this character's font.
+                let font_name = char_info.font_name();
+                let space_ratio = *font_space_ratios
+                    .entry(font_name.clone())
+                    .or_insert_with(|| compute_space_width_ratio(&char_info, &font_name));
+
                 chars.push(PdfChar {
                     codepoint: c,
                     bbox: [
@@ -60,12 +86,109 @@ pub fn extract_page_chars(page: &PdfPage, page_idx: u32) -> Result<Vec<PdfChar>,
                         rect.right().value,
                         rect.top().value,
                     ],
+                    space_threshold: font_size * space_ratio / 2.0,
                 });
             }
         }
     }
 
     Ok(chars)
+}
+
+/// Compute the space character's width as a ratio of the em square for the given font.
+///
+/// Uses pdfium-render's `PdfFont::data()` to extract embedded font bytes, then parses
+/// with `ttf-parser` to look up the space character's (U+0020) horizontal advance width.
+///
+/// Returns `advance_width / units_per_em`, which is the same value that pdfium uses
+/// internally as `font.GetCharWidthF(space_charcode) / 1000` (normalized to 1.0 = full em).
+///
+/// Falls back to `0.3` (approximate midpoint of 0.25–0.33 for typical Latin fonts) when:
+/// - The font is not embedded (`font.data()` fails)
+/// - The font data can't be parsed by ttf-parser
+/// - The font has no space glyph
+/// - The font has no horizontal advance for the space glyph
+fn compute_space_width_ratio(char_info: &PdfPageTextChar, font_name: &str) -> f32 {
+    const FALLBACK_RATIO: f32 = 0.3;
+
+    let text_obj = match char_info.text_object() {
+        Ok(obj) => obj,
+        Err(_) => {
+            tracing::warn!(
+                "word-boundary: cannot access text object for font '{}', \
+                 using fallback space ratio {FALLBACK_RATIO}",
+                font_name
+            );
+            return FALLBACK_RATIO;
+        }
+    };
+
+    let font = text_obj.font();
+
+    let font_data = match font.data() {
+        Ok(data) => data,
+        Err(_) => {
+            tracing::warn!(
+                "word-boundary: font '{}' data unavailable, \
+                 using fallback space ratio {FALLBACK_RATIO}",
+                font_name
+            );
+            return FALLBACK_RATIO;
+        }
+    };
+
+    let face = match ttf_parser::Face::parse(&font_data, 0) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                "word-boundary: failed to parse font '{}': {e}, \
+                 using fallback space ratio {FALLBACK_RATIO}",
+                font_name
+            );
+            return FALLBACK_RATIO;
+        }
+    };
+
+    let units_per_em = face.units_per_em() as f32;
+    if units_per_em == 0.0 {
+        tracing::warn!(
+            "word-boundary: font '{}' has units_per_em=0, \
+             using fallback space ratio {FALLBACK_RATIO}",
+            font_name
+        );
+        return FALLBACK_RATIO;
+    }
+
+    let space_gid = match face.glyph_index(' ') {
+        Some(gid) => gid,
+        None => {
+            tracing::warn!(
+                "word-boundary: font '{}' has no space glyph, \
+                 using fallback space ratio {FALLBACK_RATIO}",
+                font_name
+            );
+            return FALLBACK_RATIO;
+        }
+    };
+
+    match face.glyph_hor_advance(space_gid) {
+        Some(advance) => {
+            let ratio = advance as f32 / units_per_em;
+            tracing::debug!(
+                "word-boundary: font '{}' space width = {advance}/{units_per_em} = {ratio:.4}",
+                font_name
+            );
+            ratio
+        }
+        None => {
+            tracing::warn!(
+                "word-boundary: font '{}' space glyph has no advance width, \
+                 using fallback space ratio {FALLBACK_RATIO}",
+                font_name
+            );
+            FALLBACK_RATIO
+        }
+    }
 }
 
 /// Load the pdfium library, trying system paths then a cached location.

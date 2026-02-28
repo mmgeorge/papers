@@ -13,6 +13,8 @@ struct ImageChar<'a> {
     /// Bounding box in image-space PDF points: [x1, y1, x2, y2]
     /// where (x1, y1) is top-left and (x2, y2) is bottom-right.
     bbox: [f32; 4],
+    /// Pre-computed gap threshold for word boundary detection, in PDF points.
+    space_threshold: f32,
     _source: &'a PdfChar,
 }
 
@@ -53,6 +55,7 @@ fn to_image_char<'a>(c: &'a PdfChar, page_height_pt: f32) -> ImageChar<'a> {
             c.bbox[2],                       // x2 = right (unchanged)
             page_height_pt - c.bbox[1],      // y2 = page_height - bottom (now bottom in Y-down)
         ],
+        space_threshold: c.space_threshold,
         _source: c,
     }
 }
@@ -248,36 +251,86 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
     result
 }
 
-/// Build a single line of text from elements.
+/// Build a single line of text from elements sorted left-to-right.
 ///
-/// For Char elements, pdfium embeds space characters (U+0020) with zero-width
-/// bboxes at word boundaries, so we just emit each codepoint. Control characters
-/// are filtered since line structure comes from Y-proximity grouping.
-/// For Formula elements, we emit `$latex$`.
+/// # Word boundary detection
+///
+/// pdfium's text layer normally includes synthesized space characters at word
+/// boundaries. However, for some PDFs — particularly TeX-typeset academic papers —
+/// pdfium's per-character API silently drops these generated spaces, causing words
+/// to run together (e.g. "suchasmallsystem" instead of "such a small system").
+///
+/// To fix this, we replicate pdfium's own space-insertion heuristic: when the
+/// horizontal gap between consecutive characters exceeds a font-metric-based
+/// threshold, we insert a space. Each character carries a pre-computed
+/// `space_threshold` derived from the font's actual space character advance width.
+///
+/// This handles both cases transparently:
+/// - When pdfium DOES emit space characters: they pass through as normal, and the
+///   gap between surrounding chars is zero (no duplicate space inserted).
+/// - When pdfium DOESN'T emit spaces: the geometric gap exceeds the threshold,
+///   and we insert a space ourselves.
 fn build_line_text(elements: &[&LineElement]) -> String {
     let mut text = String::new();
+    let mut prev_right: Option<f32> = None;
+
+    // Compute fallback threshold from average char width, used when space_threshold
+    // is zero (no font info available). Excludes space chars and zero-width chars.
+    let avg_width = {
+        let widths: Vec<f32> = elements.iter()
+            .filter_map(|e| match e {
+                LineElement::Char(c) if !c.codepoint.is_control()
+                    && c.codepoint != ' '
+                    && (c.bbox[2] - c.bbox[0]) > 0.0 => Some(c.bbox[2] - c.bbox[0]),
+                _ => None,
+            })
+            .collect();
+        if widths.is_empty() { 0.0 }
+        else { widths.iter().sum::<f32>() / widths.len() as f32 }
+    };
+
     for elem in elements {
         match elem {
             LineElement::Char(c) => {
-                if c.codepoint.is_control() {
-                    continue;
+                if c.codepoint.is_control() { continue; }
+
+                // Gap-based word boundary detection.
+                if c.codepoint != ' ' {
+                    if let Some(pr) = prev_right {
+                        let gap = c.bbox[0] - pr;
+                        let threshold = if c.space_threshold > 0.0 {
+                            c.space_threshold
+                        } else {
+                            // Last-resort fallback when no font info at all
+                            avg_width * 0.3
+                        };
+                        if threshold > 0.0 && gap >= threshold && !text.ends_with(' ') {
+                            text.push(' ');
+                        }
+                    }
                 }
+
                 text.push(c.codepoint);
+                // Track the right edge of the last non-zero-width character.
+                // Zero-width chars (pdfium's generated spaces) are skipped so they
+                // don't reset prev_right and interfere with gap measurement.
+                let w = c.bbox[2] - c.bbox[0];
+                if w > 0.0 {
+                    prev_right = Some(c.bbox[2]);
+                }
             }
             LineElement::Formula { latex, .. } => {
-                // Ensure space before formula if needed
                 if !text.is_empty() && !text.ends_with(' ') {
                     text.push(' ');
                 }
                 text.push('$');
                 text.push_str(latex);
                 text.push('$');
-                // Add trailing space so next char isn't jammed against the formula
                 text.push(' ');
+                prev_right = None;
             }
         }
     }
-    // Collapse runs of multiple spaces into a single space
     collapse_spaces(&text)
 }
 
@@ -305,6 +358,7 @@ mod tests {
 
     /// Helper to make a PdfChar where y is specified in image space (Y-down).
     /// Converts to PDF space internally using page_height_pt.
+    /// Uses a default space_threshold of 1.5 (≈ 10pt font × 0.3 ratio / 2).
     fn make_char_image_space(c: char, x: f32, y_top_img: f32, w: f32, h: f32, page_h: f32) -> PdfChar {
         // In image space: y_top_img is the top of the char (small value = near top of page)
         // In PDF space: top = page_h - y_top_img, bottom = page_h - (y_top_img + h)
@@ -313,6 +367,7 @@ mod tests {
         PdfChar {
             codepoint: c,
             bbox: [x, pdf_bottom, x + w, pdf_top],
+            space_threshold: 1.5,
         }
     }
 
@@ -333,15 +388,16 @@ mod tests {
     #[test]
     fn test_single_line_extraction() {
         let mut chars = Vec::new();
-        // "Hello World" with pdfium-style zero-width space between words
+        // "Hello World" with pdfium-style zero-width space between words.
+        // Chars are 10pt wide with 0.5pt gap (< 1.5pt threshold) — no false spaces.
         for (i, c) in "Hello".chars().enumerate() {
-            chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 100.0, 10.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
         }
         // Zero-width space character at the word boundary (as pdfium emits)
-        let space_x = 100.0 + 5.0 * 12.0;
+        let space_x = 100.0 + 5.0 * 10.5;
         chars.push(make_char_image_space(' ', space_x, 100.0, 0.0, 12.0, PAGE_H));
         for (i, c) in "World".chars().enumerate() {
-            chars.push(make_char_image_space(c, space_x + 2.0 + i as f32 * 12.0, 100.0, 10.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, space_x + 5.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
@@ -351,13 +407,13 @@ mod tests {
     #[test]
     fn test_multi_line_extraction() {
         let mut chars = Vec::new();
-        // Line 1 at y=100 (image space)
+        // Line 1 at y=100 (image space), tight spacing (0.5pt gap < 1.5pt threshold)
         for (i, c) in "First".chars().enumerate() {
-            chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 100.0, 10.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
         }
         // Line 2 at y=130 (image space)
         for (i, c) in "Second".chars().enumerate() {
-            chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 130.0, 10.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
@@ -368,13 +424,14 @@ mod tests {
 
     #[test]
     fn test_word_boundary_from_pdfium_space() {
-        // Pdfium emits a zero-width space character between words
+        // Pdfium emits a zero-width space character between words.
+        // Within-word gap = 0.5pt (< 1.5pt threshold), between-word gap via pdfium space.
         let chars = vec![
             make_char_image_space('A', 100.0, 100.0, 10.0, 12.0, PAGE_H),
-            make_char_image_space('B', 112.0, 100.0, 10.0, 12.0, PAGE_H),
-            make_char_image_space(' ', 122.0, 100.0, 0.0, 12.0, PAGE_H), // pdfium space
-            make_char_image_space('C', 140.0, 100.0, 10.0, 12.0, PAGE_H),
-            make_char_image_space('D', 152.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('B', 110.5, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space(' ', 120.5, 100.0, 0.0, 12.0, PAGE_H), // pdfium space
+            make_char_image_space('C', 130.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('D', 140.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
@@ -383,11 +440,12 @@ mod tests {
 
     #[test]
     fn test_control_chars_filtered() {
-        // Control characters like \r, \n, U+0002 should be stripped
+        // Control characters like \r, \n, U+0002 should be stripped.
+        // B is placed tight to A (gap = 0.5pt < 1.5pt threshold) so no space inserted.
         let chars = vec![
             make_char_image_space('A', 100.0, 100.0, 10.0, 12.0, PAGE_H),
-            make_char_image_space('\u{0002}', 112.0, 100.0, 0.0, 12.0, PAGE_H),
-            make_char_image_space('B', 114.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('\u{0002}', 110.0, 100.0, 0.0, 12.0, PAGE_H),
+            make_char_image_space('B', 110.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
@@ -397,21 +455,21 @@ mod tests {
     #[test]
     fn test_paragraph_detection() {
         let mut chars = Vec::new();
-        // Line 1 at y=100
+        // Line 1 at y=100, tight spacing (0.5pt gap)
         for (i, c) in "Line1".chars().enumerate() {
-            chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 100.0, 10.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
         }
         // Line 2 at y=115 (normal spacing = 15)
         for (i, c) in "Line2".chars().enumerate() {
-            chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 115.0, 10.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 115.0, 10.0, 12.0, PAGE_H));
         }
         // Line 3 at y=130 (normal spacing = 15)
         for (i, c) in "Line3".chars().enumerate() {
-            chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 130.0, 10.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
         }
         // Line 4 at y=180 (large gap = 50 -> paragraph break)
         for (i, c) in "Line4".chars().enumerate() {
-            chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 180.0, 10.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 180.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
@@ -449,7 +507,7 @@ mod tests {
     fn test_superscript_grouping() {
         let chars = vec![
             make_char_image_space('x', 100.0, 100.0, 10.0, 12.0, PAGE_H),
-            make_char_image_space('2', 112.0, 96.0, 8.0, 10.0, PAGE_H),
+            make_char_image_space('2', 110.5, 96.0, 8.0, 10.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
@@ -464,6 +522,7 @@ mod tests {
         let top_char = PdfChar {
             codepoint: 'T',
             bbox: [100.0, 790.0, 110.0, 800.0],
+            space_threshold: 0.0,
         };
         let img = to_image_char(&top_char, page_h);
         // In image space, this should be near y=0 (top of page)
@@ -474,6 +533,7 @@ mod tests {
         let bottom_char = PdfChar {
             codepoint: 'B',
             bbox: [100.0, 0.0, 110.0, 10.0],
+            space_threshold: 0.0,
         };
         let img = to_image_char(&bottom_char, page_h);
         // In image space, this should be near y=790 (bottom of page)
@@ -484,9 +544,10 @@ mod tests {
     #[test]
     fn test_inline_formula_spliced_into_text() {
         // "we define x as" with an inline formula for "t" between "define" and "as"
+        // Tight spacing: 8pt wide chars with 0.5pt gap (< 1.5pt threshold)
         let mut chars = Vec::new();
         for (i, c) in "we define".chars().enumerate() {
-            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 8.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 8.5, 100.0, 8.0, 12.0, PAGE_H));
         }
         // Gap where inline formula "t" lives (at x=200..220)
         // Some glyph chars from pdfium that overlap the formula bbox
@@ -494,7 +555,7 @@ mod tests {
         // Continue with "as"
         chars.push(make_char_image_space(' ', 222.0, 100.0, 0.0, 12.0, PAGE_H));
         for (i, c) in "as".chars().enumerate() {
-            chars.push(make_char_image_space(c, 225.0 + i as f32 * 10.0, 100.0, 8.0, 12.0, PAGE_H));
+            chars.push(make_char_image_space(c, 225.0 + i as f32 * 8.5, 100.0, 8.0, 12.0, PAGE_H));
         }
 
         let bbox = [50.0, 50.0, 600.0, 200.0];
@@ -529,13 +590,64 @@ mod tests {
 
     #[test]
     fn test_no_inline_formulas_backward_compat() {
-        // Passing empty inline_formulas should produce identical results to before
+        // Passing empty inline_formulas should produce identical results to before.
+        // Tight spacing (0.5pt gap < 1.5pt threshold) — no false spaces.
         let chars = vec![
             make_char_image_space('H', 100.0, 100.0, 10.0, 12.0, PAGE_H),
-            make_char_image_space('i', 112.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('i', 110.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert_eq!(text, "Hi");
+    }
+
+    #[test]
+    fn test_gap_based_space_insertion() {
+        // Simulate pdfium dropping space characters: chars with a large gap between them
+        // should get a space inserted. Threshold = 1.5pt (10pt font × 0.3 ratio / 2).
+        let chars = vec![
+            // "AB" tight (gap = 0)
+            make_char_image_space('A', 100.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('B', 110.0, 100.0, 10.0, 12.0, PAGE_H),
+            // Gap of 5pt (> threshold of 1.5) — should insert space
+            make_char_image_space('C', 125.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('D', 135.0, 100.0, 10.0, 12.0, PAGE_H),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        assert_eq!(text, "AB CD");
+    }
+
+    #[test]
+    fn test_gap_detection_no_false_positives() {
+        // Tight kerning (gap < threshold) should NOT produce spurious spaces.
+        // Threshold = 1.5pt, gap between each char = 0.5pt.
+        let chars = vec![
+            make_char_image_space('H', 100.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('e', 110.5, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('l', 121.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('l', 131.5, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('o', 142.0, 100.0, 10.0, 12.0, PAGE_H),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        assert_eq!(text, "Hello");
+    }
+
+    #[test]
+    fn test_gap_with_pdfium_space_no_duplicate() {
+        // When pdfium DOES emit a zero-width space character, the gap-based detector
+        // should not insert a duplicate space.
+        let chars = vec![
+            make_char_image_space('A', 100.0, 100.0, 10.0, 12.0, PAGE_H),
+            // pdfium's zero-width space between words
+            make_char_image_space(' ', 110.0, 100.0, 0.0, 12.0, PAGE_H),
+            // gap from A's right edge (110) to B's left edge (115) = 5pt > threshold,
+            // but the space char already handled it
+            make_char_image_space('B', 115.0, 100.0, 10.0, 12.0, PAGE_H),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        assert_eq!(text, "A B");
     }
 }
