@@ -6,6 +6,7 @@ use pdfium_render::prelude::*;
 use crate::error::ExtractError;
 use crate::pdf;
 use crate::types::{ExtractionResult, Page, Region, RegionKind};
+use crate::DebugMode;
 
 /// Write the extraction result as pretty-printed JSON.
 pub fn write_json(result: &ExtractionResult, path: &Path) -> Result<(), ExtractError> {
@@ -173,13 +174,13 @@ fn region_color(kind: RegionKind) -> PdfColor {
 }
 
 /// Write debug visualization: annotate the original PDF with colored bounding boxes
-/// and labels, save as `{stem}_debug.pdf`, and render annotated pages as PNGs.
+/// and labels, then save as PNGs and/or a debug PDF under `layout/`.
 pub fn write_debug(
     pdfium: &Pdfium,
     pdf_path: &Path,
     pages: &[Page],
     output_dir: &Path,
-    stem: &str,
+    mode: DebugMode,
 ) -> Result<(), ExtractError> {
     let mut doc = pdfium
         .load_pdf_from_file(pdf_path, None)
@@ -252,23 +253,41 @@ pub fn write_debug(
         }
     }
 
-    // Save annotated PDF
-    let debug_pdf_path = output_dir.join(format!("{stem}_debug.pdf"));
-    doc.save_to_file(&debug_pdf_path)
-        .map_err(|e| ExtractError::Pdf(format!("Failed to save debug PDF: {e}")))?;
+    if mode == DebugMode::Images {
+        // Render annotated pages to PNGs
+        let layout_dir = output_dir.join("layout");
+        std::fs::create_dir_all(&layout_dir)?;
 
-    // Render annotated pages to PNGs
-    let identified_dir = output_dir.join("identified");
-    std::fs::create_dir_all(&identified_dir)?;
+        for page_info in pages {
+            let page_idx = page_info.page - 1;
+            let page = doc.pages().get(page_idx as u16).map_err(|e| {
+                ExtractError::Pdf(format!("Failed to get page {page_idx} for render: {e}"))
+            })?;
+            let img = pdf::render_page(&page, page_info.dpi)?;
+            let out_path = layout_dir.join(format!("p{}.png", page_info.page));
+            img.save(&out_path)?;
+        }
+    } else {
+        // Remove un-processed pages so the debug PDF only contains annotated pages.
+        let keep: std::collections::HashSet<u16> =
+            pages.iter().map(|p| (p.page - 1) as u16).collect();
+        let total = doc.pages().len();
 
-    for page_info in pages {
-        let page_idx = page_info.page - 1;
-        let page = doc.pages().get(page_idx as u16).map_err(|e| {
-            ExtractError::Pdf(format!("Failed to get page {page_idx} for render: {e}"))
-        })?;
-        let img = pdf::render_page(&page, page_info.dpi)?;
-        let out_path = identified_dir.join(format!("p{}.png", page_info.page));
-        img.save(&out_path)?;
+        for i in (0..total).rev() {
+            if !keep.contains(&i) {
+                doc.pages()
+                    .get(i)
+                    .map_err(|e| ExtractError::Pdf(format!("Failed to get page {i} for removal: {e}")))?
+                    .delete()
+                    .map_err(|e| ExtractError::Pdf(format!("Failed to delete page {i}: {e}")))?;
+            }
+        }
+
+        let layout_dir = output_dir.join("layout");
+        std::fs::create_dir_all(&layout_dir)?;
+        let debug_pdf_path = layout_dir.join("layout.pdf");
+        doc.save_to_file(&debug_pdf_path)
+            .map_err(|e| ExtractError::Pdf(format!("Failed to save debug PDF: {e}")))?;
     }
 
     Ok(())

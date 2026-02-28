@@ -30,8 +30,8 @@ pub struct ExtractOptions {
     pub model_cache_dir: Option<PathBuf>,
     /// Extract only this page (1-indexed). If None, extract all pages.
     pub page: Option<u32>,
-    /// Write debug visualizations: annotated PNGs in `identified/` and a debug PDF (default false).
-    pub debug: bool,
+    /// Debug visualization mode (default None).
+    pub debug: DebugMode,
 }
 
 impl Default for ExtractOptions {
@@ -44,7 +44,7 @@ impl Default for ExtractOptions {
             pdfium_path: None,
             model_cache_dir: None,
             page: None,
-            debug: false,
+            debug: DebugMode::Off,
         }
     }
 }
@@ -60,6 +60,25 @@ pub enum Quality {
     /// + PP-FormulaNet_plus-L (698 MB).
     /// Total models: ~1.18 GB. Better accuracy for complex tables and formulas.
     Quality,
+}
+
+/// Controls what debug output to produce.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DebugMode {
+    /// No debug output.
+    #[default]
+    Off,
+    /// Write annotated page PNGs to `layout/`.
+    Images,
+    /// Write annotated page PNGs to `layout/` and a vector-overlay debug PDF.
+    Pdf,
+}
+
+impl DebugMode {
+    /// Returns true if any debug output is enabled.
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
 }
 
 /// One-shot extraction — loads models, processes a single PDF, writes output.

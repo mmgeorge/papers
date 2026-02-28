@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use papers_extract::{ExtractOptions, Quality};
+use papers_extract::{DebugMode, ExtractOptions, Quality};
 
 #[derive(Parser)]
 #[command(
@@ -46,9 +46,9 @@ struct Cli {
     #[arg(long)]
     model_cache_dir: Option<PathBuf>,
 
-    /// Write debug visualizations (annotated PNGs + debug PDF)
-    #[arg(long)]
-    debug: bool,
+    /// Write layout debug output: "images" for annotated PNGs, "pdf" for PNGs + debug PDF
+    #[arg(long, value_name = "MODE")]
+    write_layout: Option<LayoutDebugArg>,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -57,6 +57,14 @@ enum QualityArg {
     Fast,
     /// PP-LCNet classifier + SLANeXt-wired + FormulaNet-L (~1.18 GB)
     Quality,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum LayoutDebugArg {
+    /// Write annotated page PNGs to layout/
+    Images,
+    /// Write annotated page PNGs + a vector-overlay debug PDF
+    Pdf,
 }
 
 fn main() {
@@ -80,7 +88,11 @@ fn main() {
         pdfium_path: cli.pdfium_path,
         model_cache_dir: cli.model_cache_dir,
         page: cli.page,
-        debug: cli.debug,
+        debug: match cli.write_layout {
+            Some(LayoutDebugArg::Images) => DebugMode::Images,
+            Some(LayoutDebugArg::Pdf) => DebugMode::Pdf,
+            None => DebugMode::Off,
+        },
     };
 
     eprintln!(

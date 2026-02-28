@@ -29,7 +29,7 @@ struct PipelineOptions {
     confidence_threshold: f32,
     extract_images: bool,
     page: Option<u32>,
-    debug: bool,
+    debug: crate::DebugMode,
 }
 
 impl Pipeline {
@@ -133,8 +133,14 @@ impl Pipeline {
             output::write_images(&result.pages, &page_images, &images_dir)?;
         }
 
-        if self.options.debug {
-            output::write_debug(&self.pdfium, pdf_path, &result.pages, output_dir, stem)?;
+        if self.options.debug.is_enabled() {
+            output::write_debug(
+                &self.pdfium,
+                pdf_path,
+                &result.pages,
+                output_dir,
+                self.options.debug,
+            )?;
         }
 
         Ok(result)
