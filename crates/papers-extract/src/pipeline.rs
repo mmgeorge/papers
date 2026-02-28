@@ -2,12 +2,13 @@ use std::path::Path;
 use std::time::Instant;
 
 use image::DynamicImage;
-use oar_ocr::domain::structure::{FormulaResult, LayoutElementType, StructureResult, TableResult};
+use oar_ocr::domain::structure::{FormulaResult, StructureResult, TableResult};
 use oar_ocr::oarocr::structure::OARStructure;
 use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
 use crate::figure;
+use crate::layout::{DetectedRegion, LayoutDetector};
 use crate::models;
 use crate::output;
 use crate::pdf::{self, PdfChar};
@@ -19,6 +20,7 @@ use crate::ExtractOptions;
 /// Reusable extraction pipeline — load models once, extract many PDFs.
 pub struct Pipeline {
     pdfium: Pdfium,
+    layout: LayoutDetector,
     structure: OARStructure,
     options: PipelineOptions,
 }
@@ -43,10 +45,12 @@ impl Pipeline {
             .unwrap_or_else(models::default_cache_dir);
 
         let paths = models::ensure_models(options.quality, &cache_dir)?;
+        let layout = models::build_layout_detector(&paths.layout)?;
         let structure = models::build_structure(&paths, options.quality)?;
 
         Ok(Self {
             pdfium,
+            layout,
             structure,
             options: PipelineOptions {
                 dpi: options.dpi,
@@ -161,15 +165,21 @@ impl Pipeline {
         // Extract characters from text layer
         let chars = pdf::extract_page_chars(page, page_idx)?;
 
-        // Run layout detection + table/formula recognition
+        // Run direct layout detection (correct bboxes + reading order)
+        let detected = self
+            .layout
+            .detect(&page_image, self.options.confidence_threshold)?;
+
+        // Run oar-ocr for table/formula recognition only
         let rgb_image = page_image.to_rgb8();
         let structure_result = self
             .structure
             .predict_image(rgb_image)
-            .map_err(|e| ExtractError::Layout(format!("Layout detection failed: {e}")))?;
+            .map_err(|e| ExtractError::Layout(format!("Structure prediction failed: {e}")))?;
 
-        // Convert layout elements to our Region types
+        // Build regions from layout detection + oar-ocr table/formula results
         let mut regions = self.build_regions(
+            &detected,
             &structure_result,
             &chars,
             &page_image,
@@ -178,7 +188,7 @@ impl Pipeline {
             height_pt,
         )?;
 
-        // If the model didn't provide reading order, use XY-Cut fallback
+        // The model provides reading order via order_key; use XY-Cut as fallback
         let has_model_order = regions.iter().any(|r| r.order > 0);
         if !has_model_order && regions.len() > 1 {
             reading_order::xy_cut_order(&mut regions);
@@ -201,45 +211,40 @@ impl Pipeline {
         Ok((result_page, page_image))
     }
 
-    /// Convert StructureResult layout elements into our Region types.
+    /// Convert DetectedRegion values (from direct ONNX) into our Region types,
+    /// augmented with table HTML and formula LaTeX from oar-ocr.
     fn build_regions(
         &self,
-        result: &StructureResult,
+        detected: &[DetectedRegion],
+        structure: &StructureResult,
         chars: &[PdfChar],
         page_image: &DynamicImage,
         page_idx: u32,
         page_width_pt: f32,
         page_height_pt: f32,
     ) -> Result<Vec<Region>, ExtractError> {
+        let scale = self.options.dpi as f32 / 72.0;
         let mut regions = Vec::new();
 
-        for element in &result.layout_elements {
-            if element.confidence < self.options.confidence_threshold {
-                continue;
-            }
+        for (idx, det) in detected.iter().enumerate() {
+            let kind = det.kind;
 
-            let kind = match map_element_type(&element.element_type) {
-                Some(k) => k,
-                None => continue,
-            };
-
-            // Convert oar-ocr bbox (pixel coords) to PDF points
-            let scale = self.options.dpi as f32 / 72.0;
+            // Convert pixel bboxes to PDF-point top-left-origin
             let bbox = [
-                element.bbox.x_min() as f32 / scale,
-                element.bbox.y_min() as f32 / scale,
-                element.bbox.x_max() as f32 / scale,
-                element.bbox.y_max() as f32 / scale,
+                det.bbox_px[0] / scale,
+                det.bbox_px[1] / scale,
+                det.bbox_px[2] / scale,
+                det.bbox_px[3] / scale,
             ];
 
-            let order = element.order_index.unwrap_or(0);
+            let order = idx as u32;
             let id = format!("p{}_{}", page_idx + 1, order);
 
             let mut region = Region {
                 id,
                 kind,
                 bbox,
-                confidence: element.confidence,
+                confidence: det.confidence,
                 order,
                 text: None,
                 html: None,
@@ -249,33 +254,33 @@ impl Pipeline {
                 chart_type: None,
             };
 
-            // Populate content based on region kind
+            // Populate text content
             if kind.is_text_bearing() || kind.is_caption() {
-                region.text = Some(text::extract_region_text(chars, bbox));
+                region.text = Some(text::extract_region_text(chars, bbox, page_height_pt));
             }
 
+            // Match tables by IoU (using pixel coords)
             if kind == RegionKind::Table {
-                // Find matching TableResult by bbox overlap (using pixel coords)
                 let elem_coords = (
-                    element.bbox.x_min() as f32,
-                    element.bbox.y_min() as f32,
-                    element.bbox.x_max() as f32,
-                    element.bbox.y_max() as f32,
+                    det.bbox_px[0],
+                    det.bbox_px[1],
+                    det.bbox_px[2],
+                    det.bbox_px[3],
                 );
-                if let Some(table) = find_matching_table(&result.tables, elem_coords) {
+                if let Some(table) = find_matching_table(&structure.tables, elem_coords) {
                     region.html = table.html_structure.clone();
                 }
             }
 
+            // Match formulas by IoU (using pixel coords)
             if kind == RegionKind::DisplayFormula {
-                // Find matching FormulaResult by bbox overlap (using pixel coords)
                 let elem_coords = (
-                    element.bbox.x_min() as f32,
-                    element.bbox.y_min() as f32,
-                    element.bbox.x_max() as f32,
-                    element.bbox.y_max() as f32,
+                    det.bbox_px[0],
+                    det.bbox_px[1],
+                    det.bbox_px[2],
+                    det.bbox_px[3],
                 );
-                if let Some(formula) = find_matching_formula(&result.formulas, elem_coords) {
+                if let Some(formula) = find_matching_formula(&structure.formulas, elem_coords) {
                     region.latex = Some(formula.latex.clone());
                 }
             }
@@ -299,35 +304,6 @@ impl Pipeline {
         }
 
         Ok(regions)
-    }
-}
-
-/// Map oar-ocr LayoutElementType to our RegionKind.
-fn map_element_type(t: &LayoutElementType) -> Option<RegionKind> {
-    use LayoutElementType::*;
-    match t {
-        DocTitle => Some(RegionKind::Title),
-        ParagraphTitle => Some(RegionKind::ParagraphTitle),
-        Text | Content | List => Some(RegionKind::Text),
-        Abstract => Some(RegionKind::Abstract),
-        Image => Some(RegionKind::Image),
-        Table => Some(RegionKind::Table),
-        Chart => Some(RegionKind::Chart),
-        Formula => Some(RegionKind::DisplayFormula),
-        FigureTitle => Some(RegionKind::FigureTitle),
-        TableTitle => Some(RegionKind::TableTitle),
-        ChartTitle => Some(RegionKind::ChartTitle),
-        FigureTableChartTitle => Some(RegionKind::FigureTableTitle),
-        Header | HeaderImage => Some(RegionKind::PageHeader),
-        Footer | FooterImage => Some(RegionKind::PageFooter),
-        Footnote => Some(RegionKind::Footnote),
-        Seal => Some(RegionKind::Seal),
-        Number => Some(RegionKind::PageNumber),
-        Reference | ReferenceContent => Some(RegionKind::References),
-        Algorithm => Some(RegionKind::Algorithm),
-        FormulaNumber => Some(RegionKind::FormulaNumber),
-        AsideText => Some(RegionKind::SidebarText),
-        Region | Other => None,
     }
 }
 

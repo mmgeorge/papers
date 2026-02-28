@@ -172,6 +172,13 @@ fn download_file(url: &str, dest: &Path) -> Result<(), ExtractError> {
     Ok(())
 }
 
+/// Build a direct layout detector from the pp-doclayoutv3.onnx model.
+pub fn build_layout_detector(
+    model_path: &Path,
+) -> Result<crate::layout::LayoutDetector, ExtractError> {
+    crate::layout::LayoutDetector::new(model_path)
+}
+
 /// Build the platform-specific ORT session configuration.
 pub fn ort_config() -> OrtSessionConfig {
     let providers = platform_execution_providers();

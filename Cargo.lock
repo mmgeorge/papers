@@ -5369,6 +5369,7 @@ dependencies = [
  "dirs",
  "flate2",
  "image",
+ "ndarray 0.17.2",
  "oar-ocr",
  "ort",
  "pdfium-render",

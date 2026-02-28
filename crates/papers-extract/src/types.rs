@@ -86,11 +86,13 @@ impl RegionKind {
             "References" | "references" | "reference" | "reference_content" => {
                 Some(Self::References)
             }
-            "Footnote" | "footnote" => Some(Self::Footnote),
+            "Footnote" | "footnote" | "vision_footnote" => Some(Self::Footnote),
             "PageHeader" | "page_header" | "header" | "header_image" => Some(Self::PageHeader),
             "PageFooter" | "page_footer" | "footer" | "footer_image" => Some(Self::PageFooter),
             "Algorithm" | "algorithm" => Some(Self::Algorithm),
-            "DisplayFormula" | "display_formula" | "formula" => Some(Self::DisplayFormula),
+            "DisplayFormula" | "display_formula" | "formula" | "inline_formula" => {
+                Some(Self::DisplayFormula)
+            }
             "FormulaNumber" | "formula_number" => Some(Self::FormulaNumber),
             "Image" | "image" => Some(Self::Image),
             "Table" | "table" => Some(Self::Table),
@@ -341,6 +343,16 @@ mod tests {
         assert_eq!(RegionKind::from_label("Title"), Some(RegionKind::Title));
         assert_eq!(RegionKind::from_label("Table"), Some(RegionKind::Table));
         assert_eq!(RegionKind::from_label("Chart"), Some(RegionKind::Chart));
+
+        // PP-DocLayoutV3 class 15 and 24
+        assert_eq!(
+            RegionKind::from_label("inline_formula"),
+            Some(RegionKind::DisplayFormula)
+        );
+        assert_eq!(
+            RegionKind::from_label("vision_footnote"),
+            Some(RegionKind::Footnote)
+        );
 
         // Unknown
         assert_eq!(RegionKind::from_label("unknown"), None);

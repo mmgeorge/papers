@@ -2,9 +2,10 @@
 
 ## Overview
 
-Local, pure-Rust PDF processing pipeline using ONNX models via `oar-ocr` and `pdfium-render`.
+Local, pure-Rust PDF processing pipeline using ONNX models and `pdfium-render`.
 Converts PDFs into structured JSON + Markdown + extracted images. Uses PP-DocLayoutV3 for
-23-class layout detection with built-in reading order.
+25-class layout detection with built-in reading order via direct `ort` inference.
+Table/formula recognition uses `oar-ocr` (SLANet/FormulaNet).
 
 ## Architecture
 
@@ -17,11 +18,12 @@ PDF Input
   [2] Per-page processing:
   │     ├── Render page at 144 DPI (pdfium → image::DynamicImage)
   │     ├── Extract characters with bboxes (pdfium text layer)
-  │     ├── Layout detection (PP-DocLayoutV3 via oar-ocr OARStructure)
-  │     │     → 23 region classes + reading order + table/formula results
-  │     ├── Text extraction (match pdfium chars to detected regions)
-  │     ├── Table HTML (from oar-ocr TableResult)
-  │     ├── Formula LaTeX (from oar-ocr FormulaResult)
+  │     ├── Layout detection (PP-DocLayoutV3 via direct ort — LayoutDetector)
+  │     │     → 25 region classes + reading order (model output column 6)
+  │     ├── Table/formula recognition (oar-ocr OARStructure — tables + formulas only)
+  │     ├── Text extraction (match pdfium chars to detected regions, Y-axis converted)
+  │     ├── Table HTML (IoU-matched from oar-ocr TableResult)
+  │     ├── Formula LaTeX (IoU-matched from oar-ocr FormulaResult)
   │     ├── Figure/chart crop (from rendered image)
   │     └── Caption association (proximity-based)
   │
@@ -36,10 +38,11 @@ PDF Input
 | `lib.rs` | Public API: `extract()`, `Pipeline`, `ExtractOptions`, `Quality` |
 | `types.rs` | `ExtractionResult`, `Page`, `Region`, `RegionKind` (23 variants), `Metadata` |
 | `error.rs` | `ExtractError` enum |
-| `pipeline.rs` | `Pipeline` struct — owns pdfium + OARStructure, orchestrates per-page processing |
-| `models.rs` | Model download from GitHub releases, OARStructure builder, execution provider config |
+| `layout.rs` | `LayoutDetector` — direct ONNX inference on PP-DocLayoutV3, `DetectedRegion` |
+| `pipeline.rs` | `Pipeline` struct — owns pdfium + LayoutDetector + OARStructure, orchestrates per-page processing |
+| `models.rs` | Model download from GitHub releases, OARStructure + LayoutDetector builders, execution provider config |
 | `pdf.rs` | `PdfChar`, `load_pdfium()`, `render_page()`, `extract_page_chars()` |
-| `text.rs` | Match pdfium characters to layout regions, reconstruct text with word/paragraph detection |
+| `text.rs` | Match pdfium characters to layout regions, reconstruct text with word/paragraph detection. Converts PdfChar Y-up coords to image Y-down space. |
 | `figure.rs` | Crop visual regions, associate captions by proximity |
 | `reading_order.rs` | XY-Cut fallback algorithm for reading order |
 | `output.rs` | Write JSON, Markdown, and cropped images to disk |
@@ -71,9 +74,10 @@ Content routing by kind:
 
 ## Dependencies
 
-- `oar-ocr` 0.6 — ONNX inference for layout, table, formula models
+- `oar-ocr` 0.6 — ONNX inference for table and formula recognition (layout detection bypassed)
 - `pdfium-render` 0.8 — PDF loading, rendering, text extraction (requires pdfium binary)
-- `ort` 2.0.0-rc.11 — DirectML (Windows) / CoreML (macOS) execution providers
+- `ort` 2.0.0-rc.11 — Direct ONNX inference for layout detection + DirectML (Windows) / CoreML (macOS) execution providers
+- `ndarray` 0.17 — Tensor construction for ort model inputs/outputs
 - `image` 0.25 — Image processing
 - `reqwest` (blocking) — Model download from GitHub releases
 

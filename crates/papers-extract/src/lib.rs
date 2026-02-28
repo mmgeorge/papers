@@ -1,5 +1,6 @@
 pub mod error;
 pub mod figure;
+pub mod layout;
 pub mod models;
 pub mod output;
 pub mod pdf;

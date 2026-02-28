@@ -13,6 +13,8 @@ clap = { workspace = true }
 oar-ocr = "0.6"
 pdfium-render = { version = "0.8", features = ["image_025"] }
 image = "0.25"
+ndarray = "0.17"
+ort = { version = "=2.0.0-rc.11" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
