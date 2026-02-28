@@ -44,7 +44,7 @@ pub struct Region {
     pub chart_type: Option<String>,
 }
 
-/// All 23 DocLayout V3 region classes.
+/// All 24 DocLayout V3 region classes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegionKind {
     Title,
@@ -60,6 +60,7 @@ pub enum RegionKind {
     PageFooter,
     Algorithm,
     DisplayFormula,
+    InlineFormula,
     FormulaNumber,
     Image,
     Table,
@@ -90,9 +91,8 @@ impl RegionKind {
             "PageHeader" | "page_header" | "header" | "header_image" => Some(Self::PageHeader),
             "PageFooter" | "page_footer" | "footer" | "footer_image" => Some(Self::PageFooter),
             "Algorithm" | "algorithm" => Some(Self::Algorithm),
-            "DisplayFormula" | "display_formula" | "formula" | "inline_formula" => {
-                Some(Self::DisplayFormula)
-            }
+            "DisplayFormula" | "display_formula" | "formula" => Some(Self::DisplayFormula),
+            "InlineFormula" | "inline_formula" => Some(Self::InlineFormula),
             "FormulaNumber" | "formula_number" => Some(Self::FormulaNumber),
             "Image" | "image" => Some(Self::Image),
             "Table" | "table" => Some(Self::Table),
@@ -164,6 +164,7 @@ mod tests {
             RegionKind::PageFooter,
             RegionKind::Algorithm,
             RegionKind::DisplayFormula,
+            RegionKind::InlineFormula,
             RegionKind::FormulaNumber,
             RegionKind::Image,
             RegionKind::Table,
@@ -347,7 +348,7 @@ mod tests {
         // PP-DocLayoutV3 class 15 and 24
         assert_eq!(
             RegionKind::from_label("inline_formula"),
-            Some(RegionKind::DisplayFormula)
+            Some(RegionKind::InlineFormula)
         );
         assert_eq!(
             RegionKind::from_label("vision_footnote"),

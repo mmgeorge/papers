@@ -1,5 +1,12 @@
 use crate::pdf::PdfChar;
 
+/// An inline formula to be spliced into text at its spatial position.
+pub struct InlineFormula {
+    /// Bounding box in image-space PDF points [x1, y1, x2, y2] (Y-down, top-left origin).
+    pub bbox: [f32; 4],
+    pub latex: String,
+}
+
 /// A character with coordinates converted to image space (Y-down, top-left origin).
 struct ImageChar<'a> {
     codepoint: char,
@@ -7,6 +14,31 @@ struct ImageChar<'a> {
     /// where (x1, y1) is top-left and (x2, y2) is bottom-right.
     bbox: [f32; 4],
     _source: &'a PdfChar,
+}
+
+/// A line element: either a character or an inline formula placeholder.
+enum LineElement<'a> {
+    Char(&'a ImageChar<'a>),
+    Formula { latex: &'a str, bbox: [f32; 4] },
+}
+
+impl LineElement<'_> {
+    fn bbox(&self) -> [f32; 4] {
+        match self {
+            LineElement::Char(c) => c.bbox,
+            LineElement::Formula { bbox, .. } => *bbox,
+        }
+    }
+
+    fn center_x(&self) -> f32 {
+        let b = self.bbox();
+        (b[0] + b[2]) / 2.0
+    }
+
+    fn center_y(&self) -> f32 {
+        let b = self.bbox();
+        (b[1] + b[3]) / 2.0
+    }
 }
 
 /// Convert a PdfChar (PDF Y-up coords) to image space (Y-down coords).
@@ -25,94 +57,138 @@ fn to_image_char<'a>(c: &'a PdfChar, page_height_pt: f32) -> ImageChar<'a> {
     }
 }
 
-/// Extract text from pdfium characters that fall within a region bounding box.
+/// Check if a point (cx, cy) falls inside a bbox [x1, y1, x2, y2].
+fn point_in_bbox(cx: f32, cy: f32, bbox: [f32; 4]) -> bool {
+    cx >= bbox[0] && cx <= bbox[2] && cy >= bbox[1] && cy <= bbox[3]
+}
+
+/// Extract text from pdfium characters that fall within a region bounding box,
+/// splicing inline formula LaTeX at the correct spatial positions.
 ///
 /// `region_bbox` is in image space (Y-down, top-left origin), in PDF points.
 /// `page_height_pt` is used to convert PdfChar coords from PDF space (Y-up) to image space.
-pub fn extract_region_text(chars: &[PdfChar], region_bbox: [f32; 4], page_height_pt: f32) -> String {
+/// `inline_formulas` are inline formulas whose LaTeX should be spliced as `$latex$` into the text.
+/// Characters whose center falls inside any inline formula bbox are excluded.
+pub fn extract_region_text(
+    chars: &[PdfChar],
+    region_bbox: [f32; 4],
+    page_height_pt: f32,
+    inline_formulas: &[&InlineFormula],
+) -> String {
     let image_chars: Vec<ImageChar> = chars
         .iter()
         .map(|c| to_image_char(c, page_height_pt))
         .collect();
 
-    let matched = match_chars_to_region(&image_chars, region_bbox);
-    if matched.is_empty() {
+    // Collect exclude bboxes from inline formulas
+    let exclude_bboxes: Vec<[f32; 4]> = inline_formulas.iter().map(|f| f.bbox).collect();
+
+    let matched = match_chars_to_region(&image_chars, region_bbox, &exclude_bboxes);
+
+    // Build LineElements from matched chars
+    let mut elements: Vec<LineElement> = matched.iter().map(|c| LineElement::Char(c)).collect();
+
+    // Add formula elements for inline formulas whose center falls within the region
+    for formula in inline_formulas {
+        let cx = (formula.bbox[0] + formula.bbox[2]) / 2.0;
+        let cy = (formula.bbox[1] + formula.bbox[3]) / 2.0;
+        if point_in_bbox(cx, cy, region_bbox) {
+            elements.push(LineElement::Formula {
+                latex: &formula.latex,
+                bbox: formula.bbox,
+            });
+        }
+    }
+
+    if elements.is_empty() {
         return String::new();
     }
 
-    let lines = group_into_lines(&matched);
+    let lines = group_elements_into_lines(&elements);
     assemble_text(&lines)
 }
 
-/// Filter characters whose center falls within the region bounding box.
-fn match_chars_to_region<'a>(chars: &'a [ImageChar], bbox: [f32; 4]) -> Vec<&'a ImageChar<'a>> {
+/// Filter characters whose center falls within the region bounding box,
+/// excluding characters whose center falls inside any exclude bbox.
+fn match_chars_to_region<'a>(
+    chars: &'a [ImageChar],
+    bbox: [f32; 4],
+    exclude_bboxes: &[[f32; 4]],
+) -> Vec<&'a ImageChar<'a>> {
     let [x1, y1, x2, y2] = bbox;
     chars
         .iter()
         .filter(|c| {
             let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
             let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
-            cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2
+            // Must be inside region
+            if !(cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) {
+                return false;
+            }
+            // Must not be inside any exclude bbox
+            !exclude_bboxes.iter().any(|eb| point_in_bbox(cx, cy, *eb))
         })
         .collect()
 }
 
-/// Group matched characters into lines by Y-proximity.
+/// Group line elements into lines by Y-proximity.
 ///
-/// Characters with center Y within `avg_char_height * 0.5` of each other
+/// Elements with center Y within `avg_height * 0.5` of each other
 /// are grouped into the same line. Lines are sorted top-to-bottom (ascending Y in image space).
-fn group_into_lines<'a>(chars: &[&'a ImageChar]) -> Vec<Vec<&'a ImageChar<'a>>> {
-    if chars.is_empty() {
+fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a LineElement<'a>>> {
+    if elements.is_empty() {
         return vec![];
     }
 
-    // Sort by Y (top-to-bottom in image space), then X (left-to-right)
-    let mut sorted: Vec<&ImageChar> = chars.to_vec();
+    // Sort by Y (top-to-bottom), then X (left-to-right)
+    let mut sorted: Vec<&LineElement> = elements.iter().collect();
     sorted.sort_by(|a, b| {
-        let ay = (a.bbox[1] + a.bbox[3]) / 2.0;
-        let by = (b.bbox[1] + b.bbox[3]) / 2.0;
-        ay.partial_cmp(&by)
+        a.center_y()
+            .partial_cmp(&b.center_y())
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(
-                a.bbox[0]
-                    .partial_cmp(&b.bbox[0])
+                a.bbox()[0]
+                    .partial_cmp(&b.bbox()[0])
                     .unwrap_or(std::cmp::Ordering::Equal),
             )
     });
 
-    // Compute average character height for threshold
+    // Compute average element height for threshold
     let avg_height = sorted
         .iter()
-        .map(|c| (c.bbox[3] - c.bbox[1]).abs())
+        .map(|e| {
+            let b = e.bbox();
+            (b[3] - b[1]).abs()
+        })
         .sum::<f32>()
         / sorted.len() as f32;
     let y_threshold = avg_height * 0.5;
 
-    let mut lines: Vec<Vec<&ImageChar>> = vec![];
-    let mut current_line: Vec<&ImageChar> = vec![sorted[0]];
-    let mut current_y = (sorted[0].bbox[1] + sorted[0].bbox[3]) / 2.0;
+    let mut lines: Vec<Vec<&LineElement>> = vec![];
+    let mut current_line: Vec<&LineElement> = vec![sorted[0]];
+    let mut current_y = sorted[0].center_y();
 
-    for &ch in &sorted[1..] {
-        let ch_y = (ch.bbox[1] + ch.bbox[3]) / 2.0;
-        if (ch_y - current_y).abs() <= y_threshold {
-            current_line.push(ch);
+    for &elem in &sorted[1..] {
+        let elem_y = elem.center_y();
+        if (elem_y - current_y).abs() <= y_threshold {
+            current_line.push(elem);
         } else {
-            // Sort current line by center-X (handles zero-width pdfium space chars correctly)
+            // Sort current line by center-X
             current_line.sort_by(|a, b| {
-                let ax = (a.bbox[0] + a.bbox[2]) / 2.0;
-                let bx = (b.bbox[0] + b.bbox[2]) / 2.0;
-                ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
+                a.center_x()
+                    .partial_cmp(&b.center_x())
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             lines.push(current_line);
-            current_line = vec![ch];
-            current_y = ch_y;
+            current_line = vec![elem];
+            current_y = elem_y;
         }
     }
     if !current_line.is_empty() {
         current_line.sort_by(|a, b| {
-            let ax = (a.bbox[0] + a.bbox[2]) / 2.0;
-            let bx = (b.bbox[0] + b.bbox[2]) / 2.0;
-            ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
+            a.center_x()
+                .partial_cmp(&b.center_x())
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         lines.push(current_line);
     }
@@ -120,12 +196,12 @@ fn group_into_lines<'a>(chars: &[&'a ImageChar]) -> Vec<Vec<&'a ImageChar<'a>>> 
     lines
 }
 
-/// Assemble lines of characters into text with paragraph breaks.
+/// Assemble lines of elements into text with paragraph breaks.
 ///
 /// Pdfium already embeds space characters at word boundaries, so we just
 /// concatenate codepoints and filter control characters. Paragraph breaks
 /// are detected from line spacing.
-fn assemble_text(lines: &[Vec<&ImageChar>]) -> String {
+fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
     if lines.is_empty() {
         return String::new();
     }
@@ -134,16 +210,8 @@ fn assemble_text(lines: &[Vec<&ImageChar>]) -> String {
     let line_spacings: Vec<f32> = lines
         .windows(2)
         .map(|pair| {
-            let y1 = pair[0]
-                .iter()
-                .map(|c| (c.bbox[1] + c.bbox[3]) / 2.0)
-                .sum::<f32>()
-                / pair[0].len() as f32;
-            let y2 = pair[1]
-                .iter()
-                .map(|c| (c.bbox[1] + c.bbox[3]) / 2.0)
-                .sum::<f32>()
-                / pair[1].len() as f32;
+            let y1 = pair[0].iter().map(|e| e.center_y()).sum::<f32>() / pair[0].len() as f32;
+            let y2 = pair[1].iter().map(|e| e.center_y()).sum::<f32>() / pair[1].len() as f32;
             (y2 - y1).abs()
         })
         .collect();
@@ -180,18 +248,34 @@ fn assemble_text(lines: &[Vec<&ImageChar>]) -> String {
     result
 }
 
-/// Build a single line of text from characters.
+/// Build a single line of text from elements.
 ///
-/// Pdfium embeds space characters (U+0020) with zero-width bboxes at word
-/// boundaries, so we just emit each codepoint. Control characters are
-/// filtered since line structure comes from Y-proximity grouping.
-fn build_line_text(chars: &[&ImageChar]) -> String {
+/// For Char elements, pdfium embeds space characters (U+0020) with zero-width
+/// bboxes at word boundaries, so we just emit each codepoint. Control characters
+/// are filtered since line structure comes from Y-proximity grouping.
+/// For Formula elements, we emit `$latex$`.
+fn build_line_text(elements: &[&LineElement]) -> String {
     let mut text = String::new();
-    for c in chars {
-        if c.codepoint.is_control() {
-            continue;
+    for elem in elements {
+        match elem {
+            LineElement::Char(c) => {
+                if c.codepoint.is_control() {
+                    continue;
+                }
+                text.push(c.codepoint);
+            }
+            LineElement::Formula { latex, .. } => {
+                // Ensure space before formula if needed
+                if !text.is_empty() && !text.ends_with(' ') {
+                    text.push(' ');
+                }
+                text.push('$');
+                text.push_str(latex);
+                text.push('$');
+                // Add trailing space so next char isn't jammed against the formula
+                text.push(' ');
+            }
         }
-        text.push(c.codepoint);
     }
     // Collapse runs of multiple spaces into a single space
     collapse_spaces(&text)
@@ -242,7 +326,7 @@ mod tests {
         ];
         // Region bbox in image space (Y-down)
         let bbox = [50.0, 50.0, 550.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert_eq!(text, "A");
     }
 
@@ -260,7 +344,7 @@ mod tests {
             chars.push(make_char_image_space(c, space_x + 2.0 + i as f32 * 12.0, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert_eq!(text, "Hello World");
     }
 
@@ -276,7 +360,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 130.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert!(text.contains("First"));
         assert!(text.contains("Second"));
         assert!(text.contains('\n'));
@@ -293,7 +377,7 @@ mod tests {
             make_char_image_space('D', 152.0, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert_eq!(text, "AB CD");
     }
 
@@ -306,7 +390,7 @@ mod tests {
             make_char_image_space('B', 114.0, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert_eq!(text, "AB");
     }
 
@@ -330,7 +414,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 12.0, 180.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert!(
             text.contains("\n\n"),
             "Expected paragraph break in: {text:?}"
@@ -344,7 +428,7 @@ mod tests {
         ];
         // Region bbox that doesn't contain any chars
         let bbox = [500.0, 500.0, 600.0, 600.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert!(text.is_empty());
     }
 
@@ -357,7 +441,7 @@ mod tests {
         ];
         let bbox = [100.0, 50.0, 600.0, 200.0];
         let image_chars: Vec<ImageChar> = chars.iter().map(|c| to_image_char(c, PAGE_H)).collect();
-        let matched = match_chars_to_region(&image_chars, bbox);
+        let matched = match_chars_to_region(&image_chars, bbox, &[]);
         assert_eq!(matched.len(), 2);
     }
 
@@ -368,7 +452,7 @@ mod tests {
             make_char_image_space('2', 112.0, 96.0, 8.0, 10.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
         assert!(!text.contains('\n'), "Superscript should stay on same line: {text:?}");
     }
 
@@ -395,5 +479,63 @@ mod tests {
         // In image space, this should be near y=790 (bottom of page)
         assert!((img.bbox[1] - 790.0).abs() < 0.01, "Bottom char y1 should be ~790, got {}", img.bbox[1]);
         assert!((img.bbox[3] - 800.0).abs() < 0.01, "Bottom char y2 should be ~800, got {}", img.bbox[3]);
+    }
+
+    #[test]
+    fn test_inline_formula_spliced_into_text() {
+        // "we define x as" with an inline formula for "t" between "define" and "as"
+        let mut chars = Vec::new();
+        for (i, c) in "we define".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 8.0, 12.0, PAGE_H));
+        }
+        // Gap where inline formula "t" lives (at x=200..220)
+        // Some glyph chars from pdfium that overlap the formula bbox
+        chars.push(make_char_image_space('t', 205.0, 100.0, 8.0, 12.0, PAGE_H));
+        // Continue with "as"
+        chars.push(make_char_image_space(' ', 222.0, 100.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "as".chars().enumerate() {
+            chars.push(make_char_image_space(c, 225.0 + i as f32 * 10.0, 100.0, 8.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let formula = InlineFormula {
+            bbox: [200.0, 96.0, 220.0, 114.0], // covers the 't' glyph
+            latex: "t".into(),
+        };
+        let formulas: Vec<&InlineFormula> = vec![&formula];
+
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas);
+        assert!(text.contains("$t$"), "Expected $t$ in: {text:?}");
+        // The raw 't' glyph should be excluded (not duplicated)
+        assert!(!text.contains("t $t$"), "Glyph 't' should be excluded: {text:?}");
+    }
+
+    #[test]
+    fn test_inline_formula_chars_excluded() {
+        // Chars inside formula bbox should be excluded from text
+        let chars = vec![
+            make_char_image_space('A', 100.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('x', 115.0, 100.0, 8.0, 12.0, PAGE_H),  // inside formula bbox
+            make_char_image_space('B', 140.0, 100.0, 10.0, 12.0, PAGE_H),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let exclude = [110.0_f32, 96.0, 130.0, 114.0]; // covers 'x'
+        let image_chars: Vec<ImageChar> = chars.iter().map(|c| to_image_char(c, PAGE_H)).collect();
+        let matched = match_chars_to_region(&image_chars, bbox, &[exclude]);
+        assert_eq!(matched.len(), 2); // A and B, not x
+        assert_eq!(matched[0].codepoint, 'A');
+        assert_eq!(matched[1].codepoint, 'B');
+    }
+
+    #[test]
+    fn test_no_inline_formulas_backward_compat() {
+        // Passing empty inline_formulas should produce identical results to before
+        let chars = vec![
+            make_char_image_space('H', 100.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('i', 112.0, 100.0, 10.0, 12.0, PAGE_H),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        assert_eq!(text, "Hi");
     }
 }

@@ -175,11 +175,11 @@ impl Pipeline {
 
         let scale = self.options.dpi as f32 / 72.0;
 
-        // Crop formula regions and run batched recognition
+        // Crop formula regions (display + inline) and run batched recognition
         let formula_entries: Vec<(usize, DynamicImage)> = detected
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.kind == RegionKind::DisplayFormula)
+            .filter(|(_, d)| d.kind == RegionKind::DisplayFormula || d.kind == RegionKind::InlineFormula)
             .map(|(i, d)| {
                 let bbox_pt = [
                     d.bbox_px[0] / scale,
@@ -318,6 +318,27 @@ impl Pipeline {
         let scale = self.options.dpi as f32 / 72.0;
         let mut regions = Vec::new();
 
+        // Collect inline formula data for text merging (bbox in PDF points, image-space Y-down)
+        let inline_formulas: Vec<(usize, text::InlineFormula)> = detected
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.kind == RegionKind::InlineFormula)
+            .filter_map(|(idx, d)| {
+                formula_latex.get(&idx).map(|latex| {
+                    let bbox = [
+                        d.bbox_px[0] / scale,
+                        d.bbox_px[1] / scale,
+                        d.bbox_px[2] / scale,
+                        d.bbox_px[3] / scale,
+                    ];
+                    (idx, text::InlineFormula { bbox, latex: latex.clone() })
+                })
+            })
+            .collect();
+
+        // Track which inline formulas are consumed by a text region
+        let mut consumed_inline = vec![false; inline_formulas.len()];
+
         for (idx, det) in detected.iter().enumerate() {
             let kind = det.kind;
 
@@ -331,6 +352,11 @@ impl Pipeline {
 
             let order = idx as u32;
             let id = format!("p{}_{}", page_idx + 1, order);
+
+            // Skip inline formulas — they are merged into text regions (or emitted as orphans below)
+            if kind == RegionKind::InlineFormula {
+                continue;
+            }
 
             let mut region = Region {
                 id,
@@ -346,9 +372,24 @@ impl Pipeline {
                 chart_type: None,
             };
 
-            // Populate text content
+            // Populate text content, splicing inline formulas
             if kind.is_text_bearing() || kind.is_caption() {
-                region.text = Some(text::extract_region_text(chars, bbox, page_height_pt));
+                // Find overlapping inline formulas (formula center inside this region bbox)
+                let mut overlapping: Vec<&text::InlineFormula> = Vec::new();
+                for (i, (_, f)) in inline_formulas.iter().enumerate() {
+                    let cx = (f.bbox[0] + f.bbox[2]) / 2.0;
+                    let cy = (f.bbox[1] + f.bbox[3]) / 2.0;
+                    if cx >= bbox[0] && cx <= bbox[2] && cy >= bbox[1] && cy <= bbox[3] {
+                        overlapping.push(f);
+                        consumed_inline[i] = true;
+                    }
+                }
+                region.text = Some(text::extract_region_text(
+                    chars,
+                    bbox,
+                    page_height_pt,
+                    &overlapping,
+                ));
             }
 
             // Populate formula LaTeX from crop-based prediction
@@ -381,6 +422,34 @@ impl Pipeline {
             }
 
             regions.push(region);
+        }
+
+        // Emit orphan inline formulas (not consumed by any text region) as standalone regions
+        for (i, (det_idx, _)) in inline_formulas.iter().enumerate() {
+            if consumed_inline[i] {
+                continue;
+            }
+            let det = &detected[*det_idx];
+            let bbox = [
+                det.bbox_px[0] / scale,
+                det.bbox_px[1] / scale,
+                det.bbox_px[2] / scale,
+                det.bbox_px[3] / scale,
+            ];
+            let order = *det_idx as u32;
+            regions.push(Region {
+                id: format!("p{}_{}", page_idx + 1, order),
+                kind: RegionKind::InlineFormula,
+                bbox,
+                confidence: det.confidence,
+                order,
+                text: None,
+                html: None,
+                latex: formula_latex.get(det_idx).cloned(),
+                image_path: None,
+                caption: None,
+                chart_type: None,
+            });
         }
 
         Ok(regions)

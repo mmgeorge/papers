@@ -21,10 +21,14 @@ PDF Input
   │     ├── Layout detection (PP-DocLayoutV3 via direct ort — LayoutDetector)
   │     │     → 25 region classes + reading order (model output column 6)
   │     ├── For DisplayFormula regions:
-  │     │     crop image → FormulaRecognitionPredictor.predict() → LaTeX
+  │     │     crop image → FormulaRecognitionPredictor.predict() → separate $$latex$$ regions
+  │     ├── For InlineFormula regions:
+  │     │     crop image → FormulaRecognitionPredictor.predict() → merged into parent text as $latex$
+  │     │     (chars under inline formula bbox excluded from text extraction)
   │     ├── For Table regions:
   │     │     crop image → TableStructureRecognitionPredictor.predict() → HTML tokens
-  │     ├── Text extraction (match pdfium chars to detected regions, Y-axis converted)
+  │     ├── Text extraction (match pdfium chars to detected regions, Y-axis converted,
+  │     │     inline formula LaTeX spliced at spatial position)
   │     ├── Figure/chart crop (from rendered image)
   │     └── Caption association (proximity-based)
   │
@@ -37,34 +41,35 @@ PDF Input
 | Module | Purpose |
 |--------|---------|
 | `lib.rs` | Public API: `extract()`, `Pipeline`, `ExtractOptions`, `Quality` |
-| `types.rs` | `ExtractionResult`, `Page`, `Region`, `RegionKind` (23 variants), `Metadata` |
+| `types.rs` | `ExtractionResult`, `Page`, `Region`, `RegionKind` (24 variants), `Metadata` |
 | `error.rs` | `ExtractError` enum |
 | `layout.rs` | `LayoutDetector` — direct ONNX inference on PP-DocLayoutV3, `DetectedRegion` |
 | `pipeline.rs` | `Pipeline` struct — owns pdfium + LayoutDetector + FormulaRecognitionPredictor + TableStructureRecognitionPredictor, orchestrates per-page processing |
 | `models.rs` | Model download from GitHub releases, predictor + LayoutDetector builders, execution provider config |
 | `pdf.rs` | `PdfChar`, `load_pdfium()`, `render_page()`, `extract_page_chars()` |
-| `text.rs` | Match pdfium characters to layout regions, reconstruct text with word/paragraph detection. Converts PdfChar Y-up coords to image Y-down space. |
+| `text.rs` | Match pdfium characters to layout regions, reconstruct text with word/paragraph detection. Splices inline formula LaTeX (`$...$`) at correct spatial positions, excluding pdfium chars under formula bboxes. Converts PdfChar Y-up coords to image Y-down space. |
 | `figure.rs` | Crop visual regions, associate captions by proximity |
 | `reading_order.rs` | XY-Cut fallback algorithm for reading order |
 | `output.rs` | Write JSON, Markdown, and cropped images to disk |
 
 ## Key Types
 
-### RegionKind (23 classes)
+### RegionKind (24 classes)
 
 ```
 Title, ParagraphTitle, Text, VerticalText, PageNumber,
 Abstract, TOC, References, Footnote, PageHeader, PageFooter,
-Algorithm, DisplayFormula, FormulaNumber,
+Algorithm, DisplayFormula, InlineFormula, FormulaNumber,
 Image, Table,
 FigureTableTitle, FigureTitle, TableTitle, ChartTitle,
 Seal, Chart, SidebarText
 ```
 
 Content routing by kind:
-- **Text-bearing** → `text` field (pdfium char extraction)
+- **Text-bearing** → `text` field (pdfium char extraction + inline formula splicing)
 - **Table** → `html` field (oar-ocr SLANet-Plus)
-- **DisplayFormula** → `latex` field (oar-ocr PP-FormulaNet)
+- **DisplayFormula** → `latex` field (oar-ocr PP-FormulaNet), rendered as `$$...$$`
+- **InlineFormula** → merged into parent text region as `$...$`; orphans emitted as standalone `$...$` regions
 - **Visual** (Image/Chart/Seal) → `image_path` field (cropped PNG)
 - **Caption** → `text` field + associated with parent via `caption`
 

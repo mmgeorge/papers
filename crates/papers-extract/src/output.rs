@@ -109,6 +109,14 @@ fn region_to_markdown(region: &Region) -> String {
                 String::new()
             }
         }
+        RegionKind::InlineFormula => {
+            // Orphan inline formula (not consumed by a text region)
+            if let Some(ref latex) = region.latex {
+                format!("${latex}$")
+            } else {
+                String::new()
+            }
+        }
         RegionKind::Image | RegionKind::Chart | RegionKind::Seal => {
             let path = region.image_path.as_deref().unwrap_or("");
             let alt = region.caption.as_deref().unwrap_or("");
@@ -161,6 +169,7 @@ fn region_color(kind: RegionKind) -> PdfColor {
         }
         RegionKind::Table => PdfColor::new(0, 200, 0, 255),
         RegionKind::DisplayFormula | RegionKind::FormulaNumber => PdfColor::new(200, 0, 200, 255),
+        RegionKind::InlineFormula => PdfColor::new(255, 100, 255, 255),
         RegionKind::Image | RegionKind::Chart | RegionKind::Seal => PdfColor::new(255, 140, 0, 255),
         RegionKind::FigureTitle
         | RegionKind::TableTitle
