@@ -321,57 +321,191 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
 }
 
 /// Assemble lines preserving their layout: each line becomes a separate `\n`-joined
-/// output line, with leading spaces computed from the first character's X offset
-/// relative to the region's left edge.
+/// output line, with leading spaces computed from the content start X offset.
 ///
 /// This is used for algorithm / pseudocode regions where line structure and
 /// indentation are structurally meaningful.
+///
+/// # Line-number handling
+///
+/// Algorithms often have left-aligned line numbers (e.g. "7 parallel for …").
+/// When detected (≥ 2 lines start with digit prefixes), the line numbers are
+/// placed at the start of each output line in a right-aligned column, and
+/// indentation is computed only for the pseudocode content that follows.
+/// Unnumbered lines (comments, titles) get the number column filled with
+/// spaces so their content aligns with numbered lines at the same nesting.
+///
+/// When the algorithm has no line numbers, indentation is computed from the
+/// leftmost element on each line.
 fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -> String {
     if lines.is_empty() {
         return String::new();
     }
 
-    // Compute median character width across all lines as the indentation unit.
+    let median_char_width = compute_median_char_width(lines);
+
+    // Split each line into optional line-number prefix and content start index.
+    let splits: Vec<(Option<String>, usize)> = lines
+        .iter()
+        .map(|line| split_line_number_prefix(line))
+        .collect();
+
+    // Detect numbered algorithm: at least 2 lines have a line-number prefix.
+    let numbered_count = splits.iter().filter(|(num, _)| num.is_some()).count();
+    let has_line_numbers = numbered_count >= 2;
+
+    // Compute content-start X for each line.
+    // Numbered: use first content element (after the number prefix).
+    // Unnumbered: use first element on the line.
+    let content_starts: Vec<f32> = if has_line_numbers {
+        lines
+            .iter()
+            .zip(splits.iter())
+            .map(|(line, (_, content_idx))| {
+                line.get(*content_idx)
+                    .map(|e| e.bbox()[0])
+                    .unwrap_or(region_left_x)
+            })
+            .collect()
+    } else {
+        lines
+            .iter()
+            .map(|line| line.first().map(|e| e.bbox()[0]).unwrap_or(region_left_x))
+            .collect()
+    };
+
+    let min_content_x = content_starts
+        .iter()
+        .copied()
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .unwrap_or(region_left_x);
+
+    // Max line-number width for right-alignment (0 when unnumbered).
+    let max_num_width = if has_line_numbers {
+        splits
+            .iter()
+            .filter_map(|(num, _)| num.as_ref().map(|s| s.len()))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let mut output_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    for i in 0..lines.len() {
+        let line = &lines[i];
+        let (ref num, content_idx) = splits[i];
+        let content_x = content_starts[i];
+
+        let indent_count = ((content_x - min_content_x) / median_char_width)
+            .round()
+            .max(0.0) as usize;
+
+        let mut formatted = String::new();
+
+        if has_line_numbers {
+            // Number column: right-aligned number or spaces for unnumbered lines.
+            match num {
+                Some(n) => {
+                    for _ in 0..(max_num_width - n.len()) {
+                        formatted.push(' ');
+                    }
+                    formatted.push_str(n);
+                }
+                None => {
+                    for _ in 0..max_num_width {
+                        formatted.push(' ');
+                    }
+                }
+            }
+            formatted.push(' ');
+            for _ in 0..indent_count {
+                formatted.push(' ');
+            }
+            formatted.push_str(&build_line_text(&line[content_idx..]));
+        } else {
+            // No line numbers: indent + full line text.
+            for _ in 0..indent_count {
+                formatted.push(' ');
+            }
+            formatted.push_str(&build_line_text(line));
+        }
+
+        output_lines.push(formatted);
+    }
+
+    output_lines.join("\n")
+}
+
+/// Compute the median width of visible characters across all lines.
+/// Used as the indentation unit for layout preservation.
+fn compute_median_char_width(lines: &[Vec<&LineElement>]) -> f32 {
     let mut char_widths: Vec<f32> = lines
         .iter()
         .flat_map(|line| line.iter())
         .filter_map(|e| match e {
             LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' ' => {
                 let w = c.bbox[2] - c.bbox[0];
-                if w > 0.0 { Some(w) } else { None }
+                if w > 0.0 {
+                    Some(w)
+                } else {
+                    None
+                }
             }
             _ => None,
         })
         .collect();
 
-    let median_char_width = if char_widths.is_empty() {
+    if char_widths.is_empty() {
         1.0 // fallback — avoids division by zero
     } else {
         char_widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         char_widths[char_widths.len() / 2]
-    };
+    }
+}
 
-    let mut output_lines: Vec<String> = Vec::with_capacity(lines.len());
+/// Split a line into an optional line-number prefix and the index where
+/// content begins.
+///
+/// Leading ASCII digits followed by whitespace are treated as a line number.
+/// If the digits consume the entire line (no content follows), they are
+/// treated as content (not a line number) and `(None, 0)` is returned.
+fn split_line_number_prefix(line: &[&LineElement]) -> (Option<String>, usize) {
+    let mut idx = 0;
+    let mut num_str = String::new();
 
-    for line in lines {
-        // Find the leftmost element's X position for indentation
-        let first_x = line
-            .iter()
-            .map(|e| e.bbox()[0])
-            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap_or(region_left_x);
-
-        let indent_count = ((first_x - region_left_x) / median_char_width)
-            .round()
-            .max(0.0) as usize;
-
-        let line_text = build_line_text(line);
-        let mut indented = " ".repeat(indent_count);
-        indented.push_str(&line_text);
-        output_lines.push(indented);
+    // Phase 1: collect leading digits
+    while idx < line.len() {
+        match &line[idx] {
+            LineElement::Char(c) if c.codepoint.is_ascii_digit() => {
+                num_str.push(c.codepoint);
+                idx += 1;
+            }
+            _ => break,
+        }
     }
 
-    output_lines.join("\n")
+    if num_str.is_empty() {
+        return (None, 0);
+    }
+
+    // Phase 2: skip whitespace after digits
+    while idx < line.len() {
+        match &line[idx] {
+            LineElement::Char(c) if c.codepoint == ' ' || c.codepoint.is_control() => {
+                idx += 1;
+            }
+            _ => break,
+        }
+    }
+
+    // If digits consumed entire line, treat as content (not a line number)
+    if idx >= line.len() {
+        return (None, 0);
+    }
+
+    (Some(num_str), idx)
 }
 
 /// Build a single line of text from elements sorted left-to-right.
@@ -935,6 +1069,150 @@ mod tests {
         let formulas: Vec<&InlineFormula> = vec![&formula];
         let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::PreserveLayout);
         assert!(text.contains("$x_0$"), "Expected $x_0$ in: {text:?}");
+    }
+
+    #[test]
+    fn test_preserve_layout_numbered_lines_at_start() {
+        // Numbered algorithm: line numbers should appear at column 0,
+        // content indented after a fixed-width number column.
+        //   "1 for x"       (number "1" at x=55, content "for" at x=75)
+        //   "2   y=0"       (number "2" at x=55, content "y=0" at x=95)
+        //   "    // hi"     (no number, comment "//" at x=95, aligned with y=0)
+        let mut chars = Vec::new();
+
+        // Line 1: "1" at x=55, then "for x" at x=75
+        chars.push(make_char_image_space('1', 55.0, 100.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 61.0, 100.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "for".chars().enumerate() {
+            chars.push(make_char_image_space(c, 75.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space(' ', 105.5, 100.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('x', 110.0, 100.0, 10.0, 12.0, PAGE_H));
+
+        // Line 2: "2" at x=55, then "y=0" at x=95 (indented deeper)
+        chars.push(make_char_image_space('2', 55.0, 130.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 61.0, 130.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "y=0".chars().enumerate() {
+            chars.push(make_char_image_space(c, 95.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        // Line 3: "// hi" at x=95 (same X as line 2's content, no line number)
+        chars.push(make_char_image_space('/', 95.0, 160.0, 5.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('/', 100.0, 160.0, 5.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 105.0, 160.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "hi".chars().enumerate() {
+            chars.push(make_char_image_space(c, 108.0 + i as f32 * 10.5, 160.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Line 1: number "1" at start, then content "for x" (least indented → 0 indent)
+        assert!(lines[0].starts_with("1 "), "Line 1 should start with number: {:?}", lines[0]);
+        assert!(lines[0].contains("for"), "Line 1: {:?}", lines[0]);
+        // Line 2: number "2" at start, content "y=0" indented
+        assert!(lines[1].starts_with("2 "), "Line 2 should start with number: {:?}", lines[1]);
+        assert!(lines[1].contains("y=0"), "Line 2: {:?}", lines[1]);
+        // Line 3: no number → spaces for number column, then "//" indented
+        assert!(lines[2].starts_with(' '), "Line 3 should start with spaces: {:?}", lines[2]);
+        assert!(lines[2].contains("//"), "Line 3: {:?}", lines[2]);
+        // Content of lines 2 and 3 should align (same X offset)
+        let y_col = lines[1].find("y=0").unwrap();
+        let slash_col = lines[2].find("//").unwrap();
+        assert_eq!(y_col, slash_col, "Content should align: {:?} vs {:?}", lines[1], lines[2]);
+    }
+
+    #[test]
+    fn test_preserve_layout_multi_digit_numbers() {
+        // Numbers "9" and "10": single-digit should be right-aligned to match "10".
+        let mut chars = Vec::new();
+
+        // Line 1: "9" at x=50, content "end" at x=75
+        chars.push(make_char_image_space('9', 50.0, 100.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 56.0, 100.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "end".chars().enumerate() {
+            chars.push(make_char_image_space(c, 75.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+
+        // Line 2: "10" at x=44, content "x=1" at x=75 (same content X → same indent)
+        chars.push(make_char_image_space('1', 44.0, 130.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('0', 50.0, 130.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 56.0, 130.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "x=1".chars().enumerate() {
+            chars.push(make_char_image_space(c, 75.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [40.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // " 9" right-aligned to match "10"
+        assert!(lines[0].starts_with(" 9"), "Line 1 should right-align: {:?}", lines[0]);
+        assert!(lines[1].starts_with("10"), "Line 2 should start with 10: {:?}", lines[1]);
+        // Content should be at the same column
+        let col1 = lines[0].find("end").unwrap();
+        let col2 = lines[1].find("x=1").unwrap();
+        assert_eq!(col1, col2, "Content should align: {:?}", lines);
+    }
+
+    #[test]
+    fn test_preserve_layout_unnumbered_algorithm() {
+        // Algorithm without line numbers: indentation from element positions.
+        let mut chars = Vec::new();
+
+        // Line 1: "for x" at x=100
+        for (i, c) in "for".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space(' ', 131.5, 100.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('x', 135.0, 100.0, 10.0, 12.0, PAGE_H));
+
+        // Line 2: "y=0" at x=120 (indented)
+        for (i, c) in "y=0".chars().enumerate() {
+            chars.push(make_char_image_space(c, 120.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        // Line 3: "end" at x=100 (same as line 1)
+        for (i, c) in "end".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 160.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        // Lines 1 and 3: no indent (at min content X)
+        assert!(!lines[0].starts_with(' '), "Line 1 no indent: {:?}", lines[0]);
+        assert!(!lines[2].starts_with(' '), "Line 3 no indent: {:?}", lines[2]);
+        // Line 2: indented
+        assert!(lines[1].starts_with(' '), "Line 2 should be indented: {:?}", lines[1]);
+        assert!(lines[1].contains("y=0"));
+        // No number column: line 1 text starts at column 0
+        assert!(lines[0].starts_with("for"), "Should start with content directly: {:?}", lines[0]);
+    }
+
+    #[test]
+    fn test_preserve_layout_single_digit_not_line_number() {
+        // Only 1 line starts with a digit → not treated as numbered algorithm.
+        // The digit is part of the content, not a line number.
+        let mut chars = Vec::new();
+
+        // Line 1: "3D" at x=100
+        chars.push(make_char_image_space('3', 100.0, 100.0, 10.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('D', 110.5, 100.0, 10.0, 12.0, PAGE_H));
+
+        // Line 2: "ok" at x=100
+        for (i, c) in "ok".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // "3D" should be intact — not split into number "3" + content "D"
+        assert!(lines[0].starts_with("3D"), "Digit should be content: {:?}", lines[0]);
     }
 
     #[test]
