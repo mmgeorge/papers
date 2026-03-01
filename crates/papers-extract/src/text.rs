@@ -777,13 +777,26 @@ fn build_line_text(elements: &[&LineElement]) -> String {
                 }
             }
             LineElement::Formula { latex, .. } => {
-                if !text.is_empty() && !text.ends_with(' ') {
+                // Merge adjacent formulas: if the text already ends with a
+                // formula (`$` or `$ `), reopen it instead of starting a new one.
+                let trimmed = text.trim_end();
+                if trimmed.ends_with('$') && trimmed.len() > 1 {
+                    // Remove the trailing `$` and any space after it
+                    let dollar_pos = trimmed.len() - 1;
+                    text.truncate(dollar_pos);
+                    text.push(' ');
+                    text.push_str(latex);
+                    text.push('$');
+                    text.push(' ');
+                } else {
+                    if !text.is_empty() && !text.ends_with(' ') {
+                        text.push(' ');
+                    }
+                    text.push('$');
+                    text.push_str(latex);
+                    text.push('$');
                     text.push(' ');
                 }
-                text.push('$');
-                text.push_str(latex);
-                text.push('$');
-                text.push(' ');
                 prev_right = None;
             }
         }
@@ -1526,7 +1539,8 @@ mod tests {
 
     #[test]
     fn test_multiple_scripts_one_line() {
-        // Two separate base+script pairs on the same line: "a_{ext} n_{max}"
+        // Two separate base+script pairs on the same line.
+        // Adjacent formulas with only a space between merge into one $ block.
         let chars = vec![
             // First pair: a_{ext}
             make_char_with_font('a', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
@@ -1544,12 +1558,13 @@ mod tests {
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert!(
-            text.contains("$a_{ext}$"),
-            "Expected $a_{{ext}}$ in: {text:?}"
+            text.contains("a_{ext}") && text.contains("n_{max}"),
+            "Expected both scripts in: {text:?}"
         );
+        // Adjacent formulas merge into a single $ block
         assert!(
-            text.contains("$n_{max}$"),
-            "Expected $n_{{max}}$ in: {text:?}"
+            text.contains("$a_{ext} n_{max}$"),
+            "Expected merged formula in: {text:?}"
         );
     }
 
@@ -1663,6 +1678,7 @@ mod tests {
     fn test_mixed_super_and_subscript() {
         // Two different script types on one line: x^2 and a_{ext}
         // Y shifts are kept small to ensure all chars group on the same line.
+        // Adjacent formulas merge into one $ block.
         let chars = vec![
             // x^2: superscript (shifted up by 1pt)
             make_char_with_font('x', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
@@ -1678,12 +1694,12 @@ mod tests {
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert!(
-            text.contains("$x^{2}$"),
-            "Expected $x^{{2}}$ in: {text:?}"
+            text.contains("x^{2}") && text.contains("a_{ext}"),
+            "Expected both scripts in: {text:?}"
         );
         assert!(
-            text.contains("$a_{ext}$"),
-            "Expected $a_{{ext}}$ in: {text:?}"
+            text.contains("$x^{2} a_{ext}$"),
+            "Expected merged formula in: {text:?}"
         );
     }
 
@@ -1714,5 +1730,109 @@ mod tests {
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert!(!text.contains('$'), "No formula for near-equal sizes: {text:?}");
+    }
+
+    #[test]
+    fn test_adjacent_formulas_merged() {
+        // When an inline formula from the model is immediately followed by a
+        // script-detected formula, they should merge into a single $...$ block.
+        let mut chars = Vec::new();
+        // "set" text before
+        for (i, c) in "set".chars().enumerate() {
+            chars.push(make_char_with_font(c, 100.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+        // Formula glyph region (chars excluded by formula bbox)
+        chars.push(make_char_with_font('y', 140.0, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        // Script chars right after the formula bbox: subscript "ext"
+        chars.push(make_char_with_font('a', 170.0, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        chars.push(make_char_with_font('e', 178.0, 103.0, 6.0, 7.3, PAGE_H, 7.3));
+        chars.push(make_char_with_font('x', 184.0, 103.0, 6.0, 7.3, PAGE_H, 7.3));
+        chars.push(make_char_with_font('t', 190.0, 103.0, 6.0, 7.3, PAGE_H, 7.3));
+
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let formula = InlineFormula {
+            bbox: [135.0, 96.0, 155.0, 114.0],
+            latex: "h^{2}".into(),
+        };
+        let formulas: Vec<&InlineFormula> = vec![&formula];
+
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        // The inline formula $h^{2}$ and the detected $a_{ext}$ should merge
+        // into a single $h^{2} a_{ext}$ block.
+        assert!(
+            text.contains("$h^{2} a_{ext}$"),
+            "Expected merged $h^{{2}} a_{{ext}}$ in: {text:?}"
+        );
+        // Should NOT have two separate $ blocks
+        assert!(
+            !text.contains("$ $"),
+            "Should not have adjacent separate formulas: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_adjacent_formulas_both_inline() {
+        // Two inline formulas from the model that are spatially adjacent should merge.
+        let mut chars = Vec::new();
+        // Some text before
+        for (i, c) in "if".chars().enumerate() {
+            chars.push(make_char_with_font(c, 100.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+        // Formula glyphs (excluded)
+        chars.push(make_char_with_font('x', 130.0, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        chars.push(make_char_with_font('y', 160.0, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        // Text after
+        for (i, c) in "then".chars().enumerate() {
+            chars.push(make_char_with_font(c, 190.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let f1 = InlineFormula {
+            bbox: [125.0, 96.0, 145.0, 114.0],
+            latex: "x>0".into(),
+        };
+        let f2 = InlineFormula {
+            bbox: [155.0, 96.0, 175.0, 114.0],
+            latex: "\\land y<1".into(),
+        };
+        let formulas: Vec<&InlineFormula> = vec![&f1, &f2];
+
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        assert!(
+            text.contains("$x>0 \\land y<1$"),
+            "Expected merged formula in: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_non_adjacent_formulas_stay_separate() {
+        // Two formulas separated by text should NOT be merged.
+        let mut chars = Vec::new();
+        // Formula glyph 1
+        chars.push(make_char_with_font('x', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        // Text between formulas: "and"
+        for (i, c) in "and".chars().enumerate() {
+            chars.push(make_char_with_font(c, 130.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+        // Formula glyph 2
+        chars.push(make_char_with_font('y', 170.0, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let f1 = InlineFormula {
+            bbox: [95.0, 96.0, 115.0, 114.0],
+            latex: "x".into(),
+        };
+        let f2 = InlineFormula {
+            bbox: [165.0, 96.0, 185.0, 114.0],
+            latex: "y".into(),
+        };
+        let formulas: Vec<&InlineFormula> = vec![&f1, &f2];
+
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        // Should have two separate formulas with "and" between
+        assert!(
+            text.contains("$x$") && text.contains("$y$") && text.contains("and"),
+            "Expected separate formulas with text between: {text:?}"
+        );
     }
 }
