@@ -63,36 +63,103 @@ pub fn extract_page_chars(page: &PdfPage, page_idx: u32) -> Result<Vec<PdfChar>,
     // Key: font name, Value: space_width / units_per_em ratio (typically 0.25–0.33 for Latin fonts).
     let mut font_space_ratios: HashMap<String, f32> = HashMap::new();
 
-    for i in 0..chars_collection.len() {
+    let total = chars_collection.len();
+    let mut i = 0usize;
+    while i < total {
         let Ok(char_info) = chars_collection.get(i) else {
+            i += 1;
             continue;
         };
 
-        if let Some(c) = char_info.unicode_char() {
-            if let Ok(rect) = char_info.loose_bounds() {
-                let font_size = char_info.scaled_font_size().value;
-
-                // Look up or compute the space width ratio for this character's font.
-                let font_name = char_info.font_name();
-                let space_ratio = *font_space_ratios
-                    .entry(font_name.clone())
-                    .or_insert_with(|| compute_space_width_ratio(&char_info, &font_name));
-
-                chars.push(PdfChar {
-                    codepoint: c,
-                    bbox: [
-                        rect.left().value,
-                        rect.bottom().value,
-                        rect.right().value,
-                        rect.top().value,
-                    ],
-                    space_threshold: font_size * space_ratio / 2.0,
-                });
+        // Try direct Unicode mapping first (works for all BMP characters).
+        let c = if let Some(c) = char_info.unicode_char() {
+            c
+        } else {
+            // On Windows (16-bit wchar_t), pdfium returns supplementary plane
+            // characters (U+10000+) as UTF-16 surrogate pairs across two
+            // consecutive char indices. `char::from_u32()` returns None for
+            // surrogate code units, so we detect and reassemble them here.
+            let raw = char_info.unicode_value();
+            if is_high_surrogate(raw) {
+                if let Some(decoded) = decode_surrogate_pair(&chars_collection, i, total) {
+                    i += 2; // consumed both surrogates
+                    push_char(
+                        &mut chars,
+                        decoded,
+                        &char_info,
+                        &mut font_space_ratios,
+                    );
+                    continue;
+                }
             }
-        }
+            // Unmappable character (not a surrogate pair) — skip it.
+            i += 1;
+            continue;
+        };
+
+        push_char(&mut chars, c, &char_info, &mut font_space_ratios);
+        i += 1;
     }
 
     Ok(chars)
+}
+
+/// Push a resolved character onto the chars vec, computing font metrics.
+fn push_char(
+    chars: &mut Vec<PdfChar>,
+    c: char,
+    char_info: &PdfPageTextChar,
+    font_space_ratios: &mut HashMap<String, f32>,
+) {
+    let Ok(rect) = char_info.loose_bounds() else {
+        return;
+    };
+    let font_size = char_info.scaled_font_size().value;
+    let font_name = char_info.font_name();
+    let space_ratio = *font_space_ratios
+        .entry(font_name.clone())
+        .or_insert_with(|| compute_space_width_ratio(char_info, &font_name));
+
+    chars.push(PdfChar {
+        codepoint: c,
+        bbox: [
+            rect.left().value,
+            rect.bottom().value,
+            rect.right().value,
+            rect.top().value,
+        ],
+        space_threshold: font_size * space_ratio / 2.0,
+    });
+}
+
+fn is_high_surrogate(raw: u32) -> bool {
+    (0xD800..=0xDBFF).contains(&raw)
+}
+
+fn is_low_surrogate(raw: u32) -> bool {
+    (0xDC00..=0xDFFF).contains(&raw)
+}
+
+/// Attempt to decode a UTF-16 surrogate pair at position `i` in the chars collection.
+/// Returns the decoded char if `i` is a high surrogate followed by a low surrogate.
+fn decode_surrogate_pair(
+    chars_collection: &PdfPageTextChars,
+    i: usize,
+    total: usize,
+) -> Option<char> {
+    if i + 1 >= total {
+        return None;
+    }
+    let Ok(next) = chars_collection.get(i + 1) else {
+        return None;
+    };
+    let raw_hi = chars_collection.get(i).ok()?.unicode_value();
+    let raw_lo = next.unicode_value();
+    if !is_low_surrogate(raw_lo) {
+        return None;
+    }
+    let codepoint = 0x10000 + ((raw_hi - 0xD800) << 10) + (raw_lo - 0xDC00);
+    char::from_u32(codepoint)
 }
 
 /// Compute the space character's width as a ratio of the em square for the given font.
