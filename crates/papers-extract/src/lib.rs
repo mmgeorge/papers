@@ -23,8 +23,10 @@ pub struct ExtractOptions {
     pub confidence_threshold: f32,
     /// Whether to extract figures as images (default true).
     pub extract_images: bool,
-    /// Quality mode — affects model selection for tables and formulas (default Fast).
+    /// Quality mode — affects model selection for tables (default Fast).
     pub quality: Quality,
+    /// Formula model quality (default Low).
+    pub formula_quality: FormulaQuality,
     /// Path to the pdfium binary (auto-detected if None).
     pub pdfium_path: Option<PathBuf>,
     /// Directory for ONNX model cache (auto-detected if None).
@@ -42,6 +44,7 @@ impl Default for ExtractOptions {
             confidence_threshold: 0.3,
             extract_images: true,
             quality: Quality::default(),
+            formula_quality: FormulaQuality::default(),
             pdfium_path: None,
             model_cache_dir: None,
             page: None,
@@ -50,17 +53,27 @@ impl Default for ExtractOptions {
     }
 }
 
-/// Quality mode controls model selection for tables and formulas.
+/// Quality mode controls model selection for tables.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Quality {
-    /// Fast mode (default): SLANet-Plus (7 MB) + PP-FormulaNet_plus-S (248 MB).
-    /// Total models: ~379 MB. Best for batch processing.
+    /// Fast mode (default): SLANet-Plus (7 MB).
     #[default]
     Fast,
-    /// Quality mode: PP-LCNet table classifier (6.5 MB) + SLANeXt-wired (351 MB)
-    /// + PP-FormulaNet_plus-L (698 MB).
-    /// Total models: ~1.18 GB. Better accuracy for complex tables and formulas.
+    /// Quality mode: PP-LCNet table classifier (6.5 MB) + SLANeXt-wired (351 MB).
+    /// Better accuracy for complex tables.
     Quality,
+}
+
+/// Formula model quality controls which PP-FormulaNet_plus model variant to use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FormulaQuality {
+    /// PP-FormulaNet_plus-S (221 MB). Fastest inference.
+    #[default]
+    Low,
+    /// PP-FormulaNet_plus-M (565 MB). Balanced speed and accuracy.
+    Med,
+    /// PP-FormulaNet_plus-L (700 MB). Best accuracy.
+    High,
 }
 
 /// Controls what debug output to produce.

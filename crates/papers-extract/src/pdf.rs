@@ -26,6 +26,10 @@ pub struct PdfChar {
     /// When font data is unavailable (non-embedded fonts), we fall back to an approximation
     /// using `space_width_ratio = 0.3` (typical for Latin fonts where space ≈ 250–333 / 1000).
     pub space_threshold: f32,
+    /// Font name as reported by pdfium (e.g. "CMMI10", "LibertineMathMI").
+    pub font_name: String,
+    /// Rendered font size in PDF points.
+    pub font_size: f32,
 }
 
 /// Render a page to an RGB image at the given DPI.
@@ -129,6 +133,8 @@ fn push_char(
             rect.top().value,
         ],
         space_threshold: font_size * space_ratio / 2.0,
+        font_name: font_name.clone(),
+        font_size,
     });
 }
 

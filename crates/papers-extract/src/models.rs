@@ -5,7 +5,7 @@ use oar_ocr::core::config::OrtSessionConfig;
 use oar_ocr::predictors::{FormulaRecognitionPredictor, TableStructureRecognitionPredictor};
 
 use crate::error::ExtractError;
-use crate::Quality;
+use crate::{FormulaQuality, Quality};
 
 /// Model file metadata for download.
 struct ModelFile {
@@ -31,10 +31,16 @@ const TABLE_DICT: ModelFile = ModelFile {
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/table_structure_dict_ch.txt",
 };
 
-// Formula recognition — small (Fast mode)
+// Formula recognition — small (Low quality)
 const FORMULANET_S: ModelFile = ModelFile {
     filename: "pp-formulanet_plus-s.onnx",
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-formulanet_plus-s.onnx",
+};
+
+// Formula recognition — medium (Med quality)
+const FORMULANET_M: ModelFile = ModelFile {
+    filename: "pp-formulanet_plus-m.onnx",
+    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-formulanet_plus-m.onnx",
 };
 
 // Formula tokenizer (required for all formula models)
@@ -55,7 +61,7 @@ const SLANEXT_WIRED: ModelFile = ModelFile {
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/slanext_wired.onnx",
 };
 
-// Formula recognition — large (Quality mode only)
+// Formula recognition — large (High quality)
 const FORMULANET_L: ModelFile = ModelFile {
     filename: "pp-formulanet_plus-l.onnx",
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-formulanet_plus-l.onnx",
@@ -87,6 +93,7 @@ pub fn default_cache_dir() -> PathBuf {
 /// Ensure all models for the given quality mode are downloaded and return their paths.
 pub fn ensure_models(
     quality: Quality,
+    formula_quality: FormulaQuality,
     cache_dir: &Path,
 ) -> Result<ModelPaths, ExtractError> {
     std::fs::create_dir_all(cache_dir)?;
@@ -97,16 +104,20 @@ pub fn ensure_models(
     let table_dict = ensure_model(cache_dir, &TABLE_DICT)?;
     let formula_tokenizer = ensure_model(cache_dir, &FORMULA_TOKENIZER)?;
 
-    let (formula, table_classifier, slanext_wired) = match quality {
-        Quality::Fast => {
-            let formula = ensure_model(cache_dir, &FORMULANET_S)?;
-            (formula, None, None)
-        }
+    // Formula model selected by --formula-quality
+    let formula = match formula_quality {
+        FormulaQuality::Low => ensure_model(cache_dir, &FORMULANET_S)?,
+        FormulaQuality::Med => ensure_model(cache_dir, &FORMULANET_M)?,
+        FormulaQuality::High => ensure_model(cache_dir, &FORMULANET_L)?,
+    };
+
+    // Table models selected by --quality
+    let (table_classifier, slanext_wired) = match quality {
+        Quality::Fast => (None, None),
         Quality::Quality => {
-            let formula = ensure_model(cache_dir, &FORMULANET_L)?;
             let classifier = ensure_model(cache_dir, &TABLE_CLASSIFIER)?;
             let wired = ensure_model(cache_dir, &SLANEXT_WIRED)?;
-            (formula, Some(classifier), Some(wired))
+            (Some(classifier), Some(wired))
         }
     };
 
@@ -205,12 +216,13 @@ fn platform_execution_providers() -> Vec<OrtExecutionProvider> {
 /// Build a standalone formula recognition predictor.
 pub fn build_formula_predictor(
     paths: &ModelPaths,
-    quality: Quality,
+    formula_quality: FormulaQuality,
 ) -> Result<FormulaRecognitionPredictor, ExtractError> {
     let config = ort_config();
-    let name = match quality {
-        Quality::Fast => "PP-FormulaNet_plus-S",
-        Quality::Quality => "PP-FormulaNet_plus-L",
+    let name = match formula_quality {
+        FormulaQuality::Low => "PP-FormulaNet_plus-S",
+        FormulaQuality::Med => "PP-FormulaNet_plus-M",
+        FormulaQuality::High => "PP-FormulaNet_plus-L",
     };
     FormulaRecognitionPredictor::builder()
         .model_name(name)

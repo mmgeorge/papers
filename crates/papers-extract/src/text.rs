@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::pdf::PdfChar;
 
 /// pdfium replaces line-end hyphens with U+0002 (STX) and flags them as
@@ -27,13 +29,15 @@ struct ImageChar<'a> {
     bbox: [f32; 4],
     /// Pre-computed gap threshold for word boundary detection, in PDF points.
     space_threshold: f32,
+    /// Rendered font size in PDF points (from PdfChar).
+    font_size: f32,
     _source: &'a PdfChar,
 }
 
 /// A line element: either a character or an inline formula placeholder.
 enum LineElement<'a> {
     Char(&'a ImageChar<'a>),
-    Formula { latex: &'a str, bbox: [f32; 4] },
+    Formula { latex: Cow<'a, str>, bbox: [f32; 4] },
 }
 
 impl LineElement<'_> {
@@ -68,6 +72,7 @@ fn to_image_char<'a>(c: &'a PdfChar, page_height_pt: f32) -> ImageChar<'a> {
             page_height_pt - c.bbox[1],      // y2 = page_height - bottom (now bottom in Y-down)
         ],
         space_threshold: c.space_threshold,
+        font_size: c.font_size,
         _source: c,
     }
 }
@@ -123,7 +128,7 @@ pub fn extract_region_text(
         let cy = (formula.bbox[1] + formula.bbox[3]) / 2.0;
         if point_in_bbox(cx, cy, region_bbox) {
             elements.push(LineElement::Formula {
-                latex: &formula.latex,
+                latex: Cow::Borrowed(&formula.latex),
                 bbox: formula.bbox,
             });
         }
@@ -286,7 +291,9 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
     let mut pending_dehyphen = false;
 
     for (line_idx, line) in lines.iter().enumerate() {
-        let line_text = build_line_text(line);
+        let processed = detect_scripts(line);
+        let processed_refs: Vec<&LineElement> = processed.iter().collect();
+        let line_text = build_line_text(&processed_refs);
         result.push_str(&line_text);
 
         let has_hyphen_marker = line.iter().any(|e| matches!(
@@ -423,13 +430,17 @@ fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -
             for _ in 0..indent_count {
                 formatted.push(' ');
             }
-            formatted.push_str(&build_line_text(&line[content_idx..]));
+            let processed = detect_scripts(&line[content_idx..]);
+            let processed_refs: Vec<&LineElement> = processed.iter().collect();
+            formatted.push_str(&build_line_text(&processed_refs));
         } else {
             // No line numbers: indent + full line text.
             for _ in 0..indent_count {
                 formatted.push(' ');
             }
-            formatted.push_str(&build_line_text(line));
+            let processed = detect_scripts(line);
+            let processed_refs: Vec<&LineElement> = processed.iter().collect();
+            formatted.push_str(&build_line_text(&processed_refs));
         }
 
         output_lines.push(formatted);
@@ -506,6 +517,195 @@ fn split_line_number_prefix(line: &[&LineElement]) -> (Option<String>, usize) {
     }
 
     (Some(num_str), idx)
+}
+
+/// Maximum font-size ratio (script / median) for a character to be considered a sub/superscript.
+const SCRIPT_FONT_RATIO: f32 = 0.85;
+
+/// Detect sub/superscript character patterns on a single line and fold them into
+/// `LineElement::Formula` entries.
+///
+/// A "script run" is detected when a baseline-sized character is immediately followed
+/// (horizontally) by one or more smaller-font characters. The vertical shift determines
+/// whether it's a subscript (shifted down in Y-down image space) or superscript (shifted up).
+///
+/// Characters that are already part of a `Formula` element pass through unchanged.
+fn detect_scripts<'a>(line: &[&'a LineElement<'a>]) -> Vec<LineElement<'a>> {
+    // Compute the baseline (max) font size of visible Char elements on the line.
+    // We use max rather than median because script chars can outnumber baseline chars
+    // (e.g. `a_{ext}` has 1 baseline + 3 script chars). The max is always the baseline
+    // font size since scripts are strictly smaller.
+    let baseline_font = line
+        .iter()
+        .filter_map(|e| match e {
+            LineElement::Char(c)
+                if !c.codepoint.is_control()
+                    && c.codepoint != ' '
+                    && (c.bbox[2] - c.bbox[0]) > 0.0
+                    && c.font_size > 0.0 =>
+            {
+                Some(c.font_size)
+            }
+            _ => None,
+        })
+        .fold(0.0_f32, f32::max);
+
+    // Need at least 2 visible chars and a positive baseline to detect scripts.
+    let visible_count = line
+        .iter()
+        .filter(|e| matches!(e, LineElement::Char(c)
+            if !c.codepoint.is_control()
+                && c.codepoint != ' '
+                && (c.bbox[2] - c.bbox[0]) > 0.0
+                && c.font_size > 0.0))
+        .count();
+
+    if visible_count < 2 || baseline_font <= 0.0 {
+        return line.iter().map(|e| clone_element(e)).collect();
+    }
+
+    let mut result: Vec<LineElement<'a>> = Vec::with_capacity(line.len());
+    let mut i = 0;
+
+    while i < line.len() {
+        let elem = &line[i];
+
+        // Only try to detect scripts starting from a baseline-sized Char.
+        let base_char = match elem {
+            LineElement::Char(c)
+                if !c.codepoint.is_control()
+                    && c.codepoint != ' '
+                    && (c.bbox[2] - c.bbox[0]) > 0.0
+                    && c.font_size / baseline_font >= SCRIPT_FONT_RATIO =>
+            {
+                c
+            }
+            _ => {
+                result.push(clone_element(elem));
+                i += 1;
+                continue;
+            }
+        };
+
+        // Look ahead for a script run: skip zero-width/control chars, find small-font chars.
+        let mut j = i + 1;
+
+        // Skip intervening control/zero-width characters
+        while j < line.len() {
+            match &line[j] {
+                LineElement::Char(c)
+                    if c.codepoint.is_control() || (c.bbox[2] - c.bbox[0]) <= 0.0 =>
+                {
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Check if next real char is a script char
+        if j >= line.len() {
+            result.push(clone_element(elem));
+            i += 1;
+            continue;
+        }
+
+        let first_script = match &line[j] {
+            LineElement::Char(c)
+                if !c.codepoint.is_control()
+                    && c.codepoint != ' '
+                    && (c.bbox[2] - c.bbox[0]) > 0.0
+                    && c.font_size > 0.0
+                    && c.font_size / baseline_font < SCRIPT_FONT_RATIO =>
+            {
+                c
+            }
+            _ => {
+                result.push(clone_element(elem));
+                i += 1;
+                continue;
+            }
+        };
+
+        // Check horizontal adjacency: script char must be close to the base char
+        let gap = first_script.bbox[0] - base_char.bbox[2];
+        if gap > base_char.space_threshold && base_char.space_threshold > 0.0 {
+            // Too far apart — not a script
+            result.push(clone_element(elem));
+            i += 1;
+            continue;
+        }
+
+        // Determine sub vs superscript from Y position.
+        // In Y-down image space: superscript center_y < base center_y (higher on page).
+        let base_cy = (base_char.bbox[1] + base_char.bbox[3]) / 2.0;
+        let script_cy = (first_script.bbox[1] + first_script.bbox[3]) / 2.0;
+        let is_superscript = script_cy < base_cy;
+
+        // Collect all consecutive small-font chars in the script run
+        let script_start = j;
+        let mut script_chars = String::new();
+        script_chars.push(first_script.codepoint);
+        let mut script_end = j + 1;
+
+        while script_end < line.len() {
+            match &line[script_end] {
+                LineElement::Char(c)
+                    if !c.codepoint.is_control()
+                        && (c.bbox[2] - c.bbox[0]) > 0.0
+                        && c.font_size > 0.0
+                        && c.font_size / baseline_font < SCRIPT_FONT_RATIO =>
+                {
+                    script_chars.push(c.codepoint);
+                    script_end += 1;
+                }
+                // Skip zero-width/control chars within the run
+                LineElement::Char(c)
+                    if c.codepoint.is_control() || (c.bbox[2] - c.bbox[0]) <= 0.0 =>
+                {
+                    script_end += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Build the LaTeX string
+        let latex = if is_superscript {
+            format!("{}^{{{}}}", base_char.codepoint, script_chars)
+        } else {
+            format!("{}_{{{}}}", base_char.codepoint, script_chars)
+        };
+
+        // Compute combined bbox covering base + all script chars
+        let last_script_idx = script_end - 1;
+        let script_last_bbox = line[last_script_idx].bbox();
+        let combined_bbox = [
+            base_char.bbox[0],
+            base_char.bbox[1].min(line[script_start].bbox()[1]),
+            script_last_bbox[2],
+            base_char.bbox[3].max(script_last_bbox[3]),
+        ];
+
+        result.push(LineElement::Formula {
+            latex: Cow::Owned(latex),
+            bbox: combined_bbox,
+        });
+
+        // Advance past all consumed elements (base + skipped + script run)
+        i = script_end;
+    }
+
+    result
+}
+
+/// Clone a `LineElement` reference into an owned `LineElement`.
+fn clone_element<'a>(elem: &LineElement<'a>) -> LineElement<'a> {
+    match elem {
+        LineElement::Char(c) => LineElement::Char(c),
+        LineElement::Formula { latex, bbox } => LineElement::Formula {
+            latex: latex.clone(),
+            bbox: *bbox,
+        },
+    }
 }
 
 /// Build a single line of text from elements sorted left-to-right.
@@ -625,6 +825,8 @@ mod tests {
             codepoint: c,
             bbox: [x, pdf_bottom, x + w, pdf_top],
             space_threshold: 1.5,
+            font_name: String::new(),
+            font_size: 10.0,
         }
     }
 
@@ -779,6 +981,8 @@ mod tests {
             codepoint: 'T',
             bbox: [100.0, 790.0, 110.0, 800.0],
             space_threshold: 0.0,
+            font_name: String::new(),
+            font_size: 10.0,
         };
         let img = to_image_char(&top_char, page_h);
         // In image space, this should be near y=0 (top of page)
@@ -790,6 +994,8 @@ mod tests {
             codepoint: 'B',
             bbox: [100.0, 0.0, 110.0, 10.0],
             space_threshold: 0.0,
+            font_name: String::new(),
+            font_size: 10.0,
         };
         let img = to_image_char(&bottom_char, page_h);
         // In image space, this should be near y=790 (bottom of page)
@@ -1228,5 +1434,285 @@ mod tests {
         let bbox = [50.0, 50.0, 600.0, 300.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hello World");
+    }
+
+    // ---- Script detection tests ----
+
+    /// Helper to make a PdfChar with a configurable font size.
+    /// Like `make_char_image_space` but takes `font_size` as a parameter.
+    fn make_char_with_font(
+        c: char,
+        x: f32,
+        y_top_img: f32,
+        w: f32,
+        h: f32,
+        page_h: f32,
+        font_size: f32,
+    ) -> PdfChar {
+        let pdf_top = page_h - y_top_img;
+        let pdf_bottom = page_h - (y_top_img + h);
+        PdfChar {
+            codepoint: c,
+            bbox: [x, pdf_bottom, x + w, pdf_top],
+            space_threshold: 1.5,
+            font_name: String::new(),
+            font_size,
+        }
+    }
+
+    #[test]
+    fn test_subscript_detection() {
+        // 'a' at 10pt baseline + "ext" at 7.3pt shifted down → $a_{ext}$
+        // In Y-down image space, subscript has HIGHER center_y than baseline.
+        let chars = vec![
+            make_char_with_font('a', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            // Subscript chars: smaller font, shifted down (higher y in image space)
+            make_char_with_font('e', 108.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+            make_char_with_font('x', 114.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+            make_char_with_font('t', 120.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("$a_{ext}$"),
+            "Expected $a_{{ext}}$ in: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_superscript_detection() {
+        // 'x' at 10pt baseline + '2' at 7.3pt shifted up → $x^{2}$
+        // In Y-down image space, superscript has LOWER center_y than baseline.
+        // Y shift must be small enough that both chars group on the same line.
+        let chars = vec![
+            make_char_with_font('x', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            // Superscript: smaller font, shifted up (lower y in image space)
+            make_char_with_font('2', 108.0, 98.0, 6.0, 7.3, PAGE_H, 7.3),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("$x^{2}$"),
+            "Expected $x^{{2}}$ in: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_false_positive_uniform_size() {
+        // All chars at the same font size → plain text, no $ wrappers.
+        let chars = vec![
+            make_char_with_font('a', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('b', 108.5, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('c', 117.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert_eq!(text, "abc");
+        assert!(!text.contains('$'), "No formulas expected: {text:?}");
+    }
+
+    #[test]
+    fn test_script_gap_too_large() {
+        // Small-font char far from the base char → no script detection.
+        let chars = vec![
+            make_char_with_font('a', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            // Far gap: 20pt away (>> space_threshold of 1.5)
+            make_char_with_font('x', 128.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(!text.contains('$'), "No formula expected for large gap: {text:?}");
+    }
+
+    #[test]
+    fn test_multiple_scripts_one_line() {
+        // Two separate base+script pairs on the same line: "a_{ext} n_{max}"
+        let chars = vec![
+            // First pair: a_{ext}
+            make_char_with_font('a', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('e', 108.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+            make_char_with_font('x', 114.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+            make_char_with_font('t', 120.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+            // Gap between the two pairs (space)
+            make_char_with_font(' ', 126.0, 100.0, 0.0, 10.0, PAGE_H, 10.0),
+            // Second pair: n_{max}
+            make_char_with_font('n', 135.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('m', 143.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+            make_char_with_font('a', 149.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+            make_char_with_font('x', 155.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("$a_{ext}$"),
+            "Expected $a_{{ext}}$ in: {text:?}"
+        );
+        assert!(
+            text.contains("$n_{max}$"),
+            "Expected $n_{{max}}$ in: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_subscript_in_prose() {
+        // Script chars embedded in normal text: "value a_{ext} is used"
+        let mut chars = Vec::new();
+        // "value " — baseline text
+        for (i, c) in "value".chars().enumerate() {
+            chars.push(make_char_with_font(c, 100.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+        chars.push(make_char_with_font(' ', 142.5, 100.0, 0.0, 10.0, PAGE_H, 10.0));
+        // "a" base + "ext" subscript
+        chars.push(make_char_with_font('a', 150.0, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        chars.push(make_char_with_font('e', 158.0, 103.0, 6.0, 7.3, PAGE_H, 7.3));
+        chars.push(make_char_with_font('x', 164.0, 103.0, 6.0, 7.3, PAGE_H, 7.3));
+        chars.push(make_char_with_font('t', 170.0, 103.0, 6.0, 7.3, PAGE_H, 7.3));
+        // " is used"
+        chars.push(make_char_with_font(' ', 176.0, 100.0, 0.0, 10.0, PAGE_H, 10.0));
+        for (i, c) in "is".chars().enumerate() {
+            chars.push(make_char_with_font(c, 183.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+        chars.push(make_char_with_font(' ', 200.0, 100.0, 0.0, 10.0, PAGE_H, 10.0));
+        for (i, c) in "used".chars().enumerate() {
+            chars.push(make_char_with_font(c, 207.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("$a_{ext}$"),
+            "Expected $a_{{ext}}$ in: {text:?}"
+        );
+        // Surrounding text should be preserved
+        assert!(text.contains("value"), "Expected 'value' in: {text:?}");
+        assert!(text.contains("is"), "Expected 'is' in: {text:?}");
+        assert!(text.contains("used"), "Expected 'used' in: {text:?}");
+    }
+
+    #[test]
+    fn test_superscript_single_char() {
+        // Common case: h^2
+        let chars = vec![
+            make_char_with_font('h', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('2', 108.0, 98.0, 6.0, 7.3, PAGE_H, 7.3),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("$h^{2}$"),
+            "Expected $h^{{2}}$ in: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_script_detection_preserves_existing_formulas() {
+        // When an inline formula is already present, script detection should not interfere.
+        let mut chars = Vec::new();
+        for (i, c) in "set".chars().enumerate() {
+            chars.push(make_char_with_font(c, 100.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+        // Formula glyph (will be excluded by the formula bbox)
+        chars.push(make_char_with_font('x', 140.0, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        // Continue after formula
+        for (i, c) in "to".chars().enumerate() {
+            chars.push(make_char_with_font(c, 165.0 + i as f32 * 8.5, 100.0, 8.0, 10.0, PAGE_H, 10.0));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let formula = InlineFormula {
+            bbox: [135.0, 96.0, 155.0, 114.0],
+            latex: "x_0".into(),
+        };
+        let formulas: Vec<&InlineFormula> = vec![&formula];
+
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        assert!(text.contains("$x_0$"), "Expected $x_0$ in: {text:?}");
+    }
+
+    #[test]
+    fn test_script_detection_only_one_small_char() {
+        // Single small char adjacent to a base char should still be detected.
+        let chars = vec![
+            make_char_with_font('n', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('i', 108.0, 103.0, 4.0, 7.3, PAGE_H, 7.3),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("$n_{i}$"),
+            "Expected $n_{{i}}$ in: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_script_with_preserve_layout() {
+        // Script detection should also work in PreserveLayout mode.
+        let chars = vec![
+            make_char_with_font('x', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('2', 108.0, 98.0, 6.0, 7.3, PAGE_H, 7.3),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        assert!(
+            text.contains("$x^{2}$"),
+            "Expected $x^{{2}}$ in PreserveLayout: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_super_and_subscript() {
+        // Two different script types on one line: x^2 and a_{ext}
+        // Y shifts are kept small to ensure all chars group on the same line.
+        let chars = vec![
+            // x^2: superscript (shifted up by 1pt)
+            make_char_with_font('x', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('2', 108.0, 99.0, 6.0, 7.3, PAGE_H, 7.3),
+            // space
+            make_char_with_font(' ', 114.0, 100.0, 0.0, 10.0, PAGE_H, 10.0),
+            // a_{ext}: subscript (shifted down by 2pt)
+            make_char_with_font('a', 125.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('e', 133.0, 102.0, 6.0, 7.3, PAGE_H, 7.3),
+            make_char_with_font('x', 139.0, 102.0, 6.0, 7.3, PAGE_H, 7.3),
+            make_char_with_font('t', 145.0, 102.0, 6.0, 7.3, PAGE_H, 7.3),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("$x^{2}$"),
+            "Expected $x^{{2}}$ in: {text:?}"
+        );
+        assert!(
+            text.contains("$a_{ext}$"),
+            "Expected $a_{{ext}}$ in: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_script_detection_skips_space_chars() {
+        // Space characters between base and script should not prevent detection.
+        // But a literal space char (with codepoint ' ') at baseline size should not
+        // become part of a script run.
+        let chars = vec![
+            make_char_with_font('x', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            // zero-width space (pdfium artifact)
+            make_char_with_font(' ', 108.0, 100.0, 0.0, 10.0, PAGE_H, 10.0),
+            // normal text continues at baseline size — not a script
+            make_char_with_font('y', 112.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(!text.contains('$'), "No formula expected: {text:?}");
+    }
+
+    #[test]
+    fn test_nearly_same_size_not_detected() {
+        // Chars with only a tiny size difference (ratio > 0.85) should NOT be scripts.
+        let chars = vec![
+            make_char_with_font('a', 100.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
+            make_char_with_font('b', 108.5, 101.0, 8.0, 9.5, PAGE_H, 9.0), // 9.0/10.0 = 0.9 > 0.85
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(!text.contains('$'), "No formula for near-equal sizes: {text:?}");
     }
 }

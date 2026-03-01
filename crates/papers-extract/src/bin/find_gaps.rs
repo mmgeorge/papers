@@ -37,12 +37,14 @@ fn main() {
         while let Some(pos) = text[search_from..].find(search) {
             let abs_pos = search_from + pos;
 
-            // Map filtered text position back to chars index
+            // Map byte offset in filtered text back to chars index.
+            // Count chars (not bytes) up to abs_pos.
+            let char_pos = text[..abs_pos].chars().count();
             let mut char_idx = 0;
             let mut filtered_count = 0;
             for (i, c) in chars.iter().enumerate() {
                 if !c.codepoint.is_control() {
-                    if filtered_count == abs_pos {
+                    if filtered_count == char_pos {
                         char_idx = i;
                         break;
                     }
@@ -53,8 +55,8 @@ fn main() {
             println!("=== Page {} (0-indexed), char index ~{} ===", page_idx, char_idx);
 
             // Show chars around the match with gap/threshold data
-            let context_before = 5;
-            let context_after = search.len() + 5;
+            let context_before = 10;
+            let context_after = search.len() + 10;
             let start = char_idx.saturating_sub(context_before);
             let end = (char_idx + context_after).min(chars.len());
 
@@ -78,13 +80,14 @@ fn main() {
                 };
                 let marker = if exceeds { " <-- SPACE INSERTED" } else { "" };
                 println!(
-                    "  [{:>4}] {:>6} left={:.2} right={:.2} w={:.2} gap={:.2} thr={:.2}{}",
-                    k, dc, ch.bbox[0], ch.bbox[2], w, gap, ch.space_threshold, marker
+                    "  [{:>4}] {:>6} left={:.2} right={:.2} bot={:.2} top={:.2} w={:.2} gap={:.2} thr={:.2} sz={:.1} font={}{}",
+                    k, dc, ch.bbox[0], ch.bbox[2], ch.bbox[1], ch.bbox[3], w, gap, ch.space_threshold, ch.font_size, ch.font_name, marker
                 );
             }
             println!();
 
-            search_from = abs_pos + 1;
+            // Advance past the match start by one full character (may be multi-byte)
+            search_from = abs_pos + text[abs_pos..].chars().next().map_or(1, |c| c.len_utf8());
         }
     }
 }

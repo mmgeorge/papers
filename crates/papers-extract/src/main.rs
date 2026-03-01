@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use papers_extract::{DebugMode, ExtractOptions, Quality};
+use papers_extract::{DebugMode, ExtractOptions, FormulaQuality, Quality};
 
 #[derive(Parser)]
 #[command(
@@ -18,9 +18,13 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Quality mode for table and formula recognition
+    /// Quality mode for table recognition
     #[arg(long, short, default_value = "fast")]
     quality: QualityArg,
+
+    /// Formula model quality: low (221 MB), med (565 MB), high (700 MB)
+    #[arg(long, default_value = "low")]
+    formula_quality: FormulaQualityArg,
 
     /// DPI for page rendering
     #[arg(long, default_value = "144")]
@@ -53,10 +57,20 @@ struct Cli {
 
 #[derive(ValueEnum, Clone, Debug)]
 enum QualityArg {
-    /// SLANet-Plus + FormulaNet-S (~379 MB)
+    /// SLANet-Plus (7 MB)
     Fast,
-    /// PP-LCNet classifier + SLANeXt-wired + FormulaNet-L (~1.18 GB)
+    /// PP-LCNet classifier + SLANeXt-wired (~358 MB)
     Quality,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum FormulaQualityArg {
+    /// PP-FormulaNet_plus-S (221 MB)
+    Low,
+    /// PP-FormulaNet_plus-M (565 MB)
+    Med,
+    /// PP-FormulaNet_plus-L (700 MB)
+    High,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -84,6 +98,11 @@ fn main() {
         quality: match cli.quality {
             QualityArg::Fast => Quality::Fast,
             QualityArg::Quality => Quality::Quality,
+        },
+        formula_quality: match cli.formula_quality {
+            FormulaQualityArg::Low => FormulaQuality::Low,
+            FormulaQualityArg::Med => FormulaQuality::Med,
+            FormulaQualityArg::High => FormulaQuality::High,
         },
         pdfium_path: cli.pdfium_path,
         model_cache_dir: cli.model_cache_dir,

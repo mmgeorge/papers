@@ -45,9 +45,9 @@ impl Pipeline {
             .clone()
             .unwrap_or_else(models::default_cache_dir);
 
-        let paths = models::ensure_models(options.quality, &cache_dir)?;
+        let paths = models::ensure_models(options.quality, options.formula_quality, &cache_dir)?;
         let layout = models::build_layout_detector(&paths.layout)?;
-        let formula = models::build_formula_predictor(&paths, options.quality)?;
+        let formula = models::build_formula_predictor(&paths, options.formula_quality)?;
         let table = models::build_table_predictor(&paths)?;
 
         Ok(Self {
