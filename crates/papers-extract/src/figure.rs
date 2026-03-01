@@ -178,6 +178,80 @@ fn edge_distance(a: [f32; 4], b: [f32; 4]) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
+/// Suppress smaller visual regions that are fully contained within a larger visual region.
+///
+/// For composite figures, the layout model often detects each sub-panel as a separate
+/// Image region alongside a larger detection spanning the entire figure. This marks
+/// the smaller contained regions as `consumed = true`, keeping only the large composite.
+///
+/// A region is considered "contained" when the intersection area is > 50% of its own area.
+/// For exact-bbox duplicates (same bbox, different kind), the lower-confidence one is consumed.
+pub fn suppress_contained_visuals(regions: &mut [Region]) {
+    // Collect indices of all visual regions
+    let visual_indices: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind.is_visual() && !r.consumed)
+        .map(|(i, _)| i)
+        .collect();
+
+    if visual_indices.len() < 2 {
+        return;
+    }
+
+    let mut to_consume: Vec<usize> = Vec::new();
+
+    for i in 0..visual_indices.len() {
+        for j in (i + 1)..visual_indices.len() {
+            let ai = visual_indices[i];
+            let bi = visual_indices[j];
+            let a_bbox = regions[ai].bbox;
+            let b_bbox = regions[bi].bbox;
+
+            let intersection = bbox_intersection_area(a_bbox, b_bbox);
+            if intersection <= 0.0 {
+                continue;
+            }
+
+            let a_area = (a_bbox[2] - a_bbox[0]) * (a_bbox[3] - a_bbox[1]);
+            let b_area = (b_bbox[2] - b_bbox[0]) * (b_bbox[3] - b_bbox[1]);
+
+            // Exact-bbox duplicate: consume the lower-confidence one
+            if (a_area - b_area).abs() < 1.0 {
+                if regions[ai].confidence >= regions[bi].confidence {
+                    to_consume.push(bi);
+                } else {
+                    to_consume.push(ai);
+                }
+                continue;
+            }
+
+            // Containment check: intersection / smaller_area > 0.5
+            let smaller_area = a_area.min(b_area);
+            if smaller_area > 0.0 && intersection / smaller_area > 0.5 {
+                // Consume the smaller region
+                if a_area < b_area {
+                    to_consume.push(ai);
+                } else {
+                    to_consume.push(bi);
+                }
+            }
+        }
+    }
+
+    for idx in to_consume {
+        regions[idx].consumed = true;
+    }
+}
+
+/// Compute the area of intersection between two axis-aligned bounding boxes.
+/// Each bbox is `[x1, y1, x2, y2]`.
+fn bbox_intersection_area(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let x_overlap = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
+    let y_overlap = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    x_overlap * y_overlap
+}
+
 /// Classify a chart type using simple heuristics on the cropped image.
 ///
 /// Returns one of: "bar", "line", "pie", "scatter", "other".
@@ -303,5 +377,60 @@ mod tests {
         // from (144,144) to (288,288) — but image is only 288x396
         assert_eq!(cropped.width(), 144);
         assert_eq!(cropped.height(), 144);
+    }
+
+    #[test]
+    fn test_suppress_smaller_image_inside_larger() {
+        let mut regions = vec![
+            make_region(RegionKind::Image, [50.0, 50.0, 500.0, 500.0], None), // large
+            make_region(RegionKind::Image, [100.0, 100.0, 200.0, 200.0], None), // small, fully inside
+        ];
+        suppress_contained_visuals(&mut regions);
+        assert!(!regions[0].consumed);
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn test_suppress_non_overlapping_untouched() {
+        let mut regions = vec![
+            make_region(RegionKind::Image, [50.0, 50.0, 200.0, 200.0], None),
+            make_region(RegionKind::Image, [300.0, 300.0, 450.0, 450.0], None),
+        ];
+        suppress_contained_visuals(&mut regions);
+        assert!(!regions[0].consumed);
+        assert!(!regions[1].consumed);
+    }
+
+    #[test]
+    fn test_suppress_exact_bbox_duplicate() {
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::Chart, [50.0, 50.0, 400.0, 400.0], None);
+                r.confidence = 0.9;
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Image, [50.0, 50.0, 400.0, 400.0], None);
+                r.confidence = 0.95;
+                r
+            },
+        ];
+        suppress_contained_visuals(&mut regions);
+        // Lower-confidence Chart should be consumed
+        assert!(regions[0].consumed);
+        assert!(!regions[1].consumed);
+    }
+
+    #[test]
+    fn test_suppress_partial_overlap_below_threshold() {
+        // Two regions that overlap but intersection / smaller_area < 0.5
+        let mut regions = vec![
+            make_region(RegionKind::Image, [0.0, 0.0, 100.0, 100.0], None),   // area = 10000
+            make_region(RegionKind::Image, [80.0, 80.0, 200.0, 200.0], None), // area = 14400, intersection = 20*20 = 400
+        ];
+        suppress_contained_visuals(&mut regions);
+        // intersection/smaller = 400/10000 = 0.04, well below 0.5
+        assert!(!regions[0].consumed);
+        assert!(!regions[1].consumed);
     }
 }

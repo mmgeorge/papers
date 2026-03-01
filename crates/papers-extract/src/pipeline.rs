@@ -282,6 +282,9 @@ impl Pipeline {
             height_pt,
         )?;
 
+        // Suppress sub-panel detections contained within a larger visual region
+        figure::suppress_contained_visuals(&mut regions);
+
         // The model provides reading order via order_key; use XY-Cut as fallback
         let has_model_order = regions.iter().any(|r| r.order > 0);
         if !has_model_order && regions.len() > 1 {
