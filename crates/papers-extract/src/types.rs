@@ -42,6 +42,12 @@ pub struct Region {
     pub caption: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chart_type: Option<String>,
+    /// True when this region's content has been spliced into a parent region
+    /// (e.g. an InlineFormula consumed by an Algorithm or Text region).
+    /// Consumed regions are kept in the JSON for debug/layout but skipped
+    /// in markdown output to avoid duplication.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consumed: bool,
 }
 
 /// All 24 DocLayout V3 region classes.
@@ -198,6 +204,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            consumed: false,
         };
 
         let json = serde_json::to_value(&region).unwrap();
@@ -220,6 +227,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            consumed: false,
         };
 
         let json = serde_json::to_value(&region).unwrap();
@@ -241,6 +249,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            consumed: false,
         };
 
         let json = serde_json::to_value(&region).unwrap();
@@ -261,6 +270,7 @@ mod tests {
             image_path: Some("images/p1_7.png".into()),
             caption: Some("Figure 1: Overview".into()),
             chart_type: None,
+            consumed: false,
         };
 
         let json = serde_json::to_value(&region).unwrap();
@@ -293,6 +303,7 @@ mod tests {
                     image_path: None,
                     caption: None,
                     chart_type: None,
+                    consumed: false,
                 }],
             }],
         };

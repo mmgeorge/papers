@@ -66,6 +66,10 @@ fn render_markdown(result: &ExtractionResult) -> String {
 
     for page in &result.pages {
         for region in &page.regions {
+            // Skip regions whose content was spliced into a parent region.
+            if region.consumed {
+                continue;
+            }
             let section = region_to_markdown(region);
             if section.is_empty() {
                 continue;
@@ -387,6 +391,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            consumed: false,
         }
     }
 

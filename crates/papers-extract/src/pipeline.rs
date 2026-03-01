@@ -201,22 +201,25 @@ impl Pipeline {
             .collect();
 
         let formula_latex: HashMap<usize, String> = if !formula_entries.is_empty() {
-            let crops: Vec<image::RgbImage> =
-                formula_entries.iter().map(|(_, img)| img.to_rgb8()).collect();
-            let results = self
-                .formula
-                .predict(crops)
-                .map_err(|e| ExtractError::Layout(format!("Formula prediction failed: {e}")))?;
-            formula_entries
-                .iter()
-                .enumerate()
-                .filter_map(|(batch_idx, (det_idx, _))| {
-                    results
-                        .formulas
-                        .get(batch_idx)
-                        .map(|latex| (*det_idx, latex.clone()))
-                })
-                .collect()
+            // Process formulas in chunks to avoid OOM with large models.
+            const FORMULA_BATCH_SIZE: usize = 8;
+            let mut all_formulas: Vec<(usize, String)> = Vec::new();
+            for chunk_start in (0..formula_entries.len()).step_by(FORMULA_BATCH_SIZE) {
+                let chunk_end = (chunk_start + FORMULA_BATCH_SIZE).min(formula_entries.len());
+                let chunk = &formula_entries[chunk_start..chunk_end];
+                let crops: Vec<image::RgbImage> =
+                    chunk.iter().map(|(_, img)| img.to_rgb8()).collect();
+                let results = self
+                    .formula
+                    .predict(crops)
+                    .map_err(|e| ExtractError::Layout(format!("Formula prediction failed: {e}")))?;
+                for (i, (det_idx, _)) in chunk.iter().enumerate() {
+                    if let Some(latex) = results.formulas.get(i) {
+                        all_formulas.push((*det_idx, latex.clone()));
+                    }
+                }
+            }
+            all_formulas.into_iter().collect()
         } else {
             HashMap::new()
         };
@@ -317,6 +320,9 @@ impl Pipeline {
     ) -> Result<Vec<Region>, ExtractError> {
         let scale = self.options.dpi as f32 / 72.0;
         let mut regions = Vec::new();
+        // Track which inline formula detection indices have been consumed
+        // (spliced into a parent text-bearing region).
+        let mut consumed_inline: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
         // Collect inline formula data for text merging (bbox in PDF points, image-space Y-down)
         let inline_formulas: Vec<(usize, text::InlineFormula)> = detected
@@ -362,6 +368,7 @@ impl Pipeline {
                 image_path: None,
                 caption: None,
                 chart_type: None,
+                consumed: kind == RegionKind::InlineFormula && consumed_inline.contains(&idx),
             };
 
             // Populate text content, splicing inline formulas.
@@ -370,10 +377,11 @@ impl Pipeline {
                 // Find overlapping inline formulas (formula center inside this region bbox)
                 let overlapping: Vec<&text::InlineFormula> = inline_formulas
                     .iter()
-                    .filter_map(|(_, f)| {
+                    .filter_map(|(det_idx, f)| {
                         let cx = (f.bbox[0] + f.bbox[2]) / 2.0;
                         let cy = (f.bbox[1] + f.bbox[3]) / 2.0;
                         if cx >= bbox[0] && cx <= bbox[2] && cy >= bbox[1] && cy <= bbox[3] {
+                            consumed_inline.insert(*det_idx);
                             Some(f)
                         } else {
                             None

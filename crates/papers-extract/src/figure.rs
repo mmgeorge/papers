@@ -204,6 +204,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            consumed: false,
         }
     }
 
