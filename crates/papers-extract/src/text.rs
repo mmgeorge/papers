@@ -77,6 +77,18 @@ fn point_in_bbox(cx: f32, cy: f32, bbox: [f32; 4]) -> bool {
     cx >= bbox[0] && cx <= bbox[2] && cy >= bbox[1] && cy <= bbox[3]
 }
 
+/// Controls how grouped lines are assembled into the final text string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssemblyMode {
+    /// Reflow: join lines with spaces, detect paragraphs, dehyphenate.
+    /// Used for normal prose text regions.
+    Reflow,
+    /// Preserve layout: keep each line separate (`\n`-joined) and compute
+    /// leading indentation from character positions. Used for algorithm /
+    /// pseudocode regions where line structure is meaningful.
+    PreserveLayout,
+}
+
 /// Extract text from pdfium characters that fall within a region bounding box,
 /// splicing inline formula LaTeX at the correct spatial positions.
 ///
@@ -84,11 +96,13 @@ fn point_in_bbox(cx: f32, cy: f32, bbox: [f32; 4]) -> bool {
 /// `page_height_pt` is used to convert PdfChar coords from PDF space (Y-up) to image space.
 /// `inline_formulas` are inline formulas whose LaTeX should be spliced as `$latex$` into the text.
 /// Characters whose center falls inside any inline formula bbox are excluded.
+/// `mode` controls whether lines are reflowed into paragraphs or preserved with indentation.
 pub fn extract_region_text(
     chars: &[PdfChar],
     region_bbox: [f32; 4],
     page_height_pt: f32,
     inline_formulas: &[&InlineFormula],
+    mode: AssemblyMode,
 ) -> String {
     let image_chars: Vec<ImageChar> = chars
         .iter()
@@ -120,7 +134,10 @@ pub fn extract_region_text(
     }
 
     let lines = group_elements_into_lines(&elements);
-    assemble_text(&lines)
+    match mode {
+        AssemblyMode::Reflow => assemble_text(&lines),
+        AssemblyMode::PreserveLayout => assemble_preserving_layout(&lines, region_bbox[0]),
+    }
 }
 
 /// Filter characters whose center falls within the region bounding box,
@@ -303,6 +320,60 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
     result
 }
 
+/// Assemble lines preserving their layout: each line becomes a separate `\n`-joined
+/// output line, with leading spaces computed from the first character's X offset
+/// relative to the region's left edge.
+///
+/// This is used for algorithm / pseudocode regions where line structure and
+/// indentation are structurally meaningful.
+fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // Compute median character width across all lines as the indentation unit.
+    let mut char_widths: Vec<f32> = lines
+        .iter()
+        .flat_map(|line| line.iter())
+        .filter_map(|e| match e {
+            LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' ' => {
+                let w = c.bbox[2] - c.bbox[0];
+                if w > 0.0 { Some(w) } else { None }
+            }
+            _ => None,
+        })
+        .collect();
+
+    let median_char_width = if char_widths.is_empty() {
+        1.0 // fallback — avoids division by zero
+    } else {
+        char_widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        char_widths[char_widths.len() / 2]
+    };
+
+    let mut output_lines: Vec<String> = Vec::with_capacity(lines.len());
+
+    for line in lines {
+        // Find the leftmost element's X position for indentation
+        let first_x = line
+            .iter()
+            .map(|e| e.bbox()[0])
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(region_left_x);
+
+        let indent_count = ((first_x - region_left_x) / median_char_width)
+            .round()
+            .max(0.0) as usize;
+
+        let line_text = build_line_text(line);
+        let mut indented = " ".repeat(indent_count);
+        indented.push_str(&line_text);
+        output_lines.push(indented);
+    }
+
+    output_lines.join("\n")
+}
+
 /// Build a single line of text from elements sorted left-to-right.
 ///
 /// # Word boundary detection
@@ -433,7 +504,7 @@ mod tests {
         ];
         // Region bbox in image space (Y-down)
         let bbox = [50.0, 50.0, 550.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "A");
     }
 
@@ -452,7 +523,7 @@ mod tests {
             chars.push(make_char_image_space(c, space_x + 5.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hello World");
     }
 
@@ -468,7 +539,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         // Same-paragraph lines are reflowed with a space (not \n)
         assert_eq!(text, "First Second");
     }
@@ -485,7 +556,7 @@ mod tests {
             make_char_image_space('D', 140.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "AB CD");
     }
 
@@ -499,7 +570,7 @@ mod tests {
             make_char_image_space('B', 110.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "AB");
     }
 
@@ -523,7 +594,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 180.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert!(
             text.contains("\n\n"),
             "Expected paragraph break in: {text:?}"
@@ -537,7 +608,7 @@ mod tests {
         ];
         // Region bbox that doesn't contain any chars
         let bbox = [500.0, 500.0, 600.0, 600.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert!(text.is_empty());
     }
 
@@ -561,7 +632,7 @@ mod tests {
             make_char_image_space('2', 110.5, 96.0, 8.0, 10.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert!(!text.contains('\n'), "Superscript should stay on same line: {text:?}");
     }
 
@@ -616,7 +687,7 @@ mod tests {
         };
         let formulas: Vec<&InlineFormula> = vec![&formula];
 
-        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
         assert!(text.contains("$t$"), "Expected $t$ in: {text:?}");
         // The raw 't' glyph should be excluded (not duplicated)
         assert!(!text.contains("t $t$"), "Glyph 't' should be excluded: {text:?}");
@@ -648,7 +719,7 @@ mod tests {
             make_char_image_space('i', 110.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hi");
     }
 
@@ -665,7 +736,7 @@ mod tests {
             make_char_image_space('D', 135.0, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "AB CD");
     }
 
@@ -681,7 +752,7 @@ mod tests {
             make_char_image_space('o', 142.0, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hello");
     }
 
@@ -702,7 +773,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "encountering");
     }
 
@@ -720,7 +791,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "the system");
     }
 
@@ -754,7 +825,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         // The intermediate '~' is joined directly (no spaces around it),
         // producing "encoun~tering" — the key point is NO space before "tering".
         assert!(
@@ -780,7 +851,104 @@ mod tests {
             make_char_image_space('B', 115.0, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[]);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "A B");
+    }
+
+    // ---- PreserveLayout tests ----
+
+    #[test]
+    fn test_preserve_layout_lines_separated() {
+        // Two lines should be joined with \n, not reflowed with a space.
+        let mut chars = Vec::new();
+        for (i, c) in "Line1".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        for (i, c) in "Line2".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+        // Region left edge at 100.0 — same as where the chars start (no indent)
+        let bbox = [100.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        assert_eq!(text, "Line1\nLine2");
+    }
+
+    #[test]
+    fn test_preserve_layout_indentation() {
+        // Line 2 is indented ~3 char widths (10pt each) from the region left edge.
+        // Region left edge = 50.0, line 1 starts at x=50 (0 indent),
+        // line 2 starts at x=80 (≈3 char widths of 10pt).
+        let mut chars = Vec::new();
+        for (i, c) in "for".chars().enumerate() {
+            chars.push(make_char_image_space(c, 50.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        for (i, c) in "x=1".chars().enumerate() {
+            chars.push(make_char_image_space(c, 80.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // First line should have no leading spaces (starts at region edge)
+        assert_eq!(lines[0], "for");
+        // Second line should have leading spaces for indentation
+        assert!(lines[1].starts_with(' '), "Expected indentation: {lines:?}");
+        assert_eq!(lines[1].trim(), "x=1");
+    }
+
+    #[test]
+    fn test_preserve_layout_single_line() {
+        // Edge case: single line should work without \n.
+        let mut chars = Vec::new();
+        for (i, c) in "return x".chars().enumerate() {
+            if c == ' ' {
+                chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 0.0, 12.0, PAGE_H));
+            } else {
+                chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+            }
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        assert!(!text.contains('\n'), "Single line should have no newlines: {text:?}");
+        assert!(text.contains("return"), "Should contain 'return': {text:?}");
+    }
+
+    #[test]
+    fn test_preserve_layout_with_inline_formula() {
+        // Inline formula in an algorithm line should be spliced correctly.
+        let mut chars = Vec::new();
+        for (i, c) in "set".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 8.5, 100.0, 8.0, 12.0, PAGE_H));
+        }
+        // Formula glyph (will be excluded)
+        chars.push(make_char_image_space('x', 140.0, 100.0, 8.0, 12.0, PAGE_H));
+        // Continue after formula
+        for (i, c) in "to".chars().enumerate() {
+            chars.push(make_char_image_space(c, 165.0 + i as f32 * 8.5, 100.0, 8.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let formula = InlineFormula {
+            bbox: [135.0, 96.0, 155.0, 114.0],
+            latex: "x_0".into(),
+        };
+        let formulas: Vec<&InlineFormula> = vec![&formula];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::PreserveLayout);
+        assert!(text.contains("$x_0$"), "Expected $x_0$ in: {text:?}");
+    }
+
+    #[test]
+    fn test_reflow_mode_unchanged() {
+        // Regression: Reflow mode should still join lines with spaces (not \n).
+        let mut chars = Vec::new();
+        for (i, c) in "Hello".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        for (i, c) in "World".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert_eq!(text, "Hello World");
     }
 }

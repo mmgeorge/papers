@@ -336,9 +336,6 @@ impl Pipeline {
             })
             .collect();
 
-        // Track which inline formulas are consumed by a text region
-        let mut consumed_inline = vec![false; inline_formulas.len()];
-
         for (idx, det) in detected.iter().enumerate() {
             let kind = det.kind;
 
@@ -352,11 +349,6 @@ impl Pipeline {
 
             let order = idx as u32;
             let id = format!("p{}_{}", page_idx + 1, order);
-
-            // Skip inline formulas — they are merged into text regions (or emitted as orphans below)
-            if kind == RegionKind::InlineFormula {
-                continue;
-            }
 
             let mut region = Region {
                 id,
@@ -372,28 +364,38 @@ impl Pipeline {
                 chart_type: None,
             };
 
-            // Populate text content, splicing inline formulas
-            if kind.is_text_bearing() || kind.is_caption() {
+            // Populate text content, splicing inline formulas.
+            // InlineFormula regions are not text-extracted — they get latex from crop recognition.
+            if (kind.is_text_bearing() || kind.is_caption()) && kind != RegionKind::InlineFormula {
                 // Find overlapping inline formulas (formula center inside this region bbox)
-                let mut overlapping: Vec<&text::InlineFormula> = Vec::new();
-                for (i, (_, f)) in inline_formulas.iter().enumerate() {
-                    let cx = (f.bbox[0] + f.bbox[2]) / 2.0;
-                    let cy = (f.bbox[1] + f.bbox[3]) / 2.0;
-                    if cx >= bbox[0] && cx <= bbox[2] && cy >= bbox[1] && cy <= bbox[3] {
-                        overlapping.push(f);
-                        consumed_inline[i] = true;
-                    }
-                }
+                let overlapping: Vec<&text::InlineFormula> = inline_formulas
+                    .iter()
+                    .filter_map(|(_, f)| {
+                        let cx = (f.bbox[0] + f.bbox[2]) / 2.0;
+                        let cy = (f.bbox[1] + f.bbox[3]) / 2.0;
+                        if cx >= bbox[0] && cx <= bbox[2] && cy >= bbox[1] && cy <= bbox[3] {
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let mode = if kind == RegionKind::Algorithm {
+                    text::AssemblyMode::PreserveLayout
+                } else {
+                    text::AssemblyMode::Reflow
+                };
                 region.text = Some(text::extract_region_text(
                     chars,
                     bbox,
                     page_height_pt,
                     &overlapping,
+                    mode,
                 ));
             }
 
             // Populate formula LaTeX from crop-based prediction
-            if kind == RegionKind::DisplayFormula {
+            if kind == RegionKind::DisplayFormula || kind == RegionKind::InlineFormula {
                 if let Some(latex) = formula_latex.get(&idx) {
                     region.latex = Some(latex.clone());
                 }
@@ -422,34 +424,6 @@ impl Pipeline {
             }
 
             regions.push(region);
-        }
-
-        // Emit orphan inline formulas (not consumed by any text region) as standalone regions
-        for (i, (det_idx, _)) in inline_formulas.iter().enumerate() {
-            if consumed_inline[i] {
-                continue;
-            }
-            let det = &detected[*det_idx];
-            let bbox = [
-                det.bbox_px[0] / scale,
-                det.bbox_px[1] / scale,
-                det.bbox_px[2] / scale,
-                det.bbox_px[3] / scale,
-            ];
-            let order = *det_idx as u32;
-            regions.push(Region {
-                id: format!("p{}_{}", page_idx + 1, order),
-                kind: RegionKind::InlineFormula,
-                bbox,
-                confidence: det.confidence,
-                order,
-                text: None,
-                html: None,
-                latex: formula_latex.get(det_idx).cloned(),
-                image_path: None,
-                caption: None,
-                chart_type: None,
-            });
         }
 
         Ok(regions)
