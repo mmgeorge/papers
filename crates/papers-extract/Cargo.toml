@@ -22,7 +22,7 @@ oar-ocr = "0.6"
 pdfium-render = { version = "0.8", features = ["image_025"] }
 image = "0.25"
 ndarray = "0.17"
-ort = { version = "=2.0.0-rc.11", features = ["load-dynamic"] }
+ort = { version = "=2.0.0-rc.11", features = ["load-dynamic", "half"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -32,10 +32,15 @@ ttf-parser = "0.25"
 reqwest = { workspace = true, features = ["blocking"] }
 flate2 = "1"
 tar = "0.4"
+# NOTE: default-features disabled to avoid esaxx-rs/cpp which forces static CRT (/MT),
+# conflicting with clipper2c-sys's dynamic CRT (/MD). We only need inference (decode),
+# not BPE training, so esaxx_fast is unnecessary. We still need a regex backend.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+half = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 oar-ocr = { version = "0.6", features = ["directml", "cuda"] }
-ort = { version = "=2.0.0-rc.11", features = ["directml", "cuda", "load-dynamic"] }
+ort = { version = "=2.0.0-rc.11", features = ["directml", "cuda", "load-dynamic", "half"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 oar-ocr = { version = "0.6", features = ["coreml"] }

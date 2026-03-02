@@ -1,10 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use oar_ocr::core::config::{OrtExecutionProvider, OrtGraphOptimizationLevel, OrtSessionConfig};
-use oar_ocr::predictors::{FormulaRecognitionPredictor, TableStructureRecognitionPredictor};
+use oar_ocr::predictors::TableStructureRecognitionPredictor;
 
 use crate::error::ExtractError;
-use crate::{FormulaQuality, Quality};
+use crate::formula::FormulaPredictor;
+use crate::Quality;
 
 /// Model file metadata for download.
 struct ModelFile {
@@ -30,22 +31,22 @@ const TABLE_DICT: ModelFile = ModelFile {
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/table_structure_dict_ch.txt",
 };
 
-// Formula recognition — small (Low quality)
-const FORMULANET_S: ModelFile = ModelFile {
-    filename: "pp-formulanet_plus-s.onnx",
-    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-formulanet_plus-s.onnx",
-};
-
-// Formula recognition — medium (Med quality)
-const FORMULANET_M: ModelFile = ModelFile {
-    filename: "pp-formulanet_plus-m.onnx",
-    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-formulanet_plus-m.onnx",
-};
-
-// Formula tokenizer (required for all formula models)
+// Formula tokenizer (required for formula recognition)
 const FORMULA_TOKENIZER: ModelFile = ModelFile {
     filename: "unimernet_tokenizer.json",
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/unimernet_tokenizer.json",
+};
+
+// Formula encoder (split FP16 model — expected in cache dir, no auto-download yet)
+const FORMULA_ENCODER: ModelFile = ModelFile {
+    filename: "encoder_fp16.onnx",
+    url: "", // No auto-download — must be pre-exported via export.py
+};
+
+// Formula decoder (split FP16 model with argmax — expected in cache dir)
+const FORMULA_DECODER: ModelFile = ModelFile {
+    filename: "decoder_fp16_argmax.onnx",
+    url: "", // No auto-download — must be pre-exported via export.py
 };
 
 // Table classification — wired vs wireless (Quality mode only)
@@ -60,18 +61,13 @@ const SLANEXT_WIRED: ModelFile = ModelFile {
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/slanext_wired.onnx",
 };
 
-// Formula recognition — large (High quality)
-const FORMULANET_L: ModelFile = ModelFile {
-    filename: "pp-formulanet_plus-l.onnx",
-    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-formulanet_plus-l.onnx",
-};
-
 /// Resolved paths to all required model files.
 pub struct ModelPaths {
     pub layout: PathBuf,
     pub slanet_plus: PathBuf,
     pub table_dict: PathBuf,
-    pub formula: PathBuf,
+    pub formula_encoder: PathBuf,
+    pub formula_decoder: PathBuf,
     pub formula_tokenizer: PathBuf,
     // Quality-mode extras
     pub table_classifier: Option<PathBuf>,
@@ -92,7 +88,6 @@ pub fn default_cache_dir() -> PathBuf {
 /// Ensure all models for the given quality mode are downloaded and return their paths.
 pub fn ensure_models(
     quality: Quality,
-    formula_quality: FormulaQuality,
     cache_dir: &Path,
 ) -> Result<ModelPaths, ExtractError> {
     std::fs::create_dir_all(cache_dir)?;
@@ -103,12 +98,9 @@ pub fn ensure_models(
     let table_dict = ensure_model(cache_dir, &TABLE_DICT)?;
     let formula_tokenizer = ensure_model(cache_dir, &FORMULA_TOKENIZER)?;
 
-    // Formula model selected by --formula-quality
-    let formula = match formula_quality {
-        FormulaQuality::Low => ensure_model(cache_dir, &FORMULANET_S)?,
-        FormulaQuality::Med => ensure_model(cache_dir, &FORMULANET_M)?,
-        FormulaQuality::High => ensure_model(cache_dir, &FORMULANET_L)?,
-    };
+    // Formula encoder/decoder (no auto-download, just check existence)
+    let formula_encoder = ensure_local_model(cache_dir, &FORMULA_ENCODER)?;
+    let formula_decoder = ensure_local_model(cache_dir, &FORMULA_DECODER)?;
 
     // Table models selected by --quality
     let (table_classifier, slanext_wired) = match quality {
@@ -124,7 +116,8 @@ pub fn ensure_models(
         layout,
         slanet_plus,
         table_dict,
-        formula,
+        formula_encoder,
+        formula_decoder,
         formula_tokenizer,
         table_classifier,
         slanext_wired,
@@ -141,6 +134,17 @@ fn ensure_model(cache_dir: &Path, model: &ModelFile) -> Result<PathBuf, ExtractE
     tracing::info!("Downloading {} from {}...", model.filename, model.url);
     download_file(model.url, &local_path)?;
     Ok(local_path)
+}
+
+/// Ensure a local-only model file exists (no download URL available).
+fn ensure_local_model(cache_dir: &Path, model: &ModelFile) -> Result<PathBuf, ExtractError> {
+    let local_path = cache_dir.join(model.filename);
+    if local_path.exists() {
+        return Ok(local_path);
+    }
+    Err(ExtractError::ModelNotFound {
+        path: local_path.display().to_string(),
+    })
 }
 
 /// Download a file from a URL to a local path, following redirects.
@@ -233,7 +237,7 @@ pub fn init_ort_runtime() -> Result<(), ExtractError> {
     }
 }
 
-/// Build the platform-specific ORT session configuration.
+/// Build the platform-specific ORT session configuration (for oar-ocr predictors).
 pub fn ort_config() -> OrtSessionConfig {
     let providers = platform_execution_providers();
     OrtSessionConfig::new()
@@ -241,7 +245,7 @@ pub fn ort_config() -> OrtSessionConfig {
         .with_optimization_level(OrtGraphOptimizationLevel::All)
 }
 
-/// Get the execution providers for the current platform.
+/// Get the execution providers for the current platform (for oar-ocr).
 fn platform_execution_providers() -> Vec<OrtExecutionProvider> {
     let mut providers = Vec::new();
 
@@ -267,23 +271,15 @@ fn platform_execution_providers() -> Vec<OrtExecutionProvider> {
     providers
 }
 
-/// Build a standalone formula recognition predictor.
+/// Build a custom CUDA formula predictor from split encoder/decoder models.
 pub fn build_formula_predictor(
     paths: &ModelPaths,
-    formula_quality: FormulaQuality,
-) -> Result<FormulaRecognitionPredictor, ExtractError> {
-    let config = ort_config();
-    let name = match formula_quality {
-        FormulaQuality::Low => "PP-FormulaNet_plus-S",
-        FormulaQuality::Med => "PP-FormulaNet_plus-M",
-        FormulaQuality::High => "PP-FormulaNet_plus-L",
-    };
-    FormulaRecognitionPredictor::builder()
-        .model_name(name)
-        .tokenizer_path(&paths.formula_tokenizer)
-        .with_ort_config(config)
-        .build(&paths.formula)
-        .map_err(|e| ExtractError::Model(format!("Failed to build formula predictor: {e}")))
+) -> Result<FormulaPredictor, ExtractError> {
+    FormulaPredictor::new(
+        &paths.formula_encoder,
+        &paths.formula_decoder,
+        &paths.formula_tokenizer,
+    )
 }
 
 /// Build a standalone table structure recognition predictor.

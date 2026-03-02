@@ -3,11 +3,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use image::DynamicImage;
-use oar_ocr::predictors::{FormulaRecognitionPredictor, TableStructureRecognitionPredictor};
+use oar_ocr::predictors::TableStructureRecognitionPredictor;
 use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
 use crate::figure;
+use crate::formula::FormulaPredictor;
 use crate::layout::{DetectedRegion, LayoutDetector};
 use crate::models;
 use crate::output;
@@ -21,7 +22,7 @@ use crate::ExtractOptions;
 pub struct Pipeline {
     pdfium: Pdfium,
     layout: LayoutDetector,
-    formula: FormulaRecognitionPredictor,
+    formula: FormulaPredictor,
     table: TableStructureRecognitionPredictor,
     options: PipelineOptions,
 }
@@ -47,9 +48,9 @@ impl Pipeline {
             .clone()
             .unwrap_or_else(models::default_cache_dir);
 
-        let paths = models::ensure_models(options.quality, options.formula_quality, &cache_dir)?;
+        let paths = models::ensure_models(options.quality, &cache_dir)?;
         let layout = models::build_layout_detector(&paths.layout)?;
-        let formula = models::build_formula_predictor(&paths, options.formula_quality)?;
+        let formula = models::build_formula_predictor(&paths)?;
         let table = models::build_table_predictor(&paths)?;
 
         Ok(Self {
@@ -209,25 +210,17 @@ impl Pipeline {
             .collect();
 
         let formula_latex: HashMap<usize, String> = if !formula_entries.is_empty() {
-            // Process formulas in chunks to avoid OOM with large models.
-            const FORMULA_BATCH_SIZE: usize = 8;
-            let mut all_formulas: Vec<(usize, String)> = Vec::new();
-            for chunk_start in (0..formula_entries.len()).step_by(FORMULA_BATCH_SIZE) {
-                let chunk_end = (chunk_start + FORMULA_BATCH_SIZE).min(formula_entries.len());
-                let chunk = &formula_entries[chunk_start..chunk_end];
-                let crops: Vec<image::RgbImage> =
-                    chunk.iter().map(|(_, img)| img.to_rgb8()).collect();
-                let results = self
-                    .formula
-                    .predict(crops)
-                    .map_err(|e| ExtractError::Layout(format!("Formula prediction failed: {e}")))?;
-                for (i, (det_idx, _)) in chunk.iter().enumerate() {
-                    if let Some(latex) = results.formulas.get(i) {
-                        all_formulas.push((*det_idx, latex.clone()));
-                    }
-                }
-            }
-            all_formulas.into_iter().collect()
+            let crops: Vec<DynamicImage> =
+                formula_entries.iter().map(|(_, img)| img.clone()).collect();
+            let results = self
+                .formula
+                .predict(&crops)
+                .map_err(|e| ExtractError::Layout(format!("Formula prediction failed: {e}")))?;
+            formula_entries
+                .iter()
+                .zip(results)
+                .map(|((det_idx, _), latex)| (*det_idx, latex))
+                .collect()
         } else {
             HashMap::new()
         };
