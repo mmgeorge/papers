@@ -1,8 +1,9 @@
 //! Custom CUDA formula predictor — replaces oar-ocr FormulaRecognitionPredictor.
 //!
 //! Uses split encoder/decoder ONNX models with CUDA EP + FP16 for fast GPU
-//! inference. The decoder runs an autoregressive loop using IoBinding to keep
-//! KV cache on GPU between steps (only next_token crosses GPU→CPU per step).
+//! inference. The decoder uses a persistent IoBinding with pre-allocated GPU
+//! buffers for zero-allocation autoregressive decoding. cudarc handles raw
+//! memcpy updates between steps. Only next_token (8 bytes) crosses GPU→CPU.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -11,10 +12,10 @@ use half::f16;
 use image::imageops::FilterType;
 use image::DynamicImage;
 use ndarray::Array4;
-use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
-use ort::value::Value;
+use ort::value::{Value, ValueType};
 
 use crate::error::ExtractError;
 
@@ -28,15 +29,68 @@ const HEAD_DIM: usize = 32;
 const MAX_SEQ: usize = 512;
 const N_KV_BUFFERS: usize = N_LAYERS * 2; // key + value per layer
 
-/// Custom formula predictor — replaces oar-ocr FormulaRecognitionPredictor.
+/// Custom formula predictor with persistent IoBinding on the decoder.
+///
+/// The encoder runs normally (one pass per formula). The decoder uses a
+/// persistent IoBinding with all buffers pre-allocated on GPU at init time.
+/// Between steps, cudarc handles small memcpy updates (input_ids, step,
+/// next_token, and KV cache output→input copies). No allocations during
+/// autoregressive decoding.
 pub struct FormulaPredictor {
     encoder: Mutex<Session>,
-    decoder: Mutex<Session>,
+    decoder: Mutex<DecoderState>,
     tokenizer: tokenizers::Tokenizer,
-    /// MemoryInfo for CUDA device 0 (reused across calls).
     cuda_mem: MemoryInfo,
-    /// MemoryInfo for CPU (used for next_token output).
-    cpu_mem: MemoryInfo,
+    #[cfg(target_os = "windows")]
+    cuda_stream: std::sync::Arc<cudarc::driver::CudaStream>,
+}
+
+/// Pre-allocated decoder state with persistent IoBinding.
+///
+/// Field order matters: `binding` must be dropped before the input Values
+/// it references (`_input_ids`, `_step`, `_enc_hidden`, `_kv_in`), because
+/// `bind_input` stores raw pointers to their GPU buffers.
+#[cfg(target_os = "windows")]
+struct DecoderState {
+    session: Session,
+    binding: ort::io_binding::IoBinding,
+    // Input Values (must outlive binding — bind_input stores raw pointers)
+    _input_ids: Value,
+    _step: Value,
+    _enc_hidden: Value,
+    _kv_in: Vec<Value>,
+    // Raw GPU pointers for cudarc memcpy
+    input_ids_ptr: u64,
+    step_ptr: u64,
+    enc_hidden_ptr: u64,
+    enc_hidden_bytes: usize,
+    // KV cache pointers (for D2D copy: out → in between steps)
+    kv_in_ptrs: Vec<u64>,
+    kv_out_ptrs: Vec<u64>,
+    kv_buf_bytes: usize,
+    // Output pointer
+    next_token_ptr: u64,
+    // Allocator must outlive all Values (dropped last in struct drop order)
+    _allocator: Allocator,
+}
+
+#[cfg(not(target_os = "windows"))]
+struct DecoderState {
+    session: Session,
+}
+
+/// Get the raw device pointer from any ORT Value (works for GPU-resident tensors).
+fn value_data_ptr(value: &Value) -> u64 {
+    use ort::AsPointer;
+    let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let api = ort::api();
+    unsafe {
+        let _ = (api.GetTensorMutableData)(
+            value.ptr() as *mut ort::sys::OrtValue,
+            &mut ptr as *mut *mut std::ffi::c_void as *mut *mut _,
+        );
+    }
+    ptr as u64
 }
 
 impl FormulaPredictor {
@@ -46,7 +100,14 @@ impl FormulaPredictor {
         decoder_path: &Path,
         tokenizer_path: &Path,
     ) -> Result<Self, ExtractError> {
-        // Encoder session (standard CUDA EP)
+        // --- CUDA context + stream (cudarc shares primary context with ORT) ---
+        #[cfg(target_os = "windows")]
+        let cuda_ctx = cudarc::driver::CudaContext::new(0)
+            .map_err(|e| ExtractError::Model(format!("cudarc CudaContext: {e}")))?;
+        #[cfg(target_os = "windows")]
+        let cuda_stream = cuda_ctx.default_stream();
+
+        // --- Encoder session (standard CUDA EP, no graphs) ---
         let encoder = Session::builder()
             .map_err(|e| ExtractError::Model(format!("Encoder session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -62,13 +123,26 @@ impl FormulaPredictor {
                 ))
             })?;
 
-        // Decoder session (CUDA EP)
-        let decoder = Session::builder()
+        // --- Decoder session (CUDA EP + CUDA graphs + shared stream) ---
+        #[cfg(target_os = "windows")]
+        let decoder_ep = {
+            let raw_stream = cuda_stream.cu_stream() as *mut ();
+            unsafe {
+                ort::execution_providers::CUDAExecutionProvider::default()
+                    .with_cuda_graph(true)
+                    .with_compute_stream(raw_stream)
+                    .build()
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let decoder_ep =
+            ort::execution_providers::CUDAExecutionProvider::default().build();
+
+        let decoder_session = Session::builder()
             .map_err(|e| ExtractError::Model(format!("Decoder session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| ExtractError::Model(format!("Decoder opt level: {e}")))?
-            .with_execution_providers([ort::execution_providers::CUDAExecutionProvider::default()
-                .build()])
+            .with_execution_providers([decoder_ep])
             .map_err(|e| ExtractError::Model(format!("Decoder EP: {e}")))?
             .commit_from_file(decoder_path)
             .map_err(|e| {
@@ -86,13 +160,57 @@ impl FormulaPredictor {
         )
         .map_err(|e| ExtractError::Model(format!("CUDA MemoryInfo: {e}")))?;
 
-        let cpu_mem = MemoryInfo::new(
-            AllocationDevice::CPU,
-            0,
-            AllocatorType::Device,
-            MemoryType::Default,
-        )
-        .map_err(|e| ExtractError::Model(format!("CPU MemoryInfo: {e}")))?;
+        // --- Determine encoder output shape via dummy forward pass ---
+        let enc_output_shape = {
+            let mut enc_probe = Session::builder()
+                .map_err(|e| ExtractError::Model(format!("Probe session builder: {e}")))?
+                .with_optimization_level(GraphOptimizationLevel::Level3)
+                .map_err(|e| ExtractError::Model(format!("Probe opt level: {e}")))?
+                .with_execution_providers([
+                    ort::execution_providers::CUDAExecutionProvider::default().build(),
+                ])
+                .map_err(|e| ExtractError::Model(format!("Probe EP: {e}")))?
+                .commit_from_file(encoder_path)
+                .map_err(|e| {
+                    ExtractError::Model(format!("Probe load: {e}"))
+                })?;
+
+            let dummy = preprocess_image(&DynamicImage::new_rgb8(64, 64));
+            let input_name = enc_probe.inputs()[0].name().to_string();
+            let output_name = enc_probe.outputs()[0].name().to_string();
+            let input_tensor = Value::from_array(dummy.into_dyn())
+                .map_err(|e| ExtractError::Model(format!("dummy encoder input: {e}")))?;
+            let mut binding = enc_probe
+                .create_binding()
+                .map_err(|e| ExtractError::Model(format!("dummy encoder binding: {e}")))?;
+            binding
+                .bind_input(&input_name, &input_tensor)
+                .map_err(|e| ExtractError::Model(format!("dummy bind_input: {e}")))?;
+            binding
+                .bind_output_to_device(&output_name, &cuda_mem)
+                .map_err(|e| ExtractError::Model(format!("dummy bind_output: {e}")))?;
+            let outputs = enc_probe
+                .run_binding(&binding)
+                .map_err(|e| ExtractError::Model(format!("dummy encoder run: {e}")))?;
+            let out = &outputs[0];
+            match out.dtype() {
+                ValueType::Tensor { shape, .. } => {
+                    shape.iter().map(|&d| d as usize).collect::<Vec<_>>()
+                }
+                _ => {
+                    return Err(ExtractError::Model(
+                        "encoder output is not a tensor".into(),
+                    ))
+                }
+            }
+        };
+        tracing::debug!("Encoder output shape: {enc_output_shape:?}");
+
+        let decoder_state = Self::build_decoder_state(
+            decoder_session,
+            &cuda_mem,
+            &enc_output_shape,
+        )?;
 
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|e| {
             ExtractError::Model(format!(
@@ -103,16 +221,147 @@ impl FormulaPredictor {
 
         let predictor = Self {
             encoder: Mutex::new(encoder),
-            decoder: Mutex::new(decoder),
+            decoder: Mutex::new(decoder_state),
             tokenizer,
             cuda_mem,
-            cpu_mem,
+            #[cfg(target_os = "windows")]
+            cuda_stream,
         };
 
-        // Warmup: run a few dummy inferences to prime ORT/CUDA
         predictor.warmup()?;
-
         Ok(predictor)
+    }
+
+    /// Build the decoder state with a persistent IoBinding and pre-allocated GPU buffers.
+    #[cfg(target_os = "windows")]
+    fn build_decoder_state(
+        decoder_session: Session,
+        cuda_mem: &MemoryInfo,
+        enc_output_shape: &[usize],
+    ) -> Result<DecoderState, ExtractError> {
+        let allocator = Allocator::new(&decoder_session, cuda_mem.clone())
+            .map_err(|e| ExtractError::Model(format!("CUDA allocator: {e}")))?;
+
+        let enc_hidden_elems: usize = enc_output_shape.iter().product();
+        let enc_hidden_bytes = enc_hidden_elems * std::mem::size_of::<f16>();
+        let kv_shape = [1usize, N_HEADS, MAX_SEQ, HEAD_DIM];
+        let kv_buf_bytes = N_HEADS * MAX_SEQ * HEAD_DIM * std::mem::size_of::<f16>();
+
+        // --- Allocate input tensors on GPU ---
+        let mut input_ids_t = ort::value::Tensor::<i64>::new(&allocator, [1usize, 1])
+            .map_err(|e| ExtractError::Model(format!("alloc input_ids: {e}")))?;
+        let input_ids_ptr = input_ids_t.data_ptr_mut() as u64;
+
+        let mut step_t = ort::value::Tensor::<i64>::new(&allocator, [1usize])
+            .map_err(|e| ExtractError::Model(format!("alloc step: {e}")))?;
+        let step_ptr = step_t.data_ptr_mut() as u64;
+
+        let mut enc_hidden_t =
+            ort::value::Tensor::<f16>::new(&allocator, enc_output_shape)
+                .map_err(|e| ExtractError::Model(format!("alloc enc_hidden: {e}")))?;
+        let enc_hidden_ptr = enc_hidden_t.data_ptr_mut() as u64;
+
+        // KV input buffers (separate from outputs to avoid aliasing)
+        let mut kv_in: Vec<Value> = Vec::with_capacity(N_KV_BUFFERS);
+        let mut kv_in_ptrs: Vec<u64> = Vec::with_capacity(N_KV_BUFFERS);
+        for _ in 0..N_KV_BUFFERS {
+            let mut t = ort::value::Tensor::<f16>::new(&allocator, kv_shape)
+                .map_err(|e| ExtractError::Model(format!("alloc kv_in: {e}")))?;
+            kv_in_ptrs.push(t.data_ptr_mut() as u64);
+            kv_in.push(t.into());
+        }
+
+        // --- Allocate output tensors on GPU ---
+        // KV output buffers
+        let mut kv_out_ptrs: Vec<u64> = Vec::with_capacity(N_KV_BUFFERS);
+        let mut kv_out_values: Vec<Value> = Vec::with_capacity(N_KV_BUFFERS);
+        for _ in 0..N_KV_BUFFERS {
+            let mut t = ort::value::Tensor::<f16>::new(&allocator, kv_shape)
+                .map_err(|e| ExtractError::Model(format!("alloc kv_out: {e}")))?;
+            kv_out_ptrs.push(t.data_ptr_mut() as u64);
+            kv_out_values.push(t.into());
+        }
+
+        // logits output (on GPU, we don't read it — model uses it internally for argmax)
+        let logits_t = ort::value::Tensor::<f16>::new(
+            &allocator,
+            [1usize, 1, 50000], // vocab_size from model metadata
+        )
+        .map_err(|e| ExtractError::Model(format!("alloc logits: {e}")))?;
+
+        // next_token output
+        let mut next_token_t = ort::value::Tensor::<i64>::new(&allocator, [1usize])
+            .map_err(|e| ExtractError::Model(format!("alloc next_token: {e}")))?;
+        let next_token_ptr = next_token_t.data_ptr_mut() as u64;
+
+        // --- Create persistent IoBinding ---
+        let mut binding = decoder_session
+            .create_binding()
+            .map_err(|e| ExtractError::Model(format!("decoder create_binding: {e}")))?;
+
+        // Convert typed tensors to Values for binding
+        let input_ids_val: Value = input_ids_t.into();
+        let step_val: Value = step_t.into();
+        let enc_hidden_val: Value = enc_hidden_t.into();
+
+        // Bind inputs (borrows — Values must outlive binding)
+        binding
+            .bind_input("input_ids", &input_ids_val)
+            .map_err(|e| ExtractError::Model(format!("bind input_ids: {e}")))?;
+        binding
+            .bind_input("step", &step_val)
+            .map_err(|e| ExtractError::Model(format!("bind step: {e}")))?;
+        binding
+            .bind_input("encoder_hidden_states", &enc_hidden_val)
+            .map_err(|e| ExtractError::Model(format!("bind enc_hidden: {e}")))?;
+
+        for (i, kv) in kv_in.iter().enumerate() {
+            binding
+                .bind_input(&kv_input_name(i), kv)
+                .map_err(|e| ExtractError::Model(format!("bind kv_in {i}: {e}")))?;
+        }
+
+        // Bind outputs (moves — binding takes ownership)
+        for (i, kv_out) in kv_out_values.into_iter().enumerate() {
+            binding
+                .bind_output(&kv_output_name(i), kv_out)
+                .map_err(|e| ExtractError::Model(format!("bind kv_out {i}: {e}")))?;
+        }
+        binding
+            .bind_output("logits", logits_t)
+            .map_err(|e| ExtractError::Model(format!("bind logits: {e}")))?;
+        binding
+            .bind_output("next_token", next_token_t)
+            .map_err(|e| ExtractError::Model(format!("bind next_token: {e}")))?;
+
+        Ok(DecoderState {
+            session: decoder_session,
+            binding,
+            _input_ids: input_ids_val,
+            _step: step_val,
+            _enc_hidden: enc_hidden_val,
+            _kv_in: kv_in,
+            input_ids_ptr,
+            step_ptr,
+            enc_hidden_ptr,
+            enc_hidden_bytes,
+            kv_in_ptrs,
+            kv_out_ptrs,
+            kv_buf_bytes,
+            next_token_ptr,
+            _allocator: allocator,
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn build_decoder_state(
+        decoder_session: Session,
+        _cuda_mem: &MemoryInfo,
+        _enc_output_shape: &[usize],
+    ) -> Result<DecoderState, ExtractError> {
+        Ok(DecoderState {
+            session: decoder_session,
+        })
     }
 
     /// Run warmup inferences to prime ORT/CUDA internals.
@@ -141,7 +390,6 @@ impl FormulaPredictor {
         // Run decoder loop
         let token_ids = self.decode_formula(enc_hidden)?;
 
-        // Decode tokens to LaTeX string
         Ok(decode_tokens(&self.tokenizer, &token_ids))
     }
 
@@ -158,7 +406,6 @@ impl FormulaPredictor {
         let input_tensor = Value::from_array(image.into_dyn())
             .map_err(|e| ExtractError::Formula(format!("encoder input tensor: {e}")))?;
 
-        // Use IoBinding so the encoder output stays on GPU
         let mut binding = session
             .create_binding()
             .map_err(|e| ExtractError::Formula(format!("encoder create_binding: {e}")))?;
@@ -178,117 +425,134 @@ impl FormulaPredictor {
             .ok_or_else(|| ExtractError::Formula("No encoder output".into()))
     }
 
-    /// Autoregressive decoder loop: generate tokens until EOS or MAX_SEQ.
+    /// Autoregressive decoder loop with persistent IoBinding (zero allocations).
     ///
-    /// Uses IoBinding per step to keep KV cache on GPU. Only next_token
-    /// (8 bytes) is copied back to CPU each step.
-    fn decode_formula(&self, enc_hidden: Value) -> Result<Vec<i64>, ExtractError> {
-        let mut session = self
+    /// All GPU buffers are pre-allocated at init. Per step:
+    /// 1. cudarc H2D: update input_ids (8B) and step (8B)
+    /// 2. session.run_binding: execute decoder (writes to pre-allocated outputs)
+    /// 3. cudarc D2H: read next_token (8B)
+    /// 4. cudarc D2D: copy kv_out → kv_in (16 × 1MB) for next step
+    #[cfg(target_os = "windows")]
+    fn decode_formula(&self, enc_hidden_val: Value) -> Result<Vec<i64>, ExtractError> {
+        let mut state = self
             .decoder
             .lock()
             .map_err(|e| ExtractError::Formula(format!("decoder lock: {e}")))?;
 
-        // Initial KV cache: zeros on CPU (ORT copies to GPU on first use)
-        let kv_size = N_HEADS * MAX_SEQ * HEAD_DIM;
-        let mut kv_values: Vec<Value> = (0..N_KV_BUFFERS)
-            .map(|_| {
-                let data = vec![f16::ZERO; kv_size];
-                let arr =
-                    Array4::<f16>::from_shape_vec([1, N_HEADS, MAX_SEQ, HEAD_DIM], data).unwrap();
-                Value::from_array(arr.into_dyn())
-                    .map(|v| v.into())
-                    .map_err(|e| ExtractError::Formula(format!("init kv zeros: {e}")))
-            })
-            .collect::<Result<_, _>>()?;
+        let cu_stream = self.cuda_stream.cu_stream();
+
+        // D2D copy: encoder output → fixed enc_hidden buffer
+        let src_ptr = value_data_ptr(&enc_hidden_val);
+        unsafe {
+            cudarc::driver::result::memcpy_dtod_async(
+                state.enc_hidden_ptr,
+                src_ptr,
+                state.enc_hidden_bytes,
+                cu_stream,
+            )
+        }
+        .map_err(|e| ExtractError::Formula(format!("D2D enc_hidden: {e}")))?;
+
+        // Zero KV input buffers for new formula
+        for &ptr in &state.kv_in_ptrs {
+            unsafe {
+                cudarc::driver::result::memset_d8_async(ptr, 0u8, state.kv_buf_bytes, cu_stream)
+            }
+            .map_err(|e| ExtractError::Formula(format!("memset kv_in: {e}")))?;
+        }
+
+        self.cuda_stream
+            .synchronize()
+            .map_err(|e| ExtractError::Formula(format!("stream sync init: {e}")))?;
 
         let mut tokens = vec![BOS_ID];
 
         for s in 0..MAX_SEQ {
-            let input_ids_arr = ndarray::array![[*tokens.last().unwrap()]];
-            let step_arr = ndarray::array![s as i64];
+            let last_token = *tokens.last().unwrap();
 
-            let input_ids_val = Value::from_array(input_ids_arr.into_dyn())
-                .map_err(|e| ExtractError::Formula(format!("input_ids tensor: {e}")))?;
-            let step_val = Value::from_array(step_arr.into_dyn())
-                .map_err(|e| ExtractError::Formula(format!("step tensor: {e}")))?;
-
-            let mut binding = session
-                .create_binding()
-                .map_err(|e| ExtractError::Formula(format!("decoder create_binding: {e}")))?;
-
-            // Bind scalar inputs
-            binding
-                .bind_input("input_ids", &input_ids_val)
-                .map_err(|e| ExtractError::Formula(format!("bind input_ids: {e}")))?;
-            binding
-                .bind_input("step", &step_val)
-                .map_err(|e| ExtractError::Formula(format!("bind step: {e}")))?;
-            binding
-                .bind_input("encoder_hidden_states", &enc_hidden)
-                .map_err(|e| ExtractError::Formula(format!("bind encoder_hidden: {e}")))?;
-
-            // Bind KV cache inputs (may be CPU for step 0, GPU for subsequent steps)
-            for (i, kv) in kv_values.iter().enumerate() {
-                let name = kv_input_name(i);
-                binding
-                    .bind_input(&name, kv)
-                    .map_err(|e| ExtractError::Formula(format!("bind {name}: {e}")))?;
+            // H2D: update input_ids and step
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    state.input_ids_ptr,
+                    &[last_token],
+                    cu_stream,
+                )
             }
+            .map_err(|e| ExtractError::Formula(format!("H2D input_ids: {e}")))?;
 
-            // Bind outputs: KV cache and logits stay on GPU, next_token to CPU
-            for i in 0..N_KV_BUFFERS {
-                let name = kv_output_name(i);
-                binding
-                    .bind_output_to_device(&name, &self.cuda_mem)
-                    .map_err(|e| ExtractError::Formula(format!("bind_out {name}: {e}")))?;
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    state.step_ptr,
+                    &[s as i64],
+                    cu_stream,
+                )
             }
-            binding
-                .bind_output_to_device("logits", &self.cuda_mem)
-                .map_err(|e| ExtractError::Formula(format!("bind_out logits: {e}")))?;
-            binding
-                .bind_output_to_device("next_token", &self.cpu_mem)
-                .map_err(|e| ExtractError::Formula(format!("bind_out next_token: {e}")))?;
+            .map_err(|e| ExtractError::Formula(format!("H2D step: {e}")))?;
 
-            // Run one decoder step
-            let mut outputs = session
-                .run_binding(&binding)
+            // Sync memcpy before ORT reads
+            self.cuda_stream
+                .synchronize()
+                .map_err(|e| ExtractError::Formula(format!("stream sync inputs: {e}")))?;
+
+            // Run decoder step (uses persistent binding — no allocations)
+            let DecoderState {
+                ref mut session,
+                ref binding,
+                ..
+            } = *state;
+            session
+                .run_binding(binding)
                 .map_err(|e| ExtractError::Formula(format!("decoder step {s}: {e}")))?;
 
-            // Read next_token (CPU-resident)
-            let next_token_val = outputs
-                .remove("next_token")
-                .ok_or_else(|| ExtractError::Formula("missing next_token output".into()))?;
-            let next_token = extract_i64_scalar(next_token_val)?;
+            // D2H: read next_token
+            let mut next_token_host = [0i64];
+            unsafe {
+                cudarc::driver::result::memcpy_dtoh_async(
+                    &mut next_token_host,
+                    state.next_token_ptr,
+                    cu_stream,
+                )
+            }
+            .map_err(|e| ExtractError::Formula(format!("D2H next_token: {e}")))?;
 
+            self.cuda_stream
+                .synchronize()
+                .map_err(|e| ExtractError::Formula(format!("stream sync token: {e}")))?;
+
+            let next_token = next_token_host[0];
             tokens.push(next_token);
             if next_token == EOS_ID {
                 break;
             }
 
-            // Update KV cache with GPU-resident output values
-            kv_values = (0..N_KV_BUFFERS)
-                .map(|i| {
-                    let name = kv_output_name(i);
-                    outputs
-                        .remove(&name)
-                        .ok_or_else(|| ExtractError::Formula(format!("missing output {name}")))
-                })
-                .collect::<Result<_, _>>()?;
+            // D2D: copy kv_out → kv_in for next step
+            for i in 0..N_KV_BUFFERS {
+                unsafe {
+                    cudarc::driver::result::memcpy_dtod_async(
+                        state.kv_in_ptrs[i],
+                        state.kv_out_ptrs[i],
+                        state.kv_buf_bytes,
+                        cu_stream,
+                    )
+                }
+                .map_err(|e| ExtractError::Formula(format!("D2D kv {i}: {e}")))?;
+            }
+
+            self.cuda_stream
+                .synchronize()
+                .map_err(|e| ExtractError::Formula(format!("stream sync kv: {e}")))?;
         }
 
         Ok(tokens)
     }
-}
 
-/// Extract a single i64 from a Value (expected to be a 1-element tensor on CPU).
-fn extract_i64_scalar(value: Value) -> Result<i64, ExtractError> {
-    let view = value
-        .try_extract_array::<i64>()
-        .map_err(|e| ExtractError::Formula(format!("extract next_token: {e}")))?;
-    Ok(*view
-        .iter()
-        .next()
-        .ok_or_else(|| ExtractError::Formula("empty next_token tensor".into()))?)
+    /// Non-Windows fallback.
+    #[cfg(not(target_os = "windows"))]
+    fn decode_formula(&self, _enc_hidden_val: Value) -> Result<Vec<i64>, ExtractError> {
+        Err(ExtractError::Formula(
+            "CUDA decoder only supported on Windows".into(),
+        ))
+    }
 }
 
 /// Preprocess a formula image for the encoder.
@@ -299,7 +563,6 @@ fn preprocess_image(image: &DynamicImage) -> Array4<f16> {
     let rgb = image.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
 
-    // Grayscale and normalize to find content bounding box
     let pixels: Vec<f32> = rgb
         .pixels()
         .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)
@@ -307,7 +570,6 @@ fn preprocess_image(image: &DynamicImage) -> Array4<f16> {
     let min_val = pixels.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_val = pixels.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
-    // Find content bounding box via thresholding
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
     if max_val > min_val {
         for py in 0..h {
@@ -324,21 +586,18 @@ fn preprocess_image(image: &DynamicImage) -> Array4<f16> {
         }
     }
 
-    // Crop to content (or use full image if no content found)
     let cropped = if x1 > x0 && y1 > y0 {
         image.crop_imm(x0, y0, x1 - x0, y1 - y0)
     } else {
         image.clone()
     };
 
-    // Resize to fit TARGET_SIZE, preserving aspect ratio
     let (cw, ch) = (cropped.width(), cropped.height());
     let scale = TARGET_SIZE as f32 / cw.max(ch) as f32;
     let new_w = (cw as f32 * scale) as u32;
     let new_h = (ch as f32 * scale) as u32;
     let resized = cropped.resize_exact(new_w, new_h, FilterType::Lanczos3);
 
-    // Center-pad to TARGET_SIZE × TARGET_SIZE on black background
     let mut padded = DynamicImage::new_rgb8(TARGET_SIZE, TARGET_SIZE);
     let offset_x = (TARGET_SIZE - new_w) / 2;
     let offset_y = (TARGET_SIZE - new_h) / 2;
@@ -349,7 +608,6 @@ fn preprocess_image(image: &DynamicImage) -> Array4<f16> {
         offset_y as i64,
     );
 
-    // Convert to luminance, normalize, and pack as f16
     let padded_rgb = padded.to_rgb8();
     let ts = TARGET_SIZE as usize;
     let mut data = vec![f16::ZERO; ts * ts];

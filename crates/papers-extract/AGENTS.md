@@ -45,7 +45,7 @@ PDF Input
 | `types.rs` | `ExtractionResult`, `Page`, `Region`, `RegionKind` (24 variants), `Metadata` |
 | `error.rs` | `ExtractError` enum |
 | `layout.rs` | `LayoutDetector` — direct ONNX inference on PP-DocLayoutV3, `DetectedRegion` |
-| `formula.rs` | `FormulaPredictor` — custom CUDA formula predictor using split encoder/decoder FP16 ONNX models with IoBinding |
+| `formula.rs` | `FormulaPredictor` — custom CUDA formula predictor using split encoder/decoder FP16 ONNX models. Persistent IoBinding with pre-allocated GPU buffers + CUDA graphs on decoder + cudarc D2D/H2D memcpy for zero-allocation decoding |
 | `pipeline.rs` | `Pipeline` struct — owns pdfium + LayoutDetector + FormulaPredictor + TableStructureRecognitionPredictor, orchestrates per-page processing |
 | `models.rs` | Model download from GitHub releases, predictor + LayoutDetector builders, execution provider config |
 | `pdf.rs` | `PdfChar`, `load_pdfium()`, `render_page()`, `extract_page_chars()` |
@@ -92,6 +92,7 @@ Formula recognition always uses the custom split encoder/decoder models (~365 MB
 - `tokenizers` 0.21 — HuggingFace tokenizer for formula token decoding
 - `image` 0.25 — Image processing
 - `reqwest` (blocking) — Model download from GitHub releases
+- `cudarc` 0.16 (Windows) — Low-level CUDA driver API for memcpy (H2D, D2D, D2H) and memset in formula decoder
 
 ## Model Management
 
