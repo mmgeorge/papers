@@ -144,7 +144,8 @@ subsequent decoder steps replay this captured graph.
 | + In-place KV (eliminated D2D KV copies) | ~96ms | ~14.5s | 2.1x |
 | + Batched sync K=4 + GPU token feed | ~83ms | ~12.5s | 2.5x |
 | + External CUDA graph (bypass ORT sync) | ~71ms | ~10.8s | 2.9x |
-| + Pinned host memory (async D2H) | **~71ms** | **~10.8s** | **2.9x** |
+| + Pinned host memory (async D2H) | ~71ms | ~10.8s | 2.9x |
+| + Separate D2H stream (overlap transfer) | **~70.5ms** | **~10.6s** | **2.9x** |
 | Python reference | ~71ms | ~10.7s | 2.9x |
 
 ---
@@ -516,6 +517,57 @@ then blocks once at `stream.synchronize()`. The CPU is free to do other work
 (PDF parsing, layout detection, text extraction) while the GPU runs decoder
 steps, making the formula predictor a GPU hog instead of a CPU hog.
 
+### 14. Separate stream for D2H token copies
+
+**Symptom:** With pinned memory (§13), the D2H copies are truly async, but they
+still sit on the main compute stream. Each 8-byte D2H is serialized between the
+preceding D2D and the next step's H2D + graph launch — the D2H must complete
+before the next graph launch begins, because they share a stream.
+
+**Cause:** On a single stream, operations execute in FIFO order. Even though the
+D2H is only 8 bytes and takes ~4µs, it occupies a slot in the stream pipeline.
+The next step's `graph.launch()` cannot begin until the D2H finishes, adding a
+tiny but per-step serialization gap.
+
+**Fix:** Create a second CUDA stream dedicated to D2H copies. After each decoder
+step's D2D (next_token → input_ids) on the main stream, record a CUDA event,
+make the D2H stream wait on it, then enqueue the D2H on the D2H stream:
+
+```rust
+let d2h_stream = cuda_ctx.new_stream()?;
+let d2h_event = event::create(CU_EVENT_DISABLE_TIMING)?;
+
+// Per step (on main stream):
+graph.launch()?;                          // decoder step
+memcpy_dtod_async(input_ids, next_token); // feed token (GPU-only)
+
+// Cross-stream handoff:
+event::record(d2h_event, main_stream)?;
+stream::wait_event(d2h_stream, d2h_event)?;
+memcpy_dtoh_async(&mut token_buf[k], next_token, d2h_stream)?;
+
+// After K=4 steps:
+d2h_stream.synchronize()?;  // implies main stream work is done too
+```
+
+The event ensures the D2H reads the correct `next_token` value (it waits for the
+main stream's graph launch + D2D to complete). But the D2H transfer then runs on
+a separate stream, so the main stream is free to start the next step's H2D +
+graph launch concurrently.
+
+We reuse a single `CU_EVENT_DISABLE_TIMING` event per formula (lighter weight
+than timed events — no timestamp recording overhead). It's created once before
+the decode loop and destroyed after.
+
+At batch end, we sync only the D2H stream. Since the D2H stream waited on an
+event recorded after the last D2D on the main stream, this also guarantees all
+main stream work through that point is complete.
+
+**Result:** ~70.5ms/formula (down from ~72.5ms with single stream). The ~2.8%
+improvement comes from overlapping the D2H transfers with the next step's early
+GPU kernels. The gain is modest because the D2H is only 8 bytes — the overlap
+window is small relative to the ~850µs decoder step.
+
 ---
 
 ## Benchmarking
@@ -542,10 +594,11 @@ nsys stats formula_profile.nsys-rep --report cuda_gpu_kern_sum
 ```
 
 Key things to look for in the profile:
-- `cuStreamSynchronize` — batched K=4 sync; should dominate (this is where we wait for GPU work)
+- `cuStreamSynchronize` — batched K=4 sync on D2H stream; should dominate (this is where we wait for GPU work)
 - `cudaEventSynchronize` — ORT-internal event waits
+- `cuEventRecord` / `cuStreamWaitEvent` — cross-stream sync between main and D2H streams (~6K calls each, §14)
 - `cuGraphLaunch` — CUDA graph replays (should dominate over `cudaLaunchKernel`)
-- `cuMemcpyDtoHAsync` — should be ~6K calls at ~4µs each (truly async with pinned memory)
+- `cuMemcpyDtoHAsync` — should be ~6K calls at ~4µs each (truly async with pinned memory on D2H stream)
 - If `cuMemcpyDtoHAsync` shows ~800µs+ avg, the token buffer is pageable, not pinned (§13)
 - `cuMemcpyHtoDAsync` — step counter updates
 - Gap between GPU kernels — indicates pipeline stalls from sync
