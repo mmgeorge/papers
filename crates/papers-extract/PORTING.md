@@ -143,7 +143,8 @@ subsequent decoder steps replay this captured graph.
 | Persistent IoBinding + ORT CUDA graphs | ~96ms | ~14.5s | 2.1x |
 | + In-place KV (eliminated D2D KV copies) | ~96ms | ~14.5s | 2.1x |
 | + Batched sync K=4 + GPU token feed | ~83ms | ~12.5s | 2.5x |
-| + External CUDA graph (bypass ORT sync) | **~71ms** | **~10.8s** | **2.9x** |
+| + External CUDA graph (bypass ORT sync) | ~71ms | ~10.8s | 2.9x |
+| + Pinned host memory (async D2H) | **~71ms** | **~10.8s** | **2.9x** |
 | Python reference | ~71ms | ~10.7s | 2.9x |
 
 ---
@@ -451,6 +452,70 @@ ctypes `cudart.cudaGraphLaunch()`, bypassing ORT's `CUDAGraphManager` entirely.
 the non-graph path (tested across all 151 formulas). The 8/151 Rust-vs-Python
 differences are pre-existing (image crate vs PIL preprocessing), not a regression.
 
+### 13. cuMemcpyDtoHAsync blocks on pageable host memory
+
+**Symptom:** After fixing §12, nsys shows `cuMemcpyDtoHAsync` as the new dominant
+cost at 57% of GPU API time (5.4s total, ~840µs average per call). An 8-byte async
+copy should complete in microseconds.
+
+**Cause:** From the CUDA documentation:
+
+> For transfers from device memory to **pageable** host memory,
+> `cuMemcpyDtoHAsync` will return only once the copy has completed.
+
+Our token buffer was stack-allocated pageable memory:
+
+```rust
+let mut token_buf = [0i64; BATCH_K];  // pageable — forces sync D2H
+```
+
+Despite the "Async" name, CUDA degrades this to a synchronous copy: the driver
+waits for all prior stream work (the `graph.launch()`) to finish, performs the
+copy, then returns. This meant our K=4 batched sync was illusory — every D2H
+call was already an implicit sync point, stalling the CPU for ~840µs per step.
+
+**Fix:** Allocate a **pinned (page-locked)** host buffer via `cuMemAllocHost`:
+
+```rust
+struct PinnedTokenBuf {
+    ptr: *mut i64,
+    len: usize,
+}
+
+impl PinnedTokenBuf {
+    fn new(len: usize) -> Result<Self, ExtractError> {
+        let raw = unsafe {
+            cudarc::driver::result::malloc_host(len * size_of::<i64>(), 0)
+        }?;
+        Ok(Self { ptr: raw as *mut i64, len })
+    }
+}
+```
+
+We use `flags=0` (not `CU_MEMHOSTALLOC_WRITECOMBINED`) because write-combined
+memory is optimized for CPU→GPU writes but slow for CPU reads — and we read the
+tokens on CPU after sync.
+
+**Result (nsys):**
+
+| Metric | Pageable | Pinned |
+|---|---|---|
+| `cuMemcpyDtoHAsync` | 5.4s (840µs avg) | **27ms (4µs avg)** |
+| `cuStreamSynchronize` | 7ms | 5.5s (3.4ms avg) |
+
+The D2H is now truly async (99.5% time reduction). The total wall time is
+unchanged (~71ms/formula) because the GPU compute time is the real floor — we
+just shifted the wait from "implicit sync inside every D2H" to "one explicit
+sync per K=4 batch."
+
+**Why it matters despite no throughput change:** With pageable memory, the CPU
+was stalled inside `cuMemcpyDtoHAsync` for ~840µs on every decoder step — ~5.4s
+of CPU time burned doing nothing across 151 formulas. With pinned memory, the
+CPU fires off all K=4 steps (H2D + graph launch + D2D + D2H) in microseconds,
+then blocks once at `stream.synchronize()`. The CPU is free to do other work
+(PDF parsing, layout detection, text extraction) while the GPU runs decoder
+steps, making the formula predictor a GPU hog instead of a CPU hog.
+
 ---
 
 ## Benchmarking
@@ -477,9 +542,11 @@ nsys stats formula_profile.nsys-rep --report cuda_gpu_kern_sum
 ```
 
 Key things to look for in the profile:
-- `cudaStreamSynchronize` / `cudaEventSynchronize` — sync overhead (should be minimized)
-- `cudaGraphLaunch` — CUDA graph replays (should dominate over `cudaLaunchKernel`)
-- `cuMemcpyDtoHAsync` — should be ~6K calls (one per decoder step), 8 bytes each
+- `cuStreamSynchronize` — batched K=4 sync; should dominate (this is where we wait for GPU work)
+- `cudaEventSynchronize` — ORT-internal event waits
+- `cuGraphLaunch` — CUDA graph replays (should dominate over `cudaLaunchKernel`)
+- `cuMemcpyDtoHAsync` — should be ~6K calls at ~4µs each (truly async with pinned memory)
+- If `cuMemcpyDtoHAsync` shows ~800µs+ avg, the token buffer is pageable, not pinned (§13)
 - `cuMemcpyHtoDAsync` — step counter updates
 - Gap between GPU kernels — indicates pipeline stalls from sync
 
