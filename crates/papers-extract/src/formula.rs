@@ -94,9 +94,16 @@ pub struct FormulaPredictor {
     decoder: Mutex<DecoderState>,
     tokenizer: tokenizers::Tokenizer,
     cuda_mem: MemoryInfo,
+    /// Main compute stream — runs graph.launch() and D2D copies.
     #[cfg(target_os = "windows")]
     cuda_stream: std::sync::Arc<cudarc::driver::CudaStream>,
-    /// Pinned host buffer for truly async D2H token reads (K=4 slots).
+    /// Separate stream for D2H token copies, overlapped with next step's GPU compute.
+    /// After each decoder step on cuda_stream, we record an event, make d2h_stream
+    /// wait on it, then enqueue the 8-byte D2H on d2h_stream. This way the D2H
+    /// transfer runs concurrently with the next step's early GPU kernels.
+    #[cfg(target_os = "windows")]
+    d2h_stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    /// Pinned host buffer for truly async D2H token reads (K slots).
     #[cfg(target_os = "windows")]
     pinned_tokens: PinnedTokenBuf,
 }
@@ -175,6 +182,10 @@ impl FormulaPredictor {
         let cuda_stream = cuda_ctx
             .new_stream()
             .map_err(|e| ExtractError::Model(format!("cudarc new_stream: {e}")))?;
+        #[cfg(target_os = "windows")]
+        let d2h_stream = cuda_ctx
+            .new_stream()
+            .map_err(|e| ExtractError::Model(format!("cudarc d2h_stream: {e}")))?;
 
         // --- Encoder session (standard CUDA EP, no graphs) ---
         let encoder = Session::builder()
@@ -323,6 +334,8 @@ impl FormulaPredictor {
             cuda_mem,
             #[cfg(target_os = "windows")]
             cuda_stream,
+            #[cfg(target_os = "windows")]
+            d2h_stream,
             #[cfg(target_os = "windows")]
             pinned_tokens,
         };
@@ -650,6 +663,11 @@ impl FormulaPredictor {
     /// Token feeding stays entirely on GPU: after each step, a D2D copy moves
     /// `next_token → input_ids` (8 bytes), so the model's output feeds directly
     /// into the next step without crossing PCIe.
+    ///
+    /// **Separate D2H stream:** The 8-byte D2H token copy runs on `d2h_stream`,
+    /// not the main compute stream. After each step's D2D, we record a CUDA event
+    /// on the main stream, make `d2h_stream` wait on it, then enqueue the D2H.
+    /// This lets the D2H transfer overlap with the next step's early GPU kernels.
     #[cfg(target_os = "windows")]
     fn decode_formula(&self, enc_hidden_val: Value) -> Result<Vec<i64>, ExtractError> {
         let mut state = self
@@ -695,8 +713,18 @@ impl FormulaPredictor {
         // D2H copy that returns immediately (no implicit sync). Without pinned
         // memory, cuMemcpyDtoHAsync to pageable memory degrades to synchronous.
         let token_buf = unsafe { self.pinned_tokens.as_mut_slice() };
+        let d2h_cu_stream = self.d2h_stream.cu_stream();
+
+        // Reusable event for cross-stream synchronization (no timing — lighter weight).
+        // Recorded on main stream after D2D, waited on by d2h_stream before D2H.
+        let d2h_event = cudarc::driver::result::event::create(
+            cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
+        )
+        .map_err(|e| ExtractError::Formula(format!("event create: {e}")))?;
+
         let mut s = 0usize;
 
+        let result = (|| -> Result<Vec<i64>, ExtractError> {
         while s < MAX_SEQ {
             // Run up to BATCH_K steps without syncing
             let batch_end = (s + BATCH_K).min(MAX_SEQ);
@@ -733,7 +761,7 @@ impl FormulaPredictor {
                         })?;
                 }
 
-                // D2D: next_token → input_ids for next step (GPU-only)
+                // D2D: next_token → input_ids for next step (GPU-only, on main stream)
                 unsafe {
                     cudarc::driver::result::memcpy_dtod_async(
                         state.input_ids_ptr,
@@ -744,21 +772,38 @@ impl FormulaPredictor {
                 }
                 .map_err(|e| ExtractError::Formula(format!("D2D next→input: {e}")))?;
 
-                // Async D2H: next_token → token_buf[k] (no sync yet)
+                // Cross-stream sync: record event on main stream after D2D, then make
+                // d2h_stream wait on it before the D2H copy. This ensures the D2H reads
+                // the correct next_token, while letting the transfer overlap with the
+                // next step's early GPU kernels on the main stream.
+                unsafe {
+                    cudarc::driver::result::event::record(d2h_event, cu_stream)
+                        .map_err(|e| ExtractError::Formula(format!("event record: {e}")))?;
+                    cudarc::driver::result::stream::wait_event(
+                        d2h_cu_stream,
+                        d2h_event,
+                        cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+                    )
+                    .map_err(|e| ExtractError::Formula(format!("stream wait_event: {e}")))?;
+                }
+
+                // Async D2H on d2h_stream: next_token → token_buf[k] (no sync yet)
                 unsafe {
                     cudarc::driver::result::memcpy_dtoh_async(
                         &mut token_buf[k..k + 1],
                         state.next_token_ptr,
-                        cu_stream,
+                        d2h_cu_stream,
                     )
                 }
                 .map_err(|e| ExtractError::Formula(format!("D2H next_token: {e}")))?;
             }
 
-            // One sync for the entire batch
-            self.cuda_stream
+            // Sync d2h_stream — ensures all D2H copies in this batch are complete.
+            // This also implies main stream work up to the last recorded event is done
+            // (d2h_stream waited on it).
+            self.d2h_stream
                 .synchronize()
-                .map_err(|e| ExtractError::Formula(format!("stream sync: {e}")))?;
+                .map_err(|e| ExtractError::Formula(format!("d2h stream sync: {e}")))?;
 
             // Scan batch for EOS
             for k in 0..batch_len {
@@ -772,6 +817,12 @@ impl FormulaPredictor {
         }
 
         Ok(tokens)
+        })(); // end closure
+
+        // Clean up the reusable event
+        unsafe { let _ = cudarc::driver::result::event::destroy(d2h_event); }
+
+        result
     }
 
     /// Non-Windows fallback.
