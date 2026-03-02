@@ -16,6 +16,10 @@ path = "src/bin/dump_chars.rs"
 name = "find_gaps"
 path = "src/bin/find_gaps.rs"
 
+[[bin]]
+name = "bench_formulas"
+path = "src/bin/bench_formulas.rs"
+
 [dependencies]
 clap = { workspace = true }
 oar-ocr = "0.6"

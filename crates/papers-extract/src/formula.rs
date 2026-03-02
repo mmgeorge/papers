@@ -48,7 +48,7 @@ pub struct FormulaPredictor {
 /// Pre-allocated decoder state with persistent IoBinding.
 ///
 /// Field order matters: `binding` must be dropped before the input Values
-/// it references (`_input_ids`, `_step`, `_enc_hidden`, `_kv_in`), because
+/// it references (`_input_ids`, `_step`, `_enc_hidden`, `_kv`), because
 /// `bind_input` stores raw pointers to their GPU buffers.
 #[cfg(target_os = "windows")]
 struct DecoderState {
@@ -58,15 +58,14 @@ struct DecoderState {
     _input_ids: Value,
     _step: Value,
     _enc_hidden: Value,
-    _kv_in: Vec<Value>,
+    _kv: Vec<Value>,
     // Raw GPU pointers for cudarc memcpy
     input_ids_ptr: u64,
     step_ptr: u64,
     enc_hidden_ptr: u64,
     enc_hidden_bytes: usize,
-    // KV cache pointers (for D2D copy: out → in between steps)
-    kv_in_ptrs: Vec<u64>,
-    kv_out_ptrs: Vec<u64>,
+    // KV cache pointers (in-place: same buffer is both input and output, memset between formulas)
+    kv_ptrs: Vec<u64>,
     kv_buf_bytes: usize,
     // Output pointer
     next_token_ptr: u64,
@@ -261,25 +260,14 @@ impl FormulaPredictor {
                 .map_err(|e| ExtractError::Model(format!("alloc enc_hidden: {e}")))?;
         let enc_hidden_ptr = enc_hidden_t.data_ptr_mut() as u64;
 
-        // KV input buffers (separate from outputs to avoid aliasing)
-        let mut kv_in: Vec<Value> = Vec::with_capacity(N_KV_BUFFERS);
-        let mut kv_in_ptrs: Vec<u64> = Vec::with_capacity(N_KV_BUFFERS);
+        // KV cache buffers (in-place: same buffer used as both input and output)
+        let mut kv: Vec<Value> = Vec::with_capacity(N_KV_BUFFERS);
+        let mut kv_ptrs: Vec<u64> = Vec::with_capacity(N_KV_BUFFERS);
         for _ in 0..N_KV_BUFFERS {
             let mut t = ort::value::Tensor::<f16>::new(&allocator, kv_shape)
-                .map_err(|e| ExtractError::Model(format!("alloc kv_in: {e}")))?;
-            kv_in_ptrs.push(t.data_ptr_mut() as u64);
-            kv_in.push(t.into());
-        }
-
-        // --- Allocate output tensors on GPU ---
-        // KV output buffers
-        let mut kv_out_ptrs: Vec<u64> = Vec::with_capacity(N_KV_BUFFERS);
-        let mut kv_out_values: Vec<Value> = Vec::with_capacity(N_KV_BUFFERS);
-        for _ in 0..N_KV_BUFFERS {
-            let mut t = ort::value::Tensor::<f16>::new(&allocator, kv_shape)
-                .map_err(|e| ExtractError::Model(format!("alloc kv_out: {e}")))?;
-            kv_out_ptrs.push(t.data_ptr_mut() as u64);
-            kv_out_values.push(t.into());
+                .map_err(|e| ExtractError::Model(format!("alloc kv: {e}")))?;
+            kv_ptrs.push(t.data_ptr_mut() as u64);
+            kv.push(t.into());
         }
 
         // logits output (on GPU, we don't read it — model uses it internally for argmax)
@@ -315,17 +303,37 @@ impl FormulaPredictor {
             .bind_input("encoder_hidden_states", &enc_hidden_val)
             .map_err(|e| ExtractError::Model(format!("bind enc_hidden: {e}")))?;
 
-        for (i, kv) in kv_in.iter().enumerate() {
+        for (i, kv_val) in kv.iter().enumerate() {
             binding
-                .bind_input(&kv_input_name(i), kv)
+                .bind_input(&kv_input_name(i), kv_val)
                 .map_err(|e| ExtractError::Model(format!("bind kv_in {i}: {e}")))?;
         }
 
-        // Bind outputs (moves — binding takes ownership)
-        for (i, kv_out) in kv_out_values.into_iter().enumerate() {
-            binding
-                .bind_output(&kv_output_name(i), kv_out)
-                .map_err(|e| ExtractError::Model(format!("bind kv_out {i}: {e}")))?;
+        // Bind KV outputs to the SAME buffers as inputs (in-place update).
+        // We bypass ort's bind_output (which moves the Value) and call the C API
+        // directly, so the same GPU buffer serves as both past input and present output.
+        {
+            use ort::AsPointer;
+            let binding_ptr = binding.ptr() as *mut ort::sys::OrtIoBinding;
+            let api = ort::api();
+            for (i, kv_val) in kv.iter().enumerate() {
+                let name = kv_output_name(i);
+                let c_name = std::ffi::CString::new(name.as_str())
+                    .map_err(|e| ExtractError::Model(format!("CString kv_out {i}: {e}")))?;
+                let status = unsafe {
+                    (api.BindOutput)(
+                        binding_ptr,
+                        c_name.as_ptr(),
+                        kv_val.ptr() as *mut ort::sys::OrtValue,
+                    )
+                };
+                if !status.0.is_null() {
+                    unsafe { (api.ReleaseStatus)(status.0) };
+                    return Err(ExtractError::Model(format!(
+                        "raw BindOutput kv {i} failed"
+                    )));
+                }
+            }
         }
         binding
             .bind_output("logits", logits_t)
@@ -340,13 +348,12 @@ impl FormulaPredictor {
             _input_ids: input_ids_val,
             _step: step_val,
             _enc_hidden: enc_hidden_val,
-            _kv_in: kv_in,
+            _kv: kv,
             input_ids_ptr,
             step_ptr,
             enc_hidden_ptr,
             enc_hidden_bytes,
-            kv_in_ptrs,
-            kv_out_ptrs,
+            kv_ptrs,
             kv_buf_bytes,
             next_token_ptr,
             _allocator: allocator,
@@ -427,13 +434,27 @@ impl FormulaPredictor {
 
     /// Autoregressive decoder loop with persistent IoBinding (zero allocations).
     ///
-    /// All GPU buffers are pre-allocated at init. Per step:
-    /// 1. cudarc H2D: update input_ids (8B) and step (8B)
-    /// 2. session.run_binding: execute decoder (writes to pre-allocated outputs)
-    /// 3. cudarc D2H: read next_token (8B)
-    /// 4. cudarc D2D: copy kv_out → kv_in (16 × 1MB) for next step
+    /// All GPU buffers are pre-allocated at init. KV cache is in-place: the same
+    /// buffer is bound as both past input and present output (via raw ORT C API
+    /// BindOutput to bypass Rust's ownership), so the model updates the cache
+    /// directly with no D2D copies between steps.
+    ///
+    /// **Batched sync (K=4):** Profiling showed `cudaStreamSynchronize` accounts
+    /// for ~52% of GPU time (~722µs per call). We need to sync to read
+    /// `next_token` on the CPU for EOS checking, but we don't need to check
+    /// every step. Instead we run K=4 decoder steps back-to-back, enqueuing
+    /// async D2H copies into separate CPU buffer slots, then sync once and scan
+    /// all K tokens for EOS. This cuts our sync calls by ~75%. Steps past EOS
+    /// produce garbage tokens that we discard — at most K-1 wasted steps per
+    /// formula, a negligible cost vs the sync savings.
+    ///
+    /// Token feeding stays entirely on GPU: after each step, a D2D copy moves
+    /// `next_token → input_ids` (8 bytes), so the model's output feeds directly
+    /// into the next step without crossing PCIe.
     #[cfg(target_os = "windows")]
     fn decode_formula(&self, enc_hidden_val: Value) -> Result<Vec<i64>, ExtractError> {
+        const BATCH_K: usize = 4;
+
         let mut state = self
             .decoder
             .lock()
@@ -453,94 +474,95 @@ impl FormulaPredictor {
         }
         .map_err(|e| ExtractError::Formula(format!("D2D enc_hidden: {e}")))?;
 
-        // Zero KV input buffers for new formula
-        for &ptr in &state.kv_in_ptrs {
+        // Zero KV cache buffers for new formula
+        for &ptr in &state.kv_ptrs {
             unsafe {
                 cudarc::driver::result::memset_d8_async(ptr, 0u8, state.kv_buf_bytes, cu_stream)
             }
-            .map_err(|e| ExtractError::Formula(format!("memset kv_in: {e}")))?;
+            .map_err(|e| ExtractError::Formula(format!("memset kv: {e}")))?;
         }
-
-        self.cuda_stream
-            .synchronize()
-            .map_err(|e| ExtractError::Formula(format!("stream sync init: {e}")))?;
 
         let mut tokens = vec![BOS_ID];
 
-        for s in 0..MAX_SEQ {
-            let last_token = *tokens.last().unwrap();
+        // Seed input_ids with BOS via H2D (only PCIe crossing for input_ids)
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(
+                state.input_ids_ptr,
+                &[BOS_ID],
+                cu_stream,
+            )
+        }
+        .map_err(|e| ExtractError::Formula(format!("H2D input_ids init: {e}")))?;
 
-            // H2D: update input_ids and step
-            unsafe {
-                cudarc::driver::result::memcpy_htod_async(
-                    state.input_ids_ptr,
-                    &[last_token],
-                    cu_stream,
-                )
-            }
-            .map_err(|e| ExtractError::Formula(format!("H2D input_ids: {e}")))?;
+        // Token buffer for batched D2H — each slot receives one async D2H copy.
+        // Must stay pinned (not moved) until sync completes.
+        let mut token_buf = [0i64; BATCH_K];
+        let mut s = 0usize;
 
-            unsafe {
-                cudarc::driver::result::memcpy_htod_async(
-                    state.step_ptr,
-                    &[s as i64],
-                    cu_stream,
-                )
-            }
-            .map_err(|e| ExtractError::Formula(format!("H2D step: {e}")))?;
+        while s < MAX_SEQ {
+            // Run up to BATCH_K steps without syncing
+            let batch_end = (s + BATCH_K).min(MAX_SEQ);
+            let batch_len = batch_end - s;
 
-            // Sync memcpy before ORT reads
-            self.cuda_stream
-                .synchronize()
-                .map_err(|e| ExtractError::Formula(format!("stream sync inputs: {e}")))?;
-
-            // Run decoder step (uses persistent binding — no allocations)
-            let DecoderState {
-                ref mut session,
-                ref binding,
-                ..
-            } = *state;
-            session
-                .run_binding(binding)
-                .map_err(|e| ExtractError::Formula(format!("decoder step {s}: {e}")))?;
-
-            // D2H: read next_token
-            let mut next_token_host = [0i64];
-            unsafe {
-                cudarc::driver::result::memcpy_dtoh_async(
-                    &mut next_token_host,
-                    state.next_token_ptr,
-                    cu_stream,
-                )
-            }
-            .map_err(|e| ExtractError::Formula(format!("D2H next_token: {e}")))?;
-
-            self.cuda_stream
-                .synchronize()
-                .map_err(|e| ExtractError::Formula(format!("stream sync token: {e}")))?;
-
-            let next_token = next_token_host[0];
-            tokens.push(next_token);
-            if next_token == EOS_ID {
-                break;
-            }
-
-            // D2D: copy kv_out → kv_in for next step
-            for i in 0..N_KV_BUFFERS {
+            for k in 0..batch_len {
+                // H2D: update step counter
                 unsafe {
-                    cudarc::driver::result::memcpy_dtod_async(
-                        state.kv_in_ptrs[i],
-                        state.kv_out_ptrs[i],
-                        state.kv_buf_bytes,
+                    cudarc::driver::result::memcpy_htod_async(
+                        state.step_ptr,
+                        &[(s + k) as i64],
                         cu_stream,
                     )
                 }
-                .map_err(|e| ExtractError::Formula(format!("D2D kv {i}: {e}")))?;
+                .map_err(|e| ExtractError::Formula(format!("H2D step: {e}")))?;
+
+                // Run decoder step (CUDA graph replay)
+                let DecoderState {
+                    ref mut session,
+                    ref binding,
+                    ..
+                } = *state;
+                session
+                    .run_binding(binding)
+                    .map_err(|e| {
+                        ExtractError::Formula(format!("decoder step {}: {e}", s + k))
+                    })?;
+
+                // D2D: next_token → input_ids for next step (GPU-only)
+                unsafe {
+                    cudarc::driver::result::memcpy_dtod_async(
+                        state.input_ids_ptr,
+                        state.next_token_ptr,
+                        std::mem::size_of::<i64>(),
+                        cu_stream,
+                    )
+                }
+                .map_err(|e| ExtractError::Formula(format!("D2D next→input: {e}")))?;
+
+                // Async D2H: next_token → token_buf[k] (no sync yet)
+                unsafe {
+                    cudarc::driver::result::memcpy_dtoh_async(
+                        &mut token_buf[k..k + 1],
+                        state.next_token_ptr,
+                        cu_stream,
+                    )
+                }
+                .map_err(|e| ExtractError::Formula(format!("D2H next_token: {e}")))?;
             }
 
+            // One sync for the entire batch
             self.cuda_stream
                 .synchronize()
-                .map_err(|e| ExtractError::Formula(format!("stream sync kv: {e}")))?;
+                .map_err(|e| ExtractError::Formula(format!("stream sync: {e}")))?;
+
+            // Scan batch for EOS
+            for k in 0..batch_len {
+                tokens.push(token_buf[k]);
+                if token_buf[k] == EOS_ID {
+                    return Ok(tokens);
+                }
+            }
+
+            s = batch_end;
         }
 
         Ok(tokens)
