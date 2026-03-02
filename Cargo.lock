@@ -1340,6 +1340,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cudarc"
+version = "0.16.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17200eb07e7d85a243aa1bf4569a7aa998385ba98d14833973a817a63cc86e92"
+dependencies = [
+ "libloading 0.8.9",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4414,6 +4423,16 @@ dependencies = [
 
 [[package]]
 name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
+name = "libloading"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
@@ -5250,7 +5269,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5df903c0d2c07b56950f1058104ab0c8557159f2741782223704de9be73c3c"
 dependencies = [
  "half",
- "libloading",
+ "libloading 0.9.0",
  "ndarray 0.17.2",
  "ort-sys",
  "smallvec",
@@ -5368,6 +5387,7 @@ name = "papers-extract"
 version = "0.3.1"
 dependencies = [
  "clap",
+ "cudarc",
  "dirs",
  "flate2",
  "half",
@@ -5532,7 +5552,7 @@ dependencies = [
  "image",
  "itertools 0.14.0",
  "js-sys",
- "libloading",
+ "libloading 0.9.0",
  "log",
  "maybe-owned",
  "once_cell",
