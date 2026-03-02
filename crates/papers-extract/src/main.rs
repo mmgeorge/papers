@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long)]
     no_images: bool,
 
+    /// Dump cropped formula images to formulas/ directory
+    #[arg(long)]
+    dump_formulas: bool,
+
     /// Path to pdfium library (auto-detected if omitted)
     #[arg(long)]
     pdfium_path: Option<PathBuf>,
@@ -112,6 +116,7 @@ fn main() {
             Some(LayoutDebugArg::Pdf) => DebugMode::Pdf,
             None => DebugMode::Off,
         },
+        dump_formulas: cli.dump_formulas,
     };
 
     eprintln!(

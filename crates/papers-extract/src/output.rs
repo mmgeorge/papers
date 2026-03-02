@@ -54,6 +54,40 @@ pub fn write_images(
     Ok(())
 }
 
+/// Save cropped formula region images to the output directory.
+pub fn write_formula_images(
+    pages: &[Page],
+    page_images: &[DynamicImage],
+    formulas_dir: &Path,
+) -> Result<(), ExtractError> {
+    std::fs::create_dir_all(formulas_dir)?;
+
+    for (page, page_img) in pages.iter().zip(page_images.iter()) {
+        for region in &page.regions {
+            if region.kind != RegionKind::DisplayFormula
+                && region.kind != RegionKind::InlineFormula
+            {
+                continue;
+            }
+
+            let filename = format!("{}.png", region.id);
+            let full_path = formulas_dir.join(&filename);
+
+            let cropped = crate::figure::crop_region(
+                page_img,
+                region.bbox,
+                page.width_pt,
+                page.height_pt,
+                page.dpi,
+            );
+
+            cropped.save(&full_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Render the full extraction result as Markdown.
 fn render_markdown(result: &ExtractionResult) -> String {
     // Collect rendered sections with metadata for cross-region dehyphenation.

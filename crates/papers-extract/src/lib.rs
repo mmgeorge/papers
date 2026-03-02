@@ -35,6 +35,8 @@ pub struct ExtractOptions {
     pub page: Option<u32>,
     /// Debug visualization mode (default None).
     pub debug: DebugMode,
+    /// Dump cropped formula region images to `formulas/` in the output directory.
+    pub dump_formulas: bool,
 }
 
 impl Default for ExtractOptions {
@@ -49,6 +51,7 @@ impl Default for ExtractOptions {
             model_cache_dir: None,
             page: None,
             debug: DebugMode::Off,
+            dump_formulas: false,
         }
     }
 }

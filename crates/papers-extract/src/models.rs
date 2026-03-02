@@ -189,6 +189,50 @@ pub fn build_layout_detector(
     crate::layout::LayoutDetector::new(model_path)
 }
 
+/// Initialize ORT with a custom runtime library if available.
+///
+/// Looks for `ORT_DYLIB_PATH` env var first, then checks for a local
+/// `onnxruntime/lib/onnxruntime.dll` (Windows) or `libonnxruntime.so` (Linux).
+/// Must be called before any ORT sessions are created.
+pub fn init_ort_runtime() -> Result<(), ExtractError> {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    let mut init_err: Option<String> = None;
+
+    INIT.call_once(|| {
+        let dylib_path = std::env::var("ORT_DYLIB_PATH").ok().or_else(|| {
+            #[cfg(target_os = "windows")]
+            let candidate = Path::new("onnxruntime/lib/onnxruntime.dll");
+            #[cfg(not(target_os = "windows"))]
+            let candidate = Path::new("onnxruntime/lib/libonnxruntime.so");
+
+            if candidate.exists() {
+                Some(candidate.to_string_lossy().into_owned())
+            } else {
+                None
+            }
+        });
+
+        if let Some(path) = dylib_path {
+            eprintln!("Loading ORT runtime from: {path}");
+            match ort::init_from(&path) {
+                Ok(builder) => {
+                    builder.commit();
+                }
+                Err(e) => {
+                    init_err = Some(format!("ORT init_from failed for '{path}': {e}"));
+                }
+            }
+        }
+    });
+
+    if let Some(err) = init_err {
+        Err(ExtractError::Model(err))
+    } else {
+        Ok(())
+    }
+}
+
 /// Build the platform-specific ORT session configuration.
 pub fn ort_config() -> OrtSessionConfig {
     let providers = platform_execution_providers();

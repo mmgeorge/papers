@@ -63,6 +63,8 @@ impl LayoutDetector {
             .map_err(|e| ExtractError::Model(format!("Failed to create session builder: {e}")))?
             .with_execution_providers([
                 #[cfg(target_os = "windows")]
+                ort::execution_providers::CUDAExecutionProvider::default().build(),
+                #[cfg(target_os = "windows")]
                 ort::execution_providers::DirectMLExecutionProvider::default().build(),
                 #[cfg(target_os = "macos")]
                 ort::execution_providers::CoreMLExecutionProvider::default().build(),

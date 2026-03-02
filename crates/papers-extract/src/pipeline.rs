@@ -31,6 +31,7 @@ struct PipelineOptions {
     dpi: u32,
     confidence_threshold: f32,
     extract_images: bool,
+    dump_formulas: bool,
     page: Option<u32>,
     debug: crate::DebugMode,
 }
@@ -38,6 +39,7 @@ struct PipelineOptions {
 impl Pipeline {
     /// Create a new pipeline, loading models and pdfium.
     pub fn new(options: &ExtractOptions) -> Result<Self, ExtractError> {
+        models::init_ort_runtime()?;
         let pdfium = pdf::load_pdfium(options.pdfium_path.as_deref())?;
 
         let cache_dir = options
@@ -59,6 +61,7 @@ impl Pipeline {
                 dpi: options.dpi,
                 confidence_threshold: options.confidence_threshold,
                 extract_images: options.extract_images,
+                dump_formulas: options.dump_formulas,
                 page: options.page,
                 debug: options.debug,
             },
@@ -138,6 +141,11 @@ impl Pipeline {
 
         if self.options.extract_images {
             output::write_images(&result.pages, &page_images, &images_dir)?;
+        }
+
+        if self.options.dump_formulas {
+            let formulas_dir = output_dir.join("formulas");
+            output::write_formula_images(&result.pages, &page_images, &formulas_dir)?;
         }
 
         if self.options.debug.is_enabled() {
