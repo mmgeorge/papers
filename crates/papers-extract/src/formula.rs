@@ -45,7 +45,12 @@ pub struct FormulaPredictor {
     cuda_stream: std::sync::Arc<cudarc::driver::CudaStream>,
 }
 
-/// Pre-allocated decoder state with persistent IoBinding.
+/// Pre-allocated decoder state with persistent IoBinding and external CUDA graph.
+///
+/// ORT's built-in CUDA graphs unconditionally call `cudaStreamSynchronize` after
+/// every replay (~760µs each, ~5.6s total). We disable ORT's graphs and capture
+/// our own via cudarc, replaying with `cudaGraphLaunch` and syncing only when
+/// we need to read tokens on the CPU (batched K=4).
 ///
 /// Field order matters: `binding` must be dropped before the input Values
 /// it references (`_input_ids`, `_step`, `_enc_hidden`, `_kv`), because
@@ -54,6 +59,9 @@ pub struct FormulaPredictor {
 struct DecoderState {
     session: Session,
     binding: ort::io_binding::IoBinding,
+    run_options: ort::session::RunOptions<ort::session::NoSelectedOutputs>,
+    // External CUDA graph captured via cudarc (None until first warmup capture)
+    cuda_graph: Option<cudarc::driver::CudaGraph>,
     // Input Values (must outlive binding — bind_input stores raw pointers)
     _input_ids: Value,
     _step: Value,
@@ -100,11 +108,17 @@ impl FormulaPredictor {
         tokenizer_path: &Path,
     ) -> Result<Self, ExtractError> {
         // --- CUDA context + stream (cudarc shares primary context with ORT) ---
+        // We use new_stream() (not default_stream()) because the CUDA default stream
+        // (stream 0) does not support cudaStreamBeginCapture — required for our
+        // external CUDA graph capture. new_stream() creates a CU_STREAM_NON_BLOCKING
+        // stream that supports capture.
         #[cfg(target_os = "windows")]
         let cuda_ctx = cudarc::driver::CudaContext::new(0)
             .map_err(|e| ExtractError::Model(format!("cudarc CudaContext: {e}")))?;
         #[cfg(target_os = "windows")]
-        let cuda_stream = cuda_ctx.default_stream();
+        let cuda_stream = cuda_ctx
+            .new_stream()
+            .map_err(|e| ExtractError::Model(format!("cudarc new_stream: {e}")))?;
 
         // --- Encoder session (standard CUDA EP, no graphs) ---
         let encoder = Session::builder()
@@ -122,13 +136,38 @@ impl FormulaPredictor {
                 ))
             })?;
 
-        // --- Decoder session (CUDA EP + CUDA graphs + shared stream) ---
+        // --- Decoder session (CUDA EP + shared stream, external CUDA graph) ---
+        //
+        // WHY WE DISABLE ORT'S BUILT-IN CUDA GRAPHS:
+        //
+        // ORT's CUDAGraphManager::Replay() in cuda_graph.cc unconditionally calls
+        // cudaStreamSynchronize(stream) after every cudaGraphLaunch() — hardcoded
+        // with no public API to disable it. This forces CPU-GPU synchronization on
+        // every decoder step (~760µs each). With ~5,500 decoder steps across 151
+        // formulas, this adds ~4.2s of pure sync overhead (measured via nsys:
+        // 3,744 cudaStreamSynchronize calls totaling 5.6s, 57.9% of total time).
+        //
+        // ORT source (cuda_graph.cc, CUDAGraphManager::Replay):
+        //   CUDA_CALL_THROW(cudaGraphLaunch(graph_exec_, stream));
+        //   CUDA_CALL_THROW(cudaStreamSynchronize(stream));  // <-- unconditional
+        //
+        // WHAT WE DO INSTEAD:
+        //
+        // 1. Disable ORT's graph: .with_cuda_graph(false)
+        // 2. Use RunOptions::disable_device_sync() to also prevent ORT's OnRunEnd sync
+        // 3. After warmup, capture ORT's run_binding() into our own cudarc CudaGraph
+        //    via cudaStreamBeginCapture/EndCapture
+        // 4. In the decode loop, replay with CudaGraph::launch() — no forced sync
+        // 5. Only sync when we actually need token values on CPU (batched K=4)
+        //
+        // Result: cudaStreamSynchronize dropped from 3,744 to 916 calls (96% less
+        // time), matching the Python reference at 71ms/formula (down from 83ms).
         #[cfg(target_os = "windows")]
         let decoder_ep = {
             let raw_stream = cuda_stream.cu_stream() as *mut ();
             unsafe {
                 ort::execution_providers::CUDAExecutionProvider::default()
-                    .with_cuda_graph(true)
+                    .with_cuda_graph(false)
                     .with_compute_stream(raw_stream)
                     .build()
             }
@@ -342,9 +381,20 @@ impl FormulaPredictor {
             .bind_output("next_token", next_token_t)
             .map_err(|e| ExtractError::Model(format!("bind next_token: {e}")))?;
 
+        // RunOptions with device sync disabled — prevents ORT from calling
+        // cudaStreamSynchronize in OnRunEnd, which would break our graph capture
+        // and add unwanted sync overhead during normal execution.
+        let mut run_options = ort::session::RunOptions::new()
+            .map_err(|e| ExtractError::Model(format!("RunOptions: {e}")))?;
+        run_options
+            .disable_device_sync()
+            .map_err(|e| ExtractError::Model(format!("disable_device_sync: {e}")))?;
+
         Ok(DecoderState {
             session: decoder_session,
             binding,
+            run_options,
+            cuda_graph: None,
             _input_ids: input_ids_val,
             _step: step_val,
             _enc_hidden: enc_hidden_val,
@@ -371,14 +421,103 @@ impl FormulaPredictor {
         })
     }
 
-    /// Run warmup inferences to prime ORT/CUDA internals.
+    /// Run warmup inferences to prime ORT/CUDA internals, then capture CUDA graph.
+    ///
+    /// Phase 1: Run 3 normal inferences to trigger ORT memory allocations and
+    /// kernel JIT compilation. These must complete before graph capture.
+    /// Phase 2: Capture a single decoder step into a cudarc CUDA graph.
+    /// All subsequent decoder steps use graph.launch() — no ORT sync overhead.
     fn warmup(&self) -> Result<(), ExtractError> {
         tracing::info!("Warming up formula predictor (3 iterations)...");
         let dummy = DynamicImage::new_rgb8(64, 64);
         for _ in 0..3 {
             let _ = self.predict_one(&dummy)?;
         }
+
+        // Capture CUDA graph for the decoder step
+        #[cfg(target_os = "windows")]
+        {
+            self.capture_decoder_graph()?;
+        }
+
         tracing::info!("Formula predictor warmup complete");
+        Ok(())
+    }
+
+    /// Capture a single decoder `run_binding()` into a cudarc CUDA graph.
+    ///
+    /// Uses `cudaStreamBeginCapture` to record all GPU kernel launches from one
+    /// ORT decoder step, then `cudaStreamEndCapture` to instantiate the graph.
+    /// Subsequent decoder steps call `CudaGraph::launch()` to replay the captured
+    /// kernel sequence with near-zero CPU overhead and no forced sync.
+    ///
+    /// Requirements for capture:
+    /// - Stream must be non-default (`new_stream()`, not `default_stream()`)
+    /// - Stream must be fully synchronized before capture begins
+    /// - `RunOptions::disable_device_sync()` must be set, otherwise ORT calls
+    ///   `cudaStreamSynchronize` inside `run_binding`, which is illegal during capture
+    /// - All buffer addresses must stay fixed after capture (our persistent IoBinding
+    ///   and pre-allocated Allocator tensors guarantee this)
+    ///
+    /// If capture fails (ORT does unsupported host-side ops), `cuda_graph` stays
+    /// `None` and the decode loop falls back to `run_binding_with_options`.
+    #[cfg(target_os = "windows")]
+    fn capture_decoder_graph(&self) -> Result<(), ExtractError> {
+        let mut state = self
+            .decoder
+            .lock()
+            .map_err(|e| ExtractError::Model(format!("decoder lock for capture: {e}")))?;
+
+        // Sync stream before capture to ensure all prior work is done
+        self.cuda_stream
+            .synchronize()
+            .map_err(|e| ExtractError::Model(format!("pre-capture sync: {e}")))?;
+
+        // Begin stream capture
+        self.cuda_stream
+            .begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL)
+            .map_err(|e| ExtractError::Model(format!("begin_capture: {e}")))?;
+
+        // Run one decoder step — all GPU work is captured, not executed.
+        // The result must be dropped before we can mutate state.cuda_graph.
+        let capture_ok = {
+            let DecoderState {
+                ref mut session,
+                ref binding,
+                ref run_options,
+                ..
+            } = *state;
+            match session.run_binding_with_options(binding, run_options) {
+                Ok(_outputs) => true, // _outputs dropped here, releasing borrow
+                Err(e) => {
+                    eprintln!("CUDA graph capture failed during run_binding: {e}");
+                    eprintln!("Falling back to run_binding without graph capture");
+                    false
+                }
+            }
+        };
+
+        let flags = cudarc::driver::sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+
+        if !capture_ok {
+            let _ = self.cuda_stream.end_capture(flags);
+            return Ok(()); // cuda_graph stays None — fallback path
+        }
+
+        // End capture and instantiate the graph
+        match self.cuda_stream.end_capture(flags) {
+            Ok(Some(graph)) => {
+                state.cuda_graph = Some(graph);
+                tracing::info!("CUDA graph captured for decoder step");
+            }
+            Ok(None) => {
+                eprintln!("CUDA graph capture returned empty graph — falling back");
+            }
+            Err(e) => {
+                eprintln!("CUDA graph end_capture failed: {e} — falling back");
+            }
+        }
+
         Ok(())
     }
 
@@ -432,21 +571,20 @@ impl FormulaPredictor {
             .ok_or_else(|| ExtractError::Formula("No encoder output".into()))
     }
 
-    /// Autoregressive decoder loop with persistent IoBinding (zero allocations).
+    /// Autoregressive decoder loop with external CUDA graph replay.
     ///
     /// All GPU buffers are pre-allocated at init. KV cache is in-place: the same
     /// buffer is bound as both past input and present output (via raw ORT C API
     /// BindOutput to bypass Rust's ownership), so the model updates the cache
     /// directly with no D2D copies between steps.
     ///
-    /// **Batched sync (K=4):** Profiling showed `cudaStreamSynchronize` accounts
-    /// for ~52% of GPU time (~722µs per call). We need to sync to read
-    /// `next_token` on the CPU for EOS checking, but we don't need to check
-    /// every step. Instead we run K=4 decoder steps back-to-back, enqueuing
+    /// Each decoder step replays a cudarc-captured CUDA graph (no ORT sync overhead).
+    /// Falls back to run_binding_with_options if graph capture failed during warmup.
+    ///
+    /// **Batched sync (K=4):** We run K=4 decoder steps back-to-back, enqueuing
     /// async D2H copies into separate CPU buffer slots, then sync once and scan
-    /// all K tokens for EOS. This cuts our sync calls by ~75%. Steps past EOS
-    /// produce garbage tokens that we discard — at most K-1 wasted steps per
-    /// formula, a negligible cost vs the sync savings.
+    /// all K tokens for EOS. Steps past EOS produce garbage tokens that we
+    /// discard — at most K-1 wasted steps per formula.
     ///
     /// Token feeding stays entirely on GPU: after each step, a D2D copy moves
     /// `next_token → input_ids` (8 bytes), so the model's output feeds directly
@@ -515,17 +653,25 @@ impl FormulaPredictor {
                 }
                 .map_err(|e| ExtractError::Formula(format!("H2D step: {e}")))?;
 
-                // Run decoder step (CUDA graph replay)
-                let DecoderState {
-                    ref mut session,
-                    ref binding,
-                    ..
-                } = *state;
-                session
-                    .run_binding(binding)
-                    .map_err(|e| {
-                        ExtractError::Formula(format!("decoder step {}: {e}", s + k))
+                // Run decoder step — external CUDA graph replay (no ORT sync),
+                // or fallback to run_binding_with_options if graph capture failed
+                if let Some(ref graph) = state.cuda_graph {
+                    graph.launch().map_err(|e| {
+                        ExtractError::Formula(format!("graph launch step {}: {e}", s + k))
                     })?;
+                } else {
+                    let DecoderState {
+                        ref mut session,
+                        ref binding,
+                        ref run_options,
+                        ..
+                    } = *state;
+                    session
+                        .run_binding_with_options(binding, run_options)
+                        .map_err(|e| {
+                            ExtractError::Formula(format!("decoder step {}: {e}", s + k))
+                        })?;
+                }
 
                 // D2D: next_token → input_ids for next step (GPU-only)
                 unsafe {
