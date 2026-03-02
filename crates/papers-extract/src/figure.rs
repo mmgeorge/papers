@@ -64,15 +64,16 @@ pub fn associate_captions(regions: &mut [Region]) {
         .map(|(i, r)| (i, r.bbox, r.text.clone()))
         .collect();
 
-    // Collect parent (figure/table/chart) indices
+    // Collect parent (figure/table/chart) indices, skipping consumed regions
     let parent_indices: Vec<usize> = regions
         .iter()
         .enumerate()
         .filter(|(_, r)| {
-            matches!(
-                r.kind,
-                RegionKind::Image | RegionKind::Chart | RegionKind::Table
-            )
+            !r.consumed
+                && matches!(
+                    r.kind,
+                    RegionKind::Image | RegionKind::Chart | RegionKind::Table
+                )
         })
         .map(|(i, _)| i)
         .collect();
@@ -149,10 +150,9 @@ pub fn associate_captions(regions: &mut [Region]) {
 
         if let Some((cap_idx, _, _)) = best_caption {
             assigned_captions[cap_idx] = true;
-            let caption_text = caption_data[cap_idx].2.clone();
-            if let Some(text) = caption_text {
-                regions[parent_idx].caption = Some(text);
-            }
+            let cap_region_idx = caption_data[cap_idx].0;
+            regions[parent_idx].caption = Some(Box::new(regions[cap_region_idx].clone()));
+            regions[cap_region_idx].consumed = true;
         }
     }
 }
@@ -282,6 +282,11 @@ mod tests {
         }
     }
 
+    /// Extract caption text from a region's caption field for test assertions.
+    fn caption_text(region: &Region) -> Option<&str> {
+        region.caption.as_ref().and_then(|c| c.text.as_deref())
+    }
+
     #[test]
     fn test_caption_below_figure() {
         let mut regions = vec![
@@ -293,10 +298,8 @@ mod tests {
             ),
         ];
         associate_captions(&mut regions);
-        assert_eq!(
-            regions[0].caption.as_deref(),
-            Some("Figure 1: Overview")
-        );
+        assert_eq!(caption_text(&regions[0]), Some("Figure 1: Overview"));
+        assert!(regions[1].consumed);
     }
 
     #[test]
@@ -310,7 +313,8 @@ mod tests {
             make_region(RegionKind::Image, [80.0, 110.0, 530.0, 400.0], None),
         ];
         associate_captions(&mut regions);
-        assert_eq!(regions[1].caption.as_deref(), Some("Figure 1: Above"));
+        assert_eq!(caption_text(&regions[1]), Some("Figure 1: Above"));
+        assert!(regions[0].consumed);
     }
 
     #[test]
@@ -325,6 +329,7 @@ mod tests {
         ];
         associate_captions(&mut regions);
         assert!(regions[0].caption.is_none());
+        assert!(!regions[1].consumed);
     }
 
     #[test]
@@ -338,7 +343,8 @@ mod tests {
             ),
         ];
         associate_captions(&mut regions);
-        assert_eq!(regions[0].caption.as_deref(), Some("Table 1: Results"));
+        assert_eq!(caption_text(&regions[0]), Some("Table 1: Results"));
+        assert!(regions[1].consumed);
     }
 
     #[test]
@@ -358,8 +364,10 @@ mod tests {
             ),
         ];
         associate_captions(&mut regions);
-        assert_eq!(regions[0].caption.as_deref(), Some("Figure 1"));
-        assert_eq!(regions[1].caption.as_deref(), Some("Figure 2"));
+        assert_eq!(caption_text(&regions[0]), Some("Figure 1"));
+        assert_eq!(caption_text(&regions[1]), Some("Figure 2"));
+        assert!(regions[2].consumed);
+        assert!(regions[3].consumed);
     }
 
     #[test]
@@ -432,5 +440,31 @@ mod tests {
         // intersection/smaller = 400/10000 = 0.04, well below 0.5
         assert!(!regions[0].consumed);
         assert!(!regions[1].consumed);
+    }
+
+    #[test]
+    fn test_caption_skips_consumed_parent() {
+        // Smaller image is consumed; caption should go to the larger surviving image
+        let mut regions = vec![
+            make_region(RegionKind::Image, [80.0, 70.0, 270.0, 150.0], None), // large
+            make_region(RegionKind::Image, [86.0, 70.0, 156.0, 150.0], None), // small, contained
+            make_region(
+                RegionKind::FigureTitle,
+                [80.0, 155.0, 270.0, 175.0],
+                Some("Fig. 4. Two collision types"),
+            ),
+        ];
+        suppress_contained_visuals(&mut regions);
+        assert!(!regions[0].consumed);
+        assert!(regions[1].consumed);
+        associate_captions(&mut regions);
+        // Caption should land on the large image, not the consumed small one
+        assert_eq!(
+            caption_text(&regions[0]),
+            Some("Fig. 4. Two collision types")
+        );
+        assert!(regions[1].caption.is_none());
+        // Caption region itself should be consumed
+        assert!(regions[2].consumed);
     }
 }

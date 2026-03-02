@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use oar_ocr::core::config::OrtExecutionProvider;
-use oar_ocr::core::config::OrtSessionConfig;
+use oar_ocr::core::config::{OrtExecutionProvider, OrtGraphOptimizationLevel, OrtSessionConfig};
 use oar_ocr::predictors::{FormulaRecognitionPredictor, TableStructureRecognitionPredictor};
 
 use crate::error::ExtractError;
@@ -193,7 +192,9 @@ pub fn build_layout_detector(
 /// Build the platform-specific ORT session configuration.
 pub fn ort_config() -> OrtSessionConfig {
     let providers = platform_execution_providers();
-    OrtSessionConfig::new().with_execution_providers(providers)
+    OrtSessionConfig::new()
+        .with_execution_providers(providers)
+        .with_optimization_level(OrtGraphOptimizationLevel::All)
 }
 
 /// Get the execution providers for the current platform.
@@ -201,7 +202,16 @@ fn platform_execution_providers() -> Vec<OrtExecutionProvider> {
     let mut providers = Vec::new();
 
     #[cfg(target_os = "windows")]
-    providers.push(OrtExecutionProvider::DirectML { device_id: None });
+    {
+        providers.push(OrtExecutionProvider::CUDA {
+            device_id: None,
+            gpu_mem_limit: None,
+            arena_extend_strategy: None,
+            cudnn_conv_algo_search: None,
+            cudnn_conv_use_max_workspace: None,
+        });
+        providers.push(OrtExecutionProvider::DirectML { device_id: None });
+    }
 
     #[cfg(target_os = "macos")]
     providers.push(OrtExecutionProvider::CoreML {

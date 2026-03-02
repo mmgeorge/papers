@@ -168,7 +168,15 @@ fn region_to_markdown(region: &Region) -> String {
 
         RegionKind::Table => {
             if let Some(ref html) = region.html {
-                html.clone()
+                let caption_text = region
+                    .caption
+                    .as_ref()
+                    .and_then(|c| c.text.as_deref());
+                if let Some(cap) = caption_text {
+                    format!("{html}\n\n{cap}")
+                } else {
+                    html.clone()
+                }
             } else {
                 String::new()
             }
@@ -190,8 +198,15 @@ fn region_to_markdown(region: &Region) -> String {
         }
         RegionKind::Image | RegionKind::Chart | RegionKind::Seal => {
             let path = region.image_path.as_deref().unwrap_or("");
-            let alt = region.caption.as_deref().unwrap_or("");
-            format!("![{alt}]({path})")
+            let caption_text = region
+                .caption
+                .as_ref()
+                .and_then(|c| c.text.as_deref());
+            if let Some(cap) = caption_text {
+                format!("![]({path})\n\n{cap}")
+            } else {
+                format!("![]({path})")
+            }
         }
         RegionKind::Algorithm => {
             if let Some(ref text) = region.text {
@@ -437,8 +452,20 @@ mod tests {
     fn test_image_to_markdown() {
         let mut r = make_region(RegionKind::Image);
         r.image_path = Some("images/p1_7.png".into());
-        r.caption = Some("Figure 1".into());
-        assert_eq!(region_to_markdown(&r), "![Figure 1](images/p1_7.png)");
+        let mut cap = make_region(RegionKind::FigureTitle);
+        cap.text = Some("Figure 1".into());
+        r.caption = Some(Box::new(cap));
+        assert_eq!(
+            region_to_markdown(&r),
+            "![](images/p1_7.png)\n\nFigure 1"
+        );
+    }
+
+    #[test]
+    fn test_image_no_caption_to_markdown() {
+        let mut r = make_region(RegionKind::Image);
+        r.image_path = Some("images/p1_7.png".into());
+        assert_eq!(region_to_markdown(&r), "![](images/p1_7.png)");
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub struct Region {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub caption: Option<String>,
+    pub caption: Option<Box<Region>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chart_type: Option<String>,
     /// True when this region's content has been spliced into a parent region
@@ -258,6 +258,20 @@ mod tests {
 
     #[test]
     fn test_region_json_image() {
+        let cap = Region {
+            id: "p1_6".into(),
+            kind: RegionKind::FigureTitle,
+            bbox: [80.0, 710.0, 530.0, 730.0],
+            confidence: 0.91,
+            order: 6,
+            text: Some("Figure 1: Overview".into()),
+            html: None,
+            latex: None,
+            image_path: None,
+            caption: None,
+            chart_type: None,
+            consumed: false,
+        };
         let region = Region {
             id: "p1_7".into(),
             kind: RegionKind::Image,
@@ -268,14 +282,15 @@ mod tests {
             html: None,
             latex: None,
             image_path: Some("images/p1_7.png".into()),
-            caption: Some("Figure 1: Overview".into()),
+            caption: Some(Box::new(cap)),
             chart_type: None,
             consumed: false,
         };
 
         let json = serde_json::to_value(&region).unwrap();
         assert_eq!(json["image_path"], "images/p1_7.png");
-        assert_eq!(json["caption"], "Figure 1: Overview");
+        assert_eq!(json["caption"]["text"], "Figure 1: Overview");
+        assert_eq!(json["caption"]["kind"], "FigureTitle");
     }
 
     #[test]

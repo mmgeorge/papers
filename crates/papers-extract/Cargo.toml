@@ -34,8 +34,8 @@ flate2 = "1"
 tar = "0.4"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-oar-ocr = { version = "0.6", features = ["directml"] }
-ort = { version = "=2.0.0-rc.11", features = ["directml"] }
+oar-ocr = { version = "0.6", features = ["directml", "cuda"] }
+ort = { version = "=2.0.0-rc.11", features = ["directml", "cuda"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 oar-ocr = { version = "0.6", features = ["coreml"] }
