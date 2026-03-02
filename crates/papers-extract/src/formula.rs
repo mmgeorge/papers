@@ -28,6 +28,59 @@ const N_HEADS: usize = 16;
 const HEAD_DIM: usize = 32;
 const MAX_SEQ: usize = 512;
 const N_KV_BUFFERS: usize = N_LAYERS * 2; // key + value per layer
+/// Number of decoder steps to batch before syncing for EOS check.
+/// Higher values reduce sync overhead but waste up to K-1 steps after EOS.
+const BATCH_K: usize = 4;
+
+/// Pinned (page-locked) host memory buffer for truly async D2H token reads.
+///
+/// Without pinned memory, `cuMemcpyDtoHAsync` to pageable (stack/heap) memory
+/// degrades to a synchronous copy — the driver waits for all prior stream work
+/// to complete before returning. With pinned memory, the copy is truly async:
+/// the call returns immediately and the DMA transfer happens in the background.
+/// This enables our K=4 batched sync to actually batch (4 steps run without any
+/// CPU-GPU sync, then one sync reads all 4 tokens).
+///
+/// Allocated via `cuMemAllocHost` (flags=0 for cache-coherent memory, NOT
+/// write-combined — we need fast CPU reads after D2H).
+#[cfg(target_os = "windows")]
+struct PinnedTokenBuf {
+    ptr: *mut i64,
+    len: usize,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for PinnedTokenBuf {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for PinnedTokenBuf {}
+
+#[cfg(target_os = "windows")]
+impl PinnedTokenBuf {
+    fn new(len: usize) -> Result<Self, ExtractError> {
+        let num_bytes = len * std::mem::size_of::<i64>();
+        let raw = unsafe { cudarc::driver::result::malloc_host(num_bytes, 0) }
+            .map_err(|e| ExtractError::Model(format!("cuMemAllocHost: {e}")))?;
+        Ok(Self {
+            ptr: raw as *mut i64,
+            len,
+        })
+    }
+
+    /// Get a mutable slice for use with `memcpy_dtoh_async`.
+    /// Only safe to read AFTER stream synchronization.
+    unsafe fn as_mut_slice(&self) -> &mut [i64] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PinnedTokenBuf {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cudarc::driver::result::free_host(self.ptr as *mut std::ffi::c_void);
+        }
+    }
+}
 
 /// Custom formula predictor with persistent IoBinding on the decoder.
 ///
@@ -43,6 +96,9 @@ pub struct FormulaPredictor {
     cuda_mem: MemoryInfo,
     #[cfg(target_os = "windows")]
     cuda_stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    /// Pinned host buffer for truly async D2H token reads (K=4 slots).
+    #[cfg(target_os = "windows")]
+    pinned_tokens: PinnedTokenBuf,
 }
 
 /// Pre-allocated decoder state with persistent IoBinding and external CUDA graph.
@@ -257,6 +313,9 @@ impl FormulaPredictor {
             ))
         })?;
 
+        #[cfg(target_os = "windows")]
+        let pinned_tokens = PinnedTokenBuf::new(BATCH_K)?;
+
         let predictor = Self {
             encoder: Mutex::new(encoder),
             decoder: Mutex::new(decoder_state),
@@ -264,6 +323,8 @@ impl FormulaPredictor {
             cuda_mem,
             #[cfg(target_os = "windows")]
             cuda_stream,
+            #[cfg(target_os = "windows")]
+            pinned_tokens,
         };
 
         predictor.warmup()?;
@@ -591,8 +652,6 @@ impl FormulaPredictor {
     /// into the next step without crossing PCIe.
     #[cfg(target_os = "windows")]
     fn decode_formula(&self, enc_hidden_val: Value) -> Result<Vec<i64>, ExtractError> {
-        const BATCH_K: usize = 4;
-
         let mut state = self
             .decoder
             .lock()
@@ -632,9 +691,10 @@ impl FormulaPredictor {
         }
         .map_err(|e| ExtractError::Formula(format!("H2D input_ids init: {e}")))?;
 
-        // Token buffer for batched D2H — each slot receives one async D2H copy.
-        // Must stay pinned (not moved) until sync completes.
-        let mut token_buf = [0i64; BATCH_K];
+        // Pinned token buffer for truly async D2H — each slot receives one async
+        // D2H copy that returns immediately (no implicit sync). Without pinned
+        // memory, cuMemcpyDtoHAsync to pageable memory degrades to synchronous.
+        let token_buf = unsafe { self.pinned_tokens.as_mut_slice() };
         let mut s = 0usize;
 
         while s < MAX_SEQ {
