@@ -836,15 +836,35 @@ impl FormulaPredictor {
 
 /// Preprocess a formula image for the encoder.
 ///
-/// Pipeline: RGB → grayscale threshold → content-crop → resize (fit 768, Lanczos)
-/// → center-pad to 768×768 black → luminance → normalize → [1,1,768,768] f16
+/// Pipeline matches PaddleOCR's UniMERNetImgDecode + UniMERNetTestTransform +
+/// LatexImageFormat, which is what the model was trained on.
+///
+/// Steps: RGB → BT.601 grayscale → content-crop (threshold 200) →
+/// bilinear resize to fit 768 → center-pad to 768×768 black →
+/// BT.601 luminance → normalize (mean=0.7931, std=0.1738) → \[1,1,768,768\] f16
 fn preprocess_image(image: &DynamicImage) -> Array4<f16> {
+    // Normalization constants from UniMERNet training pipeline.
+    // The model was trained on formula images (mostly white background, black text),
+    // so the dataset-specific mean is high and std is low.
+    // Source: UniMERNetTestTransform in ppocr/data/imaug/unimernet_aug.py and
+    //         opendatalab/UniMERNet unimernet/processors/formula_processor.py
+    // Both use: albumentations.Normalize((0.7931, 0.7931, 0.7931), (0.1738, 0.1738, 0.1738))
+    const NORM_MEAN: f32 = 0.7931;
+    const NORM_STD: f32 = 0.1738;
+
+    // Content crop threshold (after min-max normalization to 0-255).
+    // PaddleOCR/UniMERNet use 200, treating anything darker than ~78% white as content.
+    // More permissive than 127, capturing anti-aliased edges and thin strokes.
+    // Source: crop_margin() in PaddleOCR unimernet_aug.py and UniMERNet formula_processor.py
+    const CROP_THRESHOLD: f32 = 200.0;
+
     let rgb = image.to_rgb8();
     let (w, h) = (rgb.width(), rgb.height());
 
+    // BT.601 luminance for content detection, matching PIL convert("L")
     let pixels: Vec<f32> = rgb
         .pixels()
-        .map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)
+        .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
         .collect();
     let min_val = pixels.iter().cloned().fold(f32::INFINITY, f32::min);
     let max_val = pixels.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -855,7 +875,7 @@ fn preprocess_image(image: &DynamicImage) -> Array4<f16> {
             for px in 0..w {
                 let idx = (py * w + px) as usize;
                 let norm = (pixels[idx] - min_val) / (max_val - min_val) * 255.0;
-                if norm < 127.0 {
+                if norm < CROP_THRESHOLD {
                     x0 = x0.min(px);
                     y0 = y0.min(py);
                     x1 = x1.max(px + 1);
@@ -875,7 +895,9 @@ fn preprocess_image(image: &DynamicImage) -> Array4<f16> {
     let scale = TARGET_SIZE as f32 / cw.max(ch) as f32;
     let new_w = (cw as f32 * scale) as u32;
     let new_h = (ch as f32 * scale) as u32;
-    let resized = cropped.resize_exact(new_w, new_h, FilterType::Lanczos3);
+    // Bilinear interpolation, matching UniMERNetImgDecode.resize() which uses
+    // img.resize(..., resample=2) i.e. PIL.Image.BILINEAR
+    let resized = cropped.resize_exact(new_w, new_h, FilterType::Triangle);
 
     let mut padded = DynamicImage::new_rgb8(TARGET_SIZE, TARGET_SIZE);
     let offset_x = (TARGET_SIZE - new_w) / 2;
@@ -892,7 +914,7 @@ fn preprocess_image(image: &DynamicImage) -> Array4<f16> {
     let mut data = vec![f16::ZERO; ts * ts];
     for (i, p) in padded_rgb.pixels().enumerate() {
         let lum = 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32;
-        let normalized = (lum / 255.0 - 0.5) / 0.5;
+        let normalized = (lum / 255.0 - NORM_MEAN) / NORM_STD;
         data[i] = f16::from_f32(normalized);
     }
 

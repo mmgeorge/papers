@@ -26,6 +26,10 @@ struct Cli {
     #[arg(long, default_value = "5")]
     runs: usize,
 
+    /// Dump all formula outputs (filename\tlatex) to stdout for comparison
+    #[arg(long)]
+    dump: bool,
+
     /// Model cache directory
     #[arg(long)]
     model_cache_dir: Option<PathBuf>,
@@ -119,8 +123,15 @@ fn main() {
         cli.runs
     );
 
-    // Print one sample of LaTeX output
-    let sample = predictor.predict(&images[..1]).expect("sample predict");
-    eprintln!("\nSample ({}):", paths[0].file_name().unwrap().to_string_lossy());
-    eprintln!("  {}", sample[0]);
+    // Dump all outputs or print one sample
+    if cli.dump {
+        let results = predictor.predict(&images).expect("dump predict");
+        for (path, latex) in paths.iter().zip(results.iter()) {
+            println!("{}\t{}", path.file_name().unwrap().to_string_lossy(), latex);
+        }
+    } else {
+        let sample = predictor.predict(&images[..1]).expect("sample predict");
+        eprintln!("\nSample ({}):", paths[0].file_name().unwrap().to_string_lossy());
+        eprintln!("  {}", sample[0]);
+    }
 }
