@@ -250,3 +250,138 @@ In short: DirectML is viable for simple single-shot inference, but any optimizat
 ### TensorRT
 
 TRT EP was tested but underperformed CUDA Graph FP16: 95-104ms (TRT FP16/FP32) vs 75ms (CUDA Graph FP16). TRT's optimization overhead and kernel selection didn't beat ORT's CUDA graphs for this particular model shape.
+
+---
+
+## GLM-OCR: Second Model Port
+
+GLM-OCR (`zai-org/GLM-OCR`) is a higher-quality formula recognition model based
+on a vision-language architecture (CogViT encoder + GLM decoder with GQA). It
+correctly handles all 151 test formulas including the 6 that PP-FormulaNet gets
+wrong.
+
+### Export Architecture
+
+GLM-OCR requires 4 ONNX models (vs PP-FormulaNet's 2):
+
+| Model | Export script | Size | Purpose |
+|-------|---------------|------|---------|
+| `vision_encoder.onnx` | `export.py` | ~3.4 GB (FP32) | CogViT with M-RoPE |
+| `embedding.onnx` | `export.py` | 348 MB (FP16) | Token embeddings |
+| `llm.onnx` | `export.py` | 2.2 GB (FP16) | Full LLM for prefill |
+| `llm_decoder.onnx` | `export_decoder.py` | 1.3 GB (FP16) | Decode step (CUDA graphed) |
+
+The same export wrapper pattern applies: a thin `nn.Module` wrapper
+(`DecoderStepWrapper`) around the HuggingFace model that reshapes the interface
+for fixed-shape ONNX export. `torch.onnx.export()` traces through the wrapper
+and all the HuggingFace model internals, flattening everything into a single
+static ONNX graph with the trained weights embedded.
+
+### ONNX Ops That Break CUDA Graphs
+
+Two categories of problematic ops were found and eliminated from the decoder:
+
+**ScatterND (from `index_copy_`):** HuggingFace's `StaticCache` uses
+`index_copy_` to write new KV entries at the current position. This traces to
+ONNX `ScatterND`, which is incompatible with CUDA graphs for the same reason as
+GatherND (indirect addressing from temporaries).
+
+*Fix:* `WhereStaticCache` replaces `index_copy_` with `torch.where()`:
+
+```python
+# ScatterND path (original):
+self.keys.index_copy_(2, cache_position, key_states)
+
+# Where path (CUDA-graph compatible):
+mask = (positions == cache_position).view(1, 1, -1, 1)
+self.keys = torch.where(mask, key_states.expand_as(self.keys), self.keys)
+```
+
+**GatherND (from causal mask expansion):** When a 2D `attention_mask [1, MAX_SEQ]`
+is passed to HuggingFace's `GlmModel.forward()`, the internal `create_causal_mask()`
+function expands it into a 4D mask using index arithmetic that traces to ONNX
+`GatherND`. The GatherND reads from a dynamically-computed boolean tensor that ORT
+places in an internal temporary buffer — the buffer address changes between CUDA
+graph capture and replay, causing `ILLEGAL_ADDRESS`.
+
+This was diagnosed using `compute-sanitizer --tool memcheck`:
+
+```
+Invalid __global__ read of size 1 bytes
+  at void onnxruntime::cuda::_GatherNDKernel<bool>(...)
+  Address 0xf859cd4bed00 is out of bounds
+  Host Frame: cudaGraphLaunch
+```
+
+*Fix:* Pre-compute the 4D causal mask in our wrapper before calling into HuggingFace:
+
+```python
+# Before: 2D mask → HuggingFace expands internally → GatherND in ONNX
+attention_mask = (positions < (cache_pos + 1).unsqueeze(-1)).long()  # [1, MAX_SEQ]
+
+# After: 4D mask → HuggingFace returns as-is → no GatherND
+min_dtype = torch.finfo(inputs_embeds.dtype).min
+attend = positions < (cache_pos + 1)
+attention_mask = torch.where(
+    attend.view(1, 1, 1, -1),
+    torch.tensor(0.0, dtype=inputs_embeds.dtype),
+    torch.tensor(min_dtype, dtype=inputs_embeds.dtype),
+)  # [1, 1, 1, MAX_SEQ]
+```
+
+This works because `create_causal_mask()` has an early-exit: if the mask is already
+4D, it's returned as-is, bypassing all the internal expansion code. The mask
+content is identical — `0.0` for attended positions, `-65504` (fp16 min) for masked.
+
+**Key insight:** When using `torch.onnx.export()` on a wrapper that calls into
+library code (HuggingFace transformers), the ONNX tracer captures everything —
+your code AND the library internals. Problematic ops can come from deep inside the
+library's forward pass. The fix is to change what you pass to the library to steer
+the trace down a different code path, not to modify the library itself.
+
+### ONNX Op Comparison
+
+| Op | PP-FormulaNet decoder | GLM-OCR decoder (before) | GLM-OCR decoder (after) |
+|----|----------------------|--------------------------|-------------------------|
+| GatherND | 0 | 1 | **0** |
+| ScatterND | 0 | 0 (fixed by WhereStaticCache) | 0 |
+| IsNaN | 0 | 16 | **0** |
+| Where | 24 | 49 | 33 |
+| LayerNormalization | 26 (fused) | 0 | 0 |
+| Pow+ReduceMean+Sqrt+Reciprocal | 0 | 65 each (unfused LayerNorm) | 65 each |
+| Total nodes | 1278 | 1591 | 1551 |
+
+### Image Preprocessing: Resize Filter Matters
+
+The HuggingFace image processor uses `resample=3` (PIL Bicubic). Using a
+different interpolation method (e.g., Lanczos) causes visible failures on small
+images being upscaled 4x+. For p10_5 (33×19 → 112×84), Lanczos vs Bicubic
+produces max pixel differences of 36/255 across ~12K pixels — enough to cause
+the model to output `$$` instead of recognizing the formula.
+
+The Rust `image` crate's `FilterType::CatmullRom` is the equivalent of PIL's
+Bicubic. Even with matching filter types, minor implementation differences
+between Rust's bicubic and PIL's bicubic cause 9/151 formulas to differ
+slightly (`\mathbf` vs `\mathrm` for single-variable formulas). These are
+cosmetic — both render identically in LaTeX.
+
+### Performance (vbd.pdf, 151 formulas)
+
+| Version | Per-formula | Total | Speedup |
+|---------|-------------|-------|---------|
+| Ollama (GLM-OCR via LLM server) | ~152ms | ~23s | 1.0x |
+| Rust, no CUDA graph | ~318ms | ~48s | 0.5x |
+| Rust, ORT built-in CUDA graph | **~148ms** | **~22s** | **1.5x** |
+
+CUDA graphs provide a 2.2x speedup for GLM-OCR (48s → 22s). Without CUDA
+graphs, each `run_binding` call dispatches ~1551 individual CUDA kernels with
+CPU overhead per kernel. Graph replay bundles all ops into a single
+`cudaGraphLaunch` call.
+
+### Accuracy (vbd.pdf, 151 formulas)
+
+| Comparison | Differences | Nature |
+|------------|-------------|--------|
+| Rust vs Ollama | 9/151 | Cosmetic: `\mathbf`/`\mathrm`, `\mathrm`/`\text` |
+| Rust vs Python ONNX | 9/151 | Same 9 — bicubic implementation differences |
+| Python ONNX vs Ollama | 0/151 | Identical (same PIL preprocessing) |

@@ -623,8 +623,255 @@ image = "0.25"       # image preprocessing
 | File | Purpose |
 |------|---------|
 | `src/formula.rs` | `FormulaPredictor` — encoder/decoder with CUDA graphs |
+| `src/glm_ocr.rs` | `GlmOcrPredictor` — GLM-OCR with ORT built-in CUDA graphs |
 | `src/models.rs` | Model download, ORT runtime init, EP configuration |
-| `src/bin/bench_formulas.rs` | Standalone formula benchmark |
-| `py/pp-formulanet/cuda/export.py` | ONNX model export pipeline |
-| `py/pp-formulanet/cuda/run.py` | Python reference implementation |
+| `src/bin/bench_formulas.rs` | Standalone PP-FormulaNet benchmark |
+| `src/bin/bench_glm_formulas.rs` | Standalone GLM-OCR benchmark |
+| `py/pp-formulanet/cuda/export.py` | PP-FormulaNet ONNX export pipeline |
+| `py/pp-formulanet/cuda/run.py` | PP-FormulaNet Python reference |
 | `py/pp-formulanet/common/preprocess.py` | Shared preprocessing (Python) |
+| `py/glm-ocr/export.py` | GLM-OCR 3-part ONNX export (vision, embedding, llm) |
+| `py/glm-ocr/export_decoder.py` | GLM-OCR CUDA-graph-friendly decoder export |
+| `py/glm-ocr/run.py` | GLM-OCR Python reference |
+
+---
+
+## GLM-OCR Porting Notes
+
+GLM-OCR (`zai-org/GLM-OCR`) is a second formula recognition model ported to Rust.
+It uses the same persistent IoBinding + pre-allocated GPU buffer pattern as
+PP-FormulaNet, but with significant architectural differences.
+
+### Architecture: 4-Part Model Split
+
+Unlike PP-FormulaNet's 2-part split (encoder + decoder), GLM-OCR requires 4 ONNX
+sessions:
+
+| Model | Size | Purpose |
+|-------|------|---------|
+| `vision_encoder.onnx` | ~3.4 GB (FP32) | CogViT with M-RoPE position encoding |
+| `embedding.onnx` | 348 MB (FP16) | Token embeddings for prefill |
+| `llm.onnx` | 2.2 GB (FP16) | Full LLM for prefill pass (dynamic shapes) |
+| `llm_decoder.onnx` | 1.3 GB (FP16) | Decode step (fixed shapes, CUDA graphed) |
+
+The prefill phase is a key difference: the full prompt (system message + image
+tokens + "Formula Recognition:") is processed through the LLM once to populate
+the KV cache before decoding begins. PP-FormulaNet has no prefill — it just feeds
+the encoder output directly.
+
+### Export Wrapper Pattern
+
+Both PP-FormulaNet and GLM-OCR use the same pattern: a thin PyTorch `nn.Module`
+wrapper around the HuggingFace model that reshapes the interface for CUDA-graph-
+compatible ONNX export. The wrapper:
+
+1. Takes fixed-shape inputs (`input_ids [1,1]`, `step [1]`, `prefill_len [1]`,
+   KV cache `[1, 8, 512, 128]` × 32)
+2. Calls into the HuggingFace model's forward method internally
+3. Adds ArgMax to keep token selection on GPU
+
+When `torch.onnx.export()` traces this wrapper, it flattens everything — our
+wrapper code, the HuggingFace model internals, and the trained weights — into a
+single static ONNX computation graph. No Python or HuggingFace code is needed at
+runtime.
+
+### 15. GatherND breaks CUDA graphs (GLM-OCR decoder)
+
+**Symptom:** `CUDA_ERROR_ILLEGAL_ADDRESS` on CUDA graph replay (step 1 with
+in-place KV, step 2 with separate KV buffers). Both ORT built-in CUDA graphs
+and manual cudarc capture crash identically. Confirmed in both Rust and Python.
+
+**Diagnosis:** `compute-sanitizer --tool memcheck` on a minimal Python test
+pinpointed the exact kernel:
+
+```
+Invalid __global__ read of size 1 bytes
+  at void onnxruntime::cuda::_GatherNDKernel<bool>(...)
+  Address 0xf859cd4bed00 is out of bounds
+  Host Frame: cudaGraphLaunch
+```
+
+The GatherND op (node 13 in the ONNX graph) reads from a dynamically-computed
+boolean tensor (`_to_copy_1`, the causal attention mask). During graph capture,
+ORT places this tensor in an internal temporary buffer at some address X. During
+graph replay, ORT's memory arena may reuse that temporary at a different address
+Y. But the captured CUDA graph has address X baked in — so GatherND reads from
+stale memory.
+
+Operations like `Where`, `Less`, `Add` don't have this problem because they
+operate element-wise on tensors at fixed IoBinding addresses or constant
+initializers. GatherND does **indirect addressing** — the values in its index
+tensor determine where in memory to read — which is fundamentally incompatible
+with CUDA graphs when the data tensor is an ORT-internal temporary.
+
+**Root cause chain:**
+
+1. Our `export_decoder.py` wrapper passed a **2D** `attention_mask [1, MAX_SEQ]`
+   (just 1s and 0s) to `self.language_model(...)`
+2. Inside `language_model.forward()`, HuggingFace's `create_causal_mask()`
+   expanded this 2D mask into a 4D mask `[1, 1, 1, MAX_SEQ]` that attention
+   layers consume
+3. That expansion used index arithmetic that, when traced by PyTorch's ONNX
+   exporter, became a GatherND node in the exported graph
+4. The GatherND's data tensor was an ORT-internal temporary → unstable address
+   across graph replays → crash
+
+**Fix:** Pre-compute the 4D causal mask directly in the export wrapper, before
+calling into HuggingFace's code:
+
+```python
+# Before (2D mask → HuggingFace expands internally → GatherND in ONNX):
+positions = torch.arange(self.max_seq, device=input_ids.device).unsqueeze(0)
+attention_mask = (positions < (cache_pos + 1).unsqueeze(-1)).long()  # [1, MAX_SEQ]
+
+# After (4D mask → HuggingFace returns as-is → no GatherND):
+min_dtype = torch.finfo(inputs_embeds.dtype).min
+positions = torch.arange(self.max_seq, device=input_ids.device)
+attend = positions < (cache_pos + 1)  # [MAX_SEQ] bool
+attention_mask = torch.where(
+    attend.view(1, 1, 1, -1),
+    torch.tensor(0.0, dtype=inputs_embeds.dtype, device=input_ids.device),
+    torch.tensor(min_dtype, dtype=inputs_embeds.dtype, device=input_ids.device),
+)  # [1, 1, 1, MAX_SEQ]
+```
+
+This works because HuggingFace's `create_causal_mask()` has an early-exit check
+(`masking_utils.py` line 788):
+
+```python
+if isinstance(attention_mask, (torch.Tensor, BlockMask)) and len(attention_mask.shape) == 4:
+    return True, attention_mask, None, None, None  # return as-is
+```
+
+When the mask is already 4D, the entire internal expansion code (which generates
+GatherND during ONNX tracing) is never executed. The mask content is identical —
+`0.0` for attended positions, `-65504` (fp16 min) for masked positions.
+
+**ONNX op counts before/after:**
+
+| Op | Before | After |
+|----|--------|-------|
+| GatherND | 1 | **0** |
+| ScatterND | 0 | 0 |
+| IsNaN | 16 | **0** |
+| Total nodes | 1591 | 1551 |
+
+IsNaN ops (NaN guards after Softmax in attention) also disappeared — likely
+because the 4D mask with proper `-inf` masking prevents NaN from appearing in
+Softmax outputs.
+
+**Result:** ORT built-in CUDA graph (`enable_cuda_graph=true`) works correctly.
+
+### 16. GLM-OCR uses ORT built-in CUDA graphs (not external capture)
+
+Unlike PP-FormulaNet (§12), GLM-OCR uses ORT's built-in CUDA graph support
+rather than external cudarc capture. This is simpler but has different tradeoffs:
+
+**PP-FormulaNet (external capture via cudarc):**
+```rust
+// Disable ORT's graphs and sync, share our stream
+CUDAExecutionProvider::default()
+    .with_cuda_graph(false)
+    .with_compute_stream(raw_stream)
+    .build()
+
+// Capture our own graph after warmup
+cuda_stream.begin_capture()?;
+session.run_binding_with_options(&binding, &run_options)?;
+let graph = cuda_stream.end_capture()?;
+
+// Replay without ORT's forced sync
+graph.launch()?;
+```
+
+**GLM-OCR (ORT built-in):**
+```rust
+// Let ORT manage graph capture/replay
+CUDAExecutionProvider::default()
+    .with_cuda_graph(true)
+    .build()
+
+// ORT captures on first call, replays on subsequent calls
+session.run_binding_with_options(&binding, &run_options)?;
+```
+
+ORT's built-in approach is simpler (no stream management, no capture/replay
+code) but forces a `cudaStreamSynchronize` after every graph replay (hardcoded
+in ORT's `CUDAGraphManager::Replay()`). For PP-FormulaNet, this sync overhead
+was the dominant cost (§12: 83ms → 71ms by eliminating it). For GLM-OCR, the
+per-step compute is ~5x larger (1536 hidden vs 512, 16 layers vs 8, GQA), so
+the sync overhead is proportionally less significant.
+
+The decode loop is correspondingly simpler — no shared stream, no d2h_stream,
+no pinned memory, no batched sync. Just memcpy on the null stream (synchronous
+with ORT's completed work) between steps:
+
+```rust
+for s in 0..MAX_SEQ {
+    memcpy_htod_async(step_ptr, &[s as i64], null_stream)?;       // update step
+    session.run_binding_with_options(&binding, &run_options)?;     // graph replay
+    memcpy_dtod_async(input_ids_ptr, next_token_ptr, 8, null)?;   // feed token
+    memcpy_dtoh_async(&mut token_buf, next_token_ptr, null)?;     // read for EOS
+    if token_buf[0] == EOS { break; }
+}
+```
+
+### 17. Image resize filter must match HuggingFace processor (GLM-OCR)
+
+**Symptom:** 3 out of 151 formulas produce `$$` (a single token meaning the
+model failed to recognize the formula). All 3 are small images being upscaled
+4x+ (33×19, 76×20, 339×43).
+
+**Cause:** The Rust code used `FilterType::Lanczos3` for image resizing, but
+HuggingFace's `Glm46VImageProcessorFast` uses `resample=3` which is
+`PIL.Image.Resampling.BICUBIC`. For large images the difference is negligible,
+but for small images being upscaled significantly, the interpolation method
+produces meaningfully different pixel values:
+
+```
+p10_5 (33×19 → 112×84): max_diff=36/255, 11,931 differing pixels
+p5_58 (339×43 → 336×56): max_diff=28/255, 14,001 differing pixels
+```
+
+These pixel differences propagate through the vision encoder and cause the model
+to produce incorrect output for these specific images.
+
+**Fix:** Change `FilterType::Lanczos3` to `FilterType::CatmullRom` (Rust
+`image` crate's name for Bicubic interpolation):
+
+```rust
+let resized = image.resize_exact(target_w, target_h, FilterType::CatmullRom);
+```
+
+**Result:** All 3 previously-failing formulas now produce correct output. 9
+remaining differences vs Ollama are all minor (`\mathbf` vs `\mathrm` for
+single-variable formulas, `\mathrm{where}` vs `\text{where}`), caused by
+inherent differences between Rust's `image` crate bicubic and PIL's bicubic
+implementations. These same 9 differences exist between the Python ONNX pipeline
+and Rust — they're not related to CUDA graphs or model changes.
+
+### GLM-OCR Performance (vbd.pdf, 151 formulas)
+
+| Version | Per-formula | Total | Notes |
+|---------|-------------|-------|-------|
+| Ollama (GLM-OCR via LLM server) | ~152ms | ~23s | Baseline |
+| Rust, no CUDA graph | ~318ms | ~48s | Shared stream + async D2H |
+| Rust, ORT built-in CUDA graph | **~148ms** | **~22s** | 2.2x vs no-graph |
+
+The no-CUDA-graph version was slower than Ollama because each
+`run_binding_with_options` call dispatches individual CUDA kernels with CPU
+overhead per kernel. CUDA graph replay bundles all ~1551 ONNX ops into a single
+`cudaGraphLaunch` call, eliminating that overhead.
+
+### GLM-OCR Accuracy (vbd.pdf, 151 formulas)
+
+| Comparison | Differences | Nature |
+|------------|-------------|--------|
+| Rust vs Ollama | 9/151 | 7× `\mathbf`/`\mathrm`, 1× `\mathrm`/`\text`, 1× Rust more correct |
+| Rust vs Python ONNX | 9/151 | Same 9 — all from bicubic implementation differences |
+| Python ONNX vs Ollama | 0/151 | Identical (same PIL preprocessing) |
+
+All 9 Rust-vs-reference differences are cosmetic (render identically in LaTeX).
+One difference (p5_58: `\delta x_c` vs `\delta x_i`) is actually a case where
+Rust is more accurate than Ollama — the source image clearly shows subscript `c`
+in the numerator.

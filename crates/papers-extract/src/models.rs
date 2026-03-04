@@ -5,6 +5,7 @@ use oar_ocr::predictors::TableStructureRecognitionPredictor;
 
 use crate::error::ExtractError;
 use crate::formula::FormulaPredictor;
+use crate::glm_ocr::GlmOcrPredictor;
 use crate::Quality;
 
 /// Model file metadata for download.
@@ -49,6 +50,31 @@ const FORMULA_DECODER: ModelFile = ModelFile {
     url: "", // No auto-download — must be pre-exported via export.py
 };
 
+// GLM-OCR models (manual export, no auto-download)
+// Filenames match the output of export.py / export_decoder.py.
+// ONNX external data files (*.onnx.data) reference relative paths, so
+// these files must stay in their export directory (use --model-cache-dir).
+const GLM_VISION_ENCODER: ModelFile = ModelFile {
+    filename: "vision_encoder.onnx",
+    url: "",
+};
+const GLM_EMBEDDING: ModelFile = ModelFile {
+    filename: "embedding.onnx",
+    url: "",
+};
+const GLM_LLM: ModelFile = ModelFile {
+    filename: "llm.onnx",
+    url: "",
+};
+const GLM_LLM_DECODER: ModelFile = ModelFile {
+    filename: "llm_decoder.onnx",
+    url: "",
+};
+const GLM_TOKENIZER: ModelFile = ModelFile {
+    filename: "tokenizer.json",
+    url: "",
+};
+
 // Table classification — wired vs wireless (Quality mode only)
 const TABLE_CLASSIFIER: ModelFile = ModelFile {
     filename: "pp-lcnet_x1_0_table_cls.onnx",
@@ -72,6 +98,15 @@ pub struct ModelPaths {
     // Quality-mode extras
     pub table_classifier: Option<PathBuf>,
     pub slanext_wired: Option<PathBuf>,
+}
+
+/// Resolved paths for GLM-OCR models (separate from pipeline models).
+pub struct GlmOcrModelPaths {
+    pub vision_encoder: PathBuf,
+    pub embedding: PathBuf,
+    pub llm: PathBuf,
+    pub llm_decoder: PathBuf,
+    pub tokenizer: PathBuf,
 }
 
 /// Default model cache directory.
@@ -184,6 +219,40 @@ fn download_file(url: &str, dest: &Path) -> Result<(), ExtractError> {
     std::fs::rename(&tmp_path, dest)?;
     tracing::info!("Downloaded {}", dest.display());
     Ok(())
+}
+
+/// Ensure all GLM-OCR model files exist in the cache directory.
+pub fn ensure_glm_ocr_models(
+    cache_dir: &Path,
+) -> Result<GlmOcrModelPaths, ExtractError> {
+    std::fs::create_dir_all(cache_dir)?;
+
+    let vision_encoder = ensure_local_model(cache_dir, &GLM_VISION_ENCODER)?;
+    let embedding = ensure_local_model(cache_dir, &GLM_EMBEDDING)?;
+    let llm = ensure_local_model(cache_dir, &GLM_LLM)?;
+    let llm_decoder = ensure_local_model(cache_dir, &GLM_LLM_DECODER)?;
+    let tokenizer = ensure_local_model(cache_dir, &GLM_TOKENIZER)?;
+
+    Ok(GlmOcrModelPaths {
+        vision_encoder,
+        embedding,
+        llm,
+        llm_decoder,
+        tokenizer,
+    })
+}
+
+/// Build a GLM-OCR predictor from model paths.
+pub fn build_glm_ocr_predictor(
+    paths: &GlmOcrModelPaths,
+) -> Result<GlmOcrPredictor, ExtractError> {
+    GlmOcrPredictor::new(
+        &paths.vision_encoder,
+        &paths.embedding,
+        &paths.llm,
+        &paths.llm_decoder,
+        &paths.tokenizer,
+    )
 }
 
 /// Build a direct layout detector from the pp-doclayoutv3.onnx model.
