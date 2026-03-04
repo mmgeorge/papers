@@ -13,7 +13,8 @@ PyTorch re-implementation of PP-FormulaNet Plus-L for ONNX export and inference.
 GLM-OCR (zai-org/GLM-OCR) ONNX export and inference. Uses HuggingFace transformers model directly (no re-implementation).
 
 - `common/` — shared library: model constants, dtype detection, device resolution, M-RoPE position ID computation, transformers monkey-patch
-- `cuda/` — uv project for CUDA: ONNX export (3-part model + CUDA-graph decoder) and inference (needs `onnxruntime-gpu`, `torch` for export)
+- `cuda/` — uv project for CUDA: ONNX export (3-part model + CUDA-graph decoder), MHA/GQA optimization, and inference (needs `onnxruntime-gpu`, `torch` for export)
+- `directml/` — uv project for DirectML: MHA-optimized export + session.run inference (needs `onnxruntime-directml`)
 - `ollama/` — uv project for Ollama API: formula and full-page PDF OCR via local Ollama server (minimal deps, no torch/onnx)
 - `model/` — exported ONNX models + HuggingFace tokenizer/processor configs
 

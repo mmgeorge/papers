@@ -385,3 +385,84 @@ CPU overhead per kernel. Graph replay bundles all ops into a single
 | Rust vs Ollama | 9/151 | Cosmetic: `\mathbf`/`\mathrm`, `\mathrm`/`\text` |
 | Rust vs Python ONNX | 9/151 | Same 9 — bicubic implementation differences |
 | Python ONNX vs Ollama | 0/151 | Identical (same PIL preprocessing) |
+
+### ONNX Attention Fusion: MHA and GQA
+
+The raw ONNX models produced by `torch.onnx.export()` contain unfused attention — each self-attention layer traces to ~15 individual ops (MatMul, Reshape, Transpose, Softmax, etc.). ORT's `onnxruntime.transformers` library can fuse these into higher-level ops for better performance.
+
+#### Three-Level Hierarchy
+
+| Level | Op | Backends | What It Does |
+|-------|-----|----------|-------------|
+| 0 (raw) | ~15 ops/layer | All | Individual MatMul/Reshape/Transpose/Softmax. What `torch.onnx.export` produces. |
+| 1 (MHA) | `com.microsoft.MultiHeadAttention` | CUDA, CPU, DirectML | Fused attention kernel. Single op replaces the entire Q/K/V projection + attention + output projection chain. |
+| 2 (GQA) | `com.microsoft.GroupQueryAttention` | CUDA only | Fused attention with FlashAttention V2. O(1) memory scaling for attention — critical for long sequences. Supports GQA natively (different number of query vs KV heads). |
+
+For GLM-OCR with 16 decoder layers, this reduces total node count from ~1551 (raw) to ~200-300 (fused).
+
+#### How to Apply: optimize_model()
+
+```python
+from onnxruntime.transformers.optimizer import optimize_model
+
+model = optimize_model(
+    "llm.onnx",
+    model_type="gpt2",      # triggers FusionRotaryAttention
+    num_heads=16,            # query heads (GLM-OCR: 16 query, 8 KV)
+    hidden_size=1536,
+    opt_level=0,             # fusion only, no constant folding
+)
+model.save_model_to_file("llm_mha.onnx")
+```
+
+`model_type="gpt2"` tells the optimizer to look for decoder-only attention patterns. It runs `FusionRotaryAttention`, which pattern-matches the raw attention ops and replaces them with `MultiHeadAttention` nodes. `opt_level=0` means fusion only — no constant folding or graph restructuring that might break the model.
+
+#### How to Apply: replace_mha_with_gqa()
+
+```python
+from onnxruntime.transformers.convert_generation import replace_mha_with_gqa
+
+model = onnx.load("llm_mha.onnx")
+replace_mha_with_gqa(model, "attention_mask", kv_num_heads=8)
+onnx.save(model, "llm_gqa.onnx", ...)
+```
+
+This takes the MHA-fused model and upgrades `MultiHeadAttention` → `GroupQueryAttention`. The conversion:
+- Adds `seqlens_k` input (cumulative KV sequence lengths, int32)
+- Adds `total_sequence_length` input
+- Builds a subgraph from `attention_mask` to compute these values
+- Sets `kv_num_heads` attribute for GQA (8 KV heads vs 16 query heads for GLM-OCR)
+
+#### M-RoPE Handling
+
+GLM-OCR uses 3D M-RoPE (Multi-Resolution Rotary Position Embeddings) from Qwen2-VL. The standard MHA/GQA fused ops have a built-in `do_rotary` attribute for 1D rotary embeddings, but M-RoPE is 3D (temporal, height, width dimensions).
+
+Two approaches:
+1. **ORT absorbs RoPE** — If `FusionRotaryAttention` recognizes the RoPE pattern, it folds it into the fused node with `do_rotary=1`. This works for standard 1D RoPE but may not work for 3D M-RoPE.
+2. **External RoPE** — Set `do_rotary=0` on the fused node and let the RoPE computation remain as explicit ops in the graph. The fused node handles everything except RoPE; RoPE is applied before the attention input.
+
+Approach 2 is the safer bet for M-RoPE and is confirmed working by the `onnxruntime-genai` project's Qwen2.5-VL builder, which uses the same strategy.
+
+#### When to Use Which Level
+
+| Scenario | Level | Why |
+|----------|-------|-----|
+| CUDA inference (formulas) | GQA | FlashAttention V2, best throughput |
+| CUDA inference (full-page PDF) | GQA | O(1) memory scaling critical for long sequences |
+| DirectML inference | MHA | GQA is CUDA-only; MHA is the best available |
+| CPU inference | MHA | Same as DirectML — MHA has CPU kernels |
+| Debugging / validation | Raw | Easier to inspect, matches PyTorch exactly |
+
+#### Implementation
+
+**Automatic fusion** (`optimize.py`) uses ORT's `optimize_model` and `replace_mha_with_gqa`. This works when the attention pattern matches ORT's expected layout (single fused QKV projection, standard RoPE). It failed for GLM-OCR because the traced HuggingFace Qwen2 attention has 3 separate Q/K/V MatMuls, inline M-RoPE, and WhereStaticCache — too different for FusionRotaryAttention to recognize.
+
+**Manual graph surgery** (`optimize_gqa.py`) directly replaces raw attention ops with GQA nodes. Per layer, it removes ~20 nodes (WhereStaticCache KV update, repeat_kv expansion, scaled dot product attention, output reshape) and inserts 7 nodes (3 Transpose+Reshape pairs to convert BNSH→BSH, plus the GQA node). The RoPE computation is preserved externally with `do_rotary=0`. Reduces 1551 → 1336 nodes with 16 GQA nodes, numerically identical to the raw decoder.
+
+```bash
+# Manual GQA surgery (CUDA + FlashAttention):
+python optimize_gqa.py --model-dir ../model
+
+# Automatic MHA fusion (all backends — if pattern matches):
+python optimize.py --model-dir ../model --target directml
+```

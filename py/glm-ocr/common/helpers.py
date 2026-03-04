@@ -22,34 +22,30 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 
 # ── Transformers monkey-patch ────────────────────────────────────────
-# Fix for transformers 5.2.0 video_processing_auto bug.
+# transformers 5.2.0 tries to load a VideoProcessor for Qwen2-VL-based
+# models (including GLM-OCR), which requires PyTorch/torchvision. We don't
+# need video processing, so patch out the video processor loading and the
+# type check that rejects None.
 
 def _apply_transformers_patch():
     try:
-        import transformers.models.auto.video_processing_auto as _vpa
+        from transformers.models.auto.video_processing_auto import AutoVideoProcessor
+        from transformers import processing_utils
     except ImportError:
         return
 
-    def _patched_video_processor_class_from_name(class_name):
-        for module_name, extractors in _vpa.VIDEO_PROCESSOR_MAPPING_NAMES.items():
-            if extractors is None:
-                continue
-            if class_name in extractors:
-                mn = _vpa.model_type_to_module_name(module_name)
-                module = importlib.import_module(f".{mn}", "transformers.models")
-                try:
-                    return getattr(module, class_name)
-                except AttributeError:
-                    continue
-        for extractor in _vpa.VIDEO_PROCESSOR_MAPPING._extra_content.values():
-            if getattr(extractor, "__name__", None) == class_name:
-                return extractor
-        main_module = importlib.import_module("transformers")
-        if hasattr(main_module, class_name):
-            return getattr(main_module, class_name)
-        return None
+    # Return None from AutoVideoProcessor.from_pretrained
+    AutoVideoProcessor.from_pretrained = classmethod(lambda cls, *a, **kw: None)
 
-    _vpa.video_processor_class_from_name = _patched_video_processor_class_from_name
+    # Allow None for video_processor in ProcessorMixin type check
+    _original_check = processing_utils.ProcessorMixin.check_argument_for_proper_class
+
+    def _lenient_check(self, argument_name, argument):
+        if argument is None and "video" in argument_name:
+            return None
+        return _original_check(self, argument_name, argument)
+
+    processing_utils.ProcessorMixin.check_argument_for_proper_class = _lenient_check
 
 
 _apply_transformers_patch()
