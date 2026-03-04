@@ -5,7 +5,7 @@ use oar_ocr::predictors::TableStructureRecognitionPredictor;
 
 use crate::error::ExtractError;
 use crate::formula::FormulaPredictor;
-use crate::glm_ocr::GlmOcrPredictor;
+use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
 use crate::Quality;
 
 /// Model file metadata for download.
@@ -55,7 +55,7 @@ const FORMULA_DECODER: ModelFile = ModelFile {
 // ONNX external data files (*.onnx.data) reference relative paths, so
 // these files must stay in their export directory (use --model-cache-dir).
 const GLM_VISION_ENCODER: ModelFile = ModelFile {
-    filename: "vision_encoder.onnx",
+    filename: "vision_encoder_mha.onnx",
     url: "",
 };
 const GLM_EMBEDDING: ModelFile = ModelFile {
@@ -67,7 +67,7 @@ const GLM_LLM: ModelFile = ModelFile {
     url: "",
 };
 const GLM_LLM_DECODER: ModelFile = ModelFile {
-    filename: "llm_decoder.onnx",
+    filename: "llm_decoder_gqa.onnx",
     url: "",
 };
 const GLM_TOKENIZER: ModelFile = ModelFile {
@@ -242,7 +242,7 @@ pub fn ensure_glm_ocr_models(
     })
 }
 
-/// Build a GLM-OCR predictor from model paths.
+/// Build a GLM-OCR predictor from model paths (default: formula recognition, max_seq=512).
 pub fn build_glm_ocr_predictor(
     paths: &GlmOcrModelPaths,
 ) -> Result<GlmOcrPredictor, ExtractError> {
@@ -252,6 +252,21 @@ pub fn build_glm_ocr_predictor(
         &paths.llm,
         &paths.llm_decoder,
         &paths.tokenizer,
+    )
+}
+
+/// Build a GLM-OCR predictor with custom config (prompt, max_seq).
+pub fn build_glm_ocr_predictor_with_config(
+    paths: &GlmOcrModelPaths,
+    config: GlmOcrConfig,
+) -> Result<GlmOcrPredictor, ExtractError> {
+    GlmOcrPredictor::with_config(
+        &paths.vision_encoder,
+        &paths.embedding,
+        &paths.llm,
+        &paths.llm_decoder,
+        &paths.tokenizer,
+        config,
     )
 }
 

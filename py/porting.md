@@ -460,9 +460,18 @@ Approach 2 is the safer bet for M-RoPE and is confirmed working by the `onnxrunt
 **Manual graph surgery** (`optimize_gqa.py`) directly replaces raw attention ops with GQA nodes. Per layer, it removes ~20 nodes (WhereStaticCache KV update, repeat_kv expansion, scaled dot product attention, output reshape) and inserts 7 nodes (3 Transpose+Reshape pairs to convert BNSH→BSH, plus the GQA node). The RoPE computation is preserved externally with `do_rotary=0`. Reduces 1551 → 1336 nodes with 16 GQA nodes, numerically identical to the raw decoder.
 
 ```bash
-# Manual GQA surgery (CUDA + FlashAttention):
+# Manual GQA surgery on decoder (CUDA + FlashAttention):
 python optimize_gqa.py --model-dir ../model
+
+# Manual MHA surgery on vision encoder (CUDA + FlashAttention):
+python optimize_mha_vision.py --model-dir ../model
 
 # Automatic MHA fusion (all backends — if pattern matches):
 python optimize.py --model-dir ../model --target directml
 ```
+
+#### Vision encoder MHA surgery
+
+The vision encoder (CogViT, 24 layers) also benefits from fused attention. ORT's automatic `optimize_model(model_type="vit")` fails (0 MHA nodes) because Q/K RMSNorm and 2D RoPE between projection and attention break pattern matching. SDPA re-export from PyTorch is not viable — M-RoPE uses data-dependent `torch.split()` preventing `torch.onnx.export`, and SDPA decomposes back to the same matmul+softmax+matmul ops in ONNX anyway.
+
+**Manual surgery** (`optimize_mha_vision.py`) replaces the attention core (MatMul Q@K^T → Mul scale → Softmax → Cast → MatMul attn@V → Squeeze → Transpose → Reshape) with a single `com.microsoft.MultiHeadAttention` node per layer. Q/K normalization and 2D RoPE ops stay outside the fused node. Adds Reshape nodes to convert Q/K/V from [seq, heads, dim] to [1, seq, hidden] format. Reduces 3663 → 3183 nodes with 24 MHA nodes, numerically identical (cosine sim 0.9999980 on test data, 3/3 formula outputs match exactly).

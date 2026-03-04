@@ -4,7 +4,7 @@
 //!   - vision_encoder.onnx  (FP32, CogViT with M-RoPE)
 //!   - embedding.onnx       (FP16, token embeddings for prefill)
 //!   - llm.onnx             (FP32 I/O, full LLM for prefill pass)
-//!   - llm_decoder.onnx     (FP16, fixed-shape decode step with Where-based KV update)
+//!   - llm_decoder_gqa.onnx  (FP16, fixed-shape decode step with GQA / FlashAttention V2)
 //!
 //! Architecture mirrors `formula.rs` FormulaPredictor: persistent IoBinding,
 //! pre-allocated GPU buffers, pinned host memory, batched D2H via separate stream.
@@ -51,7 +51,7 @@ const HIDDEN_SIZE: usize = 1536;
 const _VOCAB_SIZE: usize = 59392;
 const EOS_IDS: [i64; 2] = [59246, 59253];
 const IMAGE_TOKEN_ID: i64 = 59280;
-const MAX_SEQ: usize = 512;
+const DEFAULT_MAX_SEQ: usize = 512;
 const N_KV_BUFFERS: usize = NUM_LAYERS * 2; // 32 (key + value per layer)
 // Image normalization (CLIP/SigLip-derived, matching GLM-OCR processor)
 const NORM_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
@@ -70,21 +70,51 @@ const NORM_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 /// Tokenize the prompt template once at init, returning (prefix, suffix).
 ///
 /// prefix: tokens before the image tokens
-/// suffix: tokens after the image tokens (including "Formula Recognition:")
+/// suffix: tokens after the image tokens (including the prompt text)
 fn tokenize_prompt_parts(
-    _tokenizer: &tokenizers::Tokenizer,
+    tokenizer: &tokenizers::Tokenizer,
+    prompt: &str,
 ) -> Result<(Vec<i64>, Vec<i64>), ExtractError> {
-    // Chat template: [gMASK]<sop><|user|>\n<|begin_of_image|>{IMAGE_TOKENS}<|end_of_image|>Formula Recognition:<|assistant|>\n
-    // Token IDs verified against HuggingFace tokenizer (processor.apply_chat_template)
+    // Chat template: [gMASK]<sop><|user|>\n<|begin_of_image|>{IMAGE_TOKENS}<|end_of_image|>{PROMPT}<|assistant|>\n
     let prefix: Vec<i64> = vec![59248, 59250, 59253, 10, 59256]; // [gMASK]<sop><|user|>\n<|begin_of_image|>
-    let suffix: Vec<i64> = vec![59257, 4000, 6062, 7404, 49600, 58, 59254, 10]; // <|end_of_image|>Formula Recognition:<|assistant|>\n
+
+    // Tokenize the prompt text, then wrap with special tokens
+    let prompt_tokens = tokenizer
+        .encode(prompt, false)
+        .map_err(|e| ExtractError::Model(format!("Tokenize prompt: {e}")))?;
+    let prompt_ids: Vec<i64> = prompt_tokens.get_ids().iter().map(|&id| id as i64).collect();
+
+    let mut suffix = vec![59257_i64]; // <|end_of_image|>
+    suffix.extend_from_slice(&prompt_ids);
+    suffix.push(59254); // <|assistant|>
+    suffix.push(10); // \n
 
     Ok((prefix, suffix))
 }
 
+// ── Configuration ─────────────────────────────────────────────────────
+
+/// Configuration for GLM-OCR predictor.
+pub struct GlmOcrConfig {
+    /// Prompt text (e.g. "Formula Recognition:" or a full-page OCR instruction).
+    pub prompt: String,
+    /// Maximum decode sequence length (KV cache size). Default: 512 for formulas.
+    /// Use 4096+ for full-page OCR.
+    pub max_seq: usize,
+}
+
+impl Default for GlmOcrConfig {
+    fn default() -> Self {
+        Self {
+            prompt: "Formula Recognition:".to_string(),
+            max_seq: DEFAULT_MAX_SEQ,
+        }
+    }
+}
+
 // ── Main predictor struct ─────────────────────────────────────────────
 
-/// GLM-OCR formula predictor with autoregressive decoding via persistent IoBinding.
+/// GLM-OCR predictor with autoregressive decoding via persistent IoBinding.
 pub struct GlmOcrPredictor {
     vision_encoder: Mutex<Session>,
     embedding: Mutex<Session>,
@@ -93,6 +123,7 @@ pub struct GlmOcrPredictor {
     tokenizer: tokenizers::Tokenizer,
     prompt_prefix: Vec<i64>,
     prompt_suffix: Vec<i64>,
+    max_seq: usize,
     #[allow(dead_code)]
     cuda_mem: MemoryInfo,
     #[cfg(target_os = "windows")]
@@ -111,11 +142,15 @@ struct DecoderState {
     _input_ids: Value,
     _step: Value,
     _prefill_len: Value,
+    _seqlens_k: Value,
+    _total_seq_len: Value,
     _kv: Vec<Value>,
     // Raw GPU pointers
     input_ids_ptr: u64,
     step_ptr: u64,
     prefill_len_ptr: u64,
+    seqlens_k_ptr: u64,
+    total_seq_len_ptr: u64,
     kv_ptrs: Vec<u64>,
     kv_buf_bytes: usize,
     // Output pointer
@@ -129,13 +164,32 @@ struct DecoderState {
 }
 
 impl GlmOcrPredictor {
-    /// Create a new GLM-OCR predictor from ONNX model files.
+    /// Create a new GLM-OCR predictor with default config (formula recognition, max_seq=512).
     pub fn new(
         vision_encoder_path: &Path,
         embedding_path: &Path,
         llm_path: &Path,
         decoder_path: &Path,
         tokenizer_path: &Path,
+    ) -> Result<Self, ExtractError> {
+        Self::with_config(
+            vision_encoder_path,
+            embedding_path,
+            llm_path,
+            decoder_path,
+            tokenizer_path,
+            GlmOcrConfig::default(),
+        )
+    }
+
+    /// Create a new GLM-OCR predictor with custom config.
+    pub fn with_config(
+        vision_encoder_path: &Path,
+        embedding_path: &Path,
+        llm_path: &Path,
+        decoder_path: &Path,
+        tokenizer_path: &Path,
+        config: GlmOcrConfig,
     ) -> Result<Self, ExtractError> {
         // CUDA context (shares primary context with ORT)
         #[cfg(target_os = "windows")]
@@ -225,7 +279,7 @@ impl GlmOcrPredictor {
         )
         .map_err(|e| ExtractError::Model(format!("CUDA MemoryInfo: {e}")))?;
 
-        let decoder_state = Self::build_decoder_state(decoder_session, &cuda_mem)?;
+        let decoder_state = Self::build_decoder_state(decoder_session, &cuda_mem, config.max_seq)?;
 
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|e| {
             ExtractError::Model(format!(
@@ -234,11 +288,12 @@ impl GlmOcrPredictor {
             ))
         })?;
 
-        let (prompt_prefix, prompt_suffix) = tokenize_prompt_parts(&tokenizer)?;
+        let (prompt_prefix, prompt_suffix) = tokenize_prompt_parts(&tokenizer, &config.prompt)?;
         tracing::debug!(
-            "GLM-OCR prompt: {} prefix + N image + {} suffix tokens",
+            "GLM-OCR prompt: {} prefix + N image + {} suffix tokens (max_seq={})",
             prompt_prefix.len(),
-            prompt_suffix.len()
+            prompt_suffix.len(),
+            config.max_seq,
         );
 
         let predictor = Self {
@@ -249,6 +304,7 @@ impl GlmOcrPredictor {
             tokenizer,
             prompt_prefix,
             prompt_suffix,
+            max_seq: config.max_seq,
             cuda_mem,
             #[cfg(target_os = "windows")]
             cuda_ctx,
@@ -264,12 +320,13 @@ impl GlmOcrPredictor {
     fn build_decoder_state(
         decoder_session: Session,
         cuda_mem: &MemoryInfo,
+        max_seq: usize,
     ) -> Result<DecoderState, ExtractError> {
         let allocator = Allocator::new(&decoder_session, cuda_mem.clone())
             .map_err(|e| ExtractError::Model(format!("CUDA allocator: {e}")))?;
 
-        let kv_shape = [1usize, NUM_KV_HEADS, MAX_SEQ, HEAD_DIM];
-        let kv_buf_bytes = NUM_KV_HEADS * MAX_SEQ * HEAD_DIM * std::mem::size_of::<f16>();
+        let kv_shape = [1usize, NUM_KV_HEADS, max_seq, HEAD_DIM];
+        let kv_buf_bytes = NUM_KV_HEADS * max_seq * HEAD_DIM * std::mem::size_of::<f16>();
 
         // Allocate input tensors on GPU
         let mut input_ids_t = ort::value::Tensor::<i64>::new(&allocator, [1usize, 1])
@@ -283,6 +340,15 @@ impl GlmOcrPredictor {
         let mut prefill_len_t = ort::value::Tensor::<i64>::new(&allocator, [1usize])
             .map_err(|e| ExtractError::Model(format!("alloc prefill_len: {e}")))?;
         let prefill_len_ptr = prefill_len_t.data_ptr_mut() as u64;
+
+        // GQA sequence length inputs (int32)
+        let mut seqlens_k_t = ort::value::Tensor::<i32>::new(&allocator, [1usize])
+            .map_err(|e| ExtractError::Model(format!("alloc seqlens_k: {e}")))?;
+        let seqlens_k_ptr = seqlens_k_t.data_ptr_mut() as u64;
+
+        let mut total_seq_len_t = ort::value::Tensor::<i32>::new(&allocator, [1usize])
+            .map_err(|e| ExtractError::Model(format!("alloc total_seq_len: {e}")))?;
+        let total_seq_len_ptr = total_seq_len_t.data_ptr_mut() as u64;
 
         // KV cache buffers (in-place: same buffer for input and output)
         let mut kv: Vec<Value> = Vec::with_capacity(N_KV_BUFFERS);
@@ -307,6 +373,8 @@ impl GlmOcrPredictor {
         let input_ids_val: Value = input_ids_t.into();
         let step_val: Value = step_t.into();
         let prefill_len_val: Value = prefill_len_t.into();
+        let seqlens_k_val: Value = seqlens_k_t.into();
+        let total_seq_len_val: Value = total_seq_len_t.into();
 
         // Bind inputs
         binding
@@ -318,6 +386,12 @@ impl GlmOcrPredictor {
         binding
             .bind_input("prefill_len", &prefill_len_val)
             .map_err(|e| ExtractError::Model(format!("bind prefill_len: {e}")))?;
+        binding
+            .bind_input("seqlens_k", &seqlens_k_val)
+            .map_err(|e| ExtractError::Model(format!("bind seqlens_k: {e}")))?;
+        binding
+            .bind_input("total_sequence_length", &total_seq_len_val)
+            .map_err(|e| ExtractError::Model(format!("bind total_seq_len: {e}")))?;
 
         for (i, kv_val) in kv.iter().enumerate() {
             let layer = i / 2;
@@ -368,10 +442,14 @@ impl GlmOcrPredictor {
             _input_ids: input_ids_val,
             _step: step_val,
             _prefill_len: prefill_len_val,
+            _seqlens_k: seqlens_k_val,
+            _total_seq_len: total_seq_len_val,
             _kv: kv,
             input_ids_ptr,
             step_ptr,
             prefill_len_ptr,
+            seqlens_k_ptr,
+            total_seq_len_ptr,
             kv_ptrs,
             kv_buf_bytes,
             next_token_ptr,
@@ -383,6 +461,7 @@ impl GlmOcrPredictor {
     fn build_decoder_state(
         decoder_session: Session,
         _cuda_mem: &MemoryInfo,
+        _max_seq: usize,
     ) -> Result<DecoderState, ExtractError> {
         Ok(DecoderState {
             session: decoder_session,
@@ -650,14 +729,14 @@ impl GlmOcrPredictor {
         }
 
         // Copy prefill KV cache (CPU f16) into decoder's fixed GPU buffers
-        // Copy head-by-head since strides differ (prefill_len vs MAX_SEQ).
+        // Copy head-by-head since strides differ (prefill_len vs max_seq).
         for (i, kv_data) in prefill_kv.iter().enumerate() {
             if prefill_len == 0 {
                 continue;
             }
 
             let src_head_stride = prefill_len * HEAD_DIM;
-            let dst_head_stride = MAX_SEQ * HEAD_DIM * std::mem::size_of::<f16>();
+            let dst_head_stride = self.max_seq * HEAD_DIM * std::mem::size_of::<f16>();
             let copy_elems = prefill_len * HEAD_DIM;
 
             for h in 0..NUM_KV_HEADS {
@@ -700,7 +779,7 @@ impl GlmOcrPredictor {
         // Decode loop: ORT CUDA graph handles compute, we update step/input_ids via memcpy
         let mut token_buf = [0i64; 1];
 
-        for s in 0..MAX_SEQ {
+        for s in 0..self.max_seq {
             // H2D: update step counter
             unsafe {
                 cudarc::driver::result::memcpy_htod_async(
@@ -710,6 +789,24 @@ impl GlmOcrPredictor {
                 )
             }
             .map_err(|e| ExtractError::Formula(format!("H2D step: {e}")))?;
+
+            // H2D: update GQA sequence length inputs
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    state.seqlens_k_ptr,
+                    &[(prefill_len + s) as i32],
+                    null_stream,
+                )
+            }
+            .map_err(|e| ExtractError::Formula(format!("H2D seqlens_k: {e}")))?;
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    state.total_seq_len_ptr,
+                    &[(prefill_len + s + 1) as i32],
+                    null_stream,
+                )
+            }
+            .map_err(|e| ExtractError::Formula(format!("H2D total_seq_len: {e}")))?;
 
             // Run decoder step (ORT captures graph on step 0, replays after)
             {
