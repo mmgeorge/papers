@@ -20,7 +20,7 @@ use papers_extract::models;
 use papers_extract::RegionKind;
 
 const DEFAULT_DPI: u32 = 150;
-const DEFAULT_MAX_SEQ: usize = 512;
+const DEFAULT_MAX_SEQ: usize = 4096;
 const DEFAULT_CONFIDENCE: f32 = 0.3;
 
 /// Map region kind to the appropriate GLM-OCR prompt.

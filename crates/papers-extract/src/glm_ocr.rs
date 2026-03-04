@@ -51,7 +51,7 @@ const HIDDEN_SIZE: usize = 1536;
 const _VOCAB_SIZE: usize = 59392;
 const EOS_IDS: [i64; 2] = [59246, 59253];
 const IMAGE_TOKEN_ID: i64 = 59280;
-const DEFAULT_MAX_SEQ: usize = 512;
+const DEFAULT_MAX_SEQ: usize = 4096;
 const N_KV_BUFFERS: usize = NUM_LAYERS * 2; // 32 (key + value per layer)
 // Image normalization (CLIP/SigLip-derived, matching GLM-OCR processor)
 const NORM_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
