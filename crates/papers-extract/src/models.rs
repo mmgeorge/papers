@@ -242,7 +242,7 @@ pub fn ensure_glm_ocr_models(
     })
 }
 
-/// Build a GLM-OCR predictor from model paths (default: formula recognition, max_seq=512).
+/// Build a GLM-OCR predictor from model paths (default: formula recognition prompt).
 pub fn build_glm_ocr_predictor(
     paths: &GlmOcrModelPaths,
 ) -> Result<GlmOcrPredictor, ExtractError> {
@@ -255,7 +255,7 @@ pub fn build_glm_ocr_predictor(
     )
 }
 
-/// Build a GLM-OCR predictor with custom config (prompt, max_seq).
+/// Build a GLM-OCR predictor with custom config (prompt).
 pub fn build_glm_ocr_predictor_with_config(
     paths: &GlmOcrModelPaths,
     config: GlmOcrConfig,

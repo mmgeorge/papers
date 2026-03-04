@@ -19,18 +19,80 @@ use ort::value::{Value, ValueType};
 
 use crate::error::ExtractError;
 
-// Model constants (must match the exported ONNX models)
+// Model constants — preprocessing and tokenizer constants are hardcoded.
+// Decoder architecture params (N_LAYERS, N_HEADS, HEAD_DIM, MAX_SEQ) are
+// read from the ONNX model's input shapes at init time — see `extract_decoder_params()`.
 const TARGET_SIZE: u32 = 768;
 const BOS_ID: i64 = 0;
 const EOS_ID: i64 = 2;
-const N_LAYERS: usize = 8;
-const N_HEADS: usize = 16;
-const HEAD_DIM: usize = 32;
-const MAX_SEQ: usize = 512;
-const N_KV_BUFFERS: usize = N_LAYERS * 2; // key + value per layer
 /// Number of decoder steps to batch before syncing for EOS check.
 /// Higher values reduce sync overhead but waste up to K-1 steps after EOS.
 const BATCH_K: usize = 4;
+
+/// Decoder architecture parameters extracted from the ONNX model's input shapes.
+struct DecoderParams {
+    num_layers: usize,
+    num_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+}
+
+/// Extract decoder architecture params from the session's input metadata.
+///
+/// Reads `past_key_values.0.key` shape `[1, N_HEADS, MAX_SEQ, HEAD_DIM]` and counts
+/// `past_key_values.*.key` inputs to determine `N_LAYERS`.
+fn extract_decoder_params(session: &Session) -> Result<DecoderParams, ExtractError> {
+    let num_layers = session
+        .inputs()
+        .iter()
+        .filter(|inp| {
+            inp.name().starts_with("past_key_values.") && inp.name().ends_with(".key")
+        })
+        .count();
+    if num_layers == 0 {
+        return Err(ExtractError::Model(
+            "decoder has no past_key_values.*.key inputs".into(),
+        ));
+    }
+
+    let ref_input = session
+        .inputs()
+        .iter()
+        .find(|inp| inp.name() == "past_key_values.0.key")
+        .ok_or_else(|| {
+            ExtractError::Model("no past_key_values.0.key input in decoder".into())
+        })?;
+
+    let shape = ref_input
+        .dtype()
+        .tensor_shape()
+        .ok_or_else(|| ExtractError::Model("past_key_values.0.key is not a tensor".into()))?;
+
+    let dims: Vec<i64> = shape.iter().copied().collect();
+    if dims.len() != 4 {
+        return Err(ExtractError::Model(format!(
+            "past_key_values.0.key has {} dims, expected 4",
+            dims.len()
+        )));
+    }
+
+    let params = DecoderParams {
+        num_layers,
+        num_heads: dims[1] as usize,
+        head_dim: dims[3] as usize,
+        max_seq: dims[2] as usize,
+    };
+
+    tracing::debug!(
+        "Decoder params from model: layers={}, heads={}, max_seq={}, head_dim={}",
+        params.num_layers,
+        params.num_heads,
+        params.max_seq,
+        params.head_dim,
+    );
+
+    Ok(params)
+}
 
 /// Pinned (page-locked) host memory buffer for truly async D2H token reads.
 ///
@@ -93,6 +155,7 @@ pub struct FormulaPredictor {
     encoder: Mutex<Session>,
     decoder: Mutex<DecoderState>,
     tokenizer: tokenizers::Tokenizer,
+    max_seq: usize,
     cuda_mem: MemoryInfo,
     /// Main compute stream — runs graph.launch() and D2D copies.
     #[cfg(target_os = "windows")]
@@ -311,10 +374,14 @@ impl FormulaPredictor {
         };
         tracing::debug!("Encoder output shape: {enc_output_shape:?}");
 
+        // Extract decoder architecture from model metadata
+        let decoder_params = extract_decoder_params(&decoder_session)?;
+
         let decoder_state = Self::build_decoder_state(
             decoder_session,
             &cuda_mem,
             &enc_output_shape,
+            &decoder_params,
         )?;
 
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|e| {
@@ -331,6 +398,7 @@ impl FormulaPredictor {
             encoder: Mutex::new(encoder),
             decoder: Mutex::new(decoder_state),
             tokenizer,
+            max_seq: decoder_params.max_seq,
             cuda_mem,
             #[cfg(target_os = "windows")]
             cuda_stream,
@@ -350,14 +418,17 @@ impl FormulaPredictor {
         decoder_session: Session,
         cuda_mem: &MemoryInfo,
         enc_output_shape: &[usize],
+        params: &DecoderParams,
     ) -> Result<DecoderState, ExtractError> {
         let allocator = Allocator::new(&decoder_session, cuda_mem.clone())
             .map_err(|e| ExtractError::Model(format!("CUDA allocator: {e}")))?;
 
         let enc_hidden_elems: usize = enc_output_shape.iter().product();
         let enc_hidden_bytes = enc_hidden_elems * std::mem::size_of::<f16>();
-        let kv_shape = [1usize, N_HEADS, MAX_SEQ, HEAD_DIM];
-        let kv_buf_bytes = N_HEADS * MAX_SEQ * HEAD_DIM * std::mem::size_of::<f16>();
+        let n_kv_buffers = params.num_layers * 2;
+        let kv_shape = [1usize, params.num_heads, params.max_seq, params.head_dim];
+        let kv_buf_bytes =
+            params.num_heads * params.max_seq * params.head_dim * std::mem::size_of::<f16>();
 
         // --- Allocate input tensors on GPU ---
         let mut input_ids_t = ort::value::Tensor::<i64>::new(&allocator, [1usize, 1])
@@ -374,9 +445,9 @@ impl FormulaPredictor {
         let enc_hidden_ptr = enc_hidden_t.data_ptr_mut() as u64;
 
         // KV cache buffers (in-place: same buffer used as both input and output)
-        let mut kv: Vec<Value> = Vec::with_capacity(N_KV_BUFFERS);
-        let mut kv_ptrs: Vec<u64> = Vec::with_capacity(N_KV_BUFFERS);
-        for _ in 0..N_KV_BUFFERS {
+        let mut kv: Vec<Value> = Vec::with_capacity(n_kv_buffers);
+        let mut kv_ptrs: Vec<u64> = Vec::with_capacity(n_kv_buffers);
+        for _ in 0..n_kv_buffers {
             let mut t = ort::value::Tensor::<f16>::new(&allocator, kv_shape)
                 .map_err(|e| ExtractError::Model(format!("alloc kv: {e}")))?;
             kv_ptrs.push(t.data_ptr_mut() as u64);
@@ -489,6 +560,7 @@ impl FormulaPredictor {
         decoder_session: Session,
         _cuda_mem: &MemoryInfo,
         _enc_output_shape: &[usize],
+        _params: &DecoderParams,
     ) -> Result<DecoderState, ExtractError> {
         Ok(DecoderState {
             session: decoder_session,
@@ -725,9 +797,9 @@ impl FormulaPredictor {
         let mut s = 0usize;
 
         let result = (|| -> Result<Vec<i64>, ExtractError> {
-        while s < MAX_SEQ {
+        while s < self.max_seq {
             // Run up to BATCH_K steps without syncing
-            let batch_end = (s + BATCH_K).min(MAX_SEQ);
+            let batch_end = (s + BATCH_K).min(self.max_seq);
             let batch_len = batch_end - s;
 
             for k in 0..batch_len {

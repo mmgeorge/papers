@@ -15,12 +15,10 @@ use std::time::Instant;
 use clap::Parser;
 use image::DynamicImage;
 use papers_extract::glm_ocr::GlmOcrConfig;
-use papers_extract::layout::LayoutDetector;
 use papers_extract::models;
 use papers_extract::RegionKind;
 
 const DEFAULT_DPI: u32 = 150;
-const DEFAULT_MAX_SEQ: usize = 4096;
 const DEFAULT_CONFIDENCE: f32 = 0.3;
 
 /// Map region kind to the appropriate GLM-OCR prompt.
@@ -76,10 +74,6 @@ struct Cli {
     /// Override the prompt (default: auto from region type)
     #[arg(long)]
     prompt: Option<String>,
-
-    /// Maximum decode sequence length
-    #[arg(long, default_value_t = DEFAULT_MAX_SEQ)]
-    max_seq: usize,
 
     /// Dump OCR output to stdout
     #[arg(long)]
@@ -184,16 +178,10 @@ fn main() {
         .prompt
         .clone()
         .unwrap_or_else(|| prompt_for_kind(target_kind).to_string());
-    eprintln!(
-        "\nLoading GLM-OCR (prompt={:?}, max_seq={})...",
-        prompt, cli.max_seq
-    );
+    eprintln!("\nLoading GLM-OCR (prompt={:?})...", prompt);
 
     let model_paths = models::ensure_glm_ocr_models(&cache_dir).expect("GLM-OCR model files");
-    let config = GlmOcrConfig {
-        prompt,
-        max_seq: cli.max_seq,
-    };
+    let config = GlmOcrConfig { prompt };
     let predictor =
         models::build_glm_ocr_predictor_with_config(&model_paths, config).expect("GLM-OCR init");
     eprintln!("GLM-OCR predictor ready\n");

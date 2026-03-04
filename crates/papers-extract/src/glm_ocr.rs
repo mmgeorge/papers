@@ -35,7 +35,11 @@ use ort::value::Value;
 
 use crate::error::ExtractError;
 
-// ── Model constants (must match exported ONNX models) ─────────────────
+// ── Model constants ──────────────────────────────────────────────────
+//
+// Image preprocessing and tokenizer constants are hardcoded (not in model metadata).
+// Decoder architecture params (NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ) are
+// read from the ONNX model's input shapes at init time — see `extract_decoder_params()`.
 
 const PATCH_SIZE: u32 = 14;
 const SPATIAL_MERGE: u32 = 2;
@@ -44,18 +48,75 @@ const GRID_UNIT: u32 = PATCH_SIZE * SPATIAL_MERGE; // 28
 const MIN_PIXELS: u32 = 12544; // from processor_config.json size.shortest_edge
 const MAX_PIXELS: u32 = 9633792; // from processor_config.json size.longest_edge
 const PATCH_ELEM: usize = TEMPORAL_PATCH_SIZE * (PATCH_SIZE as usize) * (PATCH_SIZE as usize) * 3; // 1176
-const NUM_LAYERS: usize = 16;
-const NUM_KV_HEADS: usize = 8;
-const HEAD_DIM: usize = 128;
 const HIDDEN_SIZE: usize = 1536;
-const _VOCAB_SIZE: usize = 59392;
 const EOS_IDS: [i64; 2] = [59246, 59253];
 const IMAGE_TOKEN_ID: i64 = 59280;
-const DEFAULT_MAX_SEQ: usize = 4096;
-const N_KV_BUFFERS: usize = NUM_LAYERS * 2; // 32 (key + value per layer)
 // Image normalization (CLIP/SigLip-derived, matching GLM-OCR processor)
 const NORM_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 const NORM_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+
+// ── Decoder architecture params (extracted from ONNX model at init) ──
+
+/// Decoder architecture parameters extracted from the ONNX model's input shapes.
+struct DecoderParams {
+    num_layers: usize,
+    num_kv_heads: usize,
+    max_seq: usize,
+    head_dim: usize,
+}
+
+/// Extract decoder architecture params from the session's input metadata.
+///
+/// Reads `past_key_0` shape `[1, NUM_KV_HEADS, MAX_SEQ, HEAD_DIM]` and counts
+/// `past_key_*` inputs to determine `NUM_LAYERS`.
+fn extract_decoder_params(session: &Session) -> Result<DecoderParams, ExtractError> {
+    let num_layers = session
+        .inputs()
+        .iter()
+        .filter(|inp| inp.name().starts_with("past_key_"))
+        .count();
+    if num_layers == 0 {
+        return Err(ExtractError::Model(
+            "decoder has no past_key_* inputs".into(),
+        ));
+    }
+
+    let past_key_0 = session
+        .inputs()
+        .iter()
+        .find(|inp| inp.name() == "past_key_0")
+        .ok_or_else(|| ExtractError::Model("no past_key_0 input in decoder".into()))?;
+
+    let shape = past_key_0
+        .dtype()
+        .tensor_shape()
+        .ok_or_else(|| ExtractError::Model("past_key_0 is not a tensor".into()))?;
+
+    let dims: Vec<i64> = shape.iter().copied().collect();
+    if dims.len() != 4 {
+        return Err(ExtractError::Model(format!(
+            "past_key_0 has {} dims, expected 4",
+            dims.len()
+        )));
+    }
+
+    let params = DecoderParams {
+        num_layers,
+        num_kv_heads: dims[1] as usize,
+        max_seq: dims[2] as usize,
+        head_dim: dims[3] as usize,
+    };
+
+    tracing::debug!(
+        "Decoder params from model: layers={}, kv_heads={}, max_seq={}, head_dim={}",
+        params.num_layers,
+        params.num_kv_heads,
+        params.max_seq,
+        params.head_dim,
+    );
+
+    Ok(params)
+}
 
 // ── Prompt tokens ─────────────────────────────────────────────────────
 //
@@ -98,16 +159,12 @@ fn tokenize_prompt_parts(
 pub struct GlmOcrConfig {
     /// Prompt text (e.g. "Formula Recognition:" or a full-page OCR instruction).
     pub prompt: String,
-    /// Maximum decode sequence length (KV cache size). Default: 512 for formulas.
-    /// Use 4096+ for full-page OCR.
-    pub max_seq: usize,
 }
 
 impl Default for GlmOcrConfig {
     fn default() -> Self {
         Self {
             prompt: "Formula Recognition:".to_string(),
-            max_seq: DEFAULT_MAX_SEQ,
         }
     }
 }
@@ -123,7 +180,10 @@ pub struct GlmOcrPredictor {
     tokenizer: tokenizers::Tokenizer,
     prompt_prefix: Vec<i64>,
     prompt_suffix: Vec<i64>,
+    num_layers: usize,
+    num_kv_heads: usize,
     max_seq: usize,
+    head_dim: usize,
     #[allow(dead_code)]
     cuda_mem: MemoryInfo,
     #[cfg(target_os = "windows")]
@@ -164,7 +224,7 @@ struct DecoderState {
 }
 
 impl GlmOcrPredictor {
-    /// Create a new GLM-OCR predictor with default config (formula recognition, max_seq=512).
+    /// Create a new GLM-OCR predictor with default config (formula recognition prompt).
     pub fn new(
         vision_encoder_path: &Path,
         embedding_path: &Path,
@@ -279,7 +339,9 @@ impl GlmOcrPredictor {
         )
         .map_err(|e| ExtractError::Model(format!("CUDA MemoryInfo: {e}")))?;
 
-        let decoder_state = Self::build_decoder_state(decoder_session, &cuda_mem, config.max_seq)?;
+        // Extract decoder architecture from model metadata
+        let decoder_params = extract_decoder_params(&decoder_session)?;
+        let decoder_state = Self::build_decoder_state(decoder_session, &cuda_mem, &decoder_params)?;
 
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|e| {
             ExtractError::Model(format!(
@@ -293,7 +355,7 @@ impl GlmOcrPredictor {
             "GLM-OCR prompt: {} prefix + N image + {} suffix tokens (max_seq={})",
             prompt_prefix.len(),
             prompt_suffix.len(),
-            config.max_seq,
+            decoder_params.max_seq,
         );
 
         let predictor = Self {
@@ -304,7 +366,10 @@ impl GlmOcrPredictor {
             tokenizer,
             prompt_prefix,
             prompt_suffix,
-            max_seq: config.max_seq,
+            num_layers: decoder_params.num_layers,
+            num_kv_heads: decoder_params.num_kv_heads,
+            max_seq: decoder_params.max_seq,
+            head_dim: decoder_params.head_dim,
             cuda_mem,
             #[cfg(target_os = "windows")]
             cuda_ctx,
@@ -320,13 +385,15 @@ impl GlmOcrPredictor {
     fn build_decoder_state(
         decoder_session: Session,
         cuda_mem: &MemoryInfo,
-        max_seq: usize,
+        params: &DecoderParams,
     ) -> Result<DecoderState, ExtractError> {
         let allocator = Allocator::new(&decoder_session, cuda_mem.clone())
             .map_err(|e| ExtractError::Model(format!("CUDA allocator: {e}")))?;
 
-        let kv_shape = [1usize, NUM_KV_HEADS, max_seq, HEAD_DIM];
-        let kv_buf_bytes = NUM_KV_HEADS * max_seq * HEAD_DIM * std::mem::size_of::<f16>();
+        let n_kv_buffers = params.num_layers * 2;
+        let kv_shape = [1usize, params.num_kv_heads, params.max_seq, params.head_dim];
+        let kv_buf_bytes =
+            params.num_kv_heads * params.max_seq * params.head_dim * std::mem::size_of::<f16>();
 
         // Allocate input tensors on GPU
         let mut input_ids_t = ort::value::Tensor::<i64>::new(&allocator, [1usize, 1])
@@ -351,9 +418,9 @@ impl GlmOcrPredictor {
         let total_seq_len_ptr = total_seq_len_t.data_ptr_mut() as u64;
 
         // KV cache buffers (in-place: same buffer for input and output)
-        let mut kv: Vec<Value> = Vec::with_capacity(N_KV_BUFFERS);
-        let mut kv_ptrs: Vec<u64> = Vec::with_capacity(N_KV_BUFFERS);
-        for _ in 0..N_KV_BUFFERS {
+        let mut kv: Vec<Value> = Vec::with_capacity(n_kv_buffers);
+        let mut kv_ptrs: Vec<u64> = Vec::with_capacity(n_kv_buffers);
+        for _ in 0..n_kv_buffers {
             let mut t = ort::value::Tensor::<f16>::new(&allocator, kv_shape)
                 .map_err(|e| ExtractError::Model(format!("alloc kv: {e}")))?;
             kv_ptrs.push(t.data_ptr_mut() as u64);
@@ -461,7 +528,7 @@ impl GlmOcrPredictor {
     fn build_decoder_state(
         decoder_session: Session,
         _cuda_mem: &MemoryInfo,
-        _max_seq: usize,
+        _params: &DecoderParams,
     ) -> Result<DecoderState, ExtractError> {
         Ok(DecoderState {
             session: decoder_session,
@@ -636,8 +703,9 @@ impl GlmOcrPredictor {
 
         // Empty KV cache for prefill (dynamic shape: past_seq_len = 0)
         // llm.onnx uses f32 I/O
-        let empty_kv_shape = [1usize, NUM_KV_HEADS, 0, HEAD_DIM];
-        let empty_kv: Vec<Value> = (0..N_KV_BUFFERS)
+        let n_kv_buffers = self.num_layers * 2;
+        let empty_kv_shape = [1usize, self.num_kv_heads, 0, self.head_dim];
+        let empty_kv: Vec<Value> = (0..n_kv_buffers)
             .map(|_| {
                 let arr = ndarray::Array4::<f32>::from_elem(empty_kv_shape, 0.0);
                 Value::from_array(arr.into_dyn()).expect("empty kv tensor").into()
@@ -679,8 +747,8 @@ impl GlmOcrPredictor {
             .unwrap_or(EOS_IDS[0]);
 
         // Extract KV cache outputs (CPU f32) and convert to f16
-        let mut kv_cache = Vec::with_capacity(N_KV_BUFFERS);
-        for i in 0..NUM_LAYERS {
+        let mut kv_cache = Vec::with_capacity(n_kv_buffers);
+        for i in 0..self.num_layers {
             for kv_type in &["key", "value"] {
                 let name = format!("present_{kv_type}_{i}");
                 let kv_val = outputs
@@ -735,11 +803,11 @@ impl GlmOcrPredictor {
                 continue;
             }
 
-            let src_head_stride = prefill_len * HEAD_DIM;
-            let dst_head_stride = self.max_seq * HEAD_DIM * std::mem::size_of::<f16>();
-            let copy_elems = prefill_len * HEAD_DIM;
+            let src_head_stride = prefill_len * self.head_dim;
+            let dst_head_stride = self.max_seq * self.head_dim * std::mem::size_of::<f16>();
+            let copy_elems = prefill_len * self.head_dim;
 
-            for h in 0..NUM_KV_HEADS {
+            for h in 0..self.num_kv_heads {
                 let src_start = h * src_head_stride;
                 let src_slice = &kv_data[src_start..src_start + copy_elems];
                 let dst = state.kv_ptrs[i] + (h * dst_head_stride) as u64;

@@ -874,3 +874,65 @@ All 9 Rust-vs-reference differences are cosmetic (render identically in LaTeX).
 One difference (p5_58: `\delta x_c` vs `\delta x_i`) is actually a case where
 Rust is more accurate than Ollama — the source image clearly shows subscript `c`
 in the numerator.
+
+### 18. Read model architecture from ONNX metadata
+
+**Problem:** Both `formula.rs` and `glm_ocr.rs` originally hardcoded decoder
+architecture constants (`NUM_LAYERS`, `NUM_KV_HEADS`, `HEAD_DIM`, `MAX_SEQ`)
+that had to match the exported ONNX models. When the model changed (e.g.,
+re-exporting the decoder with `--max-seq 4096`), these constants had to be
+manually updated in Rust code — error-prone and a source of silent bugs
+(buffer overflows when MAX_SEQ is too small).
+
+**Fix:** Read these values from the ONNX model's input metadata at init time.
+The decoder's KV cache inputs encode the full architecture:
+
+- `past_key_0` (GLM-OCR) or `past_key_values.0.key` (PP-FormulaNet) has shape
+  `[1, NUM_KV_HEADS, MAX_SEQ, HEAD_DIM]`
+- Counting `past_key_*` or `past_key_values.*.key` inputs gives `NUM_LAYERS`
+
+```rust
+struct DecoderParams {
+    num_layers: usize,
+    num_kv_heads: usize,
+    max_seq: usize,
+    head_dim: usize,
+}
+
+fn extract_decoder_params(session: &Session) -> Result<DecoderParams, ExtractError> {
+    let num_layers = session.inputs().iter()
+        .filter(|inp| inp.name().starts_with("past_key_"))
+        .count();
+
+    let past_key_0 = session.inputs().iter()
+        .find(|inp| inp.name() == "past_key_0")
+        .ok_or_else(|| ExtractError::Model("no past_key_0 input".into()))?;
+
+    let shape = past_key_0.dtype().tensor_shape()
+        .ok_or_else(|| ExtractError::Model("past_key_0 not a tensor".into()))?;
+    let dims: Vec<i64> = shape.iter().copied().collect();
+
+    Ok(DecoderParams {
+        num_layers,
+        num_kv_heads: dims[1] as usize,
+        max_seq: dims[2] as usize,
+        head_dim: dims[3] as usize,
+    })
+}
+```
+
+**What to extract from model vs keep hardcoded:**
+
+| Extract from model | Keep hardcoded |
+|---|---|
+| `NUM_LAYERS` (KV input count) | `PATCH_SIZE`, `SPATIAL_MERGE` (image preprocessing) |
+| `NUM_KV_HEADS` (KV shape dim 1) | `TARGET_SIZE` (encoder input size) |
+| `MAX_SEQ` (KV shape dim 2) | `BOS_ID`, `EOS_ID`, `EOS_IDS` (tokenizer constants) |
+| `HEAD_DIM` (KV shape dim 3) | `NORM_MEAN`, `NORM_STD` (image normalization) |
+| | `BATCH_K` (decode sync strategy, not model-dependent) |
+
+**Key insight:** `MAX_SEQ` is baked into the decoder ONNX model because CUDA
+graph capture requires static tensor shapes. The KV cache dimension in the
+model file is the source of truth — reading it at init time means re-exporting
+the model with a different `--max-seq` value "just works" without any Rust
+code changes.
