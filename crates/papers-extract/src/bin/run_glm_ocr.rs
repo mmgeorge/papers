@@ -1,13 +1,15 @@
 //! Run GLM-OCR on regions from a dump directory.
 //!
 //! By default runs each region once and writes results.json.
-//! With --bench, adds a warmup run and multiple timed iterations with stats.
+//! With --bench, runs multiple timed iterations and prints a summary.
 //!
 //! Usage:
 //!   run_glm_ocr data/dumps/vbd -o data/results/vbd-glm --region-type DisplayFormula
 //!   run_glm_ocr data/dumps/vbd -o data/results/vbd-glm --region-type Text --limit 10
-//!   run_glm_ocr data/dumps/vbd -o data/results/vbd-glm --region-type Algorithm --bench --runs 5
+//!   run_glm_ocr data/dumps/vbd -o data/results/vbd-glm --region-type "Text,DisplayFormula" --bench
 
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -88,25 +90,26 @@ struct Cli {
     #[arg(long)]
     page: Option<u32>,
 
-    /// Max number of regions to process
+    /// Max number of regions to process per kind
     #[arg(long)]
     limit: Option<usize>,
 
-    /// Enable benchmark mode (warmup + multiple timed runs with stats)
+    /// Enable benchmark mode (multiple timed runs with summary)
     #[arg(long)]
     bench: bool,
 
-    /// Number of timed runs per image in bench mode (default 5)
-    #[arg(long, default_value = "5")]
+    /// Number of timed runs per image in bench mode
+    #[arg(long, default_value = "2")]
     runs: usize,
-
-    /// Print OCR output to stdout
-    #[arg(long)]
-    dump: bool,
 
     /// Model cache directory
     #[arg(long)]
     model_cache_dir: Option<PathBuf>,
+}
+
+fn progress(msg: &str) {
+    eprint!("\r{:<50}", msg);
+    std::io::stderr().flush().ok();
 }
 
 fn std_dev(times: &[f64]) -> f64 {
@@ -114,6 +117,12 @@ fn std_dev(times: &[f64]) -> f64 {
     let mean = times.iter().sum::<f64>() / n;
     let variance = times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n;
     variance.sqrt()
+}
+
+/// Per-image timing record for the summary.
+struct Timing {
+    kind: RegionKind,
+    times_ms: Vec<f64>,
 }
 
 fn main() {
@@ -143,10 +152,9 @@ fn main() {
         .unwrap_or_else(models::default_cache_dir);
     let model_paths = models::ensure_glm_ocr_models(&cache_dir).expect("GLM-OCR model files");
 
-    // Group entries by prompt so we build one predictor per prompt,
-    // applying --limit per kind.
+    // Group entries by prompt, applying --limit per kind.
     let mut groups: Vec<(&'static str, Vec<&LayoutEntry>)> = Vec::new();
-    let mut kind_counts: std::collections::HashMap<RegionKind, usize> = std::collections::HashMap::new();
+    let mut kind_counts: HashMap<RegionKind, usize> = HashMap::new();
     for entry in &filtered {
         if let Some(limit) = cli.limit {
             let count = kind_counts.entry(entry.kind).or_insert(0);
@@ -164,127 +172,127 @@ fn main() {
     }
 
     let total: usize = groups.iter().map(|(_, v)| v.len()).sum();
-    eprintln!(
-        "{} regions ({:?}) from {}",
-        total,
-        target_kinds,
-        cli.dump_dir.display()
-    );
+
+    // Warmup: single prediction to prime ORT/CUDA
+    {
+        let first = groups[0].1[0];
+        let img_path = cli.dump_dir.join(first.image.trim_start_matches("./"));
+        let image = image::open(&img_path).expect("load warmup image");
+        let prompt = groups[0].0;
+        let config = GlmOcrConfig { prompt: prompt.to_string() };
+        let predictor = models::build_glm_ocr_predictor_with_config(&model_paths, config)
+            .expect("GLM-OCR init");
+        progress("warmup...");
+        let _ = predictor.predict(std::slice::from_ref(&image)).expect("warmup predict");
+    }
 
     // Create output directory
     std::fs::create_dir_all(&cli.output).expect("create output dir");
     let mut results: Vec<ResultEntry> = Vec::new();
-
-    for (prompt, entries) in &groups {
-        eprintln!("\n--- prompt={:?} ({} regions) ---", prompt, entries.len());
+    let mut timings: Vec<Timing> = Vec::new();
+    for (prompt, group_entries) in &groups {
         let config = GlmOcrConfig { prompt: prompt.to_string() };
         let predictor = models::build_glm_ocr_predictor_with_config(&model_paths, config)
             .expect("GLM-OCR init");
 
-        for entry in entries {
+        for (i, entry) in group_entries.iter().enumerate() {
+            let msg = format!("{:?}: {} of {}", entry.kind, i + 1, group_entries.len());
+            progress(&msg);
+
             let img_path = cli.dump_dir.join(entry.image.trim_start_matches("./"));
             let image = image::open(&img_path)
                 .unwrap_or_else(|err| panic!("load {}: {err}", img_path.display()));
 
-            eprintln!(
-                "=== {} {:?} (p{}, {}x{}, conf={:.2}) ===",
-                entry.id, entry.kind, entry.page,
-                image.width(), image.height(), entry.confidence,
-            );
+            let runs = if cli.bench { cli.runs } else { 1 };
+            let mut times_ms = Vec::with_capacity(runs);
+            let mut last_output = String::new();
 
-            let output = if cli.bench {
-                run_bench(&predictor, &image, &entry.id, cli.runs, cli.dump)
-            } else {
-                run_once(&predictor, &image, &entry.id, cli.dump)
-            };
+            for _ in 0..runs {
+                let t0 = Instant::now();
+                let result = predictor.predict(std::slice::from_ref(&image)).expect("predict");
+                times_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+                last_output = result.into_iter().next().unwrap();
+            }
+
+            if cli.bench {
+                timings.push(Timing {
+                    kind: entry.kind,
+                    times_ms,
+                });
+            }
 
             results.push(ResultEntry {
                 id: entry.id.clone(),
                 kind: entry.kind,
                 page: entry.page,
-                text: output,
+                text: last_output,
             });
-
-            eprintln!();
         }
     }
+
+    progress(&format!("{} regions done.", total));
+    eprintln!();
 
     // Write results JSON
     let results_path = cli.output.join("results.json");
     let json = serde_json::to_string_pretty(&results).expect("serialize results");
     std::fs::write(&results_path, &json).expect("write results.json");
-    eprintln!("Results: {} ({} regions)", results_path.display(), results.len());
-}
+    eprintln!("Results: {}", results_path.display());
 
-/// Single run, no warmup.
-fn run_once(
-    predictor: &papers_extract::glm_ocr::GlmOcrPredictor,
-    image: &image::DynamicImage,
-    id: &str,
-    dump: bool,
-) -> String {
-    let t0 = Instant::now();
-    let result = predictor.predict(std::slice::from_ref(image)).expect("predict");
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let text = &result[0];
-    eprintln!("  {:.0}ms  {} ch", ms, text.len());
-
-    if dump {
-        println!("--- {} ---", id);
-        println!("{}", text);
-        println!();
+    // Print benchmark summary
+    if cli.bench {
+        print_summary(&timings);
     }
 
-    text.clone()
 }
 
-/// Benchmark mode: warmup + multiple timed runs with stats.
-fn run_bench(
-    predictor: &papers_extract::glm_ocr::GlmOcrPredictor,
-    image: &image::DynamicImage,
-    id: &str,
-    runs: usize,
-    dump: bool,
-) -> String {
-    // Warmup
-    eprintln!("  warmup...");
-    let _ = predictor.predict(std::slice::from_ref(image)).expect("warmup predict");
+fn print_summary(timings: &[Timing]) {
+    eprintln!();
 
-    eprintln!("{:>4}  {:>10}  {:>10}", "Run", "Time", "Chars");
-    eprintln!("{}", "-".repeat(35));
-
-    let mut times = Vec::with_capacity(runs);
-    let mut last_output = String::new();
-
-    for run in 1..=runs {
-        let t0 = Instant::now();
-        let result = predictor.predict(std::slice::from_ref(image)).expect("predict");
-        let elapsed = t0.elapsed();
-        let ms = elapsed.as_secs_f64() * 1000.0;
-        let text = &result[0];
-        times.push(ms);
-        last_output = text.clone();
-
-        eprintln!("{:>4}  {:>8.0}ms  {:>8} ch", run, ms, text.len());
+    // Per-kind aggregation
+    let mut kind_times: HashMap<RegionKind, Vec<f64>> = HashMap::new();
+    for t in timings {
+        let median = median_of(&t.times_ms);
+        kind_times.entry(t.kind).or_default().push(median);
     }
 
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let median = times[times.len() / 2];
-    let min = times[0];
-    let max = times[times.len() - 1];
-    let sd = std_dev(&times);
+    eprintln!("{:<20} {:>6} {:>10} {:>10} {:>10} {:>10} {:>10}", "Kind", "Count", "Median", "Min", "Max", "StdDev", "Total");
+    eprintln!("{}", "-".repeat(80));
 
-    eprintln!("{}", "-".repeat(35));
+    let mut kinds: Vec<_> = kind_times.keys().copied().collect();
+    kinds.sort_by_key(|k| format!("{:?}", k));
+
+    let mut grand_total_ms = 0.0;
+    let mut grand_count = 0;
+
+    for kind in &kinds {
+        let mut times = kind_times[kind].clone();
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let count = times.len();
+        let med = median_of(&times);
+        let min = times[0];
+        let max = times[times.len() - 1];
+        let sd = std_dev(&times);
+        let total: f64 = times.iter().sum();
+
+        grand_total_ms += total;
+        grand_count += count;
+
+        eprintln!(
+            "{:<20} {:>6} {:>8.0}ms {:>8.0}ms {:>8.0}ms {:>8.1}ms {:>7.1}s",
+            format!("{:?}", kind), count, med, min, max, sd, total / 1000.0
+        );
+    }
+
+    eprintln!("{}", "-".repeat(80));
     eprintln!(
-        "Median: {:.0}ms  Min: {:.0}ms  Max: {:.0}ms  StdDev: {:.1}ms",
-        median, min, max, sd
+        "{:<20} {:>6} {:>49} {:>7.1}s",
+        "Total", grand_count, "", grand_total_ms / 1000.0
     );
+}
 
-    if dump {
-        println!("--- {} ---", id);
-        println!("{}", last_output);
-        println!();
-    }
-
-    last_output
+fn median_of(times: &[f64]) -> f64 {
+    let mut sorted = times.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted[sorted.len() / 2]
 }

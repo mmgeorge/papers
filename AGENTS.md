@@ -18,3 +18,44 @@ crates/papers-extract/scratch.txt
 ```
 
 The `.temp/` directory is gitignored. Create it on demand if it doesn't exist.
+
+## Benchmarks
+
+Benchmark results go in `benchmarks/<model-name>/`. Each benchmark directory
+should contain a `README.md` with findings and the raw `results.json` output.
+
+### Workflow
+
+1. **Dump layout** from a PDF (one-time per paper):
+   ```bash
+   cargo run --release --bin dump -- data/<paper>.pdf data/dumps/<paper>
+   ```
+   This creates `data/dumps/<paper>/layout.json` and cropped region images
+   organized by type (e.g. `DisplayFormula/`, `Text/`, `Algorithm/`).
+
+2. **Run a model** on dumped regions:
+   ```bash
+   # GLM-OCR (any region type, comma-separated)
+   cargo run --release --bin run_glm_ocr -- data/dumps/<paper> \
+     -o .temp/results/<paper>-glm \
+     --region-type "Text,DisplayFormula,Algorithm,Table"
+
+   # PP-FormulaNet (formulas only)
+   cargo run --release --bin bench_formulas -- data/dumps/<paper> \
+     -o .temp/results/<paper>-ppformula
+   ```
+
+3. **Benchmark mode** (`--bench`) runs each image multiple times (default 2)
+   and reports median/min/max/stddev:
+   ```bash
+   cargo run --release --bin run_glm_ocr -- data/dumps/<paper> \
+     -o .temp/results/<paper>-glm \
+     --region-type DisplayFormula --bench --runs 3
+   ```
+
+4. **Useful flags**:
+   - `--limit N` — process at most N regions per kind
+   - `--page P` — filter to a single page
+   - `--dump` — print OCR output to stdout
+
+5. **Write up results** in `benchmarks/<model-name>/README.md`.

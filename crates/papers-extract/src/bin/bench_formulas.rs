@@ -112,12 +112,7 @@ fn main() {
         &model_paths.formula_tokenizer,
     )
     .expect("FormulaPredictor::new");
-    eprintln!("Formula predictor ready");
-
-    // Warmup run
-    eprintln!("  warmup...");
-    let _ = predictor.predict(&images[..1]).expect("warmup predict");
-    eprintln!();
+    eprintln!("Formula predictor ready\n");
 
     // Benchmark runs
     eprintln!(
