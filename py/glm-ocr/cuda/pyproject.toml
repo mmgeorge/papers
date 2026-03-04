@@ -1,0 +1,32 @@
+[project]
+name = "glm-ocr-cuda"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "glm-ocr",
+    "onnxruntime-gpu",
+    "onnx",
+    "onnxconverter-common",
+    "onnxscript",
+    "ml-dtypes",
+    "pillow",
+    "numpy",
+    "huggingface-hub",
+]
+
+[project.optional-dependencies]
+export = [
+    "torch>=2.6,<2.10",
+    "torchvision",
+]
+
+[tool.uv.sources]
+glm-ocr = { path = "..", editable = true }
+
+[tool.uv]
+extra-index-url = ["https://download.pytorch.org/whl/cu128"]
+# Pin CUDA torch to prevent uv resolving CPU-only from PyPI
+override-dependencies = [
+    "torch==2.9.1+cu128",
+    "torchvision==0.24.1+cu128",
+]

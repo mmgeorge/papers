@@ -1,0 +1,8 @@
+FROM glm-ocr:latest
+
+PARAMETER num_ctx 10240
+
+TEMPLATE {{ .Prompt }}
+RENDERER glm-ocr
+PARSER glm-ocr
+PARAMETER temperature 0
