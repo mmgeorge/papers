@@ -1,4 +1,36 @@
+# Rust
 /target
+
+# Claude Code
 /.claude
-/.temp
+
+# ONNX Runtime (extracted shared lib)
 onnxruntime
+
+# Python
+__pycache__/
+*.egg-info/
+.venv/
+uv.lock
+
+# Model artifacts (downloaded/exported by export scripts)
+*.onnx
+*.onnx.data
+*.npz
+*.pdparams
+py/glm-ocr/model/
+
+# HuggingFace cache
+.cache/
+
+# Embedding model cache
+/.fastembed_cache/
+
+# Test artifacts (extracted images, benchmark outputs)
+/test-extract/
+
+# Temp files
+/.temp
+*.nsys-rep
+*.sqlite
+nul
