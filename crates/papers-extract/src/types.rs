@@ -51,7 +51,7 @@ pub struct Region {
 }
 
 /// All 24 DocLayout V3 region classes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RegionKind {
     Title,
     ParagraphTitle,

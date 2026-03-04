@@ -1,68 +1,104 @@
-//! Benchmark formula prediction in isolation.
+//! Benchmark PP-FormulaNet formula prediction on regions from a dump directory.
 //!
 //! Usage:
-//!   # First dump formulas from a PDF:
-//!   papers-extract data/vbd.pdf -o test-extract/ --dump-formulas
-//!
-//!   # Then benchmark:
-//!   bench_formulas test-extract/formulas/
-//!   bench_formulas test-extract/formulas/ --runs 5
+//!   bench_formulas data/dumps/vbd -o data/results/vbd-ppformula
+//!   bench_formulas data/dumps/vbd -o data/results/vbd-ppformula --runs 3
+//!   bench_formulas data/dumps/vbd -o data/results/vbd-ppformula --page 5
 
 use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use image::DynamicImage;
 use papers_extract::formula::FormulaPredictor;
 use papers_extract::models;
+use papers_extract::RegionKind;
+use serde::{Deserialize, Serialize};
+
+/// Layout entry from dump's layout.json.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct LayoutEntry {
+    id: String,
+    kind: RegionKind,
+    page: u32,
+    confidence: f32,
+    width: u32,
+    height: u32,
+    image: String,
+}
+
+/// Output result per region.
+#[derive(Serialize)]
+struct ResultEntry {
+    id: String,
+    kind: RegionKind,
+    page: u32,
+    text: String,
+}
 
 #[derive(Parser)]
-#[command(name = "bench_formulas", about = "Benchmark formula prediction")]
+#[command(name = "bench_formulas", about = "Benchmark PP-FormulaNet on formula regions from a dump")]
 struct Cli {
-    /// Directory containing formula PNG images
-    formulas_dir: PathBuf,
+    /// Path to dump directory (created by `dump` binary)
+    dump_dir: PathBuf,
 
-    /// Number of benchmark runs (after warmup)
+    /// Output directory for results JSON
+    #[arg(short, long)]
+    output: PathBuf,
+
+    /// Number of timed runs (excludes warmup)
     #[arg(long, default_value = "5")]
     runs: usize,
 
-    /// Dump all formula outputs (filename\tlatex) to stdout for comparison
+    /// Filter to a specific page (1-indexed)
     #[arg(long)]
-    dump: bool,
+    page: Option<u32>,
 
     /// Model cache directory
     #[arg(long)]
     model_cache_dir: Option<PathBuf>,
 }
 
+fn std_dev(times: &[f64]) -> f64 {
+    let n = times.len() as f64;
+    let mean = times.iter().sum::<f64>() / n;
+    let variance = times.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n;
+    variance.sqrt()
+}
+
 fn main() {
     let cli = Cli::parse();
 
-    // Load formula images
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&cli.formulas_dir)
-        .expect("Cannot read formulas directory")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "png"))
-        .collect();
-    paths.sort();
+    // Load layout.json and filter to formula regions
+    let json_path = cli.dump_dir.join("layout.json");
+    let json_str = std::fs::read_to_string(&json_path).expect("read layout.json");
+    let entries: Vec<LayoutEntry> = serde_json::from_str(&json_str).expect("parse layout.json");
 
-    if paths.is_empty() {
-        eprintln!("No PNG files found in {}", cli.formulas_dir.display());
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|e| e.kind == RegionKind::DisplayFormula || e.kind == RegionKind::InlineFormula)
+        .filter(|e| cli.page.map_or(true, |p| e.page == p))
+        .collect();
+
+    if filtered.is_empty() {
+        eprintln!("No formula regions found in {}", cli.dump_dir.display());
         std::process::exit(1);
     }
 
-    let images: Vec<DynamicImage> = paths
-        .iter()
-        .map(|p| image::open(p).expect(&format!("Cannot open {}", p.display())))
-        .collect();
+    let mut paths = Vec::new();
+    let mut images = Vec::new();
+    for entry in &filtered {
+        let img_path = cli.dump_dir.join(entry.image.trim_start_matches("./"));
+        let image = image::open(&img_path)
+            .unwrap_or_else(|err| panic!("load {}: {err}", img_path.display()));
+        paths.push(img_path);
+        images.push(image);
+    }
 
-    eprintln!("Loaded {} formula images", images.len());
+    eprintln!("Loaded {} formula images from {}", images.len(), cli.dump_dir.display());
 
-    // Init ORT
+    // Init ORT + load models
     models::init_ort_runtime().expect("ORT runtime init");
-
-    // Load models
     let cache_dir = cli
         .model_cache_dir
         .unwrap_or_else(models::default_cache_dir);
@@ -76,7 +112,12 @@ fn main() {
         &model_paths.formula_tokenizer,
     )
     .expect("FormulaPredictor::new");
-    eprintln!("Formula predictor ready (includes warmup)\n");
+    eprintln!("Formula predictor ready");
+
+    // Warmup run
+    eprintln!("  warmup...");
+    let _ = predictor.predict(&images[..1]).expect("warmup predict");
+    eprintln!();
 
     // Benchmark runs
     eprintln!(
@@ -86,6 +127,7 @@ fn main() {
     eprintln!("{}", "-".repeat(45));
 
     let mut times = Vec::with_capacity(cli.runs);
+    let mut last_results: Vec<String> = Vec::new();
 
     for run in 1..=cli.runs {
         let t0 = Instant::now();
@@ -94,13 +136,11 @@ fn main() {
         let ms = elapsed.as_secs_f64() * 1000.0;
         let per_formula = ms / images.len() as f64;
         times.push(ms);
+        last_results = results;
 
         eprintln!(
             "{:>4}  {:>8.0}ms  {:>8.1}ms  {:>10}",
-            run,
-            ms,
-            per_formula,
-            results.len()
+            run, ms, per_formula, last_results.len()
         );
     }
 
@@ -108,30 +148,33 @@ fn main() {
     let median = times[times.len() / 2];
     let min = times[0];
     let max = times[times.len() - 1];
+    let sd = std_dev(&times);
 
     eprintln!("{}", "-".repeat(45));
     eprintln!(
-        "Median: {:.0}ms ({:.1}ms/formula)  Min: {:.0}ms  Max: {:.0}ms",
+        "Median: {:.0}ms ({:.1}ms/formula)  Min: {:.0}ms  Max: {:.0}ms  StdDev: {:.1}ms",
         median,
         median / images.len() as f64,
         min,
-        max
+        max,
+        sd
     );
-    eprintln!(
-        "{} formulas, {} runs",
-        images.len(),
-        cli.runs
-    );
+    eprintln!("{} formulas, {} runs", images.len(), cli.runs);
 
-    // Dump all outputs or print one sample
-    if cli.dump {
-        let results = predictor.predict(&images).expect("dump predict");
-        for (path, latex) in paths.iter().zip(results.iter()) {
-            println!("{}\t{}", path.file_name().unwrap().to_string_lossy(), latex);
-        }
-    } else {
-        let sample = predictor.predict(&images[..1]).expect("sample predict");
-        eprintln!("\nSample ({}):", paths[0].file_name().unwrap().to_string_lossy());
-        eprintln!("  {}", sample[0]);
-    }
+    // Write results JSON
+    std::fs::create_dir_all(&cli.output).expect("create output dir");
+    let results: Vec<ResultEntry> = filtered
+        .iter()
+        .zip(last_results.iter())
+        .map(|(entry, text)| ResultEntry {
+            id: entry.id.clone(),
+            kind: entry.kind,
+            page: entry.page,
+            text: text.clone(),
+        })
+        .collect();
+    let results_path = cli.output.join("results.json");
+    let json = serde_json::to_string_pretty(&results).expect("serialize results");
+    std::fs::write(&results_path, &json).expect("write results.json");
+    eprintln!("\nResults: {}", results_path.display());
 }

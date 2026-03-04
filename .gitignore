@@ -1,5 +1,6 @@
 # Rust
 /target
+/data/dumps
 
 # Claude Code
 /.claude
