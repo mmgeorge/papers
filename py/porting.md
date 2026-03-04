@@ -269,7 +269,7 @@ GLM-OCR requires 4 ONNX models (vs PP-FormulaNet's 2):
 | `vision_encoder.onnx` | `export.py` | ~3.4 GB (FP32) | CogViT with M-RoPE |
 | `embedding.onnx` | `export.py` | 348 MB (FP16) | Token embeddings |
 | `llm.onnx` | `export.py` | 2.2 GB (FP16) | Full LLM for prefill |
-| `llm_decoder.onnx` | `export_decoder.py` | 1.3 GB (FP16) | Decode step (CUDA graphed) |
+| `llm_decoder.onnx` | `export.py` | 1.3 GB (FP16) | Decode step (CUDA graphed) |
 
 The same export wrapper pattern applies: a thin `nn.Module` wrapper
 (`DecoderStepWrapper`) around the HuggingFace model that reshapes the interface

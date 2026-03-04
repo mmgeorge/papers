@@ -51,7 +51,7 @@ const FORMULA_DECODER: ModelFile = ModelFile {
 };
 
 // GLM-OCR models (manual export, no auto-download)
-// Filenames match the output of export.py / export_decoder.py.
+// Filenames match the output of py/glm-ocr/cuda/export.py.
 // ONNX external data files (*.onnx.data) reference relative paths, so
 // these files must stay in their export directory (use --model-cache-dir).
 const GLM_VISION_ENCODER: ModelFile = ModelFile {

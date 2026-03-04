@@ -630,9 +630,8 @@ image = "0.25"       # image preprocessing
 | `py/pp-formulanet/cuda/export.py` | PP-FormulaNet ONNX export pipeline |
 | `py/pp-formulanet/cuda/run.py` | PP-FormulaNet Python reference |
 | `py/pp-formulanet/common/preprocess.py` | Shared preprocessing (Python) |
-| `py/glm-ocr/export.py` | GLM-OCR 3-part ONNX export (vision, embedding, llm) |
-| `py/glm-ocr/export_decoder.py` | GLM-OCR CUDA-graph-friendly decoder export |
-| `py/glm-ocr/run.py` | GLM-OCR Python reference |
+| `py/glm-ocr/cuda/export.py` | GLM-OCR 4-part ONNX export (vision, embedding, llm, decoder) |
+| `py/glm-ocr/cuda/run.py` | GLM-OCR Python reference |
 
 ---
 
@@ -706,7 +705,7 @@ with CUDA graphs when the data tensor is an ORT-internal temporary.
 
 **Root cause chain:**
 
-1. Our `export_decoder.py` wrapper passed a **2D** `attention_mask [1, MAX_SEQ]`
+1. Our `DecoderStepWrapper` (in `export.py`) passed a **2D** `attention_mask [1, MAX_SEQ]`
    (just 1s and 0s) to `self.language_model(...)`
 2. Inside `language_model.forward()`, HuggingFace's `create_causal_mask()`
    expanded this 2D mask into a 4D mask `[1, 1, 1, MAX_SEQ]` that attention
