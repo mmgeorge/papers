@@ -941,3 +941,71 @@ graph capture requires static tensor shapes. The KV cache dimension in the
 model file is the source of truth — reading it at init time means re-exporting
 the model with a different `--max-seq` value "just works" without any Rust
 code changes.
+
+### 19. IoBinding for LLM prefill — reverted (compute-bound, not transfer-bound)
+
+**Context:** nsys profiling of the GLM-OCR CUDA path on a single Algorithm
+region (~2000ms total) showed the prefill path as the apparent bottleneck:
+
+- `cudaStreamSynchronize`: 42.4% (848ms) — ORT's internal syncs in `session.run()`
+- `cudaMemcpy` (synchronous): 31.8% (636ms) — ORT pulling outputs to CPU
+- H2D transfers: 98.6% of total transfer (7262 MB) — KV cache going CPU→GPU
+
+**Root cause hypothesis:** `run_prefill_for_cuda()` uses `session.run()` which
+pulls ALL outputs (including 32 KV cache tensors) to CPU. Then `decode_loop()`
+copies them back to GPU via H2D. This GPU→CPU→GPU roundtrip was assumed to be
+the dominant cost.
+
+**What we tried (3 iterations):**
+
+1. **IoBinding for LLM prefill only:** Rewrote `run_prefill_for_cuda` to use
+   IoBinding with `bind_output_to_device("present_key/value_N", &cuda_mem)` to
+   keep KV cache on GPU. Changed return type from `Vec<Vec<bf16>>` (CPU) to
+   `Vec<Value>` (GPU-resident). Updated `decode_loop` to accept `&[Value]` and
+   use D2D copies (`memcpy_dtod_async`) instead of H2D. Used `value_data_ptr()`
+   (ORT C API `GetTensorMutableData`) to extract GPU addresses from the
+   IoBinding output Values for head-by-head strided D2D copy.
+
+2. **IoBinding for vision encoder + embedding:** Extended IoBinding to all three
+   prefill-phase sessions. Vision encoder and embedding outputs stayed on GPU.
+   Replaced CPU-side `merge_vision_embeddings` (extract → iterate → convert)
+   with a single D2D copy overwriting image token positions in token_embeds
+   (image tokens are contiguous, so one `memcpy_dtod_async`).
+
+3. **Full GPU pipeline:** Combined all three into a single GPU-resident pipeline
+   with manual CUDA stream synchronization between stages.
+
+**nsys results (Algorithm region, single image):**
+
+| Metric | Baseline (session.run) | IoBinding prefill only | Full GPU pipeline |
+|--------|----------------------|----------------------|-------------------|
+| Wall-clock median | 1937ms | 1938ms | 1919ms |
+| H2D total | 7262 MB | 3593 MB | 3589 MB |
+| D2D total | — | 848 MB | 852 MB |
+| cudaMemcpy (sync) calls | 1394 | 697 | 697 |
+| cuStreamSync calls | 2486 | 262 | 267 |
+| cuGraphLaunch time | 733ms | 884ms | 636ms |
+
+The IoBinding changes halved PCIe transfers and eliminated 89% of stream syncs,
+but wall-clock time was unchanged. The pipeline is **compute-bound** on CUDA
+graph decode steps (cuGraphLaunch), not transfer-bound. The KV cache round-trip
+that looked expensive in the profile was overlapping with GPU compute — removing
+it freed up PCIe bandwidth that wasn't the bottleneck.
+
+**Additional issue:** The full GPU pipeline (iteration 3) crashed when running
+multiple predictor groups sequentially (Text → DisplayFormula → Table). The
+third group's decoder received a garbage `seqlens_k` value (0x3E1BA5A9 instead
+of a valid sequence length), likely from leaked CUDA state across predictor
+lifecycles due to `ManuallyDrop<Session>` (needed because `with_compute_stream`
+causes session destructor crashes). This was not debugged further.
+
+**Decision:** Reverted all changes. The complexity (IoBinding setup, raw C API
+`value_data_ptr`, D2D strided copies, stream ordering, ManuallyDrop concerns)
+was not justified by the negligible wall-clock improvement. The code stayed
+with the simpler `session.run()` + H2D pattern.
+
+**Lesson:** Profile metrics (transfer volume, sync counts) can be misleading
+when operations overlap with compute. Always measure wall-clock time as the
+primary metric. For this model, the ~636-884ms of CUDA graph decode compute
+is the true floor — transfer optimizations yield diminishing returns once the
+pipeline is compute-bound.

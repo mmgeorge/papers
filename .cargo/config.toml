@@ -1,2 +1,4 @@
 [env]
 PROTOC = "C:/Users/mattm/AppData/Local/Microsoft/WinGet/Packages/Google.Protobuf_Microsoft.Winget.Source_8wekyb3d8bbwe/bin/protoc.exe"
+ORT_DYLIB_PATH = { value = ".cache/onnxruntime.dll", relative = true }
+PDFIUM_PATH = { value = ".cache", relative = true }

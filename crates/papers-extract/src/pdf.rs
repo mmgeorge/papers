@@ -264,177 +264,46 @@ fn compute_space_width_ratio(char_info: &PdfPageTextChar, font_name: &str) -> f3
     }
 }
 
-/// Load the pdfium library, trying system paths then a cached location.
+/// Load the pdfium library.
+///
+/// Search order: explicit path → `PDFIUM_PATH` env var (set by
+/// `.cargo/config.toml` for `cargo run`) → next to executable (dist bundle)
+/// → system library paths → error.
 pub fn load_pdfium(pdfium_path: Option<&Path>) -> Result<Pdfium, ExtractError> {
     // 1. User-provided explicit path
     if let Some(path) = pdfium_path {
-        let bindings = Pdfium::bind_to_library(
-            Pdfium::pdfium_platform_library_name_at_path(
-                path.to_str().unwrap_or_default(),
-            ),
-        )
-        .map_err(|_| ExtractError::PdfiumNotFound)?;
+        let lib_name = Pdfium::pdfium_platform_library_name_at_path(
+            path.to_str().unwrap_or_default(),
+        );
+        let bindings =
+            Pdfium::bind_to_library(&lib_name).map_err(|_| ExtractError::PdfiumNotFound)?;
         return Ok(Pdfium::new(bindings));
     }
 
-    // 2. Search system paths
+    // 2. PDFIUM_PATH env var (set by .cargo/config.toml for cargo run)
+    if let Ok(dir) = std::env::var("PDFIUM_PATH") {
+        let lib_name = Pdfium::pdfium_platform_library_name_at_path(&dir);
+        if let Ok(bindings) = Pdfium::bind_to_library(&lib_name) {
+            return Ok(Pdfium::new(bindings));
+        }
+    }
+
+    // 3. Next to the executable (dist bundle)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let lib_name = Pdfium::pdfium_platform_library_name_at_path(
+                exe_dir.to_str().unwrap_or_default(),
+            );
+            if let Ok(bindings) = Pdfium::bind_to_library(&lib_name) {
+                return Ok(Pdfium::new(bindings));
+            }
+        }
+    }
+
+    // 4. System library paths
     if let Ok(bindings) = Pdfium::bind_to_system_library() {
         return Ok(Pdfium::new(bindings));
     }
 
-    // 3. Check our cache dir
-    let cache = pdfium_cache_dir();
-    let lib_name = Pdfium::pdfium_platform_library_name_at_path(
-        cache.to_str().unwrap_or_default(),
-    );
-    if Path::new(&lib_name).exists() {
-        let bindings = Pdfium::bind_to_library(&lib_name)
-            .map_err(|_| ExtractError::PdfiumNotFound)?;
-        return Ok(Pdfium::new(bindings));
-    }
-
-    // 4. Download as last resort
-    eprintln!("Pdfium not found locally, downloading...");
-    download_pdfium(&cache)?;
-    let bindings = Pdfium::bind_to_library(&lib_name)
-        .map_err(|_| ExtractError::PdfiumNotFound)?;
-    Ok(Pdfium::new(bindings))
-}
-
-/// Cache directory for the pdfium binary.
-fn pdfium_cache_dir() -> std::path::PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("papers")
-        .join("pdfium")
-}
-
-/// Download pdfium binary from bblanchon/pdfium-binaries and extract to the cache dir.
-fn download_pdfium(cache_dir: &Path) -> Result<(), ExtractError> {
-    use flate2::read::GzDecoder;
-    use std::io::Write;
-    use tar::Archive;
-
-    let url = pdfium_download_url();
-    let lib_filename = pdfium_lib_filename();
-
-    eprintln!("Downloading pdfium from {url}...");
-
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| ExtractError::Download(format!("Failed to create HTTP client: {e}")))?;
-
-    let response = client
-        .get(&url)
-        .send()
-        .map_err(|e| ExtractError::Download(format!("Pdfium download failed: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(ExtractError::Download(format!(
-            "Pdfium download failed: HTTP {}",
-            response.status()
-        )));
-    }
-
-    let bytes = response
-        .bytes()
-        .map_err(|e| ExtractError::Download(format!("Failed to read pdfium archive: {e}")))?;
-
-    // Extract the library file from the .tgz archive
-    std::fs::create_dir_all(cache_dir)?;
-    let decoder = GzDecoder::new(bytes.as_ref());
-    let mut archive = Archive::new(decoder);
-
-    // Look for bin/pdfium.dll (Windows) or lib/libpdfium.so (Linux) or lib/libpdfium.dylib (macOS)
-    let target_entry = pdfium_archive_path();
-
-    for entry in archive
-        .entries()
-        .map_err(|e| ExtractError::Download(format!("Failed to read tar entries: {e}")))?
-    {
-        let mut entry =
-            entry.map_err(|e| ExtractError::Download(format!("Failed to read tar entry: {e}")))?;
-        let path = entry
-            .path()
-            .map_err(|e| ExtractError::Download(format!("Invalid path in archive: {e}")))?;
-
-        if path.to_str().map_or(false, |p| p == target_entry) {
-            let dest = cache_dir.join(lib_filename);
-            let tmp = dest.with_extension("tmp");
-            let mut file = std::fs::File::create(&tmp)?;
-            std::io::copy(&mut entry, &mut file)
-                .map_err(|e| ExtractError::Download(format!("Failed to extract pdfium: {e}")))?;
-            file.flush()?;
-            drop(file);
-            std::fs::rename(&tmp, &dest)?;
-            eprintln!("Pdfium extracted to {}", dest.display());
-            return Ok(());
-        }
-    }
-
-    Err(ExtractError::Download(format!(
-        "Could not find {target_entry} in pdfium archive"
-    )))
-}
-
-/// Platform-specific pdfium download URL.
-fn pdfium_download_url() -> String {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    {
-        "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz"
-            .to_string()
-    }
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
-    {
-        "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-arm64.tgz"
-            .to_string()
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-x64.tgz"
-            .to_string()
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    {
-        "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-arm64.tgz"
-            .to_string()
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    {
-        "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-linux-x64.tgz"
-            .to_string()
-    }
-}
-
-/// Path inside the .tgz archive where the pdfium library lives.
-fn pdfium_archive_path() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        "bin/pdfium.dll"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "lib/libpdfium.dylib"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "lib/libpdfium.so"
-    }
-}
-
-/// Filename of the pdfium library for the current platform.
-fn pdfium_lib_filename() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        "pdfium.dll"
-    }
-    #[cfg(target_os = "macos")]
-    {
-        "libpdfium.dylib"
-    }
-    #[cfg(target_os = "linux")]
-    {
-        "libpdfium.so"
-    }
+    Err(ExtractError::PdfiumNotFound)
 }

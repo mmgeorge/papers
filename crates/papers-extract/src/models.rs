@@ -302,47 +302,59 @@ pub fn build_layout_detector(
     crate::layout::LayoutDetector::new(model_path)
 }
 
-/// Initialize ORT with a custom runtime library if available.
+/// Initialize ORT with a dynamically loaded runtime library (Windows only).
 ///
-/// Looks for `ORT_DYLIB_PATH` env var first, then checks for a local
-/// `onnxruntime/lib/onnxruntime.dll` (Windows) or `libonnxruntime.so` (Linux).
-/// Must be called before any ORT sessions are created.
+/// Search order: `ORT_DYLIB_PATH` env var (set by `.cargo/config.toml` for
+/// `cargo run`) → `onnxruntime.dll` next to the executable (dist bundle).
+/// On macOS, ORT is statically linked (CoreML) so no init is needed.
 pub fn init_ort_runtime() -> Result<(), ExtractError> {
-    use std::sync::Once;
-    static INIT: Once = Once::new();
-    let mut init_err: Option<String> = None;
+    #[cfg(not(target_os = "windows"))]
+    return Ok(());
 
-    INIT.call_once(|| {
-        let dylib_path = std::env::var("ORT_DYLIB_PATH").ok().or_else(|| {
-            #[cfg(target_os = "windows")]
-            let candidate = Path::new("onnxruntime/lib/onnxruntime.dll");
-            #[cfg(not(target_os = "windows"))]
-            let candidate = Path::new("onnxruntime/lib/libonnxruntime.so");
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        let mut init_err: Option<String> = None;
 
-            if candidate.exists() {
-                Some(candidate.to_string_lossy().into_owned())
-            } else {
-                None
+        INIT.call_once(|| {
+            // 1. ORT_DYLIB_PATH env var (set by .cargo/config.toml for cargo run)
+            // 2. Next to the exe (dist bundle)
+            let path = std::env::var("ORT_DYLIB_PATH").ok().or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().map(|d| d.join("onnxruntime.dll")))
+                    .filter(|p| p.exists())
+                    .map(|p| p.to_string_lossy().into_owned())
+            });
+
+            match path {
+                Some(path) => {
+                    eprintln!("Loading ORT runtime from: {path}");
+                    match ort::init_from(&path) {
+                        Ok(b) => {
+                            b.commit();
+                        }
+                        Err(e) => {
+                            init_err =
+                                Some(format!("ORT init failed for '{path}': {e}"));
+                        }
+                    }
+                }
+                None => {
+                    init_err = Some(
+                        "onnxruntime.dll not found (set ORT_DYLIB_PATH or place next to exe)"
+                            .into(),
+                    );
+                }
             }
         });
 
-        if let Some(path) = dylib_path {
-            eprintln!("Loading ORT runtime from: {path}");
-            match ort::init_from(&path) {
-                Ok(builder) => {
-                    builder.commit();
-                }
-                Err(e) => {
-                    init_err = Some(format!("ORT init_from failed for '{path}': {e}"));
-                }
-            }
+        if let Some(err) = init_err {
+            Err(ExtractError::Model(err))
+        } else {
+            Ok(())
         }
-    });
-
-    if let Some(err) = init_err {
-        Err(ExtractError::Model(err))
-    } else {
-        Ok(())
     }
 }
 

@@ -18,4 +18,11 @@ install-updater = false
 # Whether +crt-static should be used on msvc
 msvc-crt-static = false
 github-build-setup = "../build-setup.yml"
+include = [
+  ".cache/pdfium.dll",
+  ".cache/libpdfium.dylib",
+  ".cache/onnxruntime.dll",
+  ".cache/onnxruntime_providers_cuda.dll",
+  ".cache/onnxruntime_providers_shared.dll",
+]
 
