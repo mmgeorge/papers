@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use papers_extract::glm_ocr::GlmOcrConfig;
+use papers_extract::glm_ocr::{Backend, GlmOcrConfig};
 use papers_extract::models;
 use papers_extract::RegionKind;
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,10 @@ struct Cli {
     /// Model cache directory
     #[arg(long)]
     model_cache_dir: Option<PathBuf>,
+
+    /// Inference backend: cuda, coreml, cpu, or auto (default: auto)
+    #[arg(long, default_value = "auto")]
+    backend: String,
 }
 
 fn progress(msg: &str) {
@@ -145,7 +149,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Init ORT
+    // Init ORT runtime
     models::init_ort_runtime().expect("ORT runtime init");
     let cache_dir = cli
         .model_cache_dir
@@ -179,7 +183,7 @@ fn main() {
         let img_path = cli.dump_dir.join(first.image.trim_start_matches("./"));
         let image = image::open(&img_path).expect("load warmup image");
         let prompt = groups[0].0;
-        let config = GlmOcrConfig { prompt: prompt.to_string() };
+        let config = GlmOcrConfig { prompt: prompt.to_string(), backend: Backend::from_str_loose(&cli.backend) };
         let predictor = models::build_glm_ocr_predictor_with_config(&model_paths, config)
             .expect("GLM-OCR init");
         progress("warmup...");
@@ -191,7 +195,7 @@ fn main() {
     let mut results: Vec<ResultEntry> = Vec::new();
     let mut timings: Vec<Timing> = Vec::new();
     for (prompt, group_entries) in &groups {
-        let config = GlmOcrConfig { prompt: prompt.to_string() };
+        let config = GlmOcrConfig { prompt: prompt.to_string(), backend: Backend::from_str_loose(&cli.backend) };
         let predictor = models::build_glm_ocr_predictor_with_config(&model_paths, config)
             .expect("GLM-OCR init");
 

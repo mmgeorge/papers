@@ -222,15 +222,40 @@ fn download_file(url: &str, dest: &Path) -> Result<(), ExtractError> {
 }
 
 /// Ensure all GLM-OCR model files exist in the cache directory.
+///
+/// For vision encoder: tries `vision_encoder_mha.onnx` first (CUDA/MHA-fused),
+/// falls back to `vision_encoder.onnx` (CPU/CoreML FP32).
+/// For decoder: tries `llm_decoder_gqa.onnx` first, falls back to empty path
+/// (non-CUDA backends don't need it).
 pub fn ensure_glm_ocr_models(
     cache_dir: &Path,
 ) -> Result<GlmOcrModelPaths, ExtractError> {
     std::fs::create_dir_all(cache_dir)?;
 
-    let vision_encoder = ensure_local_model(cache_dir, &GLM_VISION_ENCODER)?;
+    // Vision encoder: prefer MHA-fused, fall back to raw
+    let vision_encoder = ensure_local_model(cache_dir, &GLM_VISION_ENCODER)
+        .or_else(|_| {
+            let raw = cache_dir.join("vision_encoder.onnx");
+            if raw.exists() {
+                Ok(raw)
+            } else {
+                Err(ExtractError::ModelNotFound {
+                    path: format!(
+                        "{} or {}",
+                        cache_dir.join("vision_encoder_mha.onnx").display(),
+                        raw.display()
+                    ),
+                })
+            }
+        })?;
+
     let embedding = ensure_local_model(cache_dir, &GLM_EMBEDDING)?;
     let llm = ensure_local_model(cache_dir, &GLM_LLM)?;
-    let llm_decoder = ensure_local_model(cache_dir, &GLM_LLM_DECODER)?;
+
+    // Decoder: optional (non-CUDA backends don't need it)
+    let llm_decoder = ensure_local_model(cache_dir, &GLM_LLM_DECODER)
+        .unwrap_or_else(|_| cache_dir.join("llm_decoder_gqa.onnx"));
+
     let tokenizer = ensure_local_model(cache_dir, &GLM_TOKENIZER)?;
 
     Ok(GlmOcrModelPaths {

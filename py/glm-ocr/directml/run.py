@@ -1,10 +1,10 @@
-"""Run GLM-OCR inference with DirectML (session.run, FP16).
+"""Run GLM-OCR inference with DirectML (session.run, FP32).
 
 Uses basic session.run() with CPU-side argmax. No IOBinding or CUDA graphs
 (not supported by DirectML for autoregressive decoding with KV cache).
 
 Uses the MHA-fused LLM (llm_mha.onnx) if available, falls back to raw
-llm.onnx otherwise.
+llm.onnx otherwise. Supports FP32 (DirectML export) and FP16/BF16 models.
 
 Usage:
   uv run python run.py --image path/to/image.png
