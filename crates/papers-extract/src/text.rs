@@ -822,6 +822,251 @@ fn collapse_spaces(s: &str) -> String {
     result.trim().to_string()
 }
 
+// ── Char-based inline formula bypass ────────────────────────────────
+
+/// Map a single character to its LaTeX representation.
+///
+/// Returns `None` for unknown characters, which causes the entire formula
+/// to be rejected to ML OCR (all-or-nothing policy).
+fn char_to_latex(c: char) -> Option<&'static str> {
+    match c {
+        // ASCII letters and digits pass through
+        'a'..='z' | 'A'..='Z' | '0'..='9' => None, // handled specially — return char itself
+        // Operators
+        '+' => Some("+"),
+        '-' => Some("-"),
+        '=' => Some("="),
+        '<' => Some("<"),
+        '>' => Some(">"),
+        '/' => Some("/"),
+        '|' => Some("|"),
+        '\u{2212}' => Some("-"),       // minus sign
+        '\u{2264}' => Some("\\leq"),
+        '\u{2265}' => Some("\\geq"),
+        '\u{2260}' => Some("\\neq"),
+        '\u{2248}' => Some("\\approx"),
+        '\u{2261}' => Some("\\equiv"),
+        '\u{00B1}' => Some("\\pm"),
+        '\u{00D7}' => Some("\\times"),
+        '\u{00F7}' => Some("\\div"),
+        '\u{22C5}' => Some("\\cdot"),
+        '\u{00B7}' => Some("\\cdot"),  // middle dot
+        '\u{221E}' => Some("\\infty"),
+        // Delimiters
+        '(' => Some("("),
+        ')' => Some(")"),
+        '[' => Some("["),
+        ']' => Some("]"),
+        ',' => Some(","),
+        '.' => Some("."),
+        // Common math symbols
+        '\u{2202}' => Some("\\partial"),
+        '\u{2207}' => Some("\\nabla"),
+        '\u{2208}' => Some("\\in"),
+        '\u{2209}' => Some("\\notin"),
+        '\u{2229}' => Some("\\cap"),
+        '\u{222A}' => Some("\\cup"),
+        '\u{2286}' => Some("\\subseteq"),
+        '\u{2287}' => Some("\\supseteq"),
+        '\'' => Some("'"),
+        '\u{2032}' => Some("'"),       // prime
+        '\u{2033}' => Some("''"),      // double prime
+        // Lowercase Greek
+        '\u{03B1}' => Some("\\alpha"),
+        '\u{03B2}' => Some("\\beta"),
+        '\u{03B3}' => Some("\\gamma"),
+        '\u{03B4}' => Some("\\delta"),
+        '\u{03B5}' => Some("\\epsilon"),
+        '\u{03B6}' => Some("\\zeta"),
+        '\u{03B7}' => Some("\\eta"),
+        '\u{03B8}' => Some("\\theta"),
+        '\u{03B9}' => Some("\\iota"),
+        '\u{03BA}' => Some("\\kappa"),
+        '\u{03BB}' => Some("\\lambda"),
+        '\u{03BC}' => Some("\\mu"),
+        '\u{03BD}' => Some("\\nu"),
+        '\u{03BE}' => Some("\\xi"),
+        '\u{03BF}' => Some("o"),       // omicron = latin o
+        '\u{03C0}' => Some("\\pi"),
+        '\u{03C1}' => Some("\\rho"),
+        '\u{03C2}' => Some("\\varsigma"),
+        '\u{03C3}' => Some("\\sigma"),
+        '\u{03C4}' => Some("\\tau"),
+        '\u{03C5}' => Some("\\upsilon"),
+        '\u{03C6}' => Some("\\phi"),
+        '\u{03C7}' => Some("\\chi"),
+        '\u{03C8}' => Some("\\psi"),
+        '\u{03C9}' => Some("\\omega"),
+        // Uppercase Greek
+        '\u{0393}' => Some("\\Gamma"),
+        '\u{0394}' => Some("\\Delta"),
+        '\u{0398}' => Some("\\Theta"),
+        '\u{039B}' => Some("\\Lambda"),
+        '\u{039E}' => Some("\\Xi"),
+        '\u{03A0}' => Some("\\Pi"),
+        '\u{03A3}' => Some("\\Sigma"),
+        '\u{03A5}' => Some("\\Upsilon"),
+        '\u{03A6}' => Some("\\Phi"),
+        '\u{03A8}' => Some("\\Psi"),
+        '\u{03A9}' => Some("\\Omega"),
+        _ => None,
+    }
+}
+
+/// Check if a character is a valid LaTeX formula character.
+/// ASCII alphanumerics are always valid; other chars must be in the `char_to_latex` map.
+fn is_known_formula_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || char_to_latex(c).is_some()
+}
+
+/// Get the LaTeX representation of a character.
+/// ASCII alphanumerics return themselves; others use `char_to_latex`.
+fn get_latex_for_char(c: char) -> String {
+    if c.is_ascii_alphanumeric() {
+        c.to_string()
+    } else {
+        char_to_latex(c).unwrap().to_string()
+    }
+}
+
+/// Replace raw Unicode Greek codepoints in a LaTeX string with proper commands.
+///
+/// `detect_scripts()` produces strings like `α_{t}` containing raw Unicode.
+/// This post-processes them into `\alpha_{t}`.
+fn replace_greek_in_latex(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii() {
+            result.push(c);
+        } else if let Some(latex) = char_to_latex(c) {
+            result.push_str(latex);
+        } else {
+            // Should not happen if we validated all chars, but be safe
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// Check if a string is a LaTeX command (e.g. `\alpha`, `\nabla`).
+/// A command starts with `\` followed by one or more ASCII letters, and nothing else.
+fn is_latex_command(s: &str) -> bool {
+    s.starts_with('\\') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// Try to extract a LaTeX string for an inline formula directly from PDF characters.
+///
+/// Returns `Some(latex)` if every character in the region maps to a known LaTeX token,
+/// `None` otherwise (the formula should be sent to ML OCR).
+///
+/// `formula_bbox` is in image-space Y-down, PDF points.
+/// `page_height_pt` is used to convert PdfChar coords from PDF space (Y-up) to image space.
+pub fn try_extract_inline_formula(
+    chars: &[PdfChar],
+    formula_bbox: [f32; 4],
+    page_height_pt: f32,
+) -> Option<String> {
+    let image_chars: Vec<ImageChar> = chars
+        .iter()
+        .map(|c| to_image_char(c, page_height_pt))
+        .collect();
+
+    // Match chars to the formula bbox (no excludes)
+    let matched = match_chars_to_region(&image_chars, formula_bbox, &[]);
+
+    // Filter out control chars and zero-width chars
+    let visible: Vec<&ImageChar> = matched
+        .into_iter()
+        .filter(|c| {
+            !c.codepoint.is_control()
+                && c.codepoint != ' '
+                && (c.bbox[2] - c.bbox[0]) > 0.0
+                && c.font_size > 0.0
+        })
+        .collect();
+
+    // Reject: no chars matched
+    if visible.is_empty() {
+        return None;
+    }
+
+    // Reject: too many chars (complex formula, send to OCR)
+    if visible.len() > 20 {
+        return None;
+    }
+
+    // Reject: chars span more than one text line.
+    // Use the max char height as threshold — sub/superscripts shift Y centers within
+    // a single formula "line" so we need a generous threshold (1.5× max height).
+    let max_height = visible
+        .iter()
+        .map(|c| (c.bbox[3] - c.bbox[1]).abs())
+        .fold(0.0_f32, f32::max);
+
+    if max_height > 0.0 {
+        let y_min = visible.iter().map(|c| c.bbox[1]).fold(f32::INFINITY, f32::min);
+        let y_max = visible.iter().map(|c| c.bbox[3]).fold(f32::NEG_INFINITY, f32::max);
+        let vertical_span = y_max - y_min;
+        // If the total vertical span exceeds 3× the tallest character, it's multi-line
+        if vertical_span > max_height * 3.0 {
+            return None;
+        }
+    }
+
+    // Validate every char maps to a known LaTeX token
+    for c in &visible {
+        if !is_known_formula_char(c.codepoint) {
+            return None;
+        }
+    }
+
+    // Build LineElement::Char entries for detect_scripts()
+    let elements: Vec<LineElement> = visible.iter().map(|c| LineElement::Char(c)).collect();
+
+    // Sort left-to-right for line building
+    let mut elem_refs: Vec<&LineElement> = elements.iter().collect();
+    elem_refs.sort_by(|a, b| {
+        a.center_x()
+            .partial_cmp(&b.center_x())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Run detect_scripts to fold sub/superscripts
+    let processed = detect_scripts(&elem_refs);
+
+    // Assemble final LaTeX string directly (not using build_line_text which adds $..$ wrapping)
+    let mut tokens: Vec<String> = Vec::new();
+    for elem in &processed {
+        let token = match elem {
+            LineElement::Char(c) => get_latex_for_char(c.codepoint),
+            LineElement::Formula { latex: f, .. } => {
+                // detect_scripts produces formula elements like "x_{t}" with raw Unicode
+                replace_greek_in_latex(f)
+            }
+        };
+        tokens.push(token);
+    }
+
+    // Join tokens, inserting spaces where LaTeX requires them.
+    // A \command followed by a letter needs a separating space, otherwise
+    // LaTeX parses e.g. \alphat as a single undefined command.
+    let mut latex = String::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if i > 0 && is_latex_command(&tokens[i - 1]) && token.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            latex.push(' ');
+        }
+        latex.push_str(token);
+    }
+
+    // Final sanity: reject empty results
+    let trimmed = latex.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1834,5 +2079,565 @@ mod tests {
             text.contains("$x$") && text.contains("$y$") && text.contains("and"),
             "Expected separate formulas with text between: {text:?}"
         );
+    }
+
+    // ── Inline formula char-based bypass tests ─────────────────────────
+
+    /// Helper: make a PdfChar with explicit font_size, positioned in image-space.
+    fn make_formula_char(c: char, x: f32, y_top: f32, w: f32, h: f32, font_size: f32) -> PdfChar {
+        let pdf_top = PAGE_H - y_top;
+        let pdf_bottom = PAGE_H - (y_top + h);
+        PdfChar {
+            codepoint: c,
+            bbox: [x, pdf_bottom, x + w, pdf_top],
+            space_threshold: 1.5,
+            font_name: String::new(),
+            font_size,
+        }
+    }
+
+    #[test]
+    fn test_bypass_single_variable() {
+        let chars = vec![make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_greek_letter() {
+        let chars = vec![make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\alpha".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_subscript() {
+        // 'x' at baseline font size, 't' at smaller font size below
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('t', 108.0, 105.0, 5.0, 7.0, 7.0), // smaller, shifted down
+        ];
+        let bbox = [95.0, 95.0, 120.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x_{t}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_superscript() {
+        // 'x' at baseline, '2' smaller and shifted up
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('2', 108.0, 95.0, 5.0, 7.0, 7.0), // smaller, shifted up
+        ];
+        let bbox = [95.0, 90.0, 120.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x^{2}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_simple_expression() {
+        // x+y — all same font size, no scripts
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 110.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 120.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 135.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x+y".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_greek_with_subscript() {
+        // α with subscript t
+        let chars = vec![
+            make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('t', 108.0, 105.0, 5.0, 7.0, 7.0),
+        ];
+        let bbox = [95.0, 95.0, 120.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\alpha_{t}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_unknown_char_rejects() {
+        // PUA codepoint — should reject entire formula
+        let chars = vec![
+            make_formula_char('\u{E000}', 100.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_bypass_empty_region() {
+        let chars: Vec<PdfChar> = vec![];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_bypass_too_many_chars() {
+        // 21 chars should be rejected
+        let chars: Vec<PdfChar> = (0..21)
+            .map(|i| {
+                make_formula_char('a', 100.0 + i as f32 * 10.0, 100.0, 8.0, 10.0, 10.0)
+            })
+            .collect();
+        let bbox = [95.0, 95.0, 400.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None);
+    }
+
+    // ── Edge case tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_bypass_exactly_20_chars_passes() {
+        // Exactly 20 chars should be accepted (boundary)
+        let chars: Vec<PdfChar> = (0..20)
+            .map(|i| {
+                make_formula_char('a', 100.0 + i as f32 * 10.0, 100.0, 8.0, 10.0, 10.0)
+            })
+            .collect();
+        let bbox = [95.0, 95.0, 400.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert!(result.is_some(), "20 chars should be accepted");
+        assert_eq!(result.unwrap().len(), 20); // 20 'a's
+    }
+
+    #[test]
+    fn test_bypass_chars_outside_bbox_ignored() {
+        // Char 'x' inside bbox, chars 'A' and 'B' outside — only 'x' should be extracted
+        let chars = vec![
+            make_formula_char('A', 10.0, 100.0, 8.0, 10.0, 10.0),  // far left, outside
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0), // inside bbox
+            make_formula_char('B', 300.0, 100.0, 8.0, 10.0, 10.0), // far right, outside
+        ];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_two_separate_bboxes_from_same_chars() {
+        // Simulate two formula regions pulling from the same chars array.
+        // Chars at positions: a(50), b(60), +(150), c(160), d(170)
+        // Formula 1 bbox covers a,b; Formula 2 bbox covers c,d
+        let chars = vec![
+            make_formula_char('a', 50.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('b', 60.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('c', 150.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('d', 160.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox1 = [45.0, 95.0, 75.0, 115.0];
+        let bbox2 = [145.0, 95.0, 175.0, 115.0];
+
+        let r1 = try_extract_inline_formula(&chars, bbox1, PAGE_H);
+        let r2 = try_extract_inline_formula(&chars, bbox2, PAGE_H);
+        assert_eq!(r1, Some("ab".to_string()));
+        assert_eq!(r2, Some("cd".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_space_chars_filtered_out() {
+        // pdfium may include space chars in the region — they should be filtered
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char(' ', 108.0, 100.0, 4.0, 10.0, 10.0), // space
+            make_formula_char('y', 115.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // Space is filtered; x and y are adjacent, no script detection → "xy"
+        assert_eq!(result, Some("xy".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_control_chars_filtered_out() {
+        // Control chars (e.g., pdfium hyphen marker U+0002) should be filtered
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{0002}', 108.0, 100.0, 0.0, 10.0, 10.0), // zero-width control
+            make_formula_char('y', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("xy".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_single_digit() {
+        let chars = vec![make_formula_char('0', 100.0, 100.0, 8.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("0".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_parenthesized_expression() {
+        // (x+y)
+        let chars = vec![
+            make_formula_char('(', 100.0, 100.0, 5.0, 10.0, 10.0),
+            make_formula_char('x', 105.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 113.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 121.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char(')', 129.0, 100.0, 5.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 140.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("(x+y)".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_greek_operator_expression() {
+        // α+β
+        let chars = vec![
+            make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{03B2}', 116.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\alpha+\\beta".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_multi_char_subscript() {
+        // x_{12} — base 'x' with two small subscript chars '1' and '2'
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('1', 108.0, 105.0, 5.0, 7.0, 7.0),
+            make_formula_char('2', 113.0, 105.0, 5.0, 7.0, 7.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x_{12}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_two_subscripted_vars() {
+        // a_{i}b_{j} — two base chars each with subscript
+        // Need enough gap between 'i' and 'b' so 'b' is recognized as a new base char
+        let chars = vec![
+            make_formula_char('a', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('i', 108.0, 105.0, 4.0, 7.0, 7.0),  // subscript of a
+            make_formula_char('b', 116.0, 100.0, 8.0, 10.0, 10.0), // new base char
+            make_formula_char('j', 124.0, 105.0, 4.0, 7.0, 7.0),  // subscript of b
+        ];
+        let bbox = [95.0, 95.0, 135.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("a_{i}b_{j}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_prime_symbol() {
+        // x' (x prime)
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2032}', 108.0, 98.0, 3.0, 6.0, 6.0), // prime, small and up
+        ];
+        let bbox = [95.0, 93.0, 118.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // Prime is small font → detect_scripts sees it as superscript
+        assert!(result.is_some(), "Prime should be handled");
+        let latex = result.unwrap();
+        // Either x^{'} or x' depending on detect_scripts behavior
+        assert!(
+            latex.contains("x") && latex.contains("'"),
+            "Should contain x and prime: {latex:?}"
+        );
+    }
+
+    #[test]
+    fn test_bypass_nabla_f() {
+        // ∇f
+        let chars = vec![
+            make_formula_char('\u{2207}', 100.0, 100.0, 10.0, 10.0, 10.0),
+            make_formula_char('f', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\nabla f".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_partial_derivative() {
+        // ∂x
+        let chars = vec![
+            make_formula_char('\u{2202}', 100.0, 100.0, 10.0, 10.0, 10.0),
+            make_formula_char('x', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\partial x".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_mixed_unknown_rejects_all() {
+        // 'x', unknown PUA char, 'y' — entire formula rejected even though x and y are valid
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{E001}', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 116.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "Any unknown char should reject the whole formula");
+    }
+
+    #[test]
+    fn test_bypass_only_operators() {
+        // Just '+' alone
+        let chars = vec![make_formula_char('+', 100.0, 100.0, 8.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("+".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_leq_geq_symbols() {
+        // x≤y
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2264}', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 116.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x\\leq y".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_multi_line_rejects() {
+        // Two chars on very different Y lines — should be rejected
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 100.0, 200.0, 8.0, 10.0, 10.0), // 100pt below
+        ];
+        let bbox = [95.0, 95.0, 115.0, 215.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "Multi-line should be rejected");
+    }
+
+    #[test]
+    fn test_bypass_zero_width_chars_only() {
+        // Only zero-width chars in the region — should return None
+        let chars = vec![
+            make_formula_char(' ', 100.0, 100.0, 0.0, 10.0, 10.0),
+            make_formula_char('\u{0002}', 100.0, 100.0, 0.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_bypass_zero_font_size_filtered() {
+        // Char with font_size=0 should be filtered out, leaving only 'y'
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 0.0), // zero font size
+            make_formula_char('y', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("y".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_uppercase_greek() {
+        // Ω
+        let chars = vec![make_formula_char('\u{03A9}', 100.0, 100.0, 10.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\Omega".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_chars_unsorted_in_array() {
+        // Chars appear in reverse order in the array but should be sorted left-to-right
+        let chars = vec![
+            make_formula_char('y', 120.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 110.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 135.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x+y".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_bbox_tight_misses_subscript() {
+        // bbox only covers 'x', the subscript 't' is outside — should get just "x"
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('t', 108.0, 105.0, 5.0, 7.0, 7.0), // subscript, center outside bbox
+        ];
+        // Tight bbox: only covers 'x' region
+        let bbox = [95.0, 95.0, 107.0, 112.0]; // 't' center at (110.5, 108.5) is outside
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // Should get just "x" — partial but not wrong LaTeX
+        assert_eq!(result, Some("x".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_infty_symbol() {
+        // ∞
+        let chars = vec![make_formula_char('\u{221E}', 100.0, 100.0, 10.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\infty".to_string()));
+    }
+
+    // ── LaTeX spacing and more edge cases ──────────────────────────────
+
+    #[test]
+    fn test_bypass_greek_followed_by_letter_gets_space() {
+        // α followed by t (same font size, no script) → "\alpha t" not "\alphat"
+        let chars = vec![
+            make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('t', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\alpha t".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_greek_followed_by_digit_no_space() {
+        // α followed by 0 (same font size) → "\alpha0" — no space needed before digit
+        // (LaTeX parses \alpha0 correctly since 0 is not a letter)
+        let chars = vec![
+            make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('0', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // Digits don't need space after commands
+        assert_eq!(result, Some("\\alpha0".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_greek_followed_by_operator_no_space() {
+        // α+β → "\alpha+\beta" — no space needed between command and operator
+        let chars = vec![
+            make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{03B2}', 116.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\alpha+\\beta".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_two_greek_adjacent() {
+        // αβ → "\alpha\beta" — no space needed (\ starts next command)
+        let chars = vec![
+            make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{03B2}', 108.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\alpha\\beta".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_command_before_subscript_no_space() {
+        // α with subscript t → "\alpha_{t}" — the _{} handles separation
+        // (This is already tested in test_bypass_greek_with_subscript, but verifying
+        // the space logic doesn't interfere with detect_scripts output)
+        let chars = vec![
+            make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('t', 108.0, 105.0, 5.0, 7.0, 7.0),
+        ];
+        let bbox = [95.0, 95.0, 120.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\alpha_{t}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_minus_sign_unicode() {
+        // x − y (Unicode minus U+2212)
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2212}', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 116.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x-y".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_char_center_on_bbox_boundary() {
+        // Char center exactly on bbox edge — should be included (>= check)
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 10.0, 10.0, 10.0),
+            // center_x = 105.0, center_y = 105.0
+        ];
+        // bbox right edge = 105.0, bottom edge = 105.0 — center is exactly on boundary
+        let bbox = [100.0, 100.0, 105.0, 105.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_char_center_just_outside_bbox() {
+        // Char center just outside bbox — should NOT be included
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 10.0, 10.0, 10.0),
+            // center_x = 105.0, center_y = 105.0
+        ];
+        // bbox right edge = 104.9 — center is outside
+        let bbox = [100.0, 100.0, 104.9, 104.9];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "Char center outside bbox should not be matched");
+    }
+
+    #[test]
+    fn test_bypass_subscript_gap_too_large() {
+        // 'x' and subscript 't' far apart horizontally — detect_scripts should NOT
+        // fold them, so we get "xt" instead of "x_{t}"
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('t', 130.0, 105.0, 5.0, 7.0, 7.0), // far away
+        ];
+        let bbox = [95.0, 95.0, 140.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // Gap = 130.0 - 108.0 = 22.0 > space_threshold(1.5), so no script detection
+        assert!(result.is_some());
+        let latex = result.unwrap();
+        // Should be "xt" (no script folding) since gap is too large
+        assert_eq!(latex, "xt", "Large gap should prevent script detection");
+    }
+
+    #[test]
+    fn test_bypass_in_element_in_set() {
+        // x∈S
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2208}', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('S', 116.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x\\in S".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_double_prime() {
+        // x″ (double prime U+2033)
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2033}', 108.0, 98.0, 4.0, 6.0, 6.0),
+        ];
+        let bbox = [95.0, 93.0, 118.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert!(result.is_some(), "Double prime should be handled");
     }
 }

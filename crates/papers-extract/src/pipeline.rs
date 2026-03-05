@@ -274,11 +274,33 @@ impl Pipeline {
 
         let scale = self.options.dpi as f32 / 72.0;
 
-        // Crop formula regions (display + inline) and run batched recognition
+        // Phase A: try char-based extraction for inline formulas (skip expensive ML OCR)
+        let mut char_based_latex: HashMap<usize, String> = HashMap::new();
+        for (i, d) in detected.iter().enumerate() {
+            if d.kind == RegionKind::InlineFormula {
+                let bbox_pt = [
+                    d.bbox_px[0] / scale,
+                    d.bbox_px[1] / scale,
+                    d.bbox_px[2] / scale,
+                    d.bbox_px[3] / scale,
+                ];
+                if let Some(latex) = text::try_extract_inline_formula(&chars, bbox_pt, height_pt) {
+                    tracing::debug!(
+                        "Char-based bypass for inline formula {i}: {latex}"
+                    );
+                    char_based_latex.insert(i, latex);
+                }
+            }
+        }
+
+        // Crop formula regions (display + inline not already handled) and run batched recognition
         let formula_entries: Vec<(usize, DynamicImage)> = detected
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.kind == RegionKind::DisplayFormula || d.kind == RegionKind::InlineFormula)
+            .filter(|(i, d)| {
+                (d.kind == RegionKind::DisplayFormula || d.kind == RegionKind::InlineFormula)
+                    && !char_based_latex.contains_key(i)
+            })
             .map(|(i, d)| {
                 let bbox_pt = [
                     d.bbox_px[0] / scale,
@@ -299,7 +321,7 @@ impl Pipeline {
             })
             .collect();
 
-        let formula_latex: HashMap<usize, String> = if !formula_entries.is_empty() {
+        let mut formula_latex: HashMap<usize, String> = if !formula_entries.is_empty() {
             let crops: Vec<DynamicImage> =
                 formula_entries.iter().map(|(_, img)| img.clone()).collect();
             let results = self
@@ -315,6 +337,10 @@ impl Pipeline {
             HashMap::new()
         };
 
+        // Merge char-based results into formula_latex
+        for (idx, latex) in char_based_latex {
+            formula_latex.insert(idx, latex);
+        }
 
         // Crop table regions and run batched recognition
         let table_entries: Vec<(usize, DynamicImage)> = detected
