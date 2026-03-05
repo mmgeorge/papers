@@ -21,8 +21,9 @@ name = "bench_formulas"
 path = "src/bin/bench_formulas.rs"
 
 [[bin]]
-name = "bench_glm_formulas"
-path = "src/bin/bench_glm_formulas.rs"
+name = "run_glm_ocr"
+path = "src/bin/run_glm_ocr.rs"
+
 
 [dependencies]
 clap = { workspace = true }

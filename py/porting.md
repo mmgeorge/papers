@@ -264,18 +264,25 @@ wrong.
 
 GLM-OCR requires 4 ONNX models (vs PP-FormulaNet's 2):
 
-| Model | Export script | Size | Purpose |
-|-------|---------------|------|---------|
-| `vision_encoder.onnx` | `export.py` | ~3.4 GB (FP32) | CogViT with M-RoPE |
-| `embedding.onnx` | `export.py` | 348 MB (FP16) | Token embeddings |
-| `llm.onnx` | `export.py` | 2.2 GB (FP16) | Full LLM for prefill |
-| `llm_decoder.onnx` | `export.py` | 1.3 GB (FP16) | Decode step (CUDA graphed) |
+| Model | Export script | Size (BF16) | Purpose |
+|-------|---------------|-------------|---------|
+| `vision_encoder_mha.onnx` | `export.py` | ~844 MB | CogViT with M-RoPE + MHA fusion |
+| `embedding.onnx` | `export.py` | ~174 MB | Token embeddings |
+| `llm.onnx` | `export.py` | ~1.1 GB | Full LLM for prefill |
+| `llm_decoder_gqa.onnx` | `export.py` | ~1.3 GB | Decode step with GQA (CUDA graphed) |
+
+All models are exported in **BF16** directly from the native BF16 weights
+(`zai-org/GLM-OCR`). The export traces in FP32 (BF16→FP32 upcast is lossless),
+applies attention fusion surgery, then converts FP32→BF16 (lossless round-trip
+to the original BF16 values). Ops without BF16 CUDA kernels (Conv, LayerNorm,
+Einsum, Range) fall back to **FP32** (not FP16) to preserve full precision from
+the native weights.
 
 The same export wrapper pattern applies: a thin `nn.Module` wrapper
-(`DecoderStepWrapper`) around the HuggingFace model that reshapes the interface
-for fixed-shape ONNX export. `torch.onnx.export()` traces through the wrapper
-and all the HuggingFace model internals, flattening everything into a single
-static ONNX graph with the trained weights embedded.
+(`DecoderStepWrapper`, `VisionEncoderWrapper`) around the HuggingFace model that
+reshapes the interface for fixed-shape ONNX export. `torch.onnx.export()` traces
+through the wrapper and all the HuggingFace model internals, flattening
+everything into a single static ONNX graph with the trained weights embedded.
 
 ### ONNX Ops That Break CUDA Graphs
 
@@ -460,10 +467,13 @@ Approach 2 is the safer bet for M-RoPE and is confirmed working by the `onnxrunt
 **Manual graph surgery** (`optimize_gqa.py`) directly replaces raw attention ops with GQA nodes. Per layer, it removes ~20 nodes (WhereStaticCache KV update, repeat_kv expansion, scaled dot product attention, output reshape) and inserts 7 nodes (3 Transpose+Reshape pairs to convert BNSH→BSH, plus the GQA node). The RoPE computation is preserved externally with `do_rotary=0`. Reduces 1551 → 1336 nodes with 16 GQA nodes, numerically identical to the raw decoder.
 
 ```bash
+# Full BF16 export (vision encoder MHA surgery is integrated):
+python export.py --bf16
+
 # Manual GQA surgery on decoder (CUDA + FlashAttention):
 python optimize_gqa.py --model-dir ../model
 
-# Manual MHA surgery on vision encoder (CUDA + FlashAttention):
+# Manual MHA surgery on vision encoder (standalone, if needed):
 python optimize_mha_vision.py --model-dir ../model
 
 # Automatic MHA fusion (all backends — if pattern matches):
@@ -472,6 +482,27 @@ python optimize.py --model-dir ../model --target directml
 
 #### Vision encoder MHA surgery
 
-The vision encoder (CogViT, 24 layers) also benefits from fused attention. ORT's automatic `optimize_model(model_type="vit")` fails (0 MHA nodes) because Q/K RMSNorm and 2D RoPE between projection and attention break pattern matching. SDPA re-export from PyTorch is not viable — M-RoPE uses data-dependent `torch.split()` preventing `torch.onnx.export`, and SDPA decomposes back to the same matmul+softmax+matmul ops in ONNX anyway.
+The vision encoder (CogViT, 24 layers) also benefits from fused attention. ORT's automatic `optimize_model(model_type="vit")` fails (0 MHA nodes) because Q/K RMSNorm and 2D RoPE between projection and attention break pattern matching. SDPA re-export from PyTorch is not viable — SDPA decomposes back to the same matmul+softmax+matmul ops in ONNX anyway.
 
-**Manual surgery** (`optimize_mha_vision.py`) replaces the attention core (MatMul Q@K^T → Mul scale → Softmax → Cast → MatMul attn@V → Squeeze → Transpose → Reshape) with a single `com.microsoft.MultiHeadAttention` node per layer. Q/K normalization and 2D RoPE ops stay outside the fused node. Adds Reshape nodes to convert Q/K/V from [seq, heads, dim] to [1, seq, hidden] format. Reduces 3663 → 3183 nodes with 24 MHA nodes, numerically identical (cosine sim 0.9999980 on test data, 3/3 formula outputs match exactly).
+#### BFloat16 ONNX Type Constraints (ORT 1.24)
+
+ORT has BF16 CUDA kernels for many ops (registered via `REGISTER_KERNEL_TYPED(BFloat16)` in the source), but the **ONNX op schema type constraints** — defined in the ONNX standard, not ORT — don't include `bfloat16` for all ops. ORT validates against the schema first, rejecting models before checking kernel availability.
+
+| BF16 Support | Ops |
+|---|---|
+| **Supported** | Add, Mul, Div, Gemm, MatMul, Softmax, Sigmoid, Neg, Sqrt, Pow, Erf, Concat, Reshape, Transpose, Gather, Slice, GatherND, Unsqueeze |
+| **Not supported** | Sin, Cos, Reciprocal, Squeeze, ReduceMean, Conv, LayerNormalization, Einsum, Range |
+
+The unsupported ops include all components of unfused RMSNorm (Pow+ReduceMean+Sqrt+Reciprocal — though Pow and Sqrt are actually fine, ReduceMean and Reciprocal are not) and the RoPE trig ops (Sin, Cos). The vision encoder has 97 ReduceMean, 97 Reciprocal, 72 Squeeze, 2 Conv, and 1 each of Sin, Cos, Range, LayerNormalization — 272 ops total requiring FP32 fallback out of 1606 nodes.
+
+The `_convert_fp32_to_bf16` function in `export.py` handles this by:
+1. Converting most initializers FP32→BF16 (lossless round-trip from native BF16 weights)
+2. Keeping initializers exclusively consumed by FP32 ops as FP32
+3. Inserting Cast(BF16→FP32) before and Cast(FP32→BF16) after each FP32 op
+4. Deduplicating shared Cast nodes when multiple FP32 ops share inputs
+
+This uses FP32 (not FP16) for fallback ops to preserve full precision from the native BF16 weights. FP16 has a narrower exponent range (5 bits vs BF16's 8 bits), so FP16 would clip values outside its range.
+
+The vision encoder is exported via `VisionEncoderWrapper`, which bypasses two tracing problems: (1) M-RoPE's data-dependent Python loops in `rot_pos_emb()` are replaced by taking pre-computed `pos_ids [N, 2]` and `max_grid_size` as inputs, and (2) `cu_seqlens`-based attention splitting is replaced by inline matmul attention (single-image only). The wrapper traces cleanly in FP32.
+
+**Manual surgery** (`optimize_mha_vision.py`) replaces the attention core (MatMul Q@K^T → Mul scale → Softmax → MatMul attn@V → Squeeze → Transpose → Reshape) with a single `com.microsoft.MultiHeadAttention` node per layer. Q/K normalization and 2D RoPE ops stay outside the fused node. Adds Reshape nodes to convert Q/K/V from [seq, heads, dim] to [1, seq, hidden] format. Reduces ~1942 → ~1606 nodes with 24 MHA nodes.

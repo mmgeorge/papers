@@ -199,17 +199,24 @@ def _identify_layer(
         qkt_node, scale_node, sm_node,
     ])
 
-    # ── Forward: Softmax → Cast → Cast → MatMul(attn@V) ─────────────
-    cast1 = _sole_consumer(consumer, sm_node.output[0])
-    cast2 = _sole_consumer(consumer, cast1.output[0])
-    matmul_v = _sole_consumer(consumer, cast2.output[0])
+    # ── Forward: Softmax → [Cast → Cast →] MatMul(attn@V) ──────────
+    # FP16 exports have Cast nodes between Softmax and MatMul;
+    # FP32/BF16 exports connect Softmax → MatMul directly.
+    next_node = _sole_consumer(consumer, sm_node.output[0])
+    cast_nodes = []
+    while next_node.op_type == "Cast":
+        cast_nodes.append(next_node)
+        next_node = _sole_consumer(consumer, next_node.output[0])
+    matmul_v = next_node
+    assert matmul_v.op_type == "MatMul", \
+        f"Layer {layer}: Expected MatMul after Softmax, got {matmul_v.op_type}"
 
     # V path: MatMul_1.input[1] ← Unsqueeze ← Transpose ← V_tensor
     v_unsqueeze = producer[matmul_v.input[1]]
     v_transpose = producer[v_unsqueeze.input[0]]
     v_tensor = v_transpose.input[0]  # Keep: V after split+squeeze [seq, 16, 64]
 
-    nodes_to_remove.extend([cast1, cast2, matmul_v, v_transpose, v_unsqueeze])
+    nodes_to_remove.extend([*cast_nodes, matmul_v, v_transpose, v_unsqueeze])
 
     # ── Continue forward: MatMul_1 → Squeeze → Transpose → Reshape ──
     squeeze = _sole_consumer(consumer, matmul_v.output[0])

@@ -1,10 +1,10 @@
 //! GLM-OCR formula predictor — autoregressive decoder with persistent IoBinding.
 //!
 //! Uses 4-part ONNX model split:
-//!   - vision_encoder.onnx  (FP32, CogViT with M-RoPE)
-//!   - embedding.onnx       (FP16, token embeddings for prefill)
-//!   - llm.onnx             (FP32 I/O, full LLM for prefill pass)
-//!   - llm_decoder_gqa.onnx  (FP16, fixed-shape decode step with GQA / FlashAttention V2)
+//!   - vision_encoder.onnx  (BF16, CogViT with M-RoPE, Conv ops in FP16)
+//!   - embedding.onnx       (BF16, token embeddings for prefill)
+//!   - llm.onnx             (BF16, full LLM for prefill pass)
+//!   - llm_decoder_gqa.onnx  (BF16, fixed-shape decode step with GQA / FlashAttention V2)
 //!
 //! Architecture mirrors `formula.rs` FormulaPredictor: persistent IoBinding,
 //! pre-allocated GPU buffers, pinned host memory, batched D2H via separate stream.
@@ -24,7 +24,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use half::f16;
+use half::bf16;
 use image::imageops::FilterType;
 use image::DynamicImage;
 use ndarray::{Array2, Array3};
@@ -256,8 +256,8 @@ impl GlmOcrPredictor {
         let cuda_ctx = cudarc::driver::CudaContext::new(0)
             .map_err(|e| ExtractError::Model(format!("cudarc CudaContext: {e}")))?;
 
-        // Vision encoder — FP32, uses ORT_ENABLE_EXTENDED (FP16 conversion
-        // blocks Cast-to-FLOAT nodes creating mixed-type graph)
+        // Vision encoder — BF16 with Conv ops in FP16, uses ORT_ENABLE_EXTENDED
+        // (higher opt levels insert additional Cast nodes that break MHA nodes)
         let vision_encoder = Session::builder()
             .map_err(|e| ExtractError::Model(format!("Vision encoder session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level2) // ENABLE_EXTENDED
@@ -274,7 +274,7 @@ impl GlmOcrPredictor {
                 ))
             })?;
 
-        // Embedding — FP16, standard CUDA EP
+        // Embedding — BF16, standard CUDA EP
         let embedding = Session::builder()
             .map_err(|e| ExtractError::Model(format!("Embedding session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -291,7 +291,7 @@ impl GlmOcrPredictor {
                 ))
             })?;
 
-        // LLM for prefill — FP16, standard CUDA EP (dynamic shapes, no graph)
+        // LLM for prefill — BF16, standard CUDA EP (dynamic shapes, no graph)
         let llm = Session::builder()
             .map_err(|e| ExtractError::Model(format!("LLM session builder: {e}")))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -308,7 +308,7 @@ impl GlmOcrPredictor {
                 ))
             })?;
 
-        // Decoder — FP16, ORT built-in CUDA graph (captures on first run, replays after)
+        // Decoder — BF16, ORT built-in CUDA graph (captures on first run, replays after)
         #[cfg(target_os = "windows")]
         let decoder_ep = ort::execution_providers::CUDAExecutionProvider::default()
             .with_cuda_graph(true)
@@ -393,7 +393,7 @@ impl GlmOcrPredictor {
         let n_kv_buffers = params.num_layers * 2;
         let kv_shape = [1usize, params.num_kv_heads, params.max_seq, params.head_dim];
         let kv_buf_bytes =
-            params.num_kv_heads * params.max_seq * params.head_dim * std::mem::size_of::<f16>();
+            params.num_kv_heads * params.max_seq * params.head_dim * std::mem::size_of::<bf16>();
 
         // Allocate input tensors on GPU
         let mut input_ids_t = ort::value::Tensor::<i64>::new(&allocator, [1usize, 1])
@@ -421,7 +421,7 @@ impl GlmOcrPredictor {
         let mut kv: Vec<Value> = Vec::with_capacity(n_kv_buffers);
         let mut kv_ptrs: Vec<u64> = Vec::with_capacity(n_kv_buffers);
         for _ in 0..n_kv_buffers {
-            let mut t = ort::value::Tensor::<f16>::new(&allocator, kv_shape)
+            let mut t = ort::value::Tensor::<bf16>::new(&allocator, kv_shape)
                 .map_err(|e| ExtractError::Model(format!("alloc kv: {e}")))?;
             kv_ptrs.push(t.data_ptr_mut() as u64);
             kv.push(t.into());
@@ -621,7 +621,9 @@ impl GlmOcrPredictor {
         // Compute vision position IDs (M-RoPE)
         let (pos_ids, max_grid_size) = compute_vision_pos_ids(grid_thw);
 
-        let pv_tensor = Value::from_array(pixel_values.clone().into_dyn())
+        // Convert pixel_values f32→bf16 to match the BF16 vision encoder model
+        let pv_bf16 = pixel_values.mapv(|v| bf16::from_f32(v));
+        let pv_tensor = Value::from_array(pv_bf16.into_dyn())
             .map_err(|e| ExtractError::Formula(format!("vision pixel_values tensor: {e}")))?;
         let pos_tensor = Value::from_array(pos_ids.into_dyn())
             .map_err(|e| ExtractError::Formula(format!("vision pos_ids tensor: {e}")))?;
@@ -683,13 +685,13 @@ impl GlmOcrPredictor {
     /// Run prefill through llm.onnx with session.run() (CPU outputs).
     ///
     /// Returns (first_token, kv_cache) where kv_cache is a Vec of CPU-side
-    /// f32 Values. The decode_loop converts f32→f16 when uploading to GPU.
+    /// f32 Values. The decode_loop converts f32→bf16 when uploading to GPU.
     fn run_prefill(
         &self,
         inputs_embeds: Value,
         position_ids: &Array3<i64>,
         seq_len: usize,
-    ) -> Result<(i64, Vec<Vec<f16>>), ExtractError> {
+    ) -> Result<(i64, Vec<Vec<bf16>>), ExtractError> {
         let mut session = self
             .llm
             .lock()
@@ -702,12 +704,11 @@ impl GlmOcrPredictor {
             .map_err(|e| ExtractError::Formula(format!("prefill pos tensor: {e}")))?;
 
         // Empty KV cache for prefill (dynamic shape: past_seq_len = 0)
-        // llm.onnx uses f32 I/O
         let n_kv_buffers = self.num_layers * 2;
         let empty_kv_shape = [1usize, self.num_kv_heads, 0, self.head_dim];
         let empty_kv: Vec<Value> = (0..n_kv_buffers)
             .map(|_| {
-                let arr = ndarray::Array4::<f32>::from_elem(empty_kv_shape, 0.0);
+                let arr = ndarray::Array4::<bf16>::from_elem(empty_kv_shape, bf16::ZERO);
                 Value::from_array(arr.into_dyn()).expect("empty kv tensor").into()
             })
             .collect();
@@ -732,9 +733,8 @@ impl GlmOcrPredictor {
         let logits = outputs
             .get("logits")
             .ok_or_else(|| ExtractError::Formula("No prefill logits output".into()))?;
-        let (logits_shape, logits_data) = logits
-            .try_extract_tensor::<f32>()
-            .map_err(|e| ExtractError::Formula(format!("prefill extract logits: {e}")))?;
+        let logits_data = extract_f32(logits, "prefill logits")?;
+        let logits_shape = logits.shape();
         let logits_seq_len = logits_shape[1] as usize;
         let vocab = logits_shape[2] as usize;
         let offset = (logits_seq_len - 1) * vocab;
@@ -742,11 +742,11 @@ impl GlmOcrPredictor {
         let first_token = last_logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a): &(usize, &f32), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(idx, _)| idx as i64)
             .unwrap_or(EOS_IDS[0]);
 
-        // Extract KV cache outputs (CPU f32) and convert to f16
+        // Extract KV cache outputs and convert to bf16 for decoder
         let mut kv_cache = Vec::with_capacity(n_kv_buffers);
         for i in 0..self.num_layers {
             for kv_type in &["key", "value"] {
@@ -754,12 +754,15 @@ impl GlmOcrPredictor {
                 let kv_val = outputs
                     .get(&name)
                     .ok_or_else(|| ExtractError::Formula(format!("No prefill {name}")))?;
-                let (_, kv_data) = kv_val
-                    .try_extract_tensor::<f32>()
-                    .map_err(|e| ExtractError::Formula(format!("prefill extract {name}: {e}")))?;
-                // Convert f32 → f16 for decoder compatibility
-                let kv_f16: Vec<f16> = kv_data.iter().map(|&v| f16::from_f32(v)).collect();
-                kv_cache.push(kv_f16);
+                // Try bf16 directly first (BF16 model), then fall back to f32→bf16
+                let kv_bf16: Vec<bf16> = if let Ok((_, data)) = kv_val.try_extract_tensor::<bf16>() {
+                    data.to_vec()
+                } else {
+                    let (_, data) = kv_val.try_extract_tensor::<f32>()
+                        .map_err(|e| ExtractError::Formula(format!("prefill extract {name}: {e}")))?;
+                    data.iter().map(|&v| bf16::from_f32(v)).collect()
+                };
+                kv_cache.push(kv_bf16);
             }
         }
 
@@ -777,7 +780,7 @@ impl GlmOcrPredictor {
     fn decode_loop(
         &self,
         first_token: i64,
-        prefill_kv: &[Vec<f16>],
+        prefill_kv: &[Vec<bf16>],
         prefill_len: usize,
     ) -> Result<Vec<i64>, ExtractError> {
         let mut state = self
@@ -796,7 +799,7 @@ impl GlmOcrPredictor {
             .map_err(|e| ExtractError::Formula(format!("memset kv: {e}")))?;
         }
 
-        // Copy prefill KV cache (CPU f16) into decoder's fixed GPU buffers
+        // Copy prefill KV cache (CPU bf16) into decoder's fixed GPU buffers
         // Copy head-by-head since strides differ (prefill_len vs max_seq).
         for (i, kv_data) in prefill_kv.iter().enumerate() {
             if prefill_len == 0 {
@@ -804,7 +807,7 @@ impl GlmOcrPredictor {
             }
 
             let src_head_stride = prefill_len * self.head_dim;
-            let dst_head_stride = self.max_seq * self.head_dim * std::mem::size_of::<f16>();
+            let dst_head_stride = self.max_seq * self.head_dim * std::mem::size_of::<bf16>();
             let copy_elems = prefill_len * self.head_dim;
 
             for h in 0..self.num_kv_heads {
@@ -923,7 +926,7 @@ impl GlmOcrPredictor {
     fn decode_loop(
         &self,
         _first_token: i64,
-        _prefill_kv: &[Vec<f16>],
+        _prefill_kv: &[Vec<bf16>],
         _prefill_len: usize,
     ) -> Result<Vec<i64>, ExtractError> {
         Err(ExtractError::Formula(
@@ -1193,13 +1196,30 @@ fn build_position_ids(input_ids: &[i64], grid_thw: &Array2<i64>) -> Array3<i64> 
     Array3::from_shape_vec([3, 1, seq_len], position_ids).expect("position_ids shape")
 }
 
+// ── Tensor extraction helpers ─────────────────────────────────────────
+
+/// Extract tensor data as f32 from a Value that may contain f32 or bf16 data.
+/// ORT auto-upcasts FP16→f32 on CPU but does NOT auto-upcast BF16→f32.
+fn extract_f32(value: &Value, name: &str) -> Result<Vec<f32>, ExtractError> {
+    // Try f32 first (FP32 models, or FP16 models where ORT upcasts)
+    if let Ok((_, data)) = value.try_extract_tensor::<f32>() {
+        return Ok(data.to_vec());
+    }
+    // Try bf16 (BF16 models)
+    if let Ok((_, data)) = value.try_extract_tensor::<bf16>() {
+        return Ok(data.iter().map(|v| v.to_f32()).collect());
+    }
+    Err(ExtractError::Formula(format!(
+        "extract {name}: unsupported tensor type (expected f32 or bf16)"
+    )))
+}
+
 // ── Merge vision embeddings ───────────────────────────────────────────
 
 /// Replace image token positions in token_embeds with vision_embeds.
 ///
-/// Both values are CPU-side. session.run() may return f32 (ORT upcasts FP16
-/// on CPU), so we handle both f32 and f16 inputs. Output is f16 for the
-/// FP16 LLM prefill.
+/// Both values are CPU-side BF16 (extracted to f32 via extract_f32).
+/// Merge is done in f32 then converted to bf16 for the LLM prefill.
 fn merge_vision_embeddings(
     token_embeds: Value,
     vision_embeds: &Value,
@@ -1208,16 +1228,10 @@ fn merge_vision_embeddings(
 ) -> Result<Value, ExtractError> {
     let hidden = HIDDEN_SIZE;
 
-    // All models use f32 I/O — extract as f32
-    let (_shape, token_data) = token_embeds
-        .try_extract_tensor::<f32>()
-        .map_err(|e| ExtractError::Formula(format!("extract token_embeds: {e}")))?;
+    let token_data = extract_f32(&token_embeds, "token_embeds")?;
+    let vision_data = extract_f32(vision_embeds, "vision_embeds")?;
 
-    let (_shape, vision_data) = vision_embeds
-        .try_extract_tensor::<f32>()
-        .map_err(|e| ExtractError::Formula(format!("extract vision_embeds: {e}")))?;
-
-    // Build merged array in f32: replace IMAGE_TOKEN positions with vision embeddings
+    // Build merged array in f32 then convert to bf16 for LLM input
     let mut merged = vec![0.0f32; seq_len * hidden];
 
     let mut vis_idx = 0;
@@ -1234,8 +1248,10 @@ fn merge_vision_embeddings(
         }
     }
 
+    // Convert to bf16 for the BF16 LLM prefill model
+    let merged_bf16: Vec<bf16> = merged.iter().map(|&v| bf16::from_f32(v)).collect();
     let merged_array =
-        ndarray::Array3::from_shape_vec([1, seq_len, hidden], merged)
+        ndarray::Array3::from_shape_vec([1, seq_len, hidden], merged_bf16)
             .map_err(|e| ExtractError::Formula(format!("merged embeds shape: {e}")))?;
 
     Value::from_array(merged_array.into_dyn())
