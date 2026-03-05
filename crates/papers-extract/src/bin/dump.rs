@@ -93,8 +93,12 @@ fn main() {
 
     // Load layout model
     eprintln!("Loading layout model...");
-    let paths = models::ensure_models(papers_extract::Quality::Fast, &cache_dir)
-        .expect("layout model files");
+    let paths = models::ensure_models(
+        papers_extract::FormulaModel::PpFormulanet,
+        papers_extract::TableModel::SlanetPlus,
+        &cache_dir,
+    )
+    .expect("layout model files");
     let layout = models::build_layout_detector(&paths.layout).expect("layout detector");
 
     // Load PDF

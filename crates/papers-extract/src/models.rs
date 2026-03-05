@@ -6,7 +6,7 @@ use oar_ocr::predictors::TableStructureRecognitionPredictor;
 use crate::error::ExtractError;
 use crate::formula::FormulaPredictor;
 use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
-use crate::Quality;
+use crate::{FormulaModel, TableModel};
 
 /// Model file metadata for download.
 struct ModelFile {
@@ -90,14 +90,14 @@ const SLANEXT_WIRED: ModelFile = ModelFile {
 /// Resolved paths to all required model files.
 pub struct ModelPaths {
     pub layout: PathBuf,
-    pub slanet_plus: PathBuf,
-    pub table_dict: PathBuf,
-    pub formula_encoder: PathBuf,
-    pub formula_decoder: PathBuf,
-    pub formula_tokenizer: PathBuf,
-    // Quality-mode extras
+    pub slanet_plus: Option<PathBuf>,
+    pub table_dict: Option<PathBuf>,
+    pub formula_encoder: Option<PathBuf>,
+    pub formula_decoder: Option<PathBuf>,
+    pub formula_tokenizer: Option<PathBuf>,
     pub table_classifier: Option<PathBuf>,
     pub slanext_wired: Option<PathBuf>,
+    pub glm_ocr: Option<GlmOcrModelPaths>,
 }
 
 /// Resolved paths for GLM-OCR models (separate from pipeline models).
@@ -120,31 +120,50 @@ pub fn default_cache_dir() -> PathBuf {
         .join("models")
 }
 
-/// Ensure all models for the given quality mode are downloaded and return their paths.
+/// Ensure all models for the selected formula/table engines are downloaded.
 pub fn ensure_models(
-    quality: Quality,
+    formula: FormulaModel,
+    table: TableModel,
     cache_dir: &Path,
 ) -> Result<ModelPaths, ExtractError> {
     std::fs::create_dir_all(cache_dir)?;
 
-    // Always required
+    // Layout detection is always required
     let layout = ensure_model(cache_dir, &LAYOUT_MODEL)?;
-    let slanet_plus = ensure_model(cache_dir, &SLANET_PLUS)?;
-    let table_dict = ensure_model(cache_dir, &TABLE_DICT)?;
-    let formula_tokenizer = ensure_model(cache_dir, &FORMULA_TOKENIZER)?;
 
-    // Formula encoder/decoder (no auto-download, just check existence)
-    let formula_encoder = ensure_local_model(cache_dir, &FORMULA_ENCODER)?;
-    let formula_decoder = ensure_local_model(cache_dir, &FORMULA_DECODER)?;
+    // Formula models (only for pp-formulanet)
+    let (formula_encoder, formula_decoder, formula_tokenizer) = match formula {
+        FormulaModel::PpFormulanet => {
+            let enc = ensure_local_model(cache_dir, &FORMULA_ENCODER)?;
+            let dec = ensure_local_model(cache_dir, &FORMULA_DECODER)?;
+            let tok = ensure_model(cache_dir, &FORMULA_TOKENIZER)?;
+            (Some(enc), Some(dec), Some(tok))
+        }
+        FormulaModel::GlmOcr => (None, None, None),
+    };
 
-    // Table models selected by --quality
-    let (table_classifier, slanext_wired) = match quality {
-        Quality::Fast => (None, None),
-        Quality::Quality => {
+    // Table models (only for slanet variants)
+    let (slanet_plus, table_dict, table_classifier, slanext_wired) = match table {
+        TableModel::SlanetPlus => {
+            let slanet = ensure_model(cache_dir, &SLANET_PLUS)?;
+            let dict = ensure_model(cache_dir, &TABLE_DICT)?;
+            (Some(slanet), Some(dict), None, None)
+        }
+        TableModel::SlanextWired => {
+            let slanet = ensure_model(cache_dir, &SLANET_PLUS)?;
+            let dict = ensure_model(cache_dir, &TABLE_DICT)?;
             let classifier = ensure_model(cache_dir, &TABLE_CLASSIFIER)?;
             let wired = ensure_model(cache_dir, &SLANEXT_WIRED)?;
-            (Some(classifier), Some(wired))
+            (Some(slanet), Some(dict), Some(classifier), Some(wired))
         }
+        TableModel::GlmOcr => (None, None, None, None),
+    };
+
+    // GLM-OCR models (needed if either formula or table uses glm-ocr)
+    let glm_ocr = if formula == FormulaModel::GlmOcr || table == TableModel::GlmOcr {
+        Some(ensure_glm_ocr_models(cache_dir)?)
+    } else {
+        None
     };
 
     Ok(ModelPaths {
@@ -156,6 +175,7 @@ pub fn ensure_models(
         formula_tokenizer,
         table_classifier,
         slanext_wired,
+        glm_ocr,
     })
 }
 
@@ -393,21 +413,27 @@ fn platform_execution_providers() -> Vec<OrtExecutionProvider> {
 pub fn build_formula_predictor(
     paths: &ModelPaths,
 ) -> Result<FormulaPredictor, ExtractError> {
-    FormulaPredictor::new(
-        &paths.formula_encoder,
-        &paths.formula_decoder,
-        &paths.formula_tokenizer,
-    )
+    let enc = paths.formula_encoder.as_ref()
+        .ok_or_else(|| ExtractError::Model("formula_encoder path missing".into()))?;
+    let dec = paths.formula_decoder.as_ref()
+        .ok_or_else(|| ExtractError::Model("formula_decoder path missing".into()))?;
+    let tok = paths.formula_tokenizer.as_ref()
+        .ok_or_else(|| ExtractError::Model("formula_tokenizer path missing".into()))?;
+    FormulaPredictor::new(enc, dec, tok)
 }
 
 /// Build a standalone table structure recognition predictor.
 pub fn build_table_predictor(
     paths: &ModelPaths,
 ) -> Result<TableStructureRecognitionPredictor, ExtractError> {
+    let dict = paths.table_dict.as_ref()
+        .ok_or_else(|| ExtractError::Model("table_dict path missing".into()))?;
+    let slanet = paths.slanet_plus.as_ref()
+        .ok_or_else(|| ExtractError::Model("slanet_plus path missing".into()))?;
     let config = ort_config();
     TableStructureRecognitionPredictor::builder()
-        .dict_path(&paths.table_dict)
+        .dict_path(dict)
         .with_ort_config(config)
-        .build(&paths.slanet_plus)
+        .build(slanet)
         .map_err(|e| ExtractError::Model(format!("Failed to build table predictor: {e}")))
 }

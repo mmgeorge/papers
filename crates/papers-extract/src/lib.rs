@@ -25,8 +25,10 @@ pub struct ExtractOptions {
     pub confidence_threshold: f32,
     /// Whether to extract figures as images (default true).
     pub extract_images: bool,
-    /// Quality mode — affects model selection for tables (default Fast).
-    pub quality: Quality,
+    /// Formula recognition model (default PpFormulanet).
+    pub formula: FormulaModel,
+    /// Table recognition model (default SlanetPlus).
+    pub table: TableModel,
     /// Path to the pdfium binary (auto-detected if None).
     pub pdfium_path: Option<PathBuf>,
     /// Directory for ONNX model cache (auto-detected if None).
@@ -45,7 +47,8 @@ impl Default for ExtractOptions {
             dpi: 144,
             confidence_threshold: 0.3,
             extract_images: true,
-            quality: Quality::default(),
+            formula: FormulaModel::default(),
+            table: TableModel::default(),
             pdfium_path: None,
             model_cache_dir: None,
             page: None,
@@ -55,15 +58,26 @@ impl Default for ExtractOptions {
     }
 }
 
-/// Quality mode controls model selection for tables.
+/// Formula recognition model selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Quality {
-    /// Fast mode (default): SLANet-Plus (7 MB).
+pub enum FormulaModel {
+    /// pp-formulanet split encoder/decoder (default).
     #[default]
-    Fast,
-    /// Quality mode: PP-LCNet table classifier (6.5 MB) + SLANeXt-wired (351 MB).
-    /// Better accuracy for complex tables.
-    Quality,
+    PpFormulanet,
+    /// GLM-OCR vision-language model.
+    GlmOcr,
+}
+
+/// Table recognition model selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TableModel {
+    /// SLANet-Plus (7 MB, default).
+    #[default]
+    SlanetPlus,
+    /// PP-LCNet classifier + SLANeXt-wired (~358 MB).
+    SlanextWired,
+    /// GLM-OCR vision-language model with table prompt.
+    GlmOcr,
 }
 
 /// Controls what debug output to produce.

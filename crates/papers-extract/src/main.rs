@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use papers_extract::{DebugMode, ExtractOptions, Quality};
+use papers_extract::{DebugMode, ExtractOptions, FormulaModel, TableModel};
 
 #[derive(Parser)]
 #[command(
@@ -18,9 +18,13 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Quality mode for table recognition
-    #[arg(long, short, default_value = "fast")]
-    quality: QualityArg,
+    /// Formula recognition model
+    #[arg(long, default_value = "pp-formulanet")]
+    formula: FormulaArg,
+
+    /// Table recognition model
+    #[arg(long, default_value = "slanet-plus")]
+    table: TableArg,
 
     /// DPI for page rendering
     #[arg(long, default_value = "144")]
@@ -56,11 +60,21 @@ struct Cli {
 }
 
 #[derive(ValueEnum, Clone, Debug)]
-enum QualityArg {
+enum FormulaArg {
+    /// pp-formulanet split encoder/decoder
+    PpFormulanet,
+    /// GLM-OCR vision-language model
+    GlmOcr,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum TableArg {
     /// SLANet-Plus (7 MB)
-    Fast,
+    SlanetPlus,
     /// PP-LCNet classifier + SLANeXt-wired (~358 MB)
-    Quality,
+    SlanextWired,
+    /// GLM-OCR vision-language model
+    GlmOcr,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -85,9 +99,14 @@ fn main() {
         dpi: cli.dpi,
         confidence_threshold: cli.confidence,
         extract_images: !cli.no_images,
-        quality: match cli.quality {
-            QualityArg::Fast => Quality::Fast,
-            QualityArg::Quality => Quality::Quality,
+        formula: match cli.formula {
+            FormulaArg::PpFormulanet => FormulaModel::PpFormulanet,
+            FormulaArg::GlmOcr => FormulaModel::GlmOcr,
+        },
+        table: match cli.table {
+            TableArg::SlanetPlus => TableModel::SlanetPlus,
+            TableArg::SlanextWired => TableModel::SlanextWired,
+            TableArg::GlmOcr => TableModel::GlmOcr,
         },
         pdfium_path: cli.pdfium_path,
         model_cache_dir: cli.model_cache_dir,

@@ -9,6 +9,7 @@ use pdfium_render::prelude::*;
 use crate::error::ExtractError;
 use crate::figure;
 use crate::formula::FormulaPredictor;
+use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
 use crate::layout::{DetectedRegion, LayoutDetector};
 use crate::models;
 use crate::output;
@@ -16,14 +17,77 @@ use crate::pdf::{self, PdfChar};
 use crate::reading_order;
 use crate::text;
 use crate::types::*;
-use crate::ExtractOptions;
+use crate::{ExtractOptions, FormulaModel, TableModel};
+
+// ── Engine dispatch enums ────────────────────────────────────────────
+
+enum FormulaEngine {
+    PpFormulanet(FormulaPredictor),
+    GlmOcr(GlmOcrPredictor),
+}
+
+impl FormulaEngine {
+    fn predict(&self, images: &[DynamicImage]) -> Result<Vec<String>, ExtractError> {
+        match self {
+            Self::PpFormulanet(p) => p.predict(images),
+            Self::GlmOcr(p) => p.predict(images),
+        }
+    }
+}
+
+enum TableEngine {
+    Slanet(TableStructureRecognitionPredictor),
+    GlmOcr(GlmOcrPredictor),
+}
+
+impl TableEngine {
+    fn predict_html(
+        &self,
+        entries: &[(usize, DynamicImage)],
+    ) -> Result<HashMap<usize, String>, ExtractError> {
+        if entries.is_empty() {
+            return Ok(HashMap::new());
+        }
+        match self {
+            Self::Slanet(predictor) => {
+                let crops: Vec<image::RgbImage> =
+                    entries.iter().map(|(_, img)| img.to_rgb8()).collect();
+                let results = predictor
+                    .predict(crops)
+                    .map_err(|e| ExtractError::Layout(format!("Table prediction failed: {e}")))?;
+                Ok(entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(batch_idx, (det_idx, _))| {
+                        results
+                            .structures
+                            .get(batch_idx)
+                            .map(|tokens| (*det_idx, tokens.join("")))
+                    })
+                    .collect())
+            }
+            Self::GlmOcr(predictor) => {
+                let crops: Vec<DynamicImage> =
+                    entries.iter().map(|(_, img)| img.clone()).collect();
+                let results = predictor
+                    .predict(&crops)
+                    .map_err(|e| ExtractError::Layout(format!("Table prediction failed: {e}")))?;
+                Ok(entries
+                    .iter()
+                    .zip(results)
+                    .map(|((det_idx, _), html)| (*det_idx, html))
+                    .collect())
+            }
+        }
+    }
+}
 
 /// Reusable extraction pipeline — load models once, extract many PDFs.
 pub struct Pipeline {
     pdfium: Pdfium,
     layout: LayoutDetector,
-    formula: FormulaPredictor,
-    table: TableStructureRecognitionPredictor,
+    formula: FormulaEngine,
+    table: TableEngine,
     options: PipelineOptions,
 }
 
@@ -48,10 +112,36 @@ impl Pipeline {
             .clone()
             .unwrap_or_else(models::default_cache_dir);
 
-        let paths = models::ensure_models(options.quality, &cache_dir)?;
+        let paths = models::ensure_models(options.formula, options.table, &cache_dir)?;
         let layout = models::build_layout_detector(&paths.layout)?;
-        let formula = models::build_formula_predictor(&paths)?;
-        let table = models::build_table_predictor(&paths)?;
+
+        let formula = match options.formula {
+            FormulaModel::PpFormulanet => {
+                FormulaEngine::PpFormulanet(models::build_formula_predictor(&paths)?)
+            }
+            FormulaModel::GlmOcr => {
+                let glm_paths = paths.glm_ocr.as_ref()
+                    .ok_or_else(|| ExtractError::Model("GLM-OCR model paths missing".into()))?;
+                FormulaEngine::GlmOcr(models::build_glm_ocr_predictor(glm_paths)?)
+            }
+        };
+
+        let table = match options.table {
+            TableModel::SlanetPlus | TableModel::SlanextWired => {
+                TableEngine::Slanet(models::build_table_predictor(&paths)?)
+            }
+            TableModel::GlmOcr => {
+                let glm_paths = paths.glm_ocr.as_ref()
+                    .ok_or_else(|| ExtractError::Model("GLM-OCR model paths missing".into()))?;
+                let config = GlmOcrConfig {
+                    prompt: "Table Recognition:".into(),
+                    ..GlmOcrConfig::default()
+                };
+                TableEngine::GlmOcr(
+                    models::build_glm_ocr_predictor_with_config(glm_paths, config)?,
+                )
+            }
+        };
 
         Ok(Self {
             pdfium,
@@ -225,6 +315,7 @@ impl Pipeline {
             HashMap::new()
         };
 
+
         // Crop table regions and run batched recognition
         let table_entries: Vec<(usize, DynamicImage)> = detected
             .iter()
@@ -250,26 +341,7 @@ impl Pipeline {
             })
             .collect();
 
-        let table_html: HashMap<usize, String> = if !table_entries.is_empty() {
-            let crops: Vec<image::RgbImage> =
-                table_entries.iter().map(|(_, img)| img.to_rgb8()).collect();
-            let results = self
-                .table
-                .predict(crops)
-                .map_err(|e| ExtractError::Layout(format!("Table prediction failed: {e}")))?;
-            table_entries
-                .iter()
-                .enumerate()
-                .filter_map(|(batch_idx, (det_idx, _))| {
-                    results
-                        .structures
-                        .get(batch_idx)
-                        .map(|tokens| (*det_idx, tokens.join("")))
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        let table_html = self.table.predict_html(&table_entries)?;
 
         // Build regions from layout detection + formula/table results
         let mut regions = self.build_regions(
