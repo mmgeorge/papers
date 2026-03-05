@@ -40,7 +40,7 @@ The key insight: **doing your own export from scratch isn't that hard, and gives
 
 What you get in return for this effort:
 
-- Clean ONNX graphs that work on all execution providers (CUDA, DirectML, CPU)
+- Clean ONNX graphs that work on all execution providers (CUDA, CoreML, CPU)
 - Static-shape KV cache enabling CUDA graphs
 - Full control over I/O types (FP16 native vs keep_io)
 - Ability to do graph surgery (fuse argmax, pre-pad attention)
@@ -61,7 +61,7 @@ PaddlePaddle checkpoint (.pdparams)
 
 ### Key Design Decisions
 
-**Fixed-size KV cache.** The decoder uses pre-allocated `[B, 16, 512, 32]` buffers instead of concat-based growing tensors. New KV entries are written at position `step` via `torch.where(positions == step, new_kv, buffer)`. This makes all shapes static, enabling CUDA graphs and DirectML compatibility. We avoided `ScatterElements` (buggy on DirectML) in favor of `where`-based writes.
+**Fixed-size KV cache.** The decoder uses pre-allocated `[B, 16, 512, 32]` buffers instead of concat-based growing tensors. New KV entries are written at position `step` via `torch.where(positions == step, new_kv, buffer)`. This makes all shapes static, enabling CUDA graphs. We used `where`-based writes instead of `ScatterElements` (which breaks CUDA graphs).
 
 **Cross-attention always recomputed.** Instead of caching cross-attention KV (which requires branching logic), the decoder recomputes it from `encoder_hidden_states` every step. This eliminates control flow from the graph, making it fully tracer-friendly and CUDA-graph-compatible. The cross-attention computation is cheap relative to the self-attention over the growing sequence.
 
@@ -402,7 +402,7 @@ The raw ONNX models produced by `torch.onnx.export()` contain unfused attention 
 | Level | Op | Backends | What It Does |
 |-------|-----|----------|-------------|
 | 0 (raw) | ~15 ops/layer | All | Individual MatMul/Reshape/Transpose/Softmax. What `torch.onnx.export` produces. |
-| 1 (MHA) | `com.microsoft.MultiHeadAttention` | CUDA, CPU, DirectML | Fused attention kernel. Single op replaces the entire Q/K/V projection + attention + output projection chain. |
+| 1 (MHA) | `com.microsoft.MultiHeadAttention` | CUDA, CPU, CoreML | Fused attention kernel. Single op replaces the entire Q/K/V projection + attention + output projection chain. |
 | 2 (GQA) | `com.microsoft.GroupQueryAttention` | CUDA only | Fused attention with FlashAttention V2. O(1) memory scaling for attention — critical for long sequences. Supports GQA natively (different number of query vs KV heads). |
 
 For GLM-OCR with 16 decoder layers, this reduces total node count from ~1551 (raw) to ~200-300 (fused).
@@ -456,8 +456,7 @@ Approach 2 is the safer bet for M-RoPE and is confirmed working by the `onnxrunt
 |----------|-------|-----|
 | CUDA inference (formulas) | GQA | FlashAttention V2, best throughput |
 | CUDA inference (full-page PDF) | GQA | O(1) memory scaling critical for long sequences |
-| DirectML inference | MHA | GQA is CUDA-only; MHA is the best available |
-| CPU inference | MHA | Same as DirectML — MHA has CPU kernels |
+| CoreML / CPU inference | MHA | GQA is CUDA-only; MHA is the best available for other backends |
 | Debugging / validation | Raw | Easier to inspect, matches PyTorch exactly |
 
 #### Implementation
@@ -477,7 +476,7 @@ python optimize_gqa.py --model-dir ../model
 python optimize_mha_vision.py --model-dir ../model
 
 # Automatic MHA fusion (all backends — if pattern matches):
-python optimize.py --model-dir ../model --target directml
+python optimize.py --model-dir ../model --target other
 ```
 
 #### Vision encoder MHA surgery

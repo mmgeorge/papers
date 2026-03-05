@@ -1,7 +1,6 @@
-"""Run PP-FormulaNet inference with DirectML (session.run, FP32).
+"""Run PP-FormulaNet inference with CPU (session.run, FP32).
 
-Uses basic session.run() with CPU-side argmax. No IOBinding or CUDA graphs
-(not supported by DirectML for autoregressive decoding with KV cache).
+Uses basic session.run() with CPU-side argmax. No IOBinding or CUDA graphs.
 
 Usage:
     python run.py image.png [image2.png ...]
@@ -79,7 +78,7 @@ def decode_basic(dec_sess, encoder_hidden, max_steps=MAX_SEQ):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run PP-FormulaNet with DirectML")
+    parser = argparse.ArgumentParser(description="Run PP-FormulaNet with CPU")
     parser.add_argument("images", nargs="*", help="Image files to process")
     parser.add_argument("--formulas-dir", type=str, help="Directory of formula images")
     parser.add_argument("--encoder", default=ENCODER_PATH, help="Encoder ONNX path")
@@ -104,7 +103,7 @@ def main():
     opts.log_severity_level = 3
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-    providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    providers = ["CPUExecutionProvider"]
 
     print("Loading encoder...")
     enc_sess = ort.InferenceSession(args.encoder, sess_options=opts, providers=providers)
@@ -120,7 +119,7 @@ def main():
 
     # Run all formulas
     n = len(image_paths)
-    print(f"\nRunning on {n} formulas (DirectML + FP32)\n")
+    print(f"\nRunning on {n} formulas (CPU + FP32)\n")
     print(f"{'Image':<12} {'Tokens':>6} {'Encode':>10} {'Decode':>10} {'Total':>10}  {'LaTeX'}")
     print("-" * 120)
 

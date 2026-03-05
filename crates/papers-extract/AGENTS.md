@@ -86,7 +86,7 @@ Formula recognition always uses the custom split encoder/decoder models (~365 MB
 
 - `oar-ocr` 0.6 — TableStructureRecognitionPredictor for crop-based table recognition
 - `pdfium-render` 0.8 — PDF loading, rendering, text extraction (requires pdfium binary)
-- `ort` 2.0.0-rc.11 — Direct ONNX inference for layout detection + formula recognition; CUDA / DirectML (Windows) / CoreML (macOS) execution providers
+- `ort` 2.0.0-rc.11 — Direct ONNX inference for layout detection + formula recognition; CUDA (Windows) / CoreML (macOS) / CPU execution providers
 - `ndarray` 0.17 — Tensor construction for ort model inputs/outputs
 - `half` 2 — FP16 type for formula model tensors
 - `tokenizers` 0.21 — HuggingFace tokenizer for formula token decoding
@@ -103,8 +103,13 @@ Cache directory: `{dirs::cache_dir()}/papers/models/` (override: `PAPERS_MODEL_D
 
 ## Execution Providers
 
-- **Windows**: CUDA (NVIDIA GPU) with DirectML fallback (any DirectX 12 GPU), then CPU
-- **macOS**: CoreML (Apple Neural Engine) with CPU fallback
+Three backends with auto-detection order CUDA → CoreML → CPU:
+
+- **CUDA** (Windows, NVIDIA 3000+ GPU): BF16 precision, IoBinding + CUDA graphs + GQA-fused decoder. Uses `llm_decoder_gqa.onnx` for fast decode.
+- **CoreML** (macOS, Apple Silicon): FP32 precision, `session.run()` decode with growing KV cache. Uses `llm.onnx` for both prefill and decode.
+- **CPU** (everywhere): FP32 precision, same `session.run()` decode as CoreML. Universal fallback.
+
+CLI: `--backend cuda|coreml|cpu|auto` (default: `auto`)
 
 ## Testing
 

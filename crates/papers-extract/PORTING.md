@@ -623,7 +623,7 @@ image = "0.25"       # image preprocessing
 | File | Purpose |
 |------|---------|
 | `src/formula.rs` | `FormulaPredictor` — encoder/decoder with CUDA graphs |
-| `src/glm_ocr.rs` | `GlmOcrPredictor` — GLM-OCR with ORT built-in CUDA graphs |
+| `src/glm_ocr/` | `GlmOcrPredictor` — GLM-OCR with CUDA (IoBinding + CUDA graphs) and CPU/CoreML backends |
 | `src/models.rs` | Model download, ORT runtime init, EP configuration |
 | `src/bin/bench_formulas.rs` | Standalone PP-FormulaNet benchmark |
 | `src/bin/bench_glm_formulas.rs` | Standalone GLM-OCR benchmark |
@@ -638,25 +638,30 @@ image = "0.25"       # image preprocessing
 ## GLM-OCR Porting Notes
 
 GLM-OCR (`zai-org/GLM-OCR`) is a second formula recognition model ported to Rust.
-It uses the same persistent IoBinding + pre-allocated GPU buffer pattern as
-PP-FormulaNet, but with significant architectural differences.
+It supports 3 backends: CUDA (BF16 + IoBinding + CUDA graphs), CoreML (FP32),
+and CPU (FP32). The CUDA path uses the same persistent IoBinding + pre-allocated
+GPU buffer pattern as PP-FormulaNet; the CoreML/CPU path uses simpler
+`session.run()` with growing KV cache.
 
-### Architecture: 4-Part Model Split
+### Architecture: Backend-Dependent Model Split
 
-Unlike PP-FormulaNet's 2-part split (encoder + decoder), GLM-OCR requires 4 ONNX
-sessions:
+CUDA uses 4 ONNX sessions; CoreML/CPU use 3 (no separate decoder):
 
-| Model | Size | Purpose |
-|-------|------|---------|
-| `vision_encoder.onnx` | ~3.4 GB (FP32) | CogViT with M-RoPE position encoding |
-| `embedding.onnx` | 348 MB (FP16) | Token embeddings for prefill |
-| `llm.onnx` | 2.2 GB (FP16) | Full LLM for prefill pass (dynamic shapes) |
-| `llm_decoder.onnx` | 1.3 GB (FP16) | Decode step (fixed shapes, CUDA graphed) |
+| Model | CUDA (BF16) | CoreML/CPU (FP32) | Purpose |
+|-------|-------------|-------------------|---------|
+| `vision_encoder_mha.onnx` | ~844 MB | — | MHA-fused CogViT (CUDA only) |
+| `vision_encoder.onnx` | — | ~3.4 GB | Raw unfused CogViT (CoreML/CPU) |
+| `embedding.onnx` | ~174 MB | ~348 MB | Token embeddings |
+| `llm.onnx` | ~1.1 GB | ~2.2 GB | Full LLM (prefill + decode on CoreML/CPU) |
+| `llm_decoder_gqa.onnx` | ~1.3 GB | — | GQA-fused decoder (CUDA only) |
 
-The prefill phase is a key difference: the full prompt (system message + image
-tokens + "Formula Recognition:") is processed through the LLM once to populate
-the KV cache before decoding begins. PP-FormulaNet has no prefill — it just feeds
-the encoder output directly.
+The prefill phase is a key difference from PP-FormulaNet: the full prompt
+(system message + image tokens + "Formula Recognition:") is processed through
+the LLM once to populate the KV cache before decoding begins.
+
+On CUDA, the prefill uses `llm.onnx` (dynamic shapes) and decode uses
+`llm_decoder_gqa.onnx` (fixed shapes, CUDA graphed). On CoreML/CPU, `llm.onnx`
+handles both prefill and decode with growing KV cache per step.
 
 ### Export Wrapper Pattern
 

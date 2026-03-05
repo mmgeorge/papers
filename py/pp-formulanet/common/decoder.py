@@ -11,7 +11,7 @@ Architecture (from PaddleOCR source):
 - lm_head: Linear(512, 50000, bias=False)
 
 KV cache: fixed-size pre-allocated buffers with step-based scatter writes.
-All shapes are static (batch and max_seq fixed), enabling CUDA graphs and DirectML.
+All shapes are static (batch and max_seq fixed), enabling CUDA graphs.
 """
 
 import math
@@ -75,7 +75,7 @@ class MBartAttention(nn.Module):
             max_seq = key_buffer.shape[2]
 
             # Write new KV at position `step` using Where (avoids ScatterElements
-            # which is buggy on DirectML). Write mask is 1 at position step, 0 elsewhere.
+            # which breaks CUDA graphs). Write mask is 1 at position step, 0 elsewhere.
             positions = torch.arange(max_seq, device=key_buffer.device)
             write_mask = (positions == step).view(1, 1, max_seq, 1)
             key_buffer = torch.where(write_mask, key_new.expand_as(key_buffer), key_buffer)

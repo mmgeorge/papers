@@ -1,6 +1,6 @@
-# Porting GLM-OCR to ONNX (FP16)
+# Porting GLM-OCR to ONNX
 
-Step-by-step account of how [zai-org/GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) was exported to ONNX Runtime in FP16, including all problems encountered and their solutions.
+Step-by-step account of how [zai-org/GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) was exported to ONNX Runtime, including all problems encountered and their solutions.
 
 ## Model Overview
 
@@ -195,48 +195,71 @@ hpos = hpos.reshape(h//2, 2, w//2, 2).transpose(0, 2, 1, 3).flatten()
 pos_ids = np.stack([hpos, wpos], axis=-1)  # [num_patches, 2]
 ```
 
-## BF16 vs FP16 Decision
+## Backend-Specific Export Paths
 
-The model is natively BF16 in PyTorch — Conv2d/Conv3d genuinely compute in BF16
-on GPU (PyTorch classifies them as `lower_precision_fp`, same as MatMul). Only
-RMSNorm, rotary embeddings, and softmax explicitly upcast to FP32.
+GLM-OCR supports 3 inference backends, each with its own export path:
 
-However, ONNX Runtime support for BF16 is limited:
+| Backend | Platform | Precision | Export | Decode strategy |
+|---------|----------|-----------|--------|----------------|
+| **CUDA** | Windows (NVIDIA 3000+) | BF16 | `cuda/export.py --bf16` | `llm_decoder_gqa.onnx` + IoBinding + CUDA graphs |
+| **CoreML** | macOS (Apple Silicon) | FP32 | `cuda/export.py --fp32` | `llm.onnx` + `session.run()` growing KV cache |
+| **CPU** | Everywhere | FP32 | `cuda/export.py --fp32` | `llm.onnx` + `session.run()` growing KV cache |
 
-| | BF16 | FP16 |
-|---|---|---|
-| File size | Same (2 bytes/param) | Same (2 bytes/param) |
-| ORT CPU support | No | Yes |
-| ORT DML support | No | Yes |
-| ORT CUDA MatMul/Add/Mul | Yes | Yes |
-| ORT CUDA Conv | **No** (no kernel, even opset 22) | Yes |
+### CUDA path (BF16 + CUDA graphs + extra ops)
 
-The ONNX spec added BF16 to Conv in opset 22 (ONNX 1.17.0), but ORT has no
-BF16 Conv kernel on any provider as of v1.24 ([issue #25740](https://github.com/microsoft/onnxruntime/issues/25740)).
+The CUDA path uses BF16 precision with additional ONNX graph surgery for maximum GPU throughput:
 
-### Export modes
+- **Vision encoder**: `vision_encoder_mha.onnx` — MHA-fused (24 MultiHeadAttention nodes), BF16 with FP32 Cast islands around Conv/ReduceMean/Reciprocal ops
+- **Embedding**: `embedding.onnx` — FP32 (shared across all backends)
+- **LLM prefill**: `llm.onnx` — BF16, dynamic KV cache shapes for full-sequence prefill
+- **LLM decoder**: `llm_decoder_gqa.onnx` — BF16, fixed-shape KV cache, 16 GQA (GroupQueryAttention) nodes for FlashAttention V2, CUDA graph compatible
 
-- **`--fp16`** (default): Everything in FP16. Works on CPU, DML, and CUDA.
-- **`--bf16`**: Everything in BF16. Vision encoder Conv ops stay in FP16
-  (ORT Conv limitation) with Cast wrappers. Requires CUDA.
-- **`--fp32`**: Everything in FP32. Debug/reference only.
+Export: `python cuda/export.py --bf16` then `python cuda/optimize_gqa.py`
+
+### CoreML / CPU path (FP32 simple models)
+
+The non-CUDA path uses FP32 precision with no graph surgery — simpler models that work on all platforms:
+
+- **Vision encoder**: `vision_encoder.onnx` — raw unfused attention, FP32
+- **Embedding**: `embedding.onnx` — FP32
+- **LLM**: `llm.onnx` — FP32, dynamic KV cache (used for both prefill and decode)
+- **No separate decoder** — the decode loop reuses `llm.onnx` with `session.run()` and growing KV cache each step
+
+Export: `python cuda/export.py --fp32`
+
+### Why not DirectML?
+
+DirectML was tested but crashes on dynamic Reshape nodes (5D tensors like `[-1, 3, 2, 14, 14]` in the vision encoder and data-dependent shapes in the LLM attention layers). These are fundamental DirectML EP limitations with transformer models that use dynamic reshapes. The raw models crash — this is not an optimization issue. DirectML is not supported.
+
+### BF16 vs FP16 vs FP32
+
+The model is natively BF16 in PyTorch. ONNX Runtime support for BF16 is limited:
+
+| | BF16 | FP16 | FP32 |
+|---|---|---|---|
+| File size | 2 bytes/param | 2 bytes/param | 4 bytes/param |
+| ORT CPU support | No | Yes | Yes |
+| ORT CoreML support | No | Yes | Yes |
+| ORT CUDA MatMul/Add/Mul | Yes | Yes | Yes |
+| ORT CUDA Conv | **No** | Yes | Yes |
+
+BF16 is used for CUDA because it's the native precision and has 8-bit exponent (no overflow risk). FP32 is used for CoreML/CPU because BF16 has no CPU/CoreML kernels, and FP32 avoids the FP16 exponent range limitations. FP16 is no longer exported — BF16 (CUDA) and FP32 (everything else) cover all backends.
 
 ### BF16 Vision Encoder Conversion
 
-The BF16 vision encoder is created by post-processing the FP16 model:
+The BF16 vision encoder is created by post-processing the FP32-exported model:
 
-1. Convert all FP16 initializers, type annotations, and Cast nodes to BF16
-2. Revert Conv weight/bias initializers back to FP16
+1. Convert all FP32 initializers, type annotations, and Cast nodes to BF16
+2. Revert Conv weight/bias initializers back to FP16 (ORT has no BF16 Conv kernel)
 3. Insert `Cast(BF16→FP16)` before Conv data inputs
 4. Insert `Cast(FP16→BF16)` after Conv outputs
+5. Ops without BF16 ONNX schema support (ReduceMean, Reciprocal, Sin, Cos, etc.) stay FP32 with Cast wrappers
 
-This creates a mostly-BF16 graph with FP16 islands around Conv nodes:
+This creates a mostly-BF16 graph with FP32/FP16 islands:
 ```
 BF16 computation → Cast(BF16→FP16) → Conv(FP16) → Cast(FP16→BF16) → BF16 computation
+BF16 computation → Cast(BF16→FP32) → ReduceMean(FP32) → Cast(FP32→BF16) → BF16 computation
 ```
-
-Conv nodes inside FP32 islands (behind blocked Cast-to-FLOAT nodes) are
-untouched — they already operate in FP32 with existing Cast wrappers.
 
 ## Dependencies
 
@@ -245,7 +268,8 @@ torch>=2.10
 transformers>=5.2.0
 onnx
 onnxconverter-common
-onnxruntime>=1.24  (or onnxruntime-directml for GPU)
+onnxruntime-gpu>=1.24  (CUDA path)
+onnxruntime>=1.24      (CPU/CoreML path)
 numpy
 ml-dtypes
 Pillow
@@ -268,11 +292,12 @@ The FP16 export is 50% smaller than FP32, with identical output quality verified
 ## Running
 
 ```bash
-# Export FP16 (default, works everywhere)
-python export.py
+# Export FP32 (CoreML / CPU — simple models, no graph surgery)
+cd cuda && python export.py --fp32
 
-# Export BF16 (CUDA only, native precision for embedding+LLM)
-python export.py --bf16
+# Export BF16 (CUDA — native precision + MHA/GQA surgery)
+cd cuda && python export.py --bf16
+cd cuda && python optimize_gqa.py --model-dir ../model
 
 # Inference
 python run.py --image path/to/image.png

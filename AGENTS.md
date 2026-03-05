@@ -35,7 +35,7 @@ should contain a `README.md` with findings and the raw `results.json` output.
 
 2. **Run a model** on dumped regions:
    ```bash
-   # GLM-OCR (any region type, comma-separated)
+   # GLM-OCR (any region type, comma-separated; --backend cuda|coreml|cpu|auto)
    cargo run --release --bin run_glm_ocr -- data/dumps/<paper> \
      -o .temp/results/<paper>-glm \
      --region-type "Text,DisplayFormula,Algorithm,Table"

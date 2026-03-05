@@ -8,12 +8,12 @@ export.py. The raw graphs have ~1551 ops per decoder with unfused attention
 
 1. **MHA (MultiHeadAttention)** — Fuses raw attention ops into the
    `com.microsoft.MultiHeadAttention` contrib op. Works on CUDA, CPU, and
-   DirectML. Reduces node count from ~1551 to ~200-300.
+   CoreML. Reduces node count from ~1551 to ~200-300.
 
 2. **GQA (GroupQueryAttention)** — Upgrades MHA nodes to
    `com.microsoft.GroupQueryAttention`, which uses FlashAttention V2 on CUDA.
    O(1) memory scaling for attention — critical for long sequences (full-page
-   PDF inference). **CUDA only** — no CPU or DirectML implementation exists.
+   PDF inference). **CUDA only** — no CPU or CoreML implementation exists.
 
 ## M-RoPE handling
 
@@ -30,7 +30,7 @@ Qwen2.5-VL builder — confirmed working.
 ## Usage
 
   # MHA fusion (all backends):
-  python optimize.py --model-dir ../model --target directml
+  python optimize.py --model-dir ../model --target other
 
   # GQA fusion (CUDA + FlashAttention):
   python optimize.py --model-dir ../model --target cuda
@@ -145,7 +145,7 @@ def optimize_model_file(input_path: Path, output_dir: Path, target: str):
     Args:
         input_path: Path to raw exported ONNX model
         output_dir: Directory to write optimized model
-        target: "directml" for MHA only, "cuda" for MHA → GQA
+        target: "other" for MHA only, "cuda" for MHA → GQA
     """
     stem = input_path.stem  # e.g., "llm" or "llm_decoder"
     print(f"\nOptimizing {input_path.name} (target={target})")
@@ -154,7 +154,7 @@ def optimize_model_file(input_path: Path, output_dir: Path, target: str):
     before = count_ops(input_path)
     print(f"  Before: {sum(before.values())} nodes")
 
-    if target == "directml":
+    if target == "other":
         # MHA fusion only (works on all backends)
         out_path = output_dir / f"{stem}_mha.onnx"
         optimize_to_mha(input_path, out_path)
@@ -203,8 +203,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: same as model-dir)")
     parser.add_argument("--target", type=str, required=True,
-                        choices=["cuda", "directml"],
-                        help="Target backend: 'cuda' for GQA, 'directml' for MHA")
+                        choices=["cuda", "other"],
+                        help="Target backend: 'cuda' for GQA, 'other' for MHA only")
     parser.add_argument("--only", type=str, default=None,
                         choices=["llm", "llm_decoder"],
                         help="Optimize only this model (default: both)")

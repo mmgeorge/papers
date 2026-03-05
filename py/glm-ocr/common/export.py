@@ -1,6 +1,6 @@
 """Shared export wrappers and functions for GLM-OCR ONNX model export.
 
-Used by both cuda/export.py and directml/export.py.
+Used by both cuda/export.py and other/export.py.
 """
 
 import sys
@@ -278,7 +278,7 @@ def export_vision_encoder(model, output_dir: Path, dtype, apply_mha=True):
         model: The HuggingFace model.
         output_dir: Directory for output files.
         dtype: torch.bfloat16 for BF16 conversion, torch.float32 for FP32.
-        apply_mha: If True, apply MHA surgery (CUDA). If False, skip (DirectML).
+        apply_mha: If True, apply MHA surgery (CUDA). If False, skip (CPU/CoreML).
     """
     if apply_mha:
         output_name = "vision_encoder_mha.onnx"

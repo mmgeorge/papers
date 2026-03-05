@@ -1,10 +1,7 @@
-"""Run GLM-OCR inference with DirectML (session.run, FP32).
+"""Run GLM-OCR inference with CPU (session.run, FP32).
 
-Uses basic session.run() with CPU-side argmax. No IOBinding or CUDA graphs
-(not supported by DirectML for autoregressive decoding with KV cache).
-
-Uses the MHA-fused LLM (llm_mha.onnx) if available, falls back to raw
-llm.onnx otherwise. Supports FP32 (DirectML export) and FP16/BF16 models.
+Uses basic session.run() with CPU-side argmax. No IOBinding or CUDA graphs.
+Uses llm.onnx for both prefill and decode steps with growing KV cache.
 
 Usage:
   uv run python run.py --image path/to/image.png
@@ -161,7 +158,7 @@ def generate(sessions, processor, config, image, prompt_text, max_new_tokens):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GLM-OCR DirectML inference")
+    parser = argparse.ArgumentParser(description="GLM-OCR CPU/CoreML inference")
     parser.add_argument("--image", type=str, required=True)
     parser.add_argument("--model-dir", type=str, default=DEFAULT_MODEL_DIR)
     parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
@@ -170,10 +167,7 @@ def main():
 
     model_dir = Path(args.model_dir)
 
-    # Prefer MHA-fused LLM, fall back to raw
-    llm_path = model_dir / "llm_mha.onnx"
-    if not llm_path.exists():
-        llm_path = model_dir / "llm.onnx"
+    llm_path = model_dir / "llm.onnx"
     if not llm_path.exists():
         print(f"No LLM model found in {model_dir}")
         print("Run export.py first.")
@@ -189,21 +183,17 @@ def main():
     processor = AutoProcessor.from_pretrained(str(model_dir))
     config = AutoConfig.from_pretrained(str(model_dir))
 
-    # DirectML session options
+    # Session options
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    opts.enable_mem_pattern = False
 
-    providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+    providers = ["CPUExecutionProvider"]
 
     # Vision encoder needs ORT_ENABLE_EXTENDED (mixed-type FP16 graph)
     vis_opts = ort.SessionOptions()
     vis_opts.log_severity_level = 3
     vis_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
-    vis_opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    vis_opts.enable_mem_pattern = False
 
     print(f"Loading ONNX sessions (LLM: {llm_path.name}) ...")
     sessions = {

@@ -359,16 +359,13 @@ fn platform_execution_providers() -> Vec<OrtExecutionProvider> {
     let mut providers = Vec::new();
 
     #[cfg(target_os = "windows")]
-    {
-        providers.push(OrtExecutionProvider::CUDA {
-            device_id: None,
-            gpu_mem_limit: None,
-            arena_extend_strategy: None,
-            cudnn_conv_algo_search: None,
-            cudnn_conv_use_max_workspace: None,
-        });
-        providers.push(OrtExecutionProvider::DirectML { device_id: None });
-    }
+    providers.push(OrtExecutionProvider::CUDA {
+        device_id: None,
+        gpu_mem_limit: None,
+        arena_extend_strategy: None,
+        cudnn_conv_algo_search: None,
+        cudnn_conv_use_max_workspace: None,
+    });
 
     #[cfg(target_os = "macos")]
     providers.push(OrtExecutionProvider::CoreML {

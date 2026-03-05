@@ -64,8 +64,6 @@ impl LayoutDetector {
             .with_execution_providers([
                 #[cfg(target_os = "windows")]
                 ort::execution_providers::CUDAExecutionProvider::default().build(),
-                #[cfg(target_os = "windows")]
-                ort::execution_providers::DirectMLExecutionProvider::default().build(),
                 #[cfg(target_os = "macos")]
                 ort::execution_providers::CoreMLExecutionProvider::default().build(),
                 ort::execution_providers::CPUExecutionProvider::default().build(),

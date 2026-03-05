@@ -1,4 +1,4 @@
-"""Export PP-FormulaNet Plus-L to FP32 ONNX for DirectML inference.
+"""Export PP-FormulaNet Plus-L to FP32 ONNX for CPU/CoreML inference.
 
 Pipeline:
 1. Download PaddlePaddle checkpoint and extract .npz weights
@@ -20,7 +20,7 @@ from common.export_common import export_encoder_fp32, export_decoder_fp32
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export PP-FormulaNet for DirectML")
+    parser = argparse.ArgumentParser(description="Export PP-FormulaNet for CPU/CoreML")
     parser.add_argument("--output-dir", default="output",
                         help="Directory for output ONNX models (default: output)")
     args = parser.parse_args()

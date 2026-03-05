@@ -41,7 +41,7 @@ def preprocess_image(img_path, dtype=np.float32):
 
     Args:
         img_path: Path to the input image.
-        dtype: Output dtype (np.float32 for DirectML, np.float16 for CUDA).
+        dtype: Output dtype (np.float32 for CPU/CoreML, np.float16 for CUDA).
 
     Returns:
         Preprocessed image as [1, 1, TARGET_SIZE, TARGET_SIZE] numpy array.
