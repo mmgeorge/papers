@@ -82,14 +82,132 @@ fn decode_tokens(tokenizer: &tokenizers::Tokenizer, token_ids: &[i64]) -> String
 
     let text = tokenizer.decode(&valid, true).unwrap_or_default();
 
-    // Strip surrounding $$ or $ delimiters that the model may produce
-    let trimmed = text.trim();
-    if trimmed.len() >= 4 && trimmed.starts_with("$$") && trimmed.ends_with("$$") {
-        trimmed[2..trimmed.len() - 2].trim().to_string()
-    } else if trimmed.len() >= 2 && trimmed.starts_with('$') && trimmed.ends_with('$') {
-        trimmed[1..trimmed.len() - 1].trim().to_string()
-    } else {
-        trimmed.to_string()
+    // Strip $$ or $ delimiters at start/end independently — the model sometimes
+    // emits them at only one end (e.g. "$$\n\mathbf{H}..." with no closing $$).
+    let mut s = text.trim();
+    if s.starts_with("$$") {
+        s = s[2..].trim_start();
+    } else if s.starts_with('$') {
+        s = s[1..].trim_start();
+    }
+    if s.ends_with("$$") {
+        s = s[..s.len() - 2].trim_end();
+    } else if s.ends_with('$') {
+        s = s[..s.len() - 1].trim_end();
+    }
+    let stripped = s;
+
+    collapse_spaced_text(stripped)
+}
+
+/// Collapse single-character-spaced text inside LaTeX text commands.
+///
+/// The GLM-OCR model generates space-prefixed single-character tokens for text
+/// inside LaTeX commands, producing e.g. `\text {w i t h}` instead of `\text{with}`.
+/// This is a model training artifact — the tokenizer has whole-word tokens available
+/// but the model's weights don't produce them in this context.
+///
+/// This function detects brace groups after `\text`, `\mathrm`, `\operatorname`, etc.
+/// where the content is entirely single ASCII letters separated by single spaces,
+/// and collapses them by removing the spaces.
+fn collapse_spaced_text(s: &str) -> String {
+    use std::fmt::Write;
+
+    // Commands whose brace content is rendered as text (spaces are visible)
+    const TEXT_COMMANDS: &[&str] = &[
+        "\\text",
+        "\\mathrm",
+        "\\textrm",
+        "\\textit",
+        "\\textbf",
+        "\\operatorname",
+    ];
+
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+
+    while !rest.is_empty() {
+        // Find the earliest text command in the remaining string
+        let mut earliest: Option<(usize, &str)> = None;
+        for cmd in TEXT_COMMANDS {
+            if let Some(pos) = rest.find(cmd) {
+                if earliest.is_none() || pos < earliest.unwrap().0 {
+                    earliest = Some((pos, cmd));
+                }
+            }
+        }
+
+        let Some((cmd_start, cmd)) = earliest else {
+            result.push_str(rest);
+            break;
+        };
+
+        // Copy everything before the command
+        result.push_str(&rest[..cmd_start]);
+        let after_cmd = &rest[cmd_start + cmd.len()..];
+
+        // Expect optional whitespace then '{'
+        let after_ws = after_cmd.trim_start();
+        let _skipped_ws = after_cmd.len() - after_ws.len();
+        if !after_ws.starts_with('{') {
+            // Not a braced group — copy the command literally and continue
+            result.push_str(cmd);
+            rest = after_cmd;
+            continue;
+        }
+
+        let inside = &after_ws[1..]; // skip '{'
+        // Find matching closing brace (no nesting expected in text commands)
+        let Some(close) = inside.find('}') else {
+            result.push_str(cmd);
+            rest = after_cmd;
+            continue;
+        };
+
+        let content = &inside[..close];
+
+        // Check if content matches the spaced-letter pattern: single ASCII letters
+        // separated by single spaces, e.g. "w i t h" or "a r g m i n"
+        let collapsed = try_collapse(content);
+
+        let _ = write!(result, "{}{{{}}}", cmd, collapsed.as_deref().unwrap_or(content));
+        rest = &inside[close + 1..]; // after '}'
+    }
+
+    result
+}
+
+/// If `content` is entirely single ASCII letters separated by single spaces,
+/// return the collapsed version. Otherwise return None.
+fn try_collapse(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut chars = trimmed.chars();
+    // First char must be ASCII alphabetic
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+
+    let mut collapsed = String::with_capacity(trimmed.len());
+    collapsed.push(first);
+
+    // Remaining must be pairs of (space, ASCII letter)
+    loop {
+        match chars.next() {
+            None => return Some(collapsed),
+            Some(' ') => {
+                let letter = chars.next()?;
+                if !letter.is_ascii_alphabetic() {
+                    return None;
+                }
+                collapsed.push(letter);
+            }
+            Some(_) => return None,
+        }
     }
 }
 
@@ -577,4 +695,152 @@ fn extract_decoder_params(session: &Session) -> Result<DecoderParams, ExtractErr
     );
 
     Ok(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collapse_spaced_text_commands() {
+        assert_eq!(
+            collapse_spaced_text(r"\text {w i t h}"),
+            r"\text{with}"
+        );
+        assert_eq!(
+            collapse_spaced_text(r"\mathrm {e x t}"),
+            r"\mathrm{ext}"
+        );
+        assert_eq!(
+            collapse_spaced_text(r"\operatorname {a r g m i n}"),
+            r"\operatorname{argmin}"
+        );
+        assert_eq!(
+            collapse_spaced_text(r"\mathrm {o t h e r w i s e}"),
+            r"\mathrm{otherwise}"
+        );
+    }
+
+    #[test]
+    fn collapse_preserves_normal_text() {
+        // Already correct — no single-char pattern
+        assert_eq!(
+            collapse_spaced_text(r"\text{with}"),
+            r"\text{with}"
+        );
+        assert_eq!(
+            collapse_spaced_text(r"\text{for all}"),
+            r"\text{for all}"
+        );
+    }
+
+    #[test]
+    fn collapse_preserves_math() {
+        // Math content should pass through unchanged
+        let input = r"\frac {m _ {i}}{h ^ {2}} \mathbf {I}";
+        assert_eq!(collapse_spaced_text(input), input);
+    }
+
+    #[test]
+    fn collapse_multiple_commands() {
+        let input = r"\mathrm {w h e r e} \quad \mathrm {i f} a";
+        assert_eq!(
+            collapse_spaced_text(input),
+            r"\mathrm{where} \quad \mathrm{if} a"
+        );
+    }
+
+    #[test]
+    fn collapse_no_brace() {
+        // Command without braces — pass through
+        let input = r"\text some other stuff";
+        assert_eq!(collapse_spaced_text(input), input);
+    }
+
+    #[test]
+    fn strip_dollar_both_ends() {
+        let input = r"$$ \mathbf{x} $$";
+        // Simulating what decode_tokens does
+        let mut s = input.trim();
+        if s.starts_with("$$") {
+            s = s[2..].trim_start();
+        } else if s.starts_with('$') {
+            s = s[1..].trim_start();
+        }
+        if s.ends_with("$$") {
+            s = s[..s.len() - 2].trim_end();
+        } else if s.ends_with('$') {
+            s = s[..s.len() - 1].trim_end();
+        }
+        assert_eq!(s, r"\mathbf{x}");
+    }
+
+    #[test]
+    fn strip_dollar_start_only() {
+        // Model sometimes emits $$ only at the start (e.g. p4_6)
+        let input = "$$\n\\mathbf {H} _ {i} = \\mathbf {f} _ {i},";
+        let mut s = input.trim();
+        if s.starts_with("$$") {
+            s = s[2..].trim_start();
+        } else if s.starts_with('$') {
+            s = s[1..].trim_start();
+        }
+        if s.ends_with("$$") {
+            s = s[..s.len() - 2].trim_end();
+        } else if s.ends_with('$') {
+            s = s[..s.len() - 1].trim_end();
+        }
+        assert_eq!(s, r"\mathbf {H} _ {i} = \mathbf {f} _ {i},");
+    }
+
+    #[test]
+    fn strip_dollar_end_only() {
+        let input = r"\mathbf{x} $$";
+        let mut s = input.trim();
+        if s.starts_with("$$") {
+            s = s[2..].trim_start();
+        } else if s.starts_with('$') {
+            s = s[1..].trim_start();
+        }
+        if s.ends_with("$$") {
+            s = s[..s.len() - 2].trim_end();
+        } else if s.ends_with('$') {
+            s = s[..s.len() - 1].trim_end();
+        }
+        assert_eq!(s, r"\mathbf{x}");
+    }
+
+    #[test]
+    fn strip_single_dollar_both_ends() {
+        let input = r"$ x^2 + y^2 $";
+        let mut s = input.trim();
+        if s.starts_with("$$") {
+            s = s[2..].trim_start();
+        } else if s.starts_with('$') {
+            s = s[1..].trim_start();
+        }
+        if s.ends_with("$$") {
+            s = s[..s.len() - 2].trim_end();
+        } else if s.ends_with('$') {
+            s = s[..s.len() - 1].trim_end();
+        }
+        assert_eq!(s, r"x^2 + y^2");
+    }
+
+    #[test]
+    fn strip_no_dollars() {
+        let input = r"\mathbf{x} = 0";
+        let mut s = input.trim();
+        if s.starts_with("$$") {
+            s = s[2..].trim_start();
+        } else if s.starts_with('$') {
+            s = s[1..].trim_start();
+        }
+        if s.ends_with("$$") {
+            s = s[..s.len() - 2].trim_end();
+        } else if s.ends_with('$') {
+            s = s[..s.len() - 1].trim_end();
+        }
+        assert_eq!(s, r"\mathbf{x} = 0");
+    }
 }

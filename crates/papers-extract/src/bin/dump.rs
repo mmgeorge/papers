@@ -18,6 +18,7 @@ use serde::Serialize;
 
 use papers_extract::layout::DetectedRegion;
 use papers_extract::models;
+use papers_extract::output;
 use papers_extract::RegionKind;
 
 const DEFAULT_DPI: u32 = 150;
@@ -126,6 +127,10 @@ fn main() {
     // Track per-kind counter across all pages for unique filenames
     let mut kind_counters: HashMap<String, usize> = HashMap::new();
 
+    // Create layout/ dir for annotated page images
+    let layout_dir = cli.output.join("layout");
+    std::fs::create_dir_all(&layout_dir).expect("create layout dir");
+
     for &page_num in &pages {
         eprintln!("Page {}/{}...", page_num, total_pages);
 
@@ -139,6 +144,14 @@ fn main() {
             .expect("layout detect");
 
         eprintln!("  {} regions", detected.len());
+
+        // Build annotated page image with bounding boxes
+        let mut annotated = page_image.to_rgba8();
+        for region in &detected {
+            output::draw_region_box(&mut annotated, region.kind, region.bbox_px, 2);
+        }
+        let annotated_path = layout_dir.join(format!("p{}.png", page_num));
+        annotated.save(&annotated_path).expect("save annotated page");
 
         for region in &detected {
             let kind_dir = dir_name(region.kind);
@@ -190,6 +203,7 @@ fn main() {
         eprintln!("  {:20} {}", kind, count);
     }
     eprintln!("layout.json: {}", json_path.display());
+    eprintln!("layout images: {}", layout_dir.display());
 }
 
 fn crop_region(image: &DynamicImage, region: &DetectedRegion) -> DynamicImage {

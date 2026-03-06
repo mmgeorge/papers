@@ -177,6 +177,33 @@ fn render_markdown(result: &ExtractionResult) -> String {
     md.trim_end().to_string()
 }
 
+/// Bold the label prefix in a figure/table caption.
+///
+/// Turns `"Fig. 1. Example..."` into `"**Fig. 1.** Example..."` and
+/// `"Table 1. Performance..."` into `"**Table 1.** Performance..."`.
+/// Leaves text unchanged if no recognized label prefix is found.
+fn bold_caption_label(text: &str) -> String {
+    use std::fmt::Write;
+
+    // Match patterns: "Fig. N." / "Figure N." / "Table N." / "Algorithm N."
+    // where N can be multi-part like "1" or "1a" or absent for sub-captions
+    let prefixes = ["Fig.", "Figure", "Table", "Algorithm"];
+    for prefix in prefixes {
+        if !text.starts_with(prefix) {
+            continue;
+        }
+        // Find the second period after the number: "Fig. 1." or "Table 1."
+        let after_prefix = &text[prefix.len()..];
+        if let Some(dot_pos) = after_prefix.find('.') {
+            let end = prefix.len() + dot_pos + 1; // include the '.'
+            let mut result = String::with_capacity(text.len() + 4);
+            let _ = write!(result, "**{}**{}", &text[..end], &text[end..]);
+            return result;
+        }
+    }
+    text.to_string()
+}
+
 /// Convert a single region to its Markdown representation.
 fn region_to_markdown(region: &Region) -> String {
     match region.kind {
@@ -207,7 +234,7 @@ fn region_to_markdown(region: &Region) -> String {
                     .as_ref()
                     .and_then(|c| c.text.as_deref());
                 if let Some(cap) = caption_text {
-                    format!("{html}\n\n{cap}")
+                    format!("{html}\n\n{}", bold_caption_label(cap))
                 } else {
                     html.clone()
                 }
@@ -237,7 +264,7 @@ fn region_to_markdown(region: &Region) -> String {
                 .as_ref()
                 .and_then(|c| c.text.as_deref());
             if let Some(cap) = caption_text {
-                format!("![]({path})\n\n{cap}")
+                format!("![]({path})\n\n{}", bold_caption_label(cap))
             } else {
                 format!("![]({path})")
             }
@@ -260,8 +287,15 @@ fn region_to_markdown(region: &Region) -> String {
         | RegionKind::TableTitle
         | RegionKind::ChartTitle
         | RegionKind::FigureTableTitle => {
-            // Captions are associated with parents; skip standalone rendering
-            String::new()
+            // Consumed captions are handled by their parent (Image/Table/Chart).
+            // Orphan captions that weren't consumed still get rendered with bold labels.
+            if region.consumed {
+                String::new()
+            } else if let Some(ref text) = region.text {
+                bold_caption_label(text)
+            } else {
+                String::new()
+            }
         }
         RegionKind::PageHeader | RegionKind::PageFooter | RegionKind::PageNumber | RegionKind::TOC => {
             // Skip page structural elements
@@ -276,7 +310,67 @@ fn region_to_markdown(region: &Region) -> String {
 
 // ── Debug visualization ──────────────────────────────────────────────
 
-/// Map a RegionKind to a debug visualization color.
+/// Map a RegionKind to an (R, G, B) debug visualization color.
+pub fn region_color_rgb(kind: RegionKind) -> [u8; 3] {
+    match kind {
+        RegionKind::Title | RegionKind::ParagraphTitle => [255, 50, 50],
+        RegionKind::Text
+        | RegionKind::VerticalText
+        | RegionKind::Abstract
+        | RegionKind::SidebarText => [50, 100, 255],
+        RegionKind::References | RegionKind::Footnote | RegionKind::TOC => [0, 180, 180],
+        RegionKind::Table => [0, 200, 0],
+        RegionKind::DisplayFormula | RegionKind::FormulaNumber => [200, 0, 200],
+        RegionKind::InlineFormula => [255, 100, 255],
+        RegionKind::Image | RegionKind::Chart | RegionKind::Seal => [255, 140, 0],
+        RegionKind::FigureTitle
+        | RegionKind::TableTitle
+        | RegionKind::ChartTitle
+        | RegionKind::FigureTableTitle => [220, 200, 0],
+        RegionKind::PageHeader | RegionKind::PageFooter | RegionKind::PageNumber => [150, 150, 150],
+        RegionKind::Algorithm => [0, 160, 120],
+    }
+}
+
+/// Draw a colored bounding box for a detected region onto an RGBA image.
+///
+/// `bbox_px` is `[x1, y1, x2, y2]` in pixel coordinates matching the image.
+pub fn draw_region_box(
+    img: &mut image::RgbaImage,
+    kind: RegionKind,
+    bbox_px: [f32; 4],
+    thickness: u32,
+) {
+    let [r, g, b] = region_color_rgb(kind);
+    let color = image::Rgba([r, g, b, 200]);
+    let (iw, ih) = (img.width(), img.height());
+
+    let x1 = (bbox_px[0] as u32).min(iw.saturating_sub(1));
+    let y1 = (bbox_px[1] as u32).min(ih.saturating_sub(1));
+    let x2 = (bbox_px[2] as u32).min(iw.saturating_sub(1));
+    let y2 = (bbox_px[3] as u32).min(ih.saturating_sub(1));
+
+    // Draw horizontal lines (top and bottom edges)
+    for t in 0..thickness {
+        let yt = y1.saturating_add(t).min(y2);
+        let yb = y2.saturating_sub(t).max(y1);
+        for x in x1..=x2 {
+            img.put_pixel(x, yt, color);
+            img.put_pixel(x, yb, color);
+        }
+    }
+    // Draw vertical lines (left and right edges)
+    for t in 0..thickness {
+        let xl = x1.saturating_add(t).min(x2);
+        let xr = x2.saturating_sub(t).max(x1);
+        for y in y1..=y2 {
+            img.put_pixel(xl, y, color);
+            img.put_pixel(xr, y, color);
+        }
+    }
+}
+
+/// Map a RegionKind to a debug visualization color (pdfium).
 fn region_color(kind: RegionKind) -> PdfColor {
     match kind {
         RegionKind::Title | RegionKind::ParagraphTitle => PdfColor::new(255, 50, 50, 255),
@@ -507,6 +601,44 @@ mod tests {
         let mut r = make_region(RegionKind::Algorithm);
         r.text = Some("for i in range(n):".into());
         assert_eq!(region_to_markdown(&r), "```\nfor i in range(n):\n```");
+    }
+
+    #[test]
+    fn test_bold_caption_label() {
+        assert_eq!(
+            bold_caption_label("Fig. 1. Example simulation results"),
+            "**Fig. 1.** Example simulation results"
+        );
+        assert_eq!(
+            bold_caption_label("Table 1. Performance results"),
+            "**Table 1.** Performance results"
+        );
+        assert_eq!(
+            bold_caption_label("Figure 12. Some caption"),
+            "**Figure 12.** Some caption"
+        );
+        assert_eq!(
+            bold_caption_label("Algorithm 1. Pseudocode"),
+            "**Algorithm 1.** Pseudocode"
+        );
+        // No recognized prefix — pass through unchanged
+        assert_eq!(
+            bold_caption_label("(a) Subfigure label"),
+            "(a) Subfigure label"
+        );
+    }
+
+    #[test]
+    fn test_image_with_fig_caption() {
+        let mut r = make_region(RegionKind::Image);
+        r.image_path = Some("images/p1_5.png".into());
+        let mut cap = make_region(RegionKind::FigureTitle);
+        cap.text = Some("Fig. 1. Example simulation results".into());
+        r.caption = Some(Box::new(cap));
+        assert_eq!(
+            region_to_markdown(&r),
+            "![](images/p1_5.png)\n\n**Fig. 1.** Example simulation results"
+        );
     }
 
     #[test]
