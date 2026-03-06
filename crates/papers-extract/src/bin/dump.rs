@@ -94,13 +94,8 @@ fn main() {
 
     // Load layout model
     eprintln!("Loading layout model...");
-    let paths = models::ensure_models(
-        papers_extract::FormulaModel::PpFormulanet,
-        papers_extract::TableModel::SlanetPlus,
-        &cache_dir,
-    )
-    .expect("layout model files");
-    let layout = models::build_layout_detector(&paths.layout).expect("layout detector");
+    let layout_path = models::ensure_layout_model(&cache_dir).expect("layout model file");
+    let layout = models::build_layout_detector(&layout_path).expect("layout detector");
 
     // Load PDF
     eprintln!("Loading PDF: {}", cli.pdf.display());

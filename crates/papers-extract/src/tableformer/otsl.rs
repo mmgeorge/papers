@@ -153,6 +153,141 @@ pub fn otsl_to_html(tokens: &[i64]) -> String {
     html
 }
 
+/// Union two xyxy bounding boxes.
+fn bbox_union(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[2].max(b[2]),
+        a[3].max(b[3]),
+    ]
+}
+
+/// Map raw bbox array to per-HTML-cell bboxes in emission order.
+///
+/// Returns one `Option<[f32; 4]>` per `<td>`/`<th>` in the HTML.
+/// Cells that are skipped (first after START/NL) get `None`.
+///
+/// `raw_bboxes` are xyxy, indexed by bbox_ind from TokenTracker.
+/// `bboxes_to_merge` are (span_start, span_end) pairs from TokenTracker.
+pub fn assign_cell_bboxes(
+    tokens: &[i64],
+    raw_bboxes: &[[f32; 4]],
+    bboxes_to_merge: &[(usize, usize)],
+) -> Vec<Option<[f32; 4]>> {
+    // Apply merges: union span-start and span-end bboxes into span-start
+    let mut merged = raw_bboxes.to_vec();
+    for &(start, end) in bboxes_to_merge {
+        if start < merged.len() && end < merged.len() {
+            let union = bbox_union(merged[start], merged[end]);
+            merged[start] = union;
+        }
+    }
+
+    // Replay TokenTracker logic to map bbox_ind → HTML cell index
+    let tags: Vec<i64> = tokens
+        .iter()
+        .copied()
+        .filter(|&t| !matches!(t, PAD | UNK | START | END))
+        .collect();
+
+    // Build the same grid as otsl_to_html
+    let mut rows: Vec<Vec<i64>> = Vec::new();
+    let mut current_row: Vec<i64> = Vec::new();
+    for &tag in &tags {
+        if tag == NL {
+            if !current_row.is_empty() {
+                rows.push(current_row.clone());
+            }
+            current_row.clear();
+        } else {
+            current_row.push(tag);
+        }
+    }
+    if !current_row.is_empty() {
+        rows.push(current_row);
+    }
+    let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    for row in &mut rows {
+        row.resize(max_cols, LCEL);
+    }
+
+    // Walk the token stream to track bbox_ind (same as TokenTracker)
+    let mut skip_next_tag = true;
+    let mut first_lcel = true;
+    let mut bbox_ind: usize = 0;
+
+    // Map: (row_idx, col_idx) → bbox_ind for cell tokens
+    let mut cell_bbox_map: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+
+    let mut row_idx = 0;
+    let mut col_idx = 0;
+
+    for &tag in &tags {
+        if tag == NL {
+            // NL increments bbox_ind if not skipping
+            if !skip_next_tag {
+                bbox_ind += 1;
+            }
+            skip_next_tag = true;
+            first_lcel = true;
+            row_idx += 1;
+            col_idx = 0;
+            continue;
+        }
+
+        if is_cell_token(tag) {
+            if !skip_next_tag {
+                cell_bbox_map.insert((row_idx, col_idx), bbox_ind);
+                bbox_ind += 1;
+            }
+            // After a cell token, reset first_lcel
+            first_lcel = true;
+        } else if tag == LCEL {
+            if first_lcel {
+                // First LCEL in a span — its bbox is the span-start
+                if !skip_next_tag {
+                    cell_bbox_map.insert((row_idx, col_idx), bbox_ind);
+                    bbox_ind += 1;
+                }
+                first_lcel = false;
+            }
+            // Subsequent LCELs don't get their own bbox
+        } else if tag == UCEL {
+            if !skip_next_tag {
+                bbox_ind += 1;
+            }
+        } else if tag == XCEL {
+            // XCEL doesn't get a bbox (skip trigger)
+        }
+
+        skip_next_tag = is_skip_trigger(tag);
+        if !matches!(tag, LCEL) {
+            first_lcel = true;
+        }
+        col_idx += 1;
+    }
+
+    // Now walk the grid the same way as otsl_to_html and collect bboxes per HTML cell
+    let mut result = Vec::new();
+    for (ri, row) in rows.iter().enumerate() {
+        for (ci, &cell) in row.iter().enumerate() {
+            if !is_cell_token(cell) {
+                continue;
+            }
+
+            // Look up bbox for this cell
+            let bbox = cell_bbox_map
+                .get(&(ri, ci))
+                .and_then(|&idx| merged.get(idx).copied());
+            result.push(bbox);
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +329,49 @@ mod tests {
     fn empty_tokens() {
         assert_eq!(otsl_to_html(&[]), "");
         assert_eq!(otsl_to_html(&[START, END]), "");
+    }
+
+    #[test]
+    fn assign_bboxes_2x2() {
+        // START FCEL FCEL NL FCEL FCEL NL END
+        // TokenTracker: skip(START), FCEL→bbox0, FCEL→bbox1, NL→bbox2,
+        //   skip(NL), FCEL→bbox3, FCEL→bbox4, NL→bbox5
+        // But after NL, skip_next_tag=true, so first cell of new row is skipped
+        // Actually: START sets skip=true. First FCEL is skipped.
+        // Then FCEL→bbox0, NL→bbox1 (NL triggers skip).
+        // Row2: first FCEL skipped, second FCEL→bbox2
+        let tokens = vec![START, FCEL, FCEL, NL, FCEL, FCEL, NL, END];
+        let bboxes = vec![
+            [0.0, 0.0, 0.5, 0.5],
+            [0.5, 0.0, 1.0, 0.5],
+            [0.0, 0.5, 0.5, 1.0],
+        ];
+        let result = assign_cell_bboxes(&tokens, &bboxes, &[]);
+        // 4 HTML cells: first is None (skipped after START), second has bbox0,
+        // third is None (skipped after NL), fourth has bbox2
+        assert_eq!(result.len(), 4);
+        assert!(result[0].is_none()); // first cell skipped
+        assert_eq!(result[1], Some([0.0, 0.0, 0.5, 0.5]));
+        assert!(result[2].is_none()); // first cell after NL skipped
+        assert_eq!(result[3], Some([0.0, 0.5, 0.5, 1.0]));
+    }
+
+    #[test]
+    fn assign_bboxes_colspan() {
+        // START FCEL LCEL NL FCEL FCEL NL END
+        // Row 0: FCEL skipped (after START), LCEL: first_lcel=true → bbox0
+        // NL → bbox1 (skip), Row 1: FCEL skipped, FCEL → bbox2
+        let tokens = vec![START, FCEL, LCEL, NL, FCEL, FCEL, NL, END];
+        let bboxes = vec![
+            [0.0, 0.0, 1.0, 0.5],  // LCEL span
+            [0.5, 0.0, 1.0, 0.5],  // NL
+            [0.5, 0.5, 1.0, 1.0],  // second FCEL
+        ];
+        let result = assign_cell_bboxes(&tokens, &bboxes, &[]);
+        // HTML cells: 1 (colspan=2) + 2 = 3 cells
+        assert_eq!(result.len(), 3);
+        assert!(result[0].is_none()); // FCEL after START
+        assert!(result[1].is_none()); // first of row 2
+        assert_eq!(result[2], Some([0.5, 0.5, 1.0, 1.0]));
     }
 }

@@ -28,8 +28,19 @@ use ort::session::Session;
 use ort::value::Value;
 
 use crate::error::ExtractError;
+use crate::pdf::PdfChar;
+use crate::text;
 
 use decode::{extract_decoder_params, DecoderParams};
+
+/// Result of a single table prediction — HTML skeleton + per-cell bboxes.
+pub struct TablePrediction {
+    /// HTML table skeleton with empty cells (or filled if `fill_table_html` was called).
+    pub html: String,
+    /// Per-cell bboxes in xyxy normalized [0,1] within the table crop.
+    /// One per `<td>`/`<th>` in HTML emission order. `None` if skipped.
+    pub cell_bboxes: Vec<Option<[f32; 4]>>,
+}
 
 // ── Backend enum ─────────────────────────────────────────────────────
 
@@ -191,8 +202,8 @@ impl TableFormerPredictor {
         }
     }
 
-    /// Predict table structure for one image, returning an HTML skeleton.
-    pub fn predict_one(&self, image: &DynamicImage) -> Result<String, ExtractError> {
+    /// Predict table structure for one image, returning HTML skeleton + cell bboxes.
+    pub fn predict_one(&self, image: &DynamicImage) -> Result<TablePrediction, ExtractError> {
         // 1. Preprocess image → [1, 3, 448, 448]
         let pixel_values = preprocess::preprocess(image);
 
@@ -247,8 +258,8 @@ impl TableFormerPredictor {
             decode_result.cell_hidden_states.len(),
         );
 
-        // 4. BBox prediction (for future text filling — run but don't use results yet)
-        if !decode_result.cell_hidden_states.is_empty() {
+        // 4. BBox prediction → per-cell bboxes
+        let cell_bboxes = if !decode_result.cell_hidden_states.is_empty() {
             let n_cells = decode_result.cell_hidden_states.len();
             let d_model = decode_result.cell_hidden_states[0].len();
 
@@ -277,24 +288,150 @@ impl TableFormerPredictor {
                 ])
                 .map_err(|e| ExtractError::Table(format!("bbox_decoder run: {e}")))?;
 
-            let bboxes = outputs[0]
+            let bboxes_raw = outputs[0]
                 .try_extract_array::<f32>()
                 .map_err(|e| ExtractError::Table(format!("bboxes extract: {e}")))?;
             tracing::debug!(
                 "TableFormer: {} bboxes predicted (shape {:?})",
-                bboxes.shape()[0],
-                bboxes.shape(),
+                bboxes_raw.shape()[0],
+                bboxes_raw.shape(),
             );
-        }
+
+            // Convert cxcywh → xyxy (normalized 0-1)
+            let n = bboxes_raw.shape()[0];
+            let mut xyxy_bboxes: Vec<[f32; 4]> = Vec::with_capacity(n);
+            for i in 0..n {
+                let cx = bboxes_raw[[i, 0]];
+                let cy = bboxes_raw[[i, 1]];
+                let w = bboxes_raw[[i, 2]];
+                let h = bboxes_raw[[i, 3]];
+                xyxy_bboxes.push([
+                    (cx - w / 2.0).clamp(0.0, 1.0),
+                    (cy - h / 2.0).clamp(0.0, 1.0),
+                    (cx + w / 2.0).clamp(0.0, 1.0),
+                    (cy + h / 2.0).clamp(0.0, 1.0),
+                ]);
+            }
+
+            // Assign bboxes to HTML cells
+            otsl::assign_cell_bboxes(
+                &decode_result.tokens,
+                &xyxy_bboxes,
+                &decode_result.bboxes_to_merge,
+            )
+        } else {
+            Vec::new()
+        };
 
         // 5. Convert token sequence → HTML skeleton
         let html = otsl::otsl_to_html(&decode_result.tokens);
-        Ok(html)
+        Ok(TablePrediction { html, cell_bboxes })
     }
 
     /// Predict table structure for multiple images.
-    pub fn predict(&self, images: &[DynamicImage]) -> Result<Vec<String>, ExtractError> {
+    pub fn predict(&self, images: &[DynamicImage]) -> Result<Vec<TablePrediction>, ExtractError> {
         images.iter().map(|img| self.predict_one(img)).collect()
+    }
+}
+
+/// Fill empty HTML table cells with text extracted from PDF chars.
+///
+/// For each cell with a bbox, converts the normalized bbox to PDF-point space,
+/// extracts text from matching chars, and inserts it into the HTML.
+pub fn fill_table_html(
+    html: &str,
+    cell_bboxes: &[Option<[f32; 4]>],
+    chars: &[PdfChar],
+    table_bbox_pt: [f32; 4],
+    page_height_pt: f32,
+) -> String {
+    if cell_bboxes.is_empty() {
+        return html.to_string();
+    }
+
+    let table_w = table_bbox_pt[2] - table_bbox_pt[0];
+    let table_h = table_bbox_pt[3] - table_bbox_pt[1];
+
+    // Extract text for each cell
+    let cell_texts: Vec<String> = cell_bboxes
+        .iter()
+        .map(|bbox_opt| {
+            let Some(bbox) = bbox_opt else {
+                return String::new();
+            };
+
+            // Convert normalized bbox → PDF point space (Y-down, image-space)
+            let cell_pt = [
+                bbox[0] * table_w + table_bbox_pt[0],
+                bbox[1] * table_h + table_bbox_pt[1],
+                bbox[2] * table_w + table_bbox_pt[0],
+                bbox[3] * table_h + table_bbox_pt[1],
+            ];
+
+            text::extract_region_text(
+                chars,
+                cell_pt,
+                page_height_pt,
+                &[],
+                text::AssemblyMode::Reflow,
+            )
+        })
+        .collect();
+
+    // Insert text into HTML by replacing `></td>` or `></th>` with `>text</td>` or `>text</th>`
+    let mut result = String::with_capacity(html.len() + cell_texts.iter().map(|t| t.len()).sum::<usize>());
+    let mut cell_idx = 0;
+    let mut i = 0;
+    let bytes = html.as_bytes();
+
+    while i < bytes.len() {
+        // Look for `></td>` or `></th>`
+        if i + 5 <= bytes.len() && bytes[i] == b'>' {
+            let rest = &html[i..];
+            if rest.starts_with("></td>") {
+                // Insert cell text
+                result.push('>');
+                if cell_idx < cell_texts.len() {
+                    let text = &cell_texts[cell_idx];
+                    if !text.is_empty() {
+                        html_escape_into(text, &mut result);
+                    }
+                }
+                cell_idx += 1;
+                result.push_str("</td>");
+                i += 6; // skip `></td>`
+                continue;
+            } else if rest.starts_with("></th>") {
+                result.push('>');
+                if cell_idx < cell_texts.len() {
+                    let text = &cell_texts[cell_idx];
+                    if !text.is_empty() {
+                        html_escape_into(text, &mut result);
+                    }
+                }
+                cell_idx += 1;
+                result.push_str("</th>");
+                i += 6; // skip `></th>`
+                continue;
+            }
+        }
+        result.push(html[i..].chars().next().unwrap());
+        i += html[i..].chars().next().unwrap().len_utf8();
+    }
+
+    result
+}
+
+/// HTML-escape text into a string buffer.
+fn html_escape_into(text: &str, out: &mut String) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
     }
 }
 

@@ -23,7 +23,7 @@ struct Cli {
     formula: FormulaArg,
 
     /// Table recognition model
-    #[arg(long, default_value = "slanet-plus")]
+    #[arg(long, default_value = "table-former")]
     table: TableArg,
 
     /// DPI for page rendering
@@ -69,10 +69,6 @@ enum FormulaArg {
 
 #[derive(ValueEnum, Clone, Debug)]
 enum TableArg {
-    /// SLANet-Plus (7 MB)
-    SlanetPlus,
-    /// PP-LCNet classifier + SLANeXt-wired (~358 MB)
-    SlanextWired,
     /// GLM-OCR vision-language model
     GlmOcr,
     /// TableFormer V1 — OTSL structure recognition (~203 MB)
@@ -106,8 +102,6 @@ fn main() {
             FormulaArg::GlmOcr => FormulaModel::GlmOcr,
         },
         table: match cli.table {
-            TableArg::SlanetPlus => TableModel::SlanetPlus,
-            TableArg::SlanextWired => TableModel::SlanextWired,
             TableArg::GlmOcr => TableModel::GlmOcr,
             TableArg::TableFormer => TableModel::TableFormer,
         },

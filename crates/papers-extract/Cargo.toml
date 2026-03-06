@@ -27,7 +27,6 @@ path = "src/bin/run_glm_ocr.rs"
 
 [dependencies]
 clap = { workspace = true }
-oar-ocr = "0.6"
 pdfium-render = { version = "0.8", features = ["image_025"] }
 image = "0.25"
 ndarray = "0.17"
@@ -46,12 +45,10 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 half = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-oar-ocr = { version = "0.6", features = ["cuda"] }
 ort = { version = "=2.0.0-rc.11", features = ["cuda", "load-dynamic", "half"] }
 cudarc = { version = "0.16", default-features = false, features = ["std", "driver", "dynamic-linking", "cuda-version-from-build-system"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-oar-ocr = { version = "0.6", features = ["coreml"] }
 ort = { version = "=2.0.0-rc.11", features = ["coreml"] }
 
 [build-dependencies]

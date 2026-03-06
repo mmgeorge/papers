@@ -102,18 +102,14 @@ fn main() {
     let cache_dir = cli
         .model_cache_dir
         .unwrap_or_else(models::default_cache_dir);
-    let model_paths = models::ensure_models(
-        papers_extract::FormulaModel::PpFormulanet,
-        papers_extract::TableModel::SlanetPlus,
-        &cache_dir,
-    )
-    .expect("Model download");
+    let formula_paths = models::ensure_formula_models(&cache_dir)
+        .expect("Formula model files");
 
     eprintln!("Loading formula predictor...");
     let predictor = FormulaPredictor::new(
-        model_paths.formula_encoder.as_deref().expect("formula_encoder path"),
-        model_paths.formula_decoder.as_deref().expect("formula_decoder path"),
-        model_paths.formula_tokenizer.as_deref().expect("formula_tokenizer path"),
+        &formula_paths.encoder,
+        &formula_paths.decoder,
+        &formula_paths.tokenizer,
     )
     .expect("FormulaPredictor::new");
     eprintln!("Formula predictor ready\n");

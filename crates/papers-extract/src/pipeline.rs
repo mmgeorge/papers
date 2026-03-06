@@ -3,7 +3,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use image::DynamicImage;
-use oar_ocr::predictors::TableStructureRecognitionPredictor;
 use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
@@ -37,37 +36,27 @@ impl FormulaEngine {
 }
 
 enum TableEngine {
-    Slanet(TableStructureRecognitionPredictor),
     GlmOcr(GlmOcrPredictor),
     TableFormer(TableFormerPredictor),
 }
 
+/// Table prediction result — HTML skeleton + optional per-cell bboxes.
+enum TableResult {
+    /// HTML with cell text already filled (e.g. from GLM-OCR).
+    Html(String),
+    /// TableFormer prediction with cell bboxes for text filling.
+    Prediction(crate::tableformer::TablePrediction),
+}
+
 impl TableEngine {
-    fn predict_html(
+    fn predict(
         &self,
         entries: &[(usize, DynamicImage)],
-    ) -> Result<HashMap<usize, String>, ExtractError> {
+    ) -> Result<HashMap<usize, TableResult>, ExtractError> {
         if entries.is_empty() {
             return Ok(HashMap::new());
         }
         match self {
-            Self::Slanet(predictor) => {
-                let crops: Vec<image::RgbImage> =
-                    entries.iter().map(|(_, img)| img.to_rgb8()).collect();
-                let results = predictor
-                    .predict(crops)
-                    .map_err(|e| ExtractError::Layout(format!("Table prediction failed: {e}")))?;
-                Ok(entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(batch_idx, (det_idx, _))| {
-                        results
-                            .structures
-                            .get(batch_idx)
-                            .map(|tokens| (*det_idx, tokens.join("")))
-                    })
-                    .collect())
-            }
             Self::GlmOcr(predictor) => {
                 let crops: Vec<DynamicImage> =
                     entries.iter().map(|(_, img)| img.clone()).collect();
@@ -77,7 +66,7 @@ impl TableEngine {
                 Ok(entries
                     .iter()
                     .zip(results)
-                    .map(|((det_idx, _), html)| (*det_idx, html))
+                    .map(|((det_idx, _), html)| (*det_idx, TableResult::Html(html)))
                     .collect())
             }
             Self::TableFormer(predictor) => {
@@ -89,7 +78,7 @@ impl TableEngine {
                 Ok(entries
                     .iter()
                     .zip(results)
-                    .map(|((det_idx, _), html)| (*det_idx, html))
+                    .map(|((det_idx, _), pred)| (*det_idx, TableResult::Prediction(pred)))
                     .collect())
             }
         }
@@ -141,9 +130,6 @@ impl Pipeline {
         };
 
         let table = match options.table {
-            TableModel::SlanetPlus | TableModel::SlanextWired => {
-                TableEngine::Slanet(models::build_table_predictor(&paths, options.table)?)
-            }
             TableModel::GlmOcr => {
                 let glm_paths = paths.glm_ocr.as_ref()
                     .ok_or_else(|| ExtractError::Model("GLM-OCR model paths missing".into()))?;
@@ -386,13 +372,13 @@ impl Pipeline {
             })
             .collect();
 
-        let table_html = self.table.predict_html(&table_entries)?;
+        let table_results = self.table.predict(&table_entries)?;
 
         // Build regions from layout detection + formula/table results
         let mut regions = self.build_regions(
             &detected,
             &formula_latex,
-            &table_html,
+            &table_results,
             &chars,
             &page_image,
             page_idx,
@@ -435,7 +421,7 @@ impl Pipeline {
         &self,
         detected: &[DetectedRegion],
         formula_latex: &HashMap<usize, String>,
-        table_html: &HashMap<usize, String>,
+        table_results: &HashMap<usize, TableResult>,
         chars: &[PdfChar],
         page_image: &DynamicImage,
         page_idx: u32,
@@ -536,9 +522,21 @@ impl Pipeline {
 
             // Populate table HTML + markdown text from crop-based prediction
             if kind == RegionKind::Table {
-                if let Some(html) = table_html.get(&idx) {
-                    region.text = crate::html_table::html_table_to_markdown(html);
-                    region.html = Some(html.clone());
+                if let Some(result) = table_results.get(&idx) {
+                    let html = match result {
+                        TableResult::Html(html) => html.clone(),
+                        TableResult::Prediction(pred) => {
+                            crate::tableformer::fill_table_html(
+                                &pred.html,
+                                &pred.cell_bboxes,
+                                chars,
+                                bbox,
+                                page_height_pt,
+                            )
+                        }
+                    };
+                    region.text = crate::html_table::html_table_to_markdown(&html);
+                    region.html = Some(html);
                 }
             }
 

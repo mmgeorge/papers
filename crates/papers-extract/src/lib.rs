@@ -29,7 +29,7 @@ pub struct ExtractOptions {
     pub extract_images: bool,
     /// Formula recognition model (default PpFormulanet).
     pub formula: FormulaModel,
-    /// Table recognition model (default SlanetPlus).
+    /// Table recognition model (default TableFormer).
     pub table: TableModel,
     /// Path to the pdfium binary (auto-detected if None).
     pub pdfium_path: Option<PathBuf>,
@@ -73,14 +73,10 @@ pub enum FormulaModel {
 /// Table recognition model selection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TableModel {
-    /// SLANet-Plus (7 MB, default).
-    #[default]
-    SlanetPlus,
-    /// PP-LCNet classifier + SLANeXt-wired (~358 MB).
-    SlanextWired,
     /// GLM-OCR vision-language model with table prompt.
     GlmOcr,
-    /// TableFormer V1 — OTSL structure recognition (~203 MB).
+    /// TableFormer V1 — OTSL structure recognition (~203 MB, default).
+    #[default]
     TableFormer,
 }
 

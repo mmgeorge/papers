@@ -1,8 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use oar_ocr::core::config::{OrtExecutionProvider, OrtGraphOptimizationLevel, OrtSessionConfig};
-use oar_ocr::predictors::TableStructureRecognitionPredictor;
-
 use crate::error::ExtractError;
 use crate::formula::FormulaPredictor;
 use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
@@ -19,18 +16,6 @@ struct ModelFile {
 const LAYOUT_MODEL: ModelFile = ModelFile {
     filename: "pp-doclayoutv3.onnx",
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.6.0/pp-doclayoutv3.onnx",
-};
-
-// Table structure (Fast mode — wireless/general)
-const SLANET_PLUS: ModelFile = ModelFile {
-    filename: "slanet_plus.onnx",
-    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/slanet_plus.onnx",
-};
-
-// Table structure dictionary (always required with table models)
-const TABLE_DICT: ModelFile = ModelFile {
-    filename: "table_structure_dict_ch.txt",
-    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/table_structure_dict_ch.txt",
 };
 
 // Formula tokenizer (required for formula recognition)
@@ -90,28 +75,12 @@ const TABLEFORMER_BBOX_DECODER: ModelFile = ModelFile {
     url: "",
 };
 
-// Table classification — wired vs wireless (Quality mode only)
-const TABLE_CLASSIFIER: ModelFile = ModelFile {
-    filename: "pp-lcnet_x1_0_table_cls.onnx",
-    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/pp-lcnet_x1_0_table_cls.onnx",
-};
-
-// Table structure — wired (Quality mode only)
-const SLANEXT_WIRED: ModelFile = ModelFile {
-    filename: "slanext_wired.onnx",
-    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/slanext_wired.onnx",
-};
-
 /// Resolved paths to all required model files.
 pub struct ModelPaths {
     pub layout: PathBuf,
-    pub slanet_plus: Option<PathBuf>,
-    pub table_dict: Option<PathBuf>,
     pub formula_encoder: Option<PathBuf>,
     pub formula_decoder: Option<PathBuf>,
     pub formula_tokenizer: Option<PathBuf>,
-    pub table_classifier: Option<PathBuf>,
-    pub slanext_wired: Option<PathBuf>,
     pub glm_ocr: Option<GlmOcrModelPaths>,
     pub tableformer: Option<TableFormerModelPaths>,
 }
@@ -143,6 +112,28 @@ pub fn default_cache_dir() -> PathBuf {
         .join("models")
 }
 
+/// Ensure the layout model is downloaded and return its path.
+pub fn ensure_layout_model(cache_dir: &Path) -> Result<PathBuf, ExtractError> {
+    std::fs::create_dir_all(cache_dir)?;
+    ensure_model(cache_dir, &LAYOUT_MODEL)
+}
+
+/// Resolved paths for PP-FormulaNet models.
+pub struct FormulaModelPaths {
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub tokenizer: PathBuf,
+}
+
+/// Ensure PP-FormulaNet formula models are available.
+pub fn ensure_formula_models(cache_dir: &Path) -> Result<FormulaModelPaths, ExtractError> {
+    std::fs::create_dir_all(cache_dir)?;
+    let encoder = ensure_local_model(cache_dir, &FORMULA_ENCODER)?;
+    let decoder = ensure_local_model(cache_dir, &FORMULA_DECODER)?;
+    let tokenizer = ensure_model(cache_dir, &FORMULA_TOKENIZER)?;
+    Ok(FormulaModelPaths { encoder, decoder, tokenizer })
+}
+
 /// Ensure all models for the selected formula/table engines are downloaded.
 pub fn ensure_models(
     formula: FormulaModel,
@@ -165,23 +156,6 @@ pub fn ensure_models(
         FormulaModel::GlmOcr => (None, None, None),
     };
 
-    // Table models (only for slanet variants)
-    let (slanet_plus, table_dict, table_classifier, slanext_wired) = match table {
-        TableModel::SlanetPlus => {
-            let slanet = ensure_model(cache_dir, &SLANET_PLUS)?;
-            let dict = ensure_model(cache_dir, &TABLE_DICT)?;
-            (Some(slanet), Some(dict), None, None)
-        }
-        TableModel::SlanextWired => {
-            let slanet = ensure_model(cache_dir, &SLANET_PLUS)?;
-            let dict = ensure_model(cache_dir, &TABLE_DICT)?;
-            let classifier = ensure_model(cache_dir, &TABLE_CLASSIFIER)?;
-            let wired = ensure_model(cache_dir, &SLANEXT_WIRED)?;
-            (Some(slanet), Some(dict), Some(classifier), Some(wired))
-        }
-        TableModel::GlmOcr | TableModel::TableFormer => (None, None, None, None),
-    };
-
     // TableFormer models
     let tableformer = if table == TableModel::TableFormer {
         Some(ensure_tableformer_models(cache_dir)?)
@@ -198,13 +172,9 @@ pub fn ensure_models(
 
     Ok(ModelPaths {
         layout,
-        slanet_plus,
-        table_dict,
         formula_encoder,
         formula_decoder,
         formula_tokenizer,
-        table_classifier,
-        slanext_wired,
         glm_ocr,
         tableformer,
     })
@@ -430,37 +400,6 @@ pub fn init_ort_runtime() -> Result<(), ExtractError> {
     }
 }
 
-/// Build the platform-specific ORT session configuration (for oar-ocr predictors).
-pub fn ort_config() -> OrtSessionConfig {
-    let providers = platform_execution_providers();
-    OrtSessionConfig::new()
-        .with_execution_providers(providers)
-        .with_optimization_level(OrtGraphOptimizationLevel::All)
-}
-
-/// Get the execution providers for the current platform (for oar-ocr).
-fn platform_execution_providers() -> Vec<OrtExecutionProvider> {
-    let mut providers = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    providers.push(OrtExecutionProvider::CUDA {
-        device_id: None,
-        gpu_mem_limit: None,
-        arena_extend_strategy: None,
-        cudnn_conv_algo_search: None,
-        cudnn_conv_use_max_workspace: None,
-    });
-
-    #[cfg(target_os = "macos")]
-    providers.push(OrtExecutionProvider::CoreML {
-        ane_only: None,
-        subgraphs: None,
-    });
-
-    providers.push(OrtExecutionProvider::CPU);
-    providers
-}
-
 /// Build a custom CUDA formula predictor from split encoder/decoder models.
 pub fn build_formula_predictor(
     paths: &ModelPaths,
@@ -474,27 +413,3 @@ pub fn build_formula_predictor(
     FormulaPredictor::new(enc, dec, tok)
 }
 
-/// Build a standalone table structure recognition predictor.
-pub fn build_table_predictor(
-    paths: &ModelPaths,
-    table_model: TableModel,
-) -> Result<TableStructureRecognitionPredictor, ExtractError> {
-    let dict = paths.table_dict.as_ref()
-        .ok_or_else(|| ExtractError::Model("table_dict path missing".into()))?;
-    let config = ort_config();
-
-    let model_path = match table_model {
-        TableModel::SlanextWired => paths.slanext_wired.as_ref()
-            .ok_or_else(|| ExtractError::Model("slanext_wired path missing".into()))?,
-        _ => paths.slanet_plus.as_ref()
-            .ok_or_else(|| ExtractError::Model("slanet_plus path missing".into()))?,
-    };
-
-    // Model family (wired 512x512 vs wireless 488x488) is auto-detected
-    // from the ONNX filename by oar-ocr.
-    TableStructureRecognitionPredictor::builder()
-        .dict_path(dict)
-        .with_ort_config(config)
-        .build(model_path)
-        .map_err(|e| ExtractError::Model(format!("Failed to build table predictor: {e}")))
-}

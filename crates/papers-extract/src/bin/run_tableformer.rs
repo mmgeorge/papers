@@ -139,7 +139,7 @@ fn main() {
             let t0 = Instant::now();
             let result = predictor.predict_one(&image).expect("predict");
             times_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
-            last_output = result;
+            last_output = result.html;
         }
 
         if cli.bench {
