@@ -6,6 +6,7 @@ use oar_ocr::predictors::TableStructureRecognitionPredictor;
 use crate::error::ExtractError;
 use crate::formula::FormulaPredictor;
 use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
+use crate::tableformer::TableFormerPredictor;
 use crate::{FormulaModel, TableModel};
 
 /// Model file metadata for download.
@@ -75,6 +76,20 @@ const GLM_TOKENIZER: ModelFile = ModelFile {
     url: "",
 };
 
+// TableFormer V1 — split encoder/decoder/bbox ONNX (manual export, no auto-download)
+const TABLEFORMER_ENCODER: ModelFile = ModelFile {
+    filename: "tableformer_encoder.onnx",
+    url: "", // No auto-download — must be pre-exported via py/table_former/export.py
+};
+const TABLEFORMER_DECODER: ModelFile = ModelFile {
+    filename: "tableformer_decoder.onnx",
+    url: "",
+};
+const TABLEFORMER_BBOX_DECODER: ModelFile = ModelFile {
+    filename: "tableformer_bbox_decoder.onnx",
+    url: "",
+};
+
 // Table classification — wired vs wireless (Quality mode only)
 const TABLE_CLASSIFIER: ModelFile = ModelFile {
     filename: "pp-lcnet_x1_0_table_cls.onnx",
@@ -98,6 +113,14 @@ pub struct ModelPaths {
     pub table_classifier: Option<PathBuf>,
     pub slanext_wired: Option<PathBuf>,
     pub glm_ocr: Option<GlmOcrModelPaths>,
+    pub tableformer: Option<TableFormerModelPaths>,
+}
+
+/// Resolved paths for TableFormer models.
+pub struct TableFormerModelPaths {
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub bbox_decoder: PathBuf,
 }
 
 /// Resolved paths for GLM-OCR models (separate from pipeline models).
@@ -156,7 +179,14 @@ pub fn ensure_models(
             let wired = ensure_model(cache_dir, &SLANEXT_WIRED)?;
             (Some(slanet), Some(dict), Some(classifier), Some(wired))
         }
-        TableModel::GlmOcr => (None, None, None, None),
+        TableModel::GlmOcr | TableModel::TableFormer => (None, None, None, None),
+    };
+
+    // TableFormer models
+    let tableformer = if table == TableModel::TableFormer {
+        Some(ensure_tableformer_models(cache_dir)?)
+    } else {
+        None
     };
 
     // GLM-OCR models (needed if either formula or table uses glm-ocr)
@@ -176,6 +206,7 @@ pub fn ensure_models(
         table_classifier,
         slanext_wired,
         glm_ocr,
+        tableformer,
     })
 }
 
@@ -285,6 +316,27 @@ pub fn ensure_glm_ocr_models(
         llm_decoder,
         tokenizer,
     })
+}
+
+/// Ensure all TableFormer model files exist in the cache directory.
+pub fn ensure_tableformer_models(
+    cache_dir: &Path,
+) -> Result<TableFormerModelPaths, ExtractError> {
+    let encoder = ensure_local_model(cache_dir, &TABLEFORMER_ENCODER)?;
+    let decoder = ensure_local_model(cache_dir, &TABLEFORMER_DECODER)?;
+    let bbox_decoder = ensure_local_model(cache_dir, &TABLEFORMER_BBOX_DECODER)?;
+    Ok(TableFormerModelPaths {
+        encoder,
+        decoder,
+        bbox_decoder,
+    })
+}
+
+/// Build a TableFormer predictor from model paths.
+pub fn build_tableformer_predictor(
+    paths: &TableFormerModelPaths,
+) -> Result<TableFormerPredictor, ExtractError> {
+    TableFormerPredictor::new(&paths.encoder, &paths.decoder, &paths.bbox_decoder)
 }
 
 /// Build a GLM-OCR predictor from model paths (default: formula recognition prompt).
@@ -425,15 +477,24 @@ pub fn build_formula_predictor(
 /// Build a standalone table structure recognition predictor.
 pub fn build_table_predictor(
     paths: &ModelPaths,
+    table_model: TableModel,
 ) -> Result<TableStructureRecognitionPredictor, ExtractError> {
     let dict = paths.table_dict.as_ref()
         .ok_or_else(|| ExtractError::Model("table_dict path missing".into()))?;
-    let slanet = paths.slanet_plus.as_ref()
-        .ok_or_else(|| ExtractError::Model("slanet_plus path missing".into()))?;
     let config = ort_config();
+
+    let model_path = match table_model {
+        TableModel::SlanextWired => paths.slanext_wired.as_ref()
+            .ok_or_else(|| ExtractError::Model("slanext_wired path missing".into()))?,
+        _ => paths.slanet_plus.as_ref()
+            .ok_or_else(|| ExtractError::Model("slanet_plus path missing".into()))?,
+    };
+
+    // Model family (wired 512x512 vs wireless 488x488) is auto-detected
+    // from the ONNX filename by oar-ocr.
     TableStructureRecognitionPredictor::builder()
         .dict_path(dict)
         .with_ort_config(config)
-        .build(slanet)
+        .build(model_path)
         .map_err(|e| ExtractError::Model(format!("Failed to build table predictor: {e}")))
 }

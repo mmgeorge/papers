@@ -15,6 +15,7 @@ use crate::models;
 use crate::output;
 use crate::pdf::{self, PdfChar};
 use crate::reading_order;
+use crate::tableformer::TableFormerPredictor;
 use crate::text;
 use crate::types::*;
 use crate::{ExtractOptions, FormulaModel, TableModel};
@@ -38,6 +39,7 @@ impl FormulaEngine {
 enum TableEngine {
     Slanet(TableStructureRecognitionPredictor),
     GlmOcr(GlmOcrPredictor),
+    TableFormer(TableFormerPredictor),
 }
 
 impl TableEngine {
@@ -67,6 +69,18 @@ impl TableEngine {
                     .collect())
             }
             Self::GlmOcr(predictor) => {
+                let crops: Vec<DynamicImage> =
+                    entries.iter().map(|(_, img)| img.clone()).collect();
+                let results = predictor
+                    .predict(&crops)
+                    .map_err(|e| ExtractError::Layout(format!("Table prediction failed: {e}")))?;
+                Ok(entries
+                    .iter()
+                    .zip(results)
+                    .map(|((det_idx, _), html)| (*det_idx, html))
+                    .collect())
+            }
+            Self::TableFormer(predictor) => {
                 let crops: Vec<DynamicImage> =
                     entries.iter().map(|(_, img)| img.clone()).collect();
                 let results = predictor
@@ -128,7 +142,7 @@ impl Pipeline {
 
         let table = match options.table {
             TableModel::SlanetPlus | TableModel::SlanextWired => {
-                TableEngine::Slanet(models::build_table_predictor(&paths)?)
+                TableEngine::Slanet(models::build_table_predictor(&paths, options.table)?)
             }
             TableModel::GlmOcr => {
                 let glm_paths = paths.glm_ocr.as_ref()
@@ -140,6 +154,11 @@ impl Pipeline {
                 TableEngine::GlmOcr(
                     models::build_glm_ocr_predictor_with_config(glm_paths, config)?,
                 )
+            }
+            TableModel::TableFormer => {
+                let tf_paths = paths.tableformer.as_ref()
+                    .ok_or_else(|| ExtractError::Model("TableFormer model paths missing".into()))?;
+                TableEngine::TableFormer(models::build_tableformer_predictor(tf_paths)?)
             }
         };
 

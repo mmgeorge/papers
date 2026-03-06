@@ -9,6 +9,7 @@ pub mod output;
 pub mod pdf;
 pub mod pipeline;
 pub mod reading_order;
+pub mod tableformer;
 pub mod text;
 pub mod types;
 
@@ -79,6 +80,8 @@ pub enum TableModel {
     SlanextWired,
     /// GLM-OCR vision-language model with table prompt.
     GlmOcr,
+    /// TableFormer V1 — OTSL structure recognition (~203 MB).
+    TableFormer,
 }
 
 /// Controls what debug output to produce.

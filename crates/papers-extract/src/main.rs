@@ -75,6 +75,8 @@ enum TableArg {
     SlanextWired,
     /// GLM-OCR vision-language model
     GlmOcr,
+    /// TableFormer V1 — OTSL structure recognition (~203 MB)
+    TableFormer,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -107,6 +109,7 @@ fn main() {
             TableArg::SlanetPlus => TableModel::SlanetPlus,
             TableArg::SlanextWired => TableModel::SlanextWired,
             TableArg::GlmOcr => TableModel::GlmOcr,
+            TableArg::TableFormer => TableModel::TableFormer,
         },
         pdfium_path: cli.pdfium_path,
         model_cache_dir: cli.model_cache_dir,

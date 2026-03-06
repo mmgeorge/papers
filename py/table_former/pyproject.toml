@@ -1,0 +1,15 @@
+[project]
+name = "table-former"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "docling-ibm-models>=3.11.0",
+    "huggingface-hub",
+    "onnx>=1.20.1",
+    "onnxruntime",
+    "opencv-python-headless>=4.13.0.92",
+    "pillow",
+    "safetensors",
+    "torch>=2.0",
+    "torchvision",
+]
