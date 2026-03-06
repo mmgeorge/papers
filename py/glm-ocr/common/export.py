@@ -57,7 +57,7 @@ from transformers import (
 
 MODEL_ID = "zai-org/GLM-OCR"
 DEFAULT_OUTPUT_DIR = "../model"
-DEFAULT_MAX_SEQ = 512
+DEFAULT_MAX_SEQ = 4096
 
 # Model architecture constants (from config.json → text_config).
 # GLM-OCR uses Qwen2-based LLM with Grouped Query Attention (GQA):

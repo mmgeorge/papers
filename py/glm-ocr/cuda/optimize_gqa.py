@@ -423,9 +423,9 @@ def main():
                         help="Input ONNX model path (default: model-dir/llm_decoder.onnx)")
     parser.add_argument("--output", type=str, default=None,
                         help="Output ONNX model path (default: model-dir/llm_decoder_gqa.onnx)")
-    parser.add_argument("--max-seq", type=int, default=512,
-                        help="Max sequence length (must match export)")
     args = parser.parse_args()
+
+    from common.export import DEFAULT_MAX_SEQ
 
     model_dir = Path(args.model_dir)
     input_path = Path(args.input) if args.input else model_dir / "llm_decoder.onnx"
@@ -435,7 +435,7 @@ def main():
         print(f"Error: {input_path} not found")
         sys.exit(1)
 
-    apply_gqa_surgery(input_path, output_path, args.max_seq)
+    apply_gqa_surgery(input_path, output_path, DEFAULT_MAX_SEQ)
     print(f"\nDone: {output_path}")
 
 

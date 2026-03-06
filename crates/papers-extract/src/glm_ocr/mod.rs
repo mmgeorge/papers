@@ -365,33 +365,35 @@ impl GlmOcrPredictor {
                 }
             }
             ResolvedBackend::Other => {
-                // Read architecture from LLM session inputs
+                const DEFAULT_MAX_SEQ: usize = 4096;
+
                 let num_layers = llm
                     .inputs()
                     .iter()
                     .filter(|inp| inp.name().starts_with("past_key_"))
                     .count();
-                let (num_kv_heads, head_dim) = if let Some(past_key_0) =
-                    llm.inputs().iter().find(|inp| inp.name() == "past_key_0")
-                {
-                    if let Some(shape) = past_key_0.dtype().tensor_shape() {
-                        let dims: Vec<i64> = shape.iter().copied().collect();
-                        if dims.len() == 4 {
-                            (dims[1] as usize, dims[3] as usize)
-                        } else {
-                            (8, 128) // fallback
-                        }
-                    } else {
-                        (8, 128) // fallback
-                    }
+
+                // Read KV head count, max sequence length, and head dim from model shape.
+                // Dynamic dims (symbolic axes) report as 0 — fall back to defaults.
+                let past_key_0 = llm.inputs().iter().find(|inp| inp.name() == "past_key_0");
+                let dims: Vec<i64> = past_key_0
+                    .and_then(|inp| inp.dtype().tensor_shape())
+                    .map(|shape| shape.iter().copied().collect())
+                    .unwrap_or_default();
+
+                let (num_kv_heads, max_seq, head_dim) = if dims.len() == 4 {
+                    let kv_heads = dims[1] as usize;
+                    let seq = if dims[2] > 0 { dims[2] as usize } else { DEFAULT_MAX_SEQ };
+                    let hd = dims[3] as usize;
+                    (kv_heads, seq, hd)
                 } else {
-                    (8, 128) // fallback
+                    (8, DEFAULT_MAX_SEQ, 128)
                 };
 
                 ActiveBackend::Other {
                     num_layers,
                     num_kv_heads,
-                    max_seq: 512,
+                    max_seq,
                     head_dim,
                 }
             }

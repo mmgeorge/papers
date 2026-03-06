@@ -453,8 +453,6 @@ def main():
                         help="Skip vision encoder export (use existing file)")
     parser.add_argument("--skip-decoder", action="store_true",
                         help="Skip CUDA-graph decoder export")
-    parser.add_argument("--max-seq", type=int, default=DEFAULT_MAX_SEQ,
-                        help=f"Max sequence length for decoder KV cache (default: {DEFAULT_MAX_SEQ})")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -488,12 +486,12 @@ def main():
         if args.skip_decoder:
             print("\nSkipping decoder (--skip-decoder)")
         else:
-            export_decoder(model, output_dir, args.max_seq, export_dtype)
+            export_decoder(model, output_dir, DEFAULT_MAX_SEQ, export_dtype)
             # GQA attention fusion on the exported decoder
             from optimize_gqa import apply_gqa_surgery
             decoder_path = output_dir / "llm_decoder.onnx"
             gqa_path = output_dir / "llm_decoder_gqa.onnx"
-            apply_gqa_surgery(decoder_path, gqa_path, args.max_seq)
+            apply_gqa_surgery(decoder_path, gqa_path, DEFAULT_MAX_SEQ)
 
     # ── Validation ──
     if args.bf16:
@@ -502,7 +500,7 @@ def main():
         llm_wrapper = LLMWrapper(model).eval()
         validate_llm(llm_wrapper, output_dir, export_dtype)
         if not args.skip_decoder:
-            validate_decoder(output_dir, args.max_seq)
+            validate_decoder(output_dir, DEFAULT_MAX_SEQ)
 
     # ── Summary ──
     print(f"\n{'='*50}")
