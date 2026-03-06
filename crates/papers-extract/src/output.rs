@@ -228,18 +228,20 @@ fn region_to_markdown(region: &Region) -> String {
         | RegionKind::References => region.text.clone().unwrap_or_default(),
 
         RegionKind::Table => {
-            if let Some(ref html) = region.html {
-                let caption_text = region
-                    .caption
-                    .as_ref()
-                    .and_then(|c| c.text.as_deref());
-                if let Some(cap) = caption_text {
-                    format!("{html}\n\n{}", bold_caption_label(cap))
-                } else {
-                    html.clone()
-                }
+            let table_md = region
+                .text
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(region.html.as_deref())
+                .unwrap_or_default();
+            let caption_text = region
+                .caption
+                .as_ref()
+                .and_then(|c| c.text.as_deref());
+            if let Some(cap) = caption_text {
+                format!("{table_md}\n\n{}", bold_caption_label(cap))
             } else {
-                String::new()
+                table_md.to_string()
             }
         }
         RegionKind::DisplayFormula => {

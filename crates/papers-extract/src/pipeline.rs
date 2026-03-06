@@ -515,9 +515,10 @@ impl Pipeline {
                 }
             }
 
-            // Populate table HTML from crop-based prediction
+            // Populate table HTML + markdown text from crop-based prediction
             if kind == RegionKind::Table {
                 if let Some(html) = table_html.get(&idx) {
+                    region.text = crate::html_table::html_table_to_markdown(html);
                     region.html = Some(html.clone());
                 }
             }
