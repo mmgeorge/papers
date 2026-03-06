@@ -829,6 +829,14 @@ fn collapse_spaces(s: &str) -> String {
 /// Returns `None` for unknown characters, which causes the entire formula
 /// to be rejected to ML OCR (all-or-nothing policy).
 fn char_to_latex(c: char) -> Option<&'static str> {
+    // First handle Mathematical Alphanumeric Symbols (U+1D400–U+1D7FF).
+    // These are used in TeX-typeset PDFs for italic/bold math letters.
+    // We map them back to their ASCII equivalents (LaTeX handles styling).
+    if let Some(ascii) = math_alphanumeric_to_ascii(c) {
+        // Return None to signal "handled by is_known_formula_char / get_latex_for_char"
+        // but we need a static str, so we use a lookup table.
+        return Some(ascii);
+    }
     match c {
         // ASCII letters and digits pass through
         'a'..='z' | 'A'..='Z' | '0'..='9' => None, // handled specially — return char itself
@@ -852,13 +860,20 @@ fn char_to_latex(c: char) -> Option<&'static str> {
         '\u{22C5}' => Some("\\cdot"),
         '\u{00B7}' => Some("\\cdot"),  // middle dot
         '\u{221E}' => Some("\\infty"),
+        '\u{2225}' => Some("\\|"),     // parallel / double vertical bar (norm)
+        '\u{02C6}' => Some("\\hat{}"), // modifier circumflex accent
         // Delimiters
         '(' => Some("("),
         ')' => Some(")"),
         '[' => Some("["),
         ']' => Some("]"),
+        '{' => Some("\\{"),
+        '}' => Some("\\}"),
         ',' => Some(","),
         '.' => Some("."),
+        ':' => Some(":"),
+        ';' => Some(";"),
+        '!' => Some("!"),
         // Common math symbols
         '\u{2202}' => Some("\\partial"),
         '\u{2207}' => Some("\\nabla"),
@@ -868,10 +883,17 @@ fn char_to_latex(c: char) -> Option<&'static str> {
         '\u{222A}' => Some("\\cup"),
         '\u{2286}' => Some("\\subseteq"),
         '\u{2287}' => Some("\\supseteq"),
+        '\u{2192}' => Some("\\to"),
+        '\u{2190}' => Some("\\leftarrow"),
+        '\u{21D2}' => Some("\\Rightarrow"),
+        '\u{2200}' => Some("\\forall"),
+        '\u{2203}' => Some("\\exists"),
+        '\u{2026}' => Some("\\ldots"),
+        '\u{22EF}' => Some("\\cdots"),
         '\'' => Some("'"),
         '\u{2032}' => Some("'"),       // prime
         '\u{2033}' => Some("''"),      // double prime
-        // Lowercase Greek
+        // Lowercase Greek (standard Unicode block U+03B1–U+03C9)
         '\u{03B1}' => Some("\\alpha"),
         '\u{03B2}' => Some("\\beta"),
         '\u{03B3}' => Some("\\gamma"),
@@ -909,8 +931,105 @@ fn char_to_latex(c: char) -> Option<&'static str> {
         '\u{03A6}' => Some("\\Phi"),
         '\u{03A8}' => Some("\\Psi"),
         '\u{03A9}' => Some("\\Omega"),
+        // Mathematical italic Greek (U+1D6FC–U+1D76F) — used in TeX PDFs
+        '\u{1D6FC}' => Some("\\alpha"),
+        '\u{1D6FD}' => Some("\\beta"),
+        '\u{1D6FE}' => Some("\\gamma"),
+        '\u{1D6FF}' => Some("\\delta"),
+        '\u{1D700}' => Some("\\epsilon"),
+        '\u{1D701}' => Some("\\zeta"),
+        '\u{1D702}' => Some("\\eta"),
+        '\u{1D703}' => Some("\\theta"),
+        '\u{1D704}' => Some("\\iota"),
+        '\u{1D705}' => Some("\\kappa"),
+        '\u{1D706}' => Some("\\lambda"),
+        '\u{1D707}' => Some("\\mu"),
+        '\u{1D708}' => Some("\\nu"),
+        '\u{1D709}' => Some("\\xi"),
+        '\u{1D70B}' => Some("\\pi"),
+        '\u{1D70C}' => Some("\\rho"),
+        '\u{1D70E}' => Some("\\sigma"),
+        '\u{1D70F}' => Some("\\tau"),
+        '\u{1D710}' => Some("\\upsilon"),
+        '\u{1D711}' => Some("\\phi"),
+        '\u{1D712}' => Some("\\chi"),
+        '\u{1D713}' => Some("\\psi"),
+        '\u{1D714}' => Some("\\omega"),
+        '\u{1D715}' => Some("\\partial"),  // math italic partial
+        '\u{1D716}' => Some("\\epsilon"),  // math italic epsilon symbol
+        '\u{1D717}' => Some("\\vartheta"),
+        '\u{1D718}' => Some("\\varkappa"),
+        '\u{1D719}' => Some("\\varphi"),
+        '\u{1D71A}' => Some("\\varrho"),
+        '\u{1D71B}' => Some("\\varpi"),
+        // Mathematical italic uppercase Greek (U+1D6E2–U+1D6FB)
+        '\u{1D6E4}' => Some("\\Gamma"),
+        '\u{1D6E5}' => Some("\\Delta"),
+        '\u{1D6E9}' => Some("\\Theta"),
+        '\u{1D6EC}' => Some("\\Lambda"),
+        '\u{1D6EF}' => Some("\\Xi"),
+        '\u{1D6F1}' => Some("\\Pi"),
+        '\u{1D6F4}' => Some("\\Sigma"),
+        '\u{1D6F6}' => Some("\\Upsilon"),
+        '\u{1D6F7}' => Some("\\Phi"),
+        '\u{1D6F9}' => Some("\\Psi"),
+        '\u{1D6FA}' => Some("\\Omega"),
         _ => None,
     }
+}
+
+/// Map Mathematical Alphanumeric Symbols (U+1D400–U+1D7FF) to ASCII equivalents.
+/// These are used in TeX-typeset PDFs for italic, bold, script, etc. math letters.
+/// Returns a static str of the single ASCII character.
+fn math_alphanumeric_to_ascii(c: char) -> Option<&'static str> {
+    static ASCII_LETTERS: [&str; 52] = [
+        "A","B","C","D","E","F","G","H","I","J","K","L","M",
+        "N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
+        "a","b","c","d","e","f","g","h","i","j","k","l","m",
+        "n","o","p","q","r","s","t","u","v","w","x","y","z",
+    ];
+    let cp = c as u32;
+    // Mathematical Bold: A-Z U+1D400..1D419, a-z U+1D41A..1D433
+    // Mathematical Italic: A-Z U+1D434..1D44D, a-z U+1D44E..1D467 (h at U+210E)
+    // Mathematical Bold Italic: A-Z U+1D468..1D481, a-z U+1D482..1D49B
+    // Mathematical Script: A-Z U+1D49C..1D4B5, a-z U+1D4B6..1D4CF
+    // Mathematical Bold Script: A-Z U+1D4D0..1D4E9, a-z U+1D4EA..1D503
+    // Mathematical Fraktur: A-Z U+1D504..1D51D, a-z U+1D51E..1D537
+    // Mathematical Double-Struck: A-Z U+1D538..1D551, a-z U+1D552..1D56B
+    // Mathematical Bold Fraktur: A-Z U+1D56C..1D585, a-z U+1D586..1D59F
+    // Mathematical Sans-Serif: A-Z U+1D5A0..1D5B9, a-z U+1D5BA..1D5D3
+    // Mathematical Sans-Serif Bold: A-Z U+1D5D4..1D5ED, a-z U+1D5EE..1D607
+    // Mathematical Sans-Serif Italic: A-Z U+1D608..1D621, a-z U+1D622..1D63B
+    // Mathematical Sans-Serif Bold Italic: A-Z U+1D63C..1D655, a-z U+1D656..1D66F
+    // Mathematical Monospace: A-Z U+1D670..1D689, a-z U+1D68A..1D6A3
+    let ranges: &[(u32, u32)] = &[
+        (0x1D400, 0x1D433), // Bold
+        (0x1D434, 0x1D467), // Italic
+        (0x1D468, 0x1D49B), // Bold Italic
+        (0x1D49C, 0x1D4CF), // Script
+        (0x1D4D0, 0x1D503), // Bold Script
+        (0x1D504, 0x1D537), // Fraktur
+        (0x1D538, 0x1D56B), // Double-Struck
+        (0x1D56C, 0x1D59F), // Bold Fraktur
+        (0x1D5A0, 0x1D5D3), // Sans-Serif
+        (0x1D5D4, 0x1D607), // Sans-Serif Bold
+        (0x1D608, 0x1D63B), // Sans-Serif Italic
+        (0x1D63C, 0x1D66F), // Sans-Serif Bold Italic
+        (0x1D670, 0x1D6A3), // Monospace
+    ];
+    for &(start, end) in ranges {
+        if cp >= start && cp <= end {
+            let offset = (cp - start) as usize;
+            if offset < 52 {
+                return Some(ASCII_LETTERS[offset]);
+            }
+        }
+    }
+    // Special: Mathematical Italic Small H is at U+210E (Planck constant)
+    if cp == 0x210E {
+        return Some("h");
+    }
+    None
 }
 
 /// Check if a character is a valid LaTeX formula character.
@@ -929,20 +1048,31 @@ fn get_latex_for_char(c: char) -> String {
     }
 }
 
-/// Replace raw Unicode Greek codepoints in a LaTeX string with proper commands.
+/// Replace raw Unicode codepoints in a LaTeX string with proper commands.
 ///
-/// `detect_scripts()` produces strings like `α_{t}` containing raw Unicode.
-/// This post-processes them into `\alpha_{t}`.
+/// `detect_scripts()` produces strings like `α_{t}` or `𝐺_{𝑖}` containing raw Unicode.
+/// This post-processes them into `\alpha_{t}` or `G_{i}`, inserting spaces where
+/// LaTeX requires them (e.g. `\epsilon v` not `\epsilonv`).
 fn replace_greek_in_latex(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
+    let mut prev_was_command = false;
     for c in s.chars() {
         if c.is_ascii() {
+            if prev_was_command && c.is_ascii_alphabetic() {
+                result.push(' ');
+            }
             result.push(c);
+            prev_was_command = false;
         } else if let Some(latex) = char_to_latex(c) {
+            if prev_was_command && latex.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
+                result.push(' ');
+            }
             result.push_str(latex);
+            prev_was_command = is_latex_command(latex);
         } else {
             // Should not happen if we validated all chars, but be safe
             result.push(c);
+            prev_was_command = false;
         }
     }
     result
@@ -2630,6 +2760,61 @@ mod tests {
     }
 
     #[test]
+    fn test_bypass_math_italic_chars() {
+        // Mathematical Italic 𝑡 (U+1D461) and 𝑖 (U+1D456) — common in TeX PDFs
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D461}', 108.0, 105.0, 5.0, 7.0, 7.0), // math italic t, subscript
+        ];
+        let bbox = [95.0, 95.0, 120.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x_{t}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_math_italic_expression() {
+        // 𝐺𝑖 (U+1D43A U+1D456) — Mathematical Italic G with italic i subscript
+        let chars = vec![
+            make_formula_char('\u{1D43A}', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D456}', 108.0, 105.0, 5.0, 7.0, 7.0),
+        ];
+        let bbox = [95.0, 95.0, 120.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("G_{i}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_math_italic_greek() {
+        // 𝛿 (U+1D6FF) — Mathematical Italic Small Delta
+        let chars = vec![make_formula_char('\u{1D6FF}', 100.0, 100.0, 10.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\delta".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_planck_constant_h() {
+        // ℎ (U+210E) — Planck constant (Mathematical Italic h)
+        let chars = vec![make_formula_char('\u{210E}', 100.0, 100.0, 8.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("h".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_norm_bars() {
+        // ∥x∥ — norm notation
+        let chars = vec![
+            make_formula_char('\u{2225}', 100.0, 100.0, 5.0, 10.0, 10.0),
+            make_formula_char('x', 105.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2225}', 113.0, 100.0, 5.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\|x\\|".to_string()));
+    }
+
+    #[test]
     fn test_bypass_double_prime() {
         // x″ (double prime U+2033)
         let chars = vec![
@@ -2639,5 +2824,265 @@ mod tests {
         let bbox = [95.0, 93.0, 118.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         assert!(result.is_some(), "Double prime should be handled");
+    }
+
+    // ── Math-alphanumeric and spacing edge cases ───────────────────────
+
+    #[test]
+    fn test_bypass_math_bold_letter() {
+        // 𝐀 (U+1D400) — Mathematical Bold Capital A → "A"
+        let chars = vec![make_formula_char('\u{1D400}', 100.0, 100.0, 8.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("A".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_math_sans_serif_letter() {
+        // 𝖠 (U+1D5A0) — Mathematical Sans-Serif Capital A → "A"
+        let chars = vec![make_formula_char('\u{1D5A0}', 100.0, 100.0, 8.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("A".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_math_italic_subscript_with_greek_and_letter() {
+        // x with subscript 𝜖𝑣 → x_{\epsilon v}
+        // This tests the replace_greek_in_latex spacing: \epsilon followed by v needs space
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D716}', 108.0, 105.0, 5.0, 7.0, 7.0), // math italic epsilon
+            make_formula_char('\u{1D463}', 113.0, 105.0, 4.0, 7.0, 7.0), // math italic v
+        ];
+        let bbox = [95.0, 95.0, 125.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x_{\\epsilon v}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_subscript_two_math_italic_greeks() {
+        // x with subscript 𝛿𝜖 → x_{\delta\epsilon}
+        // Two commands: no space between them (\d is followed by \, not a letter)
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D6FF}', 108.0, 105.0, 5.0, 7.0, 7.0), // math italic delta
+            make_formula_char('\u{1D716}', 113.0, 105.0, 5.0, 7.0, 7.0), // math italic epsilon
+        ];
+        let bbox = [95.0, 95.0, 125.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x_{\\delta\\epsilon}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_math_italic_partial_followed_by_letter() {
+        // 𝜕x → \partial x (math italic partial U+1D715 needs space before letter)
+        let chars = vec![
+            make_formula_char('\u{1D715}', 100.0, 100.0, 10.0, 10.0, 10.0),
+            make_formula_char('x', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\partial x".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_math_italic_expression_e_of_x() {
+        // 𝐸(𝑥) → E(x) — common in the VBD paper
+        let chars = vec![
+            make_formula_char('\u{1D438}', 100.0, 100.0, 8.0, 10.0, 10.0), // math italic E
+            make_formula_char('(', 108.0, 100.0, 5.0, 10.0, 10.0),
+            make_formula_char('\u{1D465}', 113.0, 100.0, 8.0, 10.0, 10.0), // math italic x
+            make_formula_char(')', 121.0, 100.0, 5.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 132.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("E(x)".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_mixed_ascii_and_math_italic_subscript() {
+        // F with subscript 𝑖 — F is plain ASCII, 𝑖 is math italic
+        let chars = vec![
+            make_formula_char('F', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D456}', 108.0, 105.0, 4.0, 7.0, 7.0), // math italic i
+        ];
+        let bbox = [95.0, 95.0, 118.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("F_{i}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_double_struck_r_rejects() {
+        // ℝ (U+211D) — double-struck R, not in our map → should reject
+        let chars = vec![make_formula_char('\u{211D}', 100.0, 100.0, 10.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "Double-struck R should reject (not in map)");
+    }
+
+    #[test]
+    fn test_bypass_asterisk_rejects() {
+        // * is not in our map → should reject
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('*', 108.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 122.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "Asterisk should reject");
+    }
+
+    #[test]
+    fn test_bypass_combining_mark_rejects() {
+        // U+0300 (combining grave accent) — not in map → reject
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{0300}', 108.0, 98.0, 3.0, 5.0, 5.0),
+        ];
+        let bbox = [95.0, 93.0, 118.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "Combining marks should reject");
+    }
+
+    #[test]
+    fn test_bypass_arrow_symbol() {
+        // x→y using U+2192
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2192}', 108.0, 100.0, 10.0, 10.0, 10.0),
+            make_formula_char('y', 118.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 132.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x\\to y".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_forall_x() {
+        // ∀x
+        let chars = vec![
+            make_formula_char('\u{2200}', 100.0, 100.0, 10.0, 10.0, 10.0),
+            make_formula_char('x', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\forall x".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_ellipsis() {
+        // … (U+2026)
+        let chars = vec![make_formula_char('\u{2026}', 100.0, 100.0, 12.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 118.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\ldots".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_colon_in_formula() {
+        // f:A — colon is a delimiter, not a command, so no spacing issues
+        let chars = vec![
+            make_formula_char('f', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char(':', 108.0, 100.0, 4.0, 10.0, 10.0),
+            make_formula_char('A', 112.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("f:A".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_h_in_r_3_from_real_pdf() {
+        // Simulates "H_{i}∈R^{3×3}" from real PDF data
+        // H is ASCII, 𝑖 is math italic, ∈, R is ASCII, 3 digits, × operator
+        let chars = vec![
+            make_formula_char('H', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D456}', 108.0, 105.0, 4.0, 7.0, 7.0), // math italic i (sub)
+            make_formula_char('\u{2208}', 116.0, 100.0, 8.0, 10.0, 10.0), // ∈
+            make_formula_char('R', 124.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('3', 132.0, 96.0, 5.0, 7.0, 7.0),  // superscript
+            make_formula_char('\u{00D7}', 137.0, 96.0, 5.0, 7.0, 7.0), // × (same size as 3)
+            make_formula_char('3', 142.0, 96.0, 5.0, 7.0, 7.0),  // superscript
+        ];
+        let bbox = [95.0, 91.0, 152.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert!(result.is_some(), "Complex expression should be handled: {:?}", result);
+        let latex = result.unwrap();
+        // Should contain H_{i}, ∈, R^{...}
+        assert!(latex.contains("H_{i}"), "Should have H_{{i}}: {latex}");
+        assert!(latex.contains("\\in"), "Should have \\in: {latex}");
+        assert!(latex.contains("R"), "Should have R: {latex}");
+    }
+
+    #[test]
+    fn test_bypass_planck_h_with_comma() {
+        // ℎ, — from real PDF (vbd.pdf page 3 formula #21)
+        let chars = vec![
+            make_formula_char('\u{210E}', 100.0, 100.0, 8.0, 10.0, 10.0), // Planck h
+            make_formula_char(',', 108.0, 100.0, 3.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 118.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("h,".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_norm_with_math_italic() {
+        // ∥𝑢∥ — norm bars around math italic u
+        let chars = vec![
+            make_formula_char('\u{2225}', 100.0, 100.0, 5.0, 10.0, 10.0), // ∥
+            make_formula_char('\u{1D462}', 105.0, 100.0, 8.0, 10.0, 10.0), // math italic u
+            make_formula_char('\u{2225}', 113.0, 100.0, 5.0, 10.0, 10.0), // ∥
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\|u\\|".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_delta_x_subscript_c() {
+        // 𝛿x𝑐 — math italic delta, plain x, math italic c as subscript
+        // Should produce \delta x_{c}
+        let chars = vec![
+            make_formula_char('\u{1D6FF}', 100.0, 100.0, 8.0, 10.0, 10.0), // math italic delta
+            make_formula_char('x', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D450}', 116.0, 105.0, 4.0, 7.0, 7.0), // math italic c (sub)
+        ];
+        let bbox = [95.0, 95.0, 127.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // \delta is a command, x is a letter → space. Then x_{c} from detect_scripts.
+        // But detect_scripts sees x (baseline) followed by c (subscript) → Formula("x_{𝑐}")
+        // After replace_greek_in_latex: "x_{c}"
+        // And the \delta before it: is_latex_command("\delta") = true, "x" starts with letter → space
+        // Result: "\delta x_{c}"
+        assert_eq!(result, Some("\\delta x_{c}".to_string()));
+    }
+
+    #[test]
+    fn test_bypass_v_equals_expression_from_pdf() {
+        // v_{i}=(x_{i}-x_{ti})/h — a realistic formula from vbd.pdf
+        // v baseline, 𝑖 subscript, =, (, x baseline, 𝑖 subscript, -, x baseline,
+        // 𝑡 subscript, 𝑖 subscript (part of same run), ), /, h
+        let chars = vec![
+            make_formula_char('v', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D456}', 108.0, 105.0, 4.0, 7.0, 7.0), // 𝑖 sub
+            make_formula_char('=', 116.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('(', 124.0, 100.0, 5.0, 10.0, 10.0),
+            make_formula_char('x', 129.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D456}', 137.0, 105.0, 4.0, 7.0, 7.0), // 𝑖 sub
+            make_formula_char('-', 145.0, 100.0, 6.0, 10.0, 10.0),
+            make_formula_char('x', 151.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{1D461}', 159.0, 105.0, 4.0, 7.0, 7.0), // 𝑡 sub
+            make_formula_char('\u{1D456}', 163.0, 105.0, 4.0, 7.0, 7.0), // 𝑖 sub (same run)
+            make_formula_char(')', 170.0, 100.0, 5.0, 10.0, 10.0),
+            make_formula_char('/', 175.0, 100.0, 6.0, 10.0, 10.0),
+            make_formula_char('\u{210E}', 181.0, 100.0, 8.0, 10.0, 10.0), // Planck h
+        ];
+        let bbox = [95.0, 95.0, 195.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert!(result.is_some(), "Should handle realistic formula");
+        let latex = result.unwrap();
+        assert_eq!(latex, "v_{i}=(x_{i}-x_{ti})/h");
     }
 }
