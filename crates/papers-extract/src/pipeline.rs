@@ -396,6 +396,9 @@ impl Pipeline {
         // Associate captions with their parent regions
         figure::associate_captions(&mut regions);
 
+        // Attach formula numbers to their nearest display formula
+        associate_formula_numbers(&mut regions);
+
         let result_page = Page {
             page: page_idx + 1,
             width_pt,
@@ -470,6 +473,7 @@ impl Pipeline {
                 image_path: None,
                 caption: None,
                 chart_type: None,
+                tag: None,
                 consumed: kind == RegionKind::InlineFormula && consumed_inline.contains(&idx),
             };
 
@@ -537,5 +541,331 @@ impl Pipeline {
         }
 
         Ok(regions)
+    }
+}
+
+/// Associate `FormulaNumber` regions with their nearest `DisplayFormula`.
+///
+/// For each formula number with extracted text, finds the closest display
+/// formula by vertical-center distance (in PDF points).  Appends `\tag{…}`
+/// to the formula's LaTeX and marks the number region as consumed.
+///
+/// Logs a warning and discards any formula number that cannot be matched.
+fn associate_formula_numbers(regions: &mut [Region]) {
+    use std::collections::HashSet;
+
+    let display_indices: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == RegionKind::DisplayFormula && r.latex.is_some() && !r.consumed)
+        .map(|(i, _)| i)
+        .collect();
+
+    let number_indices: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == RegionKind::FormulaNumber && !r.consumed)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut matched_formulas: HashSet<usize> = HashSet::new();
+
+    for &num_idx in &number_indices {
+        let num_text = match &regions[num_idx].text {
+            Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => {
+                tracing::warn!(
+                    "FormulaNumber (id={}) has no text content, discarding",
+                    regions[num_idx].id,
+                );
+                regions[num_idx].consumed = true;
+                continue;
+            }
+        };
+
+        let num_bbox = regions[num_idx].bbox;
+        let num_cy = (num_bbox[1] + num_bbox[3]) / 2.0;
+
+        // Find the closest unmatched DisplayFormula by vertical center distance
+        let mut best: Option<(usize, f32)> = None;
+        for &disp_idx in &display_indices {
+            if matched_formulas.contains(&disp_idx) {
+                continue;
+            }
+            let disp_bbox = regions[disp_idx].bbox;
+            let disp_cy = (disp_bbox[1] + disp_bbox[3]) / 2.0;
+            let dist = (num_cy - disp_cy).abs();
+
+            if best.map_or(true, |(_, best_dist)| dist < best_dist) {
+                best = Some((disp_idx, dist));
+            }
+        }
+
+        // Maximum vertical center distance in PDF points (~2 text lines)
+        const MAX_DIST_PT: f32 = 50.0;
+
+        match best {
+            Some((disp_idx, dist)) if dist <= MAX_DIST_PT => {
+                matched_formulas.insert(disp_idx);
+                regions[num_idx].consumed = true;
+
+                // Strip outer parentheses: "(10)" → "10"
+                let tag = num_text.trim();
+                let tag = if tag.starts_with('(') && tag.ends_with(')') {
+                    &tag[1..tag.len() - 1]
+                } else {
+                    tag
+                };
+
+                regions[disp_idx].tag = Some(tag.to_string());
+
+                if let Some(ref mut latex) = regions[disp_idx].latex {
+                    latex.push_str(&format!(" \\tag{{{}}}", tag));
+                }
+            }
+            Some((_, dist)) => {
+                tracing::warn!(
+                    "FormulaNumber '{}' (id={}) too far from any DisplayFormula \
+                     (closest={:.1}pt), discarding",
+                    num_text,
+                    regions[num_idx].id,
+                    dist,
+                );
+                regions[num_idx].consumed = true;
+            }
+            None => {
+                tracing::warn!(
+                    "FormulaNumber '{}' (id={}) has no DisplayFormula on this page, discarding",
+                    num_text,
+                    regions[num_idx].id,
+                );
+                regions[num_idx].consumed = true;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to build a minimal Region for testing.
+    fn make_region(kind: RegionKind, bbox: [f32; 4]) -> Region {
+        Region {
+            id: String::new(),
+            kind,
+            bbox,
+            confidence: 0.9,
+            order: 0,
+            text: None,
+            html: None,
+            latex: None,
+            image_path: None,
+            caption: None,
+            chart_type: None,
+            tag: None,
+            consumed: false,
+        }
+    }
+
+    #[test]
+    fn formula_number_basic_association() {
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [50.0, 100.0, 300.0, 130.0]);
+                r.latex = Some("E = mc^2".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [310.0, 105.0, 340.0, 125.0]);
+                r.text = Some("(1)".into());
+                r
+            },
+        ];
+
+        associate_formula_numbers(&mut regions);
+
+        assert_eq!(regions[0].latex.as_deref(), Some("E = mc^2 \\tag{1}"));
+        assert_eq!(regions[0].tag.as_deref(), Some("1"));
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn formula_number_no_parens() {
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [50.0, 100.0, 300.0, 130.0]);
+                r.latex = Some("a + b".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [310.0, 105.0, 340.0, 125.0]);
+                r.text = Some("2a".into());
+                r
+            },
+        ];
+
+        associate_formula_numbers(&mut regions);
+
+        assert_eq!(regions[0].latex.as_deref(), Some("a + b \\tag{2a}"));
+        assert_eq!(regions[0].tag.as_deref(), Some("2a"));
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn formula_number_below_formula() {
+        // Formula number slightly below the formula (like VBD p5 eq.10)
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [50.0, 233.0, 289.0, 265.0]);
+                r.latex = Some("x^2".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [280.0, 264.0, 295.0, 275.0]);
+                r.text = Some("(10)".into());
+                r
+            },
+        ];
+
+        associate_formula_numbers(&mut regions);
+
+        assert_eq!(regions[0].latex.as_deref(), Some("x^2 \\tag{10}"));
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn formula_number_stacked_formulas() {
+        // Two formulas close together, each with its own number
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [50.0, 100.0, 300.0, 120.0]);
+                r.latex = Some("a = b".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [310.0, 103.0, 340.0, 117.0]);
+                r.text = Some("(13)".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [50.0, 130.0, 300.0, 160.0]);
+                r.latex = Some("c = d".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [310.0, 138.0, 340.0, 152.0]);
+                r.text = Some("(14)".into());
+                r
+            },
+        ];
+
+        associate_formula_numbers(&mut regions);
+
+        assert_eq!(regions[0].latex.as_deref(), Some("a = b \\tag{13}"));
+        assert_eq!(regions[2].latex.as_deref(), Some("c = d \\tag{14}"));
+        assert!(regions[1].consumed);
+        assert!(regions[3].consumed);
+    }
+
+    #[test]
+    fn formula_number_too_far() {
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [50.0, 100.0, 300.0, 130.0]);
+                r.latex = Some("y = x".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [310.0, 400.0, 340.0, 420.0]);
+                r.id = "p1_5".into();
+                r.text = Some("(99)".into());
+                r
+            },
+        ];
+
+        associate_formula_numbers(&mut regions);
+
+        // Formula should be unchanged, number should be consumed (discarded)
+        assert_eq!(regions[0].latex.as_deref(), Some("y = x"));
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn formula_number_no_display_formula() {
+        let mut regions = vec![{
+            let mut r = make_region(RegionKind::FormulaNumber, [310.0, 105.0, 340.0, 125.0]);
+            r.id = "p1_0".into();
+            r.text = Some("(7)".into());
+            r
+        }];
+
+        associate_formula_numbers(&mut regions);
+
+        assert!(regions[0].consumed);
+    }
+
+    #[test]
+    fn formula_number_empty_text() {
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [50.0, 100.0, 300.0, 130.0]);
+                r.latex = Some("z = w".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [310.0, 105.0, 340.0, 125.0]);
+                r.id = "p1_1".into();
+                r.text = Some("  ".into()); // whitespace-only
+                r
+            },
+        ];
+
+        associate_formula_numbers(&mut regions);
+
+        // Formula untouched, number consumed
+        assert_eq!(regions[0].latex.as_deref(), Some("z = w"));
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn formula_number_already_consumed() {
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [50.0, 100.0, 300.0, 130.0]);
+                r.latex = Some("p = q".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [310.0, 105.0, 340.0, 125.0]);
+                r.text = Some("(3)".into());
+                r.consumed = true; // already consumed by something else
+                r
+            },
+        ];
+
+        associate_formula_numbers(&mut regions);
+
+        // Formula should be unchanged since the number was already consumed
+        assert_eq!(regions[0].latex.as_deref(), Some("p = q"));
+    }
+
+    #[test]
+    fn formula_no_latex_skipped() {
+        // DisplayFormula with no LaTeX shouldn't be a match target
+        let mut regions = vec![
+            make_region(RegionKind::DisplayFormula, [50.0, 100.0, 300.0, 130.0]),
+            {
+                let mut r = make_region(RegionKind::FormulaNumber, [310.0, 105.0, 340.0, 125.0]);
+                r.id = "p1_1".into();
+                r.text = Some("(5)".into());
+                r
+            },
+        ];
+
+        associate_formula_numbers(&mut regions);
+
+        // Number should be consumed (discarded) since there's no valid formula
+        assert!(regions[1].consumed);
     }
 }

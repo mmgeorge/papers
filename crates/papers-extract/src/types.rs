@@ -42,6 +42,9 @@ pub struct Region {
     pub caption: Option<Box<Region>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chart_type: Option<String>,
+    /// Equation number tag for display formulas (e.g. "1", "2a").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
     /// True when this region's content has been spliced into a parent region
     /// (e.g. an InlineFormula consumed by an Algorithm or Text region).
     /// Consumed regions are kept in the JSON for debug/layout but skipped
@@ -204,6 +207,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            tag: None,
             consumed: false,
         };
 
@@ -227,6 +231,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            tag: None,
             consumed: false,
         };
 
@@ -249,6 +254,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            tag: None,
             consumed: false,
         };
 
@@ -270,6 +276,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            tag: None,
             consumed: false,
         };
         let region = Region {
@@ -284,6 +291,7 @@ mod tests {
             image_path: Some("images/p1_7.png".into()),
             caption: Some(Box::new(cap)),
             chart_type: None,
+            tag: None,
             consumed: false,
         };
 
@@ -318,6 +326,7 @@ mod tests {
                     image_path: None,
                     caption: None,
                     chart_type: None,
+                    tag: None,
                     consumed: false,
                 }],
             }],

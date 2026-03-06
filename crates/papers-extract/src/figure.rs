@@ -278,6 +278,7 @@ mod tests {
             image_path: None,
             caption: None,
             chart_type: None,
+            tag: None,
             consumed: false,
         }
     }
