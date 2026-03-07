@@ -13,7 +13,7 @@ pub const MODEL_NAME: &str = "embedding-gemma-300m";
 pub fn ep_name() -> &'static str {
     #[cfg(target_os = "windows")]
     {
-        "DirectML"
+        "CUDA"
     }
     #[cfg(target_os = "macos")]
     {
@@ -22,6 +22,49 @@ pub fn ep_name() -> &'static str {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         "CPU"
+    }
+}
+
+/// Initialize ORT with the dynamically loaded GPU runtime (Windows only).
+///
+/// Searches `ORT_DYLIB_PATH` env var (set by `.cargo/config.toml`) then
+/// `onnxruntime.dll` next to the executable. No-op on macOS (statically linked).
+#[cfg(target_os = "windows")]
+fn init_ort_runtime() -> Result<(), DbError> {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    let mut init_err: Option<String> = None;
+
+    INIT.call_once(|| {
+        let path = std::env::var("ORT_DYLIB_PATH").ok().or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join("onnxruntime.dll")))
+                .filter(|p| p.exists())
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+
+        match path {
+            Some(path) => match ort::init_from(&path) {
+                Ok(b) => {
+                    b.commit();
+                }
+                Err(e) => {
+                    init_err = Some(format!("ORT init failed for '{path}': {e}"));
+                }
+            },
+            None => {
+                init_err = Some(
+                    "onnxruntime.dll not found (set ORT_DYLIB_PATH or place next to exe)".into(),
+                );
+            }
+        }
+    });
+
+    if let Some(err) = init_err {
+        Err(DbError::Embed(err))
+    } else {
+        Ok(())
     }
 }
 
@@ -39,6 +82,9 @@ impl Embedder {
     /// Blocking constructor — call from spawn_blocking.
     /// Downloads model weights on first run from the HF Hub cache.
     pub fn new() -> Result<Self, DbError> {
+        #[cfg(target_os = "windows")]
+        init_ort_runtime()?;
+
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("papers")
@@ -50,7 +96,7 @@ impl Embedder {
         #[cfg(target_os = "windows")]
         {
             opts =
-                opts.with_execution_providers(vec![ort::ep::directml::DirectML::default().build()]);
+                opts.with_execution_providers(vec![ort::ep::cuda::CUDA::default().build()]);
         }
         #[cfg(target_os = "macos")]
         {
