@@ -69,10 +69,10 @@ fn main() {
     match papers_extract::extract(&cli.pdf, &output_dir, &options) {
         Ok(result) => {
             eprintln!(
-                "Done: {} pages, {} regions, {}ms",
+                "Done: {} pages, {} regions, {:.1}s",
                 result.metadata.page_count,
                 result.pages.iter().map(|p| p.regions.len()).sum::<usize>(),
-                result.metadata.extraction_time_ms,
+                result.metadata.extraction_time_ms as f64 / 1000.0,
             );
         }
         Err(e) => {

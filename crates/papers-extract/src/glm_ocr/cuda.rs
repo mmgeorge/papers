@@ -266,8 +266,6 @@ pub(crate) fn decode_loop(
 
     // Decode loop: ORT CUDA graph handles compute, we update step/input_ids via memcpy
     let mut token_buf = [0i64; 1];
-    let decode_start = std::time::Instant::now();
-    let mut step0_time = std::time::Duration::ZERO;
 
     for s in 0..max_seq {
         // H2D: update step counter
@@ -298,9 +296,8 @@ pub(crate) fn decode_loop(
         }
         .map_err(|e| ExtractError::Formula(format!("H2D total_seq_len: {e}")))?;
 
-        // Run decoder step (ORT CUDA graph replay)
+        // Run decoder step (ORT CUDA graph replay — internally synchronous)
         {
-            let step_t = std::time::Instant::now();
             let DecoderState {
                 ref mut session,
                 ref binding,
@@ -310,9 +307,6 @@ pub(crate) fn decode_loop(
             session
                 .run_binding_with_options(binding, run_options)
                 .map_err(|e| ExtractError::Formula(format!("decoder step {s}: {e}")))?;
-            if s == 0 {
-                step0_time = step_t.elapsed();
-            }
         }
 
         // D2D: next_token → input_ids (for next step)
@@ -341,21 +335,6 @@ pub(crate) fn decode_loop(
             break;
         }
     }
-
-    let total = decode_start.elapsed();
-    let steps = tokens.len().saturating_sub(1).max(1);
-    let avg_step = if steps > 1 {
-        (total - step0_time).as_micros() / (steps - 1) as u128
-    } else {
-        0
-    };
-    eprintln!(
-        "      decode: step0={}us, avg_other={}us, total={}ms ({} steps)",
-        step0_time.as_micros(),
-        avg_step,
-        total.as_millis(),
-        steps,
-    );
 
     Ok(tokens)
 }

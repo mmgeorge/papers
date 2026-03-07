@@ -92,23 +92,18 @@ struct PipelineOptions {
 impl Pipeline {
     /// Create a new pipeline, loading models and pdfium.
     pub fn new(options: &ExtractOptions) -> Result<Self, ExtractError> {
-        let t0 = Instant::now();
-
+        eprint!("\r  Loading models: ort");
         models::init_ort_runtime()?;
-        let t_ort = t0.elapsed();
-
         let pdfium = pdf::load_pdfium(options.pdfium_path.as_deref())?;
-        let t_pdfium = t0.elapsed();
 
         let paths = models::ensure_models(options.table, options.model_cache_dir.as_deref())?;
-        let t_paths = t0.elapsed();
-
+        eprint!("\r  Loading models: layout");
         let layout = models::build_layout_detector(&paths.layout)?;
-        let t_layout = t0.elapsed();
 
+        eprint!("\r  Loading models: formula");
         let formula = models::build_glm_ocr_predictor(&paths.glm_ocr)?;
-        let t_formula = t0.elapsed();
 
+        eprint!("\r  Loading models: table");
         let table = match options.table {
             TableModel::GlmOcr => {
                 let config = GlmOcrConfig {
@@ -125,18 +120,7 @@ impl Pipeline {
                 TableEngine::TableFormer(models::build_tableformer_predictor(tf_paths)?)
             }
         };
-        let t_table = t0.elapsed();
-
-        eprintln!(
-            "Models loaded in {}ms (ort={}, pdfium={}, resolve={}, layout={}, formula={}, table={})",
-            t_table.as_millis(),
-            t_ort.as_millis(),
-            (t_pdfium - t_ort).as_millis(),
-            (t_paths - t_pdfium).as_millis(),
-            (t_layout - t_paths).as_millis(),
-            (t_formula - t_layout).as_millis(),
-            (t_table - t_formula).as_millis(),
-        );
+        eprint!("\r{}\r", " ".repeat(60));
 
         Ok(Self {
             pdfium,
@@ -196,14 +180,20 @@ impl Pipeline {
         };
         let page_count = page_indices.len() as u32;
 
-        for page_idx in page_indices {
-            let page = doc.pages().get(page_idx as u16).map_err(|e| {
+        for (i, page_idx) in page_indices.iter().enumerate() {
+            eprint!(
+                "\r  Page {}/{page_count}: layout",
+                i + 1,
+            );
+            let page = doc.pages().get(*page_idx as u16).map_err(|e| {
                 ExtractError::Pdf(format!("Failed to get page {page_idx}: {e}"))
             })?;
-            let (result_page, page_img) = self.process_page(&page, page_idx, output_dir)?;
+            let (result_page, page_img) = self.process_page(&page, *page_idx, page_count, output_dir)?;
             page_images.push(page_img);
             pages.push(result_page);
         }
+        // Clear the progress line
+        eprint!("\r{}\r", " ".repeat(60));
 
         let extraction_time_ms = start.elapsed().as_millis() as u64;
 
@@ -216,9 +206,8 @@ impl Pipeline {
             pages,
         };
 
-        let t_pages = start.elapsed();
-
         // Write output files
+        eprint!("\r  Writing output...");
         let t_out = Instant::now();
         std::fs::create_dir_all(output_dir)?;
         let json_path = output_dir.join(format!("{stem}.json"));
@@ -238,6 +227,7 @@ impl Pipeline {
         }
 
         if self.options.debug.is_enabled() {
+            eprint!("\r  Writing debug layout...");
             output::write_debug(
                 &self.pdfium,
                 pdf_path,
@@ -246,12 +236,15 @@ impl Pipeline {
                 self.options.debug,
             )?;
         }
-
-        eprintln!(
-            "Timing: pages={}ms, output={}ms",
-            t_pages.as_millis(),
-            t_out.elapsed().as_millis(),
-        );
+        let out_secs = t_out.elapsed().as_secs_f64();
+        if out_secs >= 0.5 {
+            eprintln!("\r  Output: {out_secs:.1}s{}",
+                " ".repeat(40),
+            );
+        } else {
+            // Clear the progress line
+            eprint!("\r{}\r", " ".repeat(60));
+        }
 
         Ok(result)
     }
@@ -261,25 +254,23 @@ impl Pipeline {
         &self,
         page: &PdfPage,
         page_idx: u32,
+        page_count: u32,
         output_dir: &Path,
     ) -> Result<(Page, DynamicImage), ExtractError> {
-        let t0 = Instant::now();
+        let page_num = page_idx + 1;
         let width_pt = page.width().value;
         let height_pt = page.height().value;
 
         // Render page to image
         let page_image = pdf::render_page(page, self.options.dpi)?;
-        let t_render = t0.elapsed();
 
         // Extract characters from text layer
         let chars = pdf::extract_page_chars(page, page_idx)?;
-        let t_chars = t0.elapsed();
 
         // Run direct layout detection (correct bboxes + reading order)
         let detected = self
             .layout
             .detect(&page_image, self.options.confidence_threshold)?;
-        let t_layout = t0.elapsed();
 
         let scale = self.options.dpi as f32 / 72.0;
 
@@ -331,11 +322,20 @@ impl Pipeline {
             .collect();
 
         let mut formula_latex: HashMap<usize, String> = if !formula_entries.is_empty() {
+            eprint!(
+                "\r  Page {page_num}/{page_count}: formulas 0/{}",
+                formula_entries.len(),
+            );
             let crops: Vec<DynamicImage> =
                 formula_entries.iter().map(|(_, img)| img.clone()).collect();
+            let formula_count = crops.len();
             let results = self
                 .formula
-                .predict(&crops)
+                .predict_with_progress(&crops, |done| {
+                    eprint!(
+                        "\r  Page {page_num}/{page_count}: formulas {done}/{formula_count}",
+                    );
+                })
                 .map_err(|e| ExtractError::Layout(format!("Formula prediction failed: {e}")))?;
             formula_entries
                 .iter()
@@ -350,7 +350,6 @@ impl Pipeline {
         for (idx, latex) in char_based_latex {
             formula_latex.insert(idx, latex);
         }
-        let t_formulas = t0.elapsed();
 
         // Crop table regions and run batched recognition
         let table_entries: Vec<(usize, DynamicImage)> = detected
@@ -377,8 +376,13 @@ impl Pipeline {
             })
             .collect();
 
+        if !table_entries.is_empty() {
+            eprint!(
+                "\r  Page {page_num}/{page_count}: tables ({})",
+                table_entries.len(),
+            );
+        }
         let table_results = self.table.predict(&table_entries)?;
-        let t_tables = t0.elapsed();
 
         // Write table debug overlays if layout debug is enabled
         if self.options.debug.is_enabled() {
@@ -422,22 +426,6 @@ impl Pipeline {
 
         // Attach formula numbers to their nearest display formula
         associate_formula_numbers(&mut regions);
-
-        let t_post = t0.elapsed();
-
-        eprintln!(
-            "  p{}: {}ms (render={}, chars={}, layout={}, formulas={}x{}, tables={}x{}, post={})",
-            page_idx + 1,
-            t_post.as_millis(),
-            t_render.as_millis(),
-            (t_chars - t_render).as_millis(),
-            (t_layout - t_chars).as_millis(),
-            formula_entries.len(),
-            (t_formulas - t_layout).as_millis(),
-            table_entries.len(),
-            (t_tables - t_formulas).as_millis(),
-            (t_post - t_tables).as_millis(),
-        );
 
         let result_page = Page {
             page: page_idx + 1,

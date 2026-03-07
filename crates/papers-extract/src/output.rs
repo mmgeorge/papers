@@ -222,6 +222,18 @@ fn bold_caption_label(text: &str) -> String {
 }
 
 /// Convert a single region to its Markdown representation.
+/// Strip `$$` or `$` delimiters the model may have included in its output.
+fn strip_dollar_delimiters(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(inner) = s.strip_prefix("$$") {
+        inner.strip_suffix("$$").unwrap_or(inner).trim()
+    } else if let Some(inner) = s.strip_prefix('$') {
+        inner.strip_suffix('$').unwrap_or(inner).trim()
+    } else {
+        s
+    }
+}
+
 fn region_to_markdown(region: &Region) -> String {
     match region.kind {
         RegionKind::Title => {
@@ -263,7 +275,8 @@ fn region_to_markdown(region: &Region) -> String {
         }
         RegionKind::DisplayFormula => {
             if let Some(ref latex) = region.latex {
-                format!("$${latex}$$")
+                let s = strip_dollar_delimiters(latex);
+                format!("$${s}$$")
             } else {
                 String::new()
             }
@@ -271,7 +284,8 @@ fn region_to_markdown(region: &Region) -> String {
         RegionKind::InlineFormula => {
             // Orphan inline formula (not consumed by a text region)
             if let Some(ref latex) = region.latex {
-                format!("${latex}$")
+                let s = strip_dollar_delimiters(latex);
+                format!("${s}$")
             } else {
                 String::new()
             }
@@ -703,6 +717,20 @@ mod tests {
         let mut r = make_region(RegionKind::DisplayFormula);
         r.latex = Some("E = mc^2".into());
         assert_eq!(region_to_markdown(&r), "$$E = mc^2$$");
+    }
+
+    #[test]
+    fn test_formula_strips_double_dollar() {
+        let mut r = make_region(RegionKind::DisplayFormula);
+        r.latex = Some("$$\nx^2 + y^2\n$$".into());
+        assert_eq!(region_to_markdown(&r), "$$x^2 + y^2$$");
+    }
+
+    #[test]
+    fn test_formula_strips_single_dollar() {
+        let mut r = make_region(RegionKind::InlineFormula);
+        r.latex = Some("$x$".into());
+        assert_eq!(region_to_markdown(&r), "$x$");
     }
 
     #[test]

@@ -395,7 +395,7 @@ pub fn init_ort_runtime() -> Result<(), ExtractError> {
 
             match path {
                 Some(path) => {
-                    eprintln!("Loading ORT runtime from: {path}");
+                    tracing::info!("Loading ORT runtime from: {path}");
                     match ort::init_from(&path) {
                         Ok(b) => {
                             b.commit();

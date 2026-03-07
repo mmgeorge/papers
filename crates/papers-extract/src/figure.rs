@@ -1,6 +1,65 @@
+//! Figure, caption, and grouping logic for PDF document extraction.
+//!
+//! ## Processing pipeline (called from `pipeline.rs`)
+//!
+//! 1. [`suppress_contained_visuals`] — remove redundant overlapping detections.
+//! 2. [`associate_captions`] — match caption regions to their parent figures.
+//! 3. [`group_figure_regions`] — cluster nearby visuals into `FigureGroup`s.
+//!
+//! ## Key design decisions
+//!
+//! - **Horizontal alignment** guards prevent cross-column caption stealing
+//!   in multi-column layouts.
+//! - **Main-prefix priority** (`"Fig"` / `"Table"`) ensures the primary caption
+//!   wins over closer sub-labels like `"(a) Detail"`.
+//! - **Sub-label backfill** re-assigns orphaned sub-labels to items that lost
+//!   their caption during group promotion.
+
 use image::DynamicImage;
 
 use crate::types::{Region, RegionKind};
+
+// ── Shared helpers ──────────────────────────────────────────────────
+
+/// Returns `true` if `text` starts with "fig" or "table" (case-insensitive),
+/// indicating a main figure/table caption rather than a sub-label like "(a)".
+fn has_main_prefix(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.starts_with("fig") || lower.starts_with("table")
+}
+
+/// Returns `true` if the region's caption text has a main figure/table prefix.
+fn region_has_main_caption(r: &Region) -> bool {
+    r.caption
+        .as_ref()
+        .and_then(|c| c.text.as_deref())
+        .map(|t| has_main_prefix(t))
+        .unwrap_or(false)
+}
+
+/// Returns `true` if `cap_center_x` falls within `[bbox[0], bbox[2]]`.
+///
+/// Used to prevent cross-column caption association in multi-column layouts.
+fn is_horizontally_aligned(cap_bbox: [f32; 4], parent_bbox: [f32; 4]) -> bool {
+    let cap_center_x = (cap_bbox[0] + cap_bbox[2]) / 2.0;
+    cap_center_x >= parent_bbox[0] && cap_center_x <= parent_bbox[2]
+}
+
+/// Compute the median height across all regions, used as a base distance
+/// threshold for caption association and orphan absorption.
+fn median_region_height(regions: &[Region]) -> f32 {
+    if regions.is_empty() {
+        return 20.0;
+    }
+    let mut heights: Vec<f32> = regions
+        .iter()
+        .map(|r| (r.bbox[3] - r.bbox[1]).abs())
+        .collect();
+    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    heights[heights.len() / 2]
+}
+
+// ── Public API ──────────────────────────────────────────────────────
 
 /// Crop a region from the rendered page image.
 ///
@@ -36,25 +95,28 @@ pub fn crop_region(
 
 /// Associate caption regions with their parent figure/table/chart regions.
 ///
-/// For each Image/Chart/Table region, finds the nearest caption region
-/// (FigureTitle/TableTitle/ChartTitle/FigureTableTitle) within
-/// `2 × median_region_height` distance. Prefers captions below the figure.
+/// For each non-consumed Image/Chart/Table region, finds the best matching
+/// caption (FigureTitle/TableTitle/ChartTitle/FigureTableTitle) using a
+/// multi-criteria scoring system:
 ///
-/// Sets the `caption` field on the parent region with the caption text,
-/// and also sets the `text` field on caption regions.
+/// 1. **Kind compatibility** — caption kind must match parent kind, with a
+///    text-based override (e.g. a FigureTitle whose text starts with "Table"
+///    can match a Table parent).
+/// 2. **Horizontal alignment** — the caption's horizontal center must fall
+///    within the parent's x-range, preventing cross-column mis-association.
+/// 3. **Distance threshold** — base threshold is `2 × median_region_height`.
+///    Main captions ("Fig"/"Table" prefix) get `2×` the base threshold to
+///    account for sub-labels between the figure and its main caption.
+/// 4. **Scoring priority** — main-prefix caption > below parent > closer distance.
+///
+/// Must be called **before** [`group_figure_regions`] so individual items
+/// have captions attached before grouping and promotion.
 pub fn associate_captions(regions: &mut [Region]) {
     if regions.is_empty() {
         return;
     }
 
-    // Compute median region height for distance threshold
-    let mut heights: Vec<f32> = regions
-        .iter()
-        .map(|r| (r.bbox[3] - r.bbox[1]).abs())
-        .collect();
-    heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_height = heights[heights.len() / 2];
-    let max_distance = median_height * 2.0;
+    let max_distance = median_region_height(regions) * 2.0;
 
     // Collect caption indices and their data
     let caption_data: Vec<(usize, [f32; 4], Option<String>)> = regions
@@ -134,8 +196,19 @@ pub fn associate_captions(regions: &mut [Region]) {
                 continue;
             }
 
+            if !is_horizontally_aligned(cap_bbox, parent_bbox) {
+                continue;
+            }
+
+            let has_main = has_main_prefix(&cap_text_lower);
+            let effective_max = if has_main {
+                max_distance * 2.0
+            } else {
+                max_distance
+            };
+
             let distance = edge_distance(parent_bbox, cap_bbox);
-            if distance > max_distance {
+            if distance > effective_max {
                 continue;
             }
 
@@ -146,9 +219,20 @@ pub fn associate_captions(regions: &mut [Region]) {
 
             let is_better = match best_caption {
                 None => true,
-                Some((_, best_dist, best_below)) => {
-                    // Prefer below, then closer distance
-                    if is_below && !best_below {
+                Some((best_cap_idx, best_dist, best_below)) => {
+                    let best_text_lower = caption_data[best_cap_idx]
+                        .2
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase();
+                    let best_has_main = has_main_prefix(&best_text_lower);
+
+                    // Prefer main-caption prefix, then below, then closer distance
+                    if has_main && !best_has_main {
+                        true
+                    } else if !has_main && best_has_main {
+                        false
+                    } else if is_below && !best_below {
                         true
                     } else if !is_below && best_below {
                         false
@@ -281,14 +365,22 @@ const FIGURE_GROUP_MAX_GAP: f32 = 30.0;
 
 /// Group spatially close visual regions into `FigureGroup` containers.
 ///
-/// Uses connected-component clustering: two groupable regions are connected
-/// if their edge-to-edge distance is less than [`FIGURE_GROUP_MAX_GAP`].
-/// Each component with 2+ members becomes a FigureGroup.
+/// Uses Union-Find connected-component clustering: two groupable regions
+/// (Image, Chart, Table, Seal) are connected if their edge-to-edge distance
+/// is less than [`FIGURE_GROUP_MAX_GAP`] (30 PDF points). Two regions that
+/// **both** carry a main "Fig"/"Table" caption are never merged (they are
+/// distinct figures). A safety net also discards any component where
+/// transitive chaining produced multiple main-captioned members.
 ///
-/// Should be called **after** `associate_captions` so that individual items
-/// already have their captions attached. The function then promotes a
-/// suitable caption (starting with "Fig" or "Table") to the group level
-/// and absorbs nearby orphaned captions.
+/// For each component with 2+ members:
+/// 1. **Caption promotion** — move the main caption from an item to the group.
+/// 2. **Sub-label backfill** — the promoted item gets the nearest unconsumed
+///    sub-label (e.g. "(b) Accelerated") so it keeps a descriptive label.
+/// 3. **Fallback promotion** — if no main caption, promote a sole item caption.
+/// 4. **Orphaned caption absorption** — adopt a nearby unconsumed main caption.
+///
+/// Must be called **after** [`associate_captions`] so items already have
+/// their captions attached.
 pub fn group_figure_regions(regions: &mut Vec<Region>) {
     // Collect indices of non-consumed groupable regions
     let groupable: Vec<usize> = regions
@@ -321,17 +413,22 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
         }
     }
 
-    // Build adjacency via pairwise distance
+    // Build adjacency via pairwise distance, but never merge two regions
+    // that each have their own main caption (they are distinct figures).
     for i in 0..n {
         for j in (i + 1)..n {
             let dist = edge_distance(regions[groupable[i]].bbox, regions[groupable[j]].bbox);
             if dist < FIGURE_GROUP_MAX_GAP {
-                union(&mut parent, i, j);
+                let both_main = region_has_main_caption(&regions[groupable[i]])
+                    && region_has_main_caption(&regions[groupable[j]]);
+                if !both_main {
+                    union(&mut parent, i, j);
+                }
             }
         }
     }
 
-    // Collect components
+    // Collect connected components
     let mut components: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
     for i in 0..n {
@@ -339,20 +436,18 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
         components.entry(root).or_default().push(groupable[i]);
     }
 
-    // Compute median height for orphaned caption absorption threshold
-    let median_height = {
-        let mut heights: Vec<f32> = regions
+    // Safety net: discard any component where multiple members carry
+    // distinct main captions — they are separate figures that got
+    // chained through an intermediate uncaptioned region.
+    components.retain(|_, members| {
+        let captioned_count = members
             .iter()
-            .map(|r| (r.bbox[3] - r.bbox[1]).abs())
-            .collect();
-        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        if heights.is_empty() {
-            20.0
-        } else {
-            heights[heights.len() / 2]
-        }
-    };
-    let caption_max_dist = median_height * 2.0;
+            .filter(|&&i| region_has_main_caption(&regions[i]))
+            .count();
+        captioned_count <= 1
+    });
+
+    let caption_max_dist = median_region_height(regions) * 2.0;
 
     let mut new_groups: Vec<Region> = Vec::new();
 
@@ -380,23 +475,46 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
             min_order = min_order.min(item.order);
         }
 
-        // Caption promotion: find an item whose caption starts with "Fig" or "Table"
+        // ── Caption promotion ──
+        // Move the main "Fig"/"Table" caption from an individual item up to
+        // the group level. After promotion, try to backfill the item with a
+        // nearby unconsumed sub-label (e.g. "(b) Accelerated").
         let mut group_caption: Option<Box<Region>> = None;
-
-        // First pass: look for an item whose caption starts with a main label
-        let promoted_idx = items.iter().position(|item| {
-            item.caption
-                .as_ref()
-                .and_then(|c| c.text.as_deref())
-                .map(|t| {
-                    let lower = t.to_lowercase();
-                    lower.starts_with("fig") || lower.starts_with("table")
-                })
-                .unwrap_or(false)
-        });
+        let promoted_idx = items.iter().position(|item| region_has_main_caption(item));
 
         if let Some(idx) = promoted_idx {
             group_caption = items[idx].caption.take();
+
+            // Sub-label backfill: find the closest unconsumed sub-label that
+            // is horizontally aligned with the promoted item.
+            let item_bbox = items[idx].bbox;
+            let mut best_sublabel: Option<(usize, f32)> = None;
+            for (ri, r) in regions.iter().enumerate() {
+                if r.consumed || !r.kind.is_caption() {
+                    continue;
+                }
+                if member_indices.contains(&ri) {
+                    continue;
+                }
+                let text = r.text.as_deref().unwrap_or("");
+                if has_main_prefix(text) {
+                    continue;
+                }
+                if !is_horizontally_aligned(r.bbox, item_bbox) {
+                    continue;
+                }
+                let dist = edge_distance(item_bbox, r.bbox);
+                if dist > caption_max_dist {
+                    continue;
+                }
+                if best_sublabel.map_or(true, |(_, d)| dist < d) {
+                    best_sublabel = Some((ri, dist));
+                }
+            }
+            if let Some((sub_idx, _)) = best_sublabel {
+                items[idx].caption = Some(Box::new(regions[sub_idx].clone()));
+                regions[sub_idx].consumed = true;
+            }
         } else {
             // Fallback: if exactly 1 item has a caption, promote it
             let with_caption: Vec<usize> = items
@@ -410,23 +528,21 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
             }
         }
 
-        // Orphaned caption absorption: scan nearby non-consumed caption regions
+        // ── Orphaned caption absorption ──
+        // If no item had a promotable caption, look for a nearby unconsumed
+        // main caption (must start with "Fig"/"Table") to adopt.
         if group_caption.is_none() {
             let mut best_orphan: Option<(usize, f32)> = None;
             for (ri, r) in regions.iter().enumerate() {
-                if r.consumed || !r.kind.is_caption() {
+                if r.consumed || !r.kind.is_caption() || member_indices.contains(&ri) {
                     continue;
                 }
-                // Skip captions that are members of the group
-                if member_indices.contains(&ri) {
+                let text = r.text.as_deref().unwrap_or("");
+                if !has_main_prefix(text) {
                     continue;
                 }
                 let dist = edge_distance(union_bbox, r.bbox);
                 if dist > caption_max_dist {
-                    continue;
-                }
-                let text_lower = r.text.as_deref().unwrap_or("").to_lowercase();
-                if !text_lower.starts_with("fig") && !text_lower.starts_with("table") {
                     continue;
                 }
                 if best_orphan.map_or(true, |(_, d)| dist < d) {
@@ -496,6 +612,8 @@ mod tests {
     fn caption_text(region: &Region) -> Option<&str> {
         region.caption.as_ref().and_then(|c| c.text.as_deref())
     }
+
+    // ── Caption association tests ───────────────────────────────────
 
     #[test]
     fn test_caption_below_figure() {
@@ -578,6 +696,35 @@ mod tests {
         assert_eq!(caption_text(&regions[1]), Some("Figure 2"));
         assert!(regions[2].consumed);
         assert!(regions[3].consumed);
+    }
+
+    #[test]
+    fn test_fig_caption_preferred_over_sublabel() {
+        // Image with a sub-label close below and a "Fig" caption further below.
+        // The "Fig" caption should win despite being farther away.
+        let mut regions = vec![
+            make_region(RegionKind::Image, [49.0, 79.0, 295.0, 158.0], None),
+            make_region(
+                RegionKind::FigureTitle,
+                [55.0, 163.0, 142.0, 184.0],
+                Some("(a) Previous (b) Inertia position"),
+            ),
+            make_region(
+                RegionKind::FigureTitle,
+                [48.0, 188.0, 296.0, 278.0],
+                Some("Fig. 5. Different initialization options for a swinging elastic pendulum"),
+            ),
+        ];
+        associate_captions(&mut regions);
+        assert_eq!(
+            caption_text(&regions[0]),
+            Some("Fig. 5. Different initialization options for a swinging elastic pendulum"),
+            "Fig-prefixed caption should be preferred over sub-label"
+        );
+        // Sub-label should remain unconsumed
+        assert!(!regions[1].consumed);
+        // Fig caption should be consumed
+        assert!(regions[2].consumed);
     }
 
     #[test]
@@ -763,7 +910,33 @@ mod tests {
 
     #[test]
     fn test_caption_promotion() {
-        // Two images, one with "Fig. 5" caption → promoted to group level
+        // Two images, one with "Fig. 5" caption, other uncaptioned → promoted to group level
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 150.0, 170.0], Some("Fig. 5. Results"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        // Group caption should be the "Fig. 5" one
+        let cap_text = group.caption.as_ref().unwrap().text.as_deref().unwrap();
+        assert!(cap_text.starts_with("Fig. 5"));
+        // The item that had "Fig. 5" should have its caption removed
+        let items = group.items.as_ref().unwrap();
+        let fig5_item = items.iter().find(|i| i.id == "p1_0").unwrap();
+        assert!(fig5_item.caption.is_none());
+    }
+
+    #[test]
+    fn test_fig_caption_and_sublabel_grouped() {
+        // Image with "Fig. 5" caption + image with "(a) Detail" sub-label → GROUPED
+        // (sub-labels indicate sub-panels of the same figure)
         let mut regions = vec![
             {
                 let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
@@ -782,17 +955,14 @@ mod tests {
         ];
         group_figure_regions(&mut regions);
 
-        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
-        // Group caption should be the "Fig. 5" one
-        let cap_text = group.caption.as_ref().unwrap().text.as_deref().unwrap();
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1, "Fig caption + sub-label should be grouped as multi-panel figure");
+        // "Fig. 5" caption should be promoted to group level
+        let cap_text = groups[0].caption.as_ref().unwrap().text.as_deref().unwrap();
         assert!(cap_text.starts_with("Fig. 5"));
-        // The item that had "Fig. 5" should have its caption removed
-        let items = group.items.as_ref().unwrap();
-        let fig5_item = items.iter().find(|i| i.id == "p1_0").unwrap();
-        assert!(fig5_item.caption.is_none());
-        // The "(a) Detail" sub-label should still be on its item
-        let detail_item = items.iter().find(|i| i.id == "p1_1").unwrap();
-        assert!(detail_item.caption.is_some());
     }
 
     #[test]
@@ -1005,6 +1175,116 @@ mod tests {
             .collect();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].items.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_adjacent_images_with_separate_captions_not_grouped() {
+        // Two images side by side, each with its own "Fig" caption — must remain separate
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p2_2", RegionKind::Image, [54.0, 78.0, 290.0, 127.0], 2);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [49.0, 133.0, 296.0, 167.0],
+                    Some("Fig. 2. Twisting two beams together"),
+                );
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            {
+                let mut r = make_groupable("p2_9", RegionKind::Image, [317.0, 82.0, 560.0, 182.0], 9);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [314.0, 187.0, 562.0, 264.0],
+                    Some("Fig. 3. Stress tests that begin simulations"),
+                );
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 0, "images with separate Fig captions must not be grouped");
+    }
+
+    #[test]
+    fn test_cross_column_figures_with_fig_captions_not_grouped() {
+        // Two images in separate columns, each with its own "Fig" caption
+        // (mirrors p6 vbd.pdf after correct caption association)
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p6_2", RegionKind::Image, [49.6, 79.0, 295.2, 158.4], 2);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [48.7, 188.3, 296.0, 277.8],
+                    Some("Fig. 5. Different initialization options"),
+                );
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            {
+                let mut r = make_groupable("p6_21", RegionKind::Image, [315.7, 76.2, 560.4, 157.1], 21);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [314.7, 163.3, 562.6, 208.6],
+                    Some("Fig. 6. The ratio of gravity used with adaptive initialization"),
+                );
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 0, "Fig-captioned image + sub-label image must not be grouped");
+    }
+
+    #[test]
+    fn test_transitive_chain_with_separate_captions_not_grouped() {
+        // A(captioned) - B(no caption) - C(captioned): should NOT group via transitive chain
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [0.0, 50.0, 100.0, 150.0], 0);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [0.0, 155.0, 100.0, 175.0],
+                    Some("Fig. 1. First figure"),
+                );
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [125.0, 50.0, 225.0, 150.0], 1),
+            {
+                let mut r = make_groupable("p1_2", RegionKind::Image, [250.0, 50.0, 350.0, 150.0], 2);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [250.0, 155.0, 350.0, 175.0],
+                    Some("Fig. 2. Second figure"),
+                );
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 0, "transitive chain with separate Fig captions must not be grouped");
     }
 
     #[test]
@@ -1235,6 +1515,8 @@ mod tests {
         assert_eq!(groups.len(), 1);
     }
 
+    // ── Caption kind/text crosscheck tests ────────────────────────────
+
     #[test]
     fn test_caption_text_crosscheck_table_on_image() {
         // FigureTitle with "Table 1..." text should NOT match an Image
@@ -1315,5 +1597,263 @@ mod tests {
         let items = group.items.as_ref().unwrap();
         assert!(items[0].image_path.is_some());
         assert!(items[1].image_path.is_some());
+    }
+
+    // ── Sub-label backfill tests ────────────────────────────────────
+
+    #[test]
+    fn test_backfill_sublabel_after_promotion() {
+        // 3-panel figure: item 0 has "Fig. 7" caption, items 1 and 2 have sub-labels.
+        // After promotion, item 0 should be backfilled with the nearest
+        // unconsumed sub-label "(a) Not accelerated".
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p7_0", RegionKind::Image, [50.0, 50.0, 200.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 200.0, 175.0], Some("Fig. 7. Comparison"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            {
+                let mut r = make_groupable("p7_1", RegionKind::Image, [210.0, 50.0, 360.0, 150.0], 1);
+                let mut cap = make_region(RegionKind::FigureTitle, [210.0, 155.0, 360.0, 175.0], Some("(b) Accelerated"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p7_2", RegionKind::Image, [370.0, 50.0, 520.0, 150.0], 2),
+            // Unconsumed sub-label near item 0
+            make_region(RegionKind::FigureTitle, [50.0, 155.0, 200.0, 175.0], Some("(a) Not accelerated")),
+        ];
+        regions[3].order = 3;
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        // Group gets "Fig. 7" caption
+        assert!(group.caption.as_ref().unwrap().text.as_deref().unwrap().starts_with("Fig. 7"));
+        // Item 0 should now have the backfilled sub-label
+        let items = group.items.as_ref().unwrap();
+        let item0 = items.iter().find(|i| i.id == "p7_0").unwrap();
+        assert_eq!(caption_text(item0), Some("(a) Not accelerated"));
+        // Item 1 keeps its original sub-label
+        let item1 = items.iter().find(|i| i.id == "p7_1").unwrap();
+        assert_eq!(caption_text(item1), Some("(b) Accelerated"));
+        // The backfilled sub-label region should be consumed
+        assert!(regions.iter().any(|r| r.text.as_deref() == Some("(a) Not accelerated") && r.consumed));
+    }
+
+    #[test]
+    fn test_backfill_no_sublabel_available() {
+        // 2-panel figure: item 0 has "Fig. 5" caption, item 1 uncaptioned.
+        // No unconsumed sub-labels exist — item 0 should remain captionless
+        // after promotion.
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 150.0, 170.0], Some("Fig. 5. Results"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        let items = group.items.as_ref().unwrap();
+        let item0 = items.iter().find(|i| i.id == "p1_0").unwrap();
+        assert!(item0.caption.is_none(), "no sub-label available to backfill");
+    }
+
+    #[test]
+    fn test_backfill_rejects_cross_column_sublabel() {
+        // Item 0 (left column) has "Fig. 5" promoted. A sub-label exists
+        // but in the right column — should NOT be backfilled.
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 200.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 200.0, 175.0], Some("Fig. 5. Results"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [210.0, 50.0, 360.0, 150.0], 1),
+            // Sub-label in the right column (center-x = 450, outside item 0's x-range [50..200])
+            make_region(RegionKind::FigureTitle, [400.0, 155.0, 500.0, 175.0], Some("(a) Detail")),
+        ];
+        regions[2].order = 2;
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        let items = group.items.as_ref().unwrap();
+        let item0 = items.iter().find(|i| i.id == "p1_0").unwrap();
+        assert!(item0.caption.is_none(), "cross-column sub-label should not be backfilled");
+    }
+
+    #[test]
+    fn test_backfill_skips_main_caption() {
+        // Item 0 has "Fig. 5" promoted. A nearby "Fig. 8" exists —
+        // it should NOT be used as a backfill since it's a main caption.
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 200.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 200.0, 175.0], Some("Fig. 5. Results"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [210.0, 50.0, 360.0, 150.0], 1),
+            // Nearby unconsumed caption with main prefix
+            make_region(RegionKind::FigureTitle, [50.0, 180.0, 200.0, 200.0], Some("Fig. 8. Another figure")),
+        ];
+        regions[2].order = 2;
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        let items = group.items.as_ref().unwrap();
+        let item0 = items.iter().find(|i| i.id == "p1_0").unwrap();
+        assert!(item0.caption.is_none(), "main-prefix caption should not be used for backfill");
+    }
+
+    #[test]
+    fn test_backfill_too_far_sublabel_rejected() {
+        // Item 0 has "Fig. 5" promoted. A sub-label exists but is too far away.
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 200.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 200.0, 175.0], Some("Fig. 5. Results"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [210.0, 50.0, 360.0, 150.0], 1),
+            // Sub-label very far below
+            make_region(RegionKind::FigureTitle, [50.0, 700.0, 200.0, 720.0], Some("(a) Far away")),
+        ];
+        regions[2].order = 2;
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        let items = group.items.as_ref().unwrap();
+        let item0 = items.iter().find(|i| i.id == "p1_0").unwrap();
+        assert!(item0.caption.is_none(), "distant sub-label should not be backfilled");
+    }
+
+    #[test]
+    fn test_backfill_picks_closest_sublabel() {
+        // Two sub-labels near item 0 — the closer one should be chosen.
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 200.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 200.0, 175.0], Some("Fig. 7. Comparison"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [210.0, 50.0, 360.0, 150.0], 1),
+            // Closer sub-label (5pt below item 0)
+            make_region(RegionKind::FigureTitle, [50.0, 155.0, 200.0, 170.0], Some("(a) Closer")),
+            // Farther sub-label (30pt below item 0)
+            make_region(RegionKind::FigureTitle, [50.0, 180.0, 200.0, 195.0], Some("(c) Farther")),
+        ];
+        regions[2].order = 2;
+        regions[3].order = 3;
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        let items = group.items.as_ref().unwrap();
+        let item0 = items.iter().find(|i| i.id == "p1_0").unwrap();
+        assert_eq!(caption_text(item0), Some("(a) Closer"));
+    }
+
+    // ── Horizontal alignment tests ──────────────────────────────────
+
+    #[test]
+    fn test_cross_column_caption_rejected() {
+        // Image in left column, caption in right column — should not match.
+        // Image x-range: [50, 280], caption center-x: (320+550)/2 = 435
+        let mut regions = vec![
+            make_region(RegionKind::Image, [50.0, 100.0, 280.0, 300.0], None),
+            make_region(
+                RegionKind::FigureTitle,
+                [320.0, 310.0, 550.0, 330.0],
+                Some("Fig. 1. Cross-column caption"),
+            ),
+        ];
+        associate_captions(&mut regions);
+        assert!(regions[0].caption.is_none(), "cross-column caption should not be associated");
+        assert!(!regions[1].consumed);
+    }
+
+    #[test]
+    fn test_aligned_caption_accepted() {
+        // Image and caption in same column — should match.
+        // Image x-range: [50, 280], caption center-x: (60+270)/2 = 165
+        let mut regions = vec![
+            make_region(RegionKind::Image, [50.0, 100.0, 280.0, 300.0], None),
+            make_region(
+                RegionKind::FigureTitle,
+                [60.0, 310.0, 270.0, 330.0],
+                Some("Fig. 2. Aligned caption"),
+            ),
+        ];
+        associate_captions(&mut regions);
+        assert_eq!(caption_text(&regions[0]), Some("Fig. 2. Aligned caption"));
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn test_two_column_correct_association() {
+        // Two figures in different columns, each with its own caption.
+        // Captions should match their respective column figure.
+        let mut regions = vec![
+            // Left column figure
+            make_region(RegionKind::Image, [50.0, 100.0, 280.0, 300.0], None),
+            // Right column figure
+            make_region(RegionKind::Image, [320.0, 100.0, 550.0, 300.0], None),
+            // Left column caption
+            make_region(
+                RegionKind::FigureTitle,
+                [50.0, 310.0, 280.0, 330.0],
+                Some("Fig. 1. Left figure"),
+            ),
+            // Right column caption
+            make_region(
+                RegionKind::FigureTitle,
+                [320.0, 310.0, 550.0, 330.0],
+                Some("Fig. 2. Right figure"),
+            ),
+        ];
+        associate_captions(&mut regions);
+        assert_eq!(caption_text(&regions[0]), Some("Fig. 1. Left figure"));
+        assert_eq!(caption_text(&regions[1]), Some("Fig. 2. Right figure"));
+    }
+
+    #[test]
+    fn test_extended_distance_for_main_caption() {
+        // Three regions of height 100pt each → median height = 100pt →
+        // max_distance = 200pt. Main captions get 2× = 400pt threshold.
+        // Sub-label at 210pt is beyond base 200pt and should NOT match.
+        // Main "Fig" caption at 250pt is beyond base 200pt but within 2× = 400pt.
+        let mut regions = vec![
+            make_region(RegionKind::Image, [50.0, 100.0, 250.0, 200.0], None),  // height=100
+            // Sub-label at 210pt (edge distance = 410 - 200 = 210 > 200)
+            make_region(
+                RegionKind::FigureTitle,
+                [50.0, 410.0, 250.0, 510.0],    // height=100
+                Some("(a) A sub-label"),
+            ),
+            // Main "Fig" caption at 250pt (edge distance = 450 - 200 = 250, within 400)
+            make_region(
+                RegionKind::FigureTitle,
+                [50.0, 450.0, 250.0, 550.0],    // height=100
+                Some("Fig. 3. Extended distance"),
+            ),
+        ];
+        associate_captions(&mut regions);
+        // "Fig" caption should match: it's within 2× threshold and gets main prefix priority
+        assert_eq!(caption_text(&regions[0]), Some("Fig. 3. Extended distance"));
+        // Sub-label beyond base threshold should not be consumed
+        assert!(!regions[1].consumed);
     }
 }
