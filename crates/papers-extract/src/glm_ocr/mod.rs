@@ -535,17 +535,37 @@ impl GlmOcrPredictor {
 
     /// Predict LaTeX for a batch of cropped formula images.
     pub fn predict(&self, images: &[DynamicImage]) -> Result<Vec<String>, ExtractError> {
-        images.iter().map(|img| self.predict_one(img)).collect()
+        let mut results = Vec::with_capacity(images.len());
+        for (i, img) in images.iter().enumerate() {
+            let t = std::time::Instant::now();
+            let latex = self.predict_one(img)?;
+            eprintln!(
+                "    formula {}/{}: {}ms, {}×{}, {} tokens → {}",
+                i + 1,
+                images.len(),
+                t.elapsed().as_millis(),
+                img.width(),
+                img.height(),
+                latex.len(),
+                if latex.len() > 60 { &latex[..60] } else { &latex },
+            );
+            results.push(latex);
+        }
+        Ok(results)
     }
 
     /// Predict LaTeX for a single formula image.
     fn predict_one(&self, image: &DynamicImage) -> Result<String, ExtractError> {
+        let t0 = std::time::Instant::now();
+
         // 1. Preprocess image → RGB normalized
         let (pixel_values, grid_thw) = preprocess_image(image);
+        let t_pre = t0.elapsed();
 
         // 2. Vision encoder
         let vision_embeds =
             run_vision_encoder(&self.vision_encoder, &pixel_values, &grid_thw, self.use_bf16)?;
+        let t_vision = t0.elapsed();
 
         // 3. Build input_ids for the full prompt
         let num_vision_tokens = {
@@ -580,6 +600,7 @@ impl GlmOcrPredictor {
 
         // 6. Build 3D M-RoPE position IDs
         let position_ids = build_position_ids(&input_ids, &grid_thw);
+        let t_embed = t0.elapsed();
 
         // 7. Prefill + decode (backend-specific)
         let token_ids = match &self.backend {
@@ -601,11 +622,12 @@ impl GlmOcrPredictor {
                     *num_kv_heads,
                     *head_dim,
                 )?;
+                let t_prefill = t0.elapsed();
 
                 let mut state = decoder
                     .lock()
                     .map_err(|e| ExtractError::Formula(format!("decoder lock: {e}")))?;
-                cuda::decode_loop(
+                let ids = cuda::decode_loop(
                     &mut state,
                     first_token,
                     &kv_cache,
@@ -613,7 +635,19 @@ impl GlmOcrPredictor {
                     *num_kv_heads,
                     *max_seq,
                     *head_dim,
-                )?
+                )?;
+
+                eprintln!(
+                    "      stages: pre={}ms, vision={}ms, embed={}ms, prefill={}ms, decode={}ms ({} steps, seq={})",
+                    t_pre.as_millis(),
+                    (t_vision - t_pre).as_millis(),
+                    (t_embed - t_vision).as_millis(),
+                    (t_prefill - t_embed).as_millis(),
+                    (t0.elapsed() - t_prefill).as_millis(),
+                    ids.len(),
+                    seq_len,
+                );
+                ids
             }
             ActiveBackend::Other {
                 num_layers,
@@ -630,8 +664,9 @@ impl GlmOcrPredictor {
                     *num_kv_heads,
                     *head_dim,
                 )?;
+                let t_prefill = t0.elapsed();
 
-                other::decode_loop(
+                let ids = other::decode_loop(
                     &self.llm,
                     &self.embedding,
                     first_token,
@@ -641,7 +676,19 @@ impl GlmOcrPredictor {
                     *num_kv_heads,
                     *head_dim,
                     *max_seq,
-                )?
+                )?;
+
+                eprintln!(
+                    "      stages: pre={}ms, vision={}ms, embed={}ms, prefill={}ms, decode={}ms ({} steps, seq={})",
+                    t_pre.as_millis(),
+                    (t_vision - t_pre).as_millis(),
+                    (t_embed - t_vision).as_millis(),
+                    (t_prefill - t_embed).as_millis(),
+                    (t0.elapsed() - t_prefill).as_millis(),
+                    ids.len(),
+                    seq_len,
+                );
+                ids
             }
         };
 

@@ -92,13 +92,22 @@ struct PipelineOptions {
 impl Pipeline {
     /// Create a new pipeline, loading models and pdfium.
     pub fn new(options: &ExtractOptions) -> Result<Self, ExtractError> {
+        let t0 = Instant::now();
+
         models::init_ort_runtime()?;
+        let t_ort = t0.elapsed();
+
         let pdfium = pdf::load_pdfium(options.pdfium_path.as_deref())?;
+        let t_pdfium = t0.elapsed();
 
         let paths = models::ensure_models(options.table, options.model_cache_dir.as_deref())?;
+        let t_paths = t0.elapsed();
+
         let layout = models::build_layout_detector(&paths.layout)?;
+        let t_layout = t0.elapsed();
 
         let formula = models::build_glm_ocr_predictor(&paths.glm_ocr)?;
+        let t_formula = t0.elapsed();
 
         let table = match options.table {
             TableModel::GlmOcr => {
@@ -116,6 +125,18 @@ impl Pipeline {
                 TableEngine::TableFormer(models::build_tableformer_predictor(tf_paths)?)
             }
         };
+        let t_table = t0.elapsed();
+
+        eprintln!(
+            "Models loaded in {}ms (ort={}, pdfium={}, resolve={}, layout={}, formula={}, table={})",
+            t_table.as_millis(),
+            t_ort.as_millis(),
+            (t_pdfium - t_ort).as_millis(),
+            (t_paths - t_pdfium).as_millis(),
+            (t_layout - t_paths).as_millis(),
+            (t_formula - t_layout).as_millis(),
+            (t_table - t_formula).as_millis(),
+        );
 
         Ok(Self {
             pdfium,
@@ -195,7 +216,10 @@ impl Pipeline {
             pages,
         };
 
+        let t_pages = start.elapsed();
+
         // Write output files
+        let t_out = Instant::now();
         std::fs::create_dir_all(output_dir)?;
         let json_path = output_dir.join(format!("{stem}.json"));
         let md_path = output_dir.join(format!("{stem}.md"));
@@ -223,6 +247,12 @@ impl Pipeline {
             )?;
         }
 
+        eprintln!(
+            "Timing: pages={}ms, output={}ms",
+            t_pages.as_millis(),
+            t_out.elapsed().as_millis(),
+        );
+
         Ok(result)
     }
 
@@ -233,19 +263,23 @@ impl Pipeline {
         page_idx: u32,
         output_dir: &Path,
     ) -> Result<(Page, DynamicImage), ExtractError> {
+        let t0 = Instant::now();
         let width_pt = page.width().value;
         let height_pt = page.height().value;
 
         // Render page to image
         let page_image = pdf::render_page(page, self.options.dpi)?;
+        let t_render = t0.elapsed();
 
         // Extract characters from text layer
         let chars = pdf::extract_page_chars(page, page_idx)?;
+        let t_chars = t0.elapsed();
 
         // Run direct layout detection (correct bboxes + reading order)
         let detected = self
             .layout
             .detect(&page_image, self.options.confidence_threshold)?;
+        let t_layout = t0.elapsed();
 
         let scale = self.options.dpi as f32 / 72.0;
 
@@ -316,6 +350,7 @@ impl Pipeline {
         for (idx, latex) in char_based_latex {
             formula_latex.insert(idx, latex);
         }
+        let t_formulas = t0.elapsed();
 
         // Crop table regions and run batched recognition
         let table_entries: Vec<(usize, DynamicImage)> = detected
@@ -343,6 +378,7 @@ impl Pipeline {
             .collect();
 
         let table_results = self.table.predict(&table_entries)?;
+        let t_tables = t0.elapsed();
 
         // Write table debug overlays if layout debug is enabled
         if self.options.debug.is_enabled() {
@@ -386,6 +422,22 @@ impl Pipeline {
 
         // Attach formula numbers to their nearest display formula
         associate_formula_numbers(&mut regions);
+
+        let t_post = t0.elapsed();
+
+        eprintln!(
+            "  p{}: {}ms (render={}, chars={}, layout={}, formulas={}x{}, tables={}x{}, post={})",
+            page_idx + 1,
+            t_post.as_millis(),
+            t_render.as_millis(),
+            (t_chars - t_render).as_millis(),
+            (t_layout - t_chars).as_millis(),
+            formula_entries.len(),
+            (t_formulas - t_layout).as_millis(),
+            table_entries.len(),
+            (t_tables - t_formulas).as_millis(),
+            (t_post - t_tables).as_millis(),
+        );
 
         let result_page = Page {
             page: page_idx + 1,
