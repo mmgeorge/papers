@@ -308,11 +308,27 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
             {
                 result.push_str("\n\n"); // paragraph break
                 pending_dehyphen = false;
-            } else if has_hyphen_marker || pending_dehyphen {
-                // Dehyphenate: join directly with the next line (no separator).
-                // Propagate forward if this line has its own STX marker, in case
-                // the continuation is on a non-adjacent line.
-                pending_dehyphen = has_hyphen_marker;
+            } else if has_hyphen_marker {
+                // This line ends with a hyphen split — join directly with
+                // the next line (no separator).
+                pending_dehyphen = true;
+            } else if pending_dehyphen {
+                // Propagating dehyphenation across non-adjacent lines
+                // (e.g., when a formula sits between the two halves of a
+                // split word). Intermediate lines have very few visible
+                // text characters (1–3 formula glyphs); real text lines
+                // have many more. When we see a substantial text line,
+                // the continuation was already received on the previous
+                // join, so resume normal reflow spacing.
+                let text_char_count = line.iter().filter(|e| matches!(
+                    e, LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' '
+                )).count();
+                if text_char_count > 4 {
+                    result.push(' ');
+                    pending_dehyphen = false;
+                }
+                // else: short intermediate line (e.g., formula glyph) —
+                // keep propagating
             } else {
                 result.push(' '); // reflow: join with space
             }

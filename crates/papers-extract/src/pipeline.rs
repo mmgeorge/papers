@@ -427,6 +427,12 @@ impl Pipeline {
         // Attach formula numbers to their nearest display formula
         associate_formula_numbers(&mut regions);
 
+        // Remove structural/redundant regions from output:
+        // - FormulaNumber (already captured as tag on DisplayFormula)
+        // - PageHeader / PageFooter (structural noise)
+        // - Any region fully contained within a PageHeader bbox (e.g. duplicate Title)
+        strip_structural_regions(&mut regions);
+
         let result_page = Page {
             page: page_idx + 1,
             width_pt,
@@ -685,6 +691,50 @@ fn associate_formula_numbers(regions: &mut [Region]) {
             }
         }
     }
+}
+
+/// Returns true when `inner` bbox is fully contained within `outer` bbox
+/// (with a small tolerance for floating-point rounding).
+fn bbox_contains(outer: [f32; 4], inner: [f32; 4]) -> bool {
+    const EPS: f32 = 1.0; // 1pt tolerance
+    inner[0] >= outer[0] - EPS
+        && inner[1] >= outer[1] - EPS
+        && inner[2] <= outer[2] + EPS
+        && inner[3] <= outer[3] + EPS
+}
+
+/// Remove structural/redundant regions from the output:
+/// - `FormulaNumber` (already captured as `tag` on DisplayFormula)
+/// - `PageHeader` / `PageFooter`
+/// - Any non-header region whose bbox is fully contained within a PageHeader bbox
+///   (e.g. a duplicate Title detection that overlaps the header)
+fn strip_structural_regions(regions: &mut Vec<Region>) {
+    // Collect PageHeader bboxes before filtering.
+    let header_bboxes: Vec<[f32; 4]> = regions
+        .iter()
+        .filter(|r| r.kind == RegionKind::PageHeader)
+        .map(|r| r.bbox)
+        .collect();
+
+    regions.retain(|r| {
+        // Always drop these kinds.
+        if matches!(
+            r.kind,
+            RegionKind::FormulaNumber | RegionKind::PageHeader | RegionKind::PageFooter
+        ) {
+            return false;
+        }
+
+        // Drop any region fully contained within a PageHeader bbox.
+        if header_bboxes
+            .iter()
+            .any(|hdr| bbox_contains(*hdr, r.bbox))
+        {
+            return false;
+        }
+
+        true
+    });
 }
 
 #[cfg(test)]
