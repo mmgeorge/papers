@@ -1,10 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::ExtractError;
-use crate::formula::FormulaPredictor;
 use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
 use crate::tableformer::TableFormerPredictor;
-use crate::{FormulaModel, TableModel};
+use crate::TableModel;
 
 /// Model file metadata for download.
 struct ModelFile {
@@ -16,24 +15,6 @@ struct ModelFile {
 const LAYOUT_MODEL: ModelFile = ModelFile {
     filename: "pp-doclayoutv3.onnx",
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.6.0/pp-doclayoutv3.onnx",
-};
-
-// Formula tokenizer (required for formula recognition)
-const FORMULA_TOKENIZER: ModelFile = ModelFile {
-    filename: "unimernet_tokenizer.json",
-    url: "https://github.com/GreatV/oar-ocr/releases/download/v0.3.0/unimernet_tokenizer.json",
-};
-
-// Formula encoder (split FP16 model — expected in cache dir, no auto-download yet)
-const FORMULA_ENCODER: ModelFile = ModelFile {
-    filename: "encoder_fp16.onnx",
-    url: "", // No auto-download — must be pre-exported via export.py
-};
-
-// Formula decoder (split FP16 model with argmax — expected in cache dir)
-const FORMULA_DECODER: ModelFile = ModelFile {
-    filename: "decoder_fp16_argmax.onnx",
-    url: "", // No auto-download — must be pre-exported via export.py
 };
 
 // GLM-OCR models (manual export, no auto-download)
@@ -78,10 +59,7 @@ const TABLEFORMER_BBOX_DECODER: ModelFile = ModelFile {
 /// Resolved paths to all required model files.
 pub struct ModelPaths {
     pub layout: PathBuf,
-    pub formula_encoder: Option<PathBuf>,
-    pub formula_decoder: Option<PathBuf>,
-    pub formula_tokenizer: Option<PathBuf>,
-    pub glm_ocr: Option<GlmOcrModelPaths>,
+    pub glm_ocr: GlmOcrModelPaths,
     pub tableformer: Option<TableFormerModelPaths>,
 }
 
@@ -118,25 +96,8 @@ pub fn ensure_layout_model(cache_dir: &Path) -> Result<PathBuf, ExtractError> {
     ensure_model(cache_dir, &LAYOUT_MODEL)
 }
 
-/// Resolved paths for PP-FormulaNet models.
-pub struct FormulaModelPaths {
-    pub encoder: PathBuf,
-    pub decoder: PathBuf,
-    pub tokenizer: PathBuf,
-}
-
-/// Ensure PP-FormulaNet formula models are available.
-pub fn ensure_formula_models(cache_dir: &Path) -> Result<FormulaModelPaths, ExtractError> {
-    std::fs::create_dir_all(cache_dir)?;
-    let encoder = ensure_local_model(cache_dir, &FORMULA_ENCODER)?;
-    let decoder = ensure_local_model(cache_dir, &FORMULA_DECODER)?;
-    let tokenizer = ensure_model(cache_dir, &FORMULA_TOKENIZER)?;
-    Ok(FormulaModelPaths { encoder, decoder, tokenizer })
-}
-
-/// Ensure all models for the selected formula/table engines are downloaded.
+/// Ensure all models for the selected table engine are downloaded.
 pub fn ensure_models(
-    formula: FormulaModel,
     table: TableModel,
     cache_dir: &Path,
 ) -> Result<ModelPaths, ExtractError> {
@@ -145,17 +106,6 @@ pub fn ensure_models(
     // Layout detection is always required
     let layout = ensure_model(cache_dir, &LAYOUT_MODEL)?;
 
-    // Formula models (only for pp-formulanet)
-    let (formula_encoder, formula_decoder, formula_tokenizer) = match formula {
-        FormulaModel::PpFormulanet => {
-            let enc = ensure_local_model(cache_dir, &FORMULA_ENCODER)?;
-            let dec = ensure_local_model(cache_dir, &FORMULA_DECODER)?;
-            let tok = ensure_model(cache_dir, &FORMULA_TOKENIZER)?;
-            (Some(enc), Some(dec), Some(tok))
-        }
-        FormulaModel::GlmOcr => (None, None, None),
-    };
-
     // TableFormer models
     let tableformer = if table == TableModel::TableFormer {
         Some(ensure_tableformer_models(cache_dir)?)
@@ -163,18 +113,11 @@ pub fn ensure_models(
         None
     };
 
-    // GLM-OCR models (needed if either formula or table uses glm-ocr)
-    let glm_ocr = if formula == FormulaModel::GlmOcr || table == TableModel::GlmOcr {
-        Some(ensure_glm_ocr_models(cache_dir)?)
-    } else {
-        None
-    };
+    // GLM-OCR models (always required for formula recognition)
+    let glm_ocr = ensure_glm_ocr_models(cache_dir)?;
 
     Ok(ModelPaths {
         layout,
-        formula_encoder,
-        formula_decoder,
-        formula_tokenizer,
         glm_ocr,
         tableformer,
     })
@@ -400,16 +343,4 @@ pub fn init_ort_runtime() -> Result<(), ExtractError> {
     }
 }
 
-/// Build a custom CUDA formula predictor from split encoder/decoder models.
-pub fn build_formula_predictor(
-    paths: &ModelPaths,
-) -> Result<FormulaPredictor, ExtractError> {
-    let enc = paths.formula_encoder.as_ref()
-        .ok_or_else(|| ExtractError::Model("formula_encoder path missing".into()))?;
-    let dec = paths.formula_decoder.as_ref()
-        .ok_or_else(|| ExtractError::Model("formula_decoder path missing".into()))?;
-    let tok = paths.formula_tokenizer.as_ref()
-        .ok_or_else(|| ExtractError::Model("formula_tokenizer path missing".into()))?;
-    FormulaPredictor::new(enc, dec, tok)
-}
 

@@ -7,7 +7,6 @@ use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
 use crate::figure;
-use crate::formula::FormulaPredictor;
 use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
 use crate::layout::{DetectedRegion, LayoutDetector};
 use crate::models;
@@ -17,23 +16,9 @@ use crate::reading_order;
 use crate::tableformer::TableFormerPredictor;
 use crate::text;
 use crate::types::*;
-use crate::{ExtractOptions, FormulaModel, TableModel};
+use crate::{ExtractOptions, TableModel};
 
 // ── Engine dispatch enums ────────────────────────────────────────────
-
-enum FormulaEngine {
-    PpFormulanet(FormulaPredictor),
-    GlmOcr(GlmOcrPredictor),
-}
-
-impl FormulaEngine {
-    fn predict(&self, images: &[DynamicImage]) -> Result<Vec<String>, ExtractError> {
-        match self {
-            Self::PpFormulanet(p) => p.predict(images),
-            Self::GlmOcr(p) => p.predict(images),
-        }
-    }
-}
 
 enum TableEngine {
     GlmOcr(GlmOcrPredictor),
@@ -89,7 +74,7 @@ impl TableEngine {
 pub struct Pipeline {
     pdfium: Pdfium,
     layout: LayoutDetector,
-    formula: FormulaEngine,
+    formula: GlmOcrPredictor,
     table: TableEngine,
     options: PipelineOptions,
 }
@@ -115,30 +100,19 @@ impl Pipeline {
             .clone()
             .unwrap_or_else(models::default_cache_dir);
 
-        let paths = models::ensure_models(options.formula, options.table, &cache_dir)?;
+        let paths = models::ensure_models(options.table, &cache_dir)?;
         let layout = models::build_layout_detector(&paths.layout)?;
 
-        let formula = match options.formula {
-            FormulaModel::PpFormulanet => {
-                FormulaEngine::PpFormulanet(models::build_formula_predictor(&paths)?)
-            }
-            FormulaModel::GlmOcr => {
-                let glm_paths = paths.glm_ocr.as_ref()
-                    .ok_or_else(|| ExtractError::Model("GLM-OCR model paths missing".into()))?;
-                FormulaEngine::GlmOcr(models::build_glm_ocr_predictor(glm_paths)?)
-            }
-        };
+        let formula = models::build_glm_ocr_predictor(&paths.glm_ocr)?;
 
         let table = match options.table {
             TableModel::GlmOcr => {
-                let glm_paths = paths.glm_ocr.as_ref()
-                    .ok_or_else(|| ExtractError::Model("GLM-OCR model paths missing".into()))?;
                 let config = GlmOcrConfig {
                     prompt: "Table Recognition:".into(),
                     ..GlmOcrConfig::default()
                 };
                 TableEngine::GlmOcr(
-                    models::build_glm_ocr_predictor_with_config(glm_paths, config)?,
+                    models::build_glm_ocr_predictor_with_config(&paths.glm_ocr, config)?,
                 )
             }
             TableModel::TableFormer => {

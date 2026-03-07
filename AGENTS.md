@@ -39,10 +39,6 @@ should contain a `README.md` with findings and the raw `results.json` output.
    cargo run --release --bin run_glm_ocr -- data/dumps/<paper> \
      -o .temp/results/<paper>-glm \
      --region-type "Text,DisplayFormula,Algorithm,Table"
-
-   # PP-FormulaNet (formulas only)
-   cargo run --release --bin bench_formulas -- data/dumps/<paper> \
-     -o .temp/results/<paper>-ppformula
    ```
 
 3. **Benchmark mode** (`--bench`) runs each image multiple times (default 2)

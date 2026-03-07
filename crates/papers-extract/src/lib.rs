@@ -1,6 +1,5 @@
 pub mod error;
 pub mod figure;
-pub mod formula;
 pub mod glm_ocr;
 pub mod html_table;
 pub mod layout;
@@ -27,8 +26,6 @@ pub struct ExtractOptions {
     pub confidence_threshold: f32,
     /// Whether to extract figures as images (default true).
     pub extract_images: bool,
-    /// Formula recognition model (default PpFormulanet).
-    pub formula: FormulaModel,
     /// Table recognition model (default TableFormer).
     pub table: TableModel,
     /// Path to the pdfium binary (auto-detected if None).
@@ -49,7 +46,6 @@ impl Default for ExtractOptions {
             dpi: 144,
             confidence_threshold: 0.3,
             extract_images: true,
-            formula: FormulaModel::default(),
             table: TableModel::default(),
             pdfium_path: None,
             model_cache_dir: None,
@@ -58,16 +54,6 @@ impl Default for ExtractOptions {
             dump_formulas: false,
         }
     }
-}
-
-/// Formula recognition model selection.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FormulaModel {
-    /// pp-formulanet split encoder/decoder (default).
-    #[default]
-    PpFormulanet,
-    /// GLM-OCR vision-language model.
-    GlmOcr,
 }
 
 /// Table recognition model selection.

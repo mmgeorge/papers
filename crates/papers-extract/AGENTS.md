@@ -5,8 +5,8 @@
 Local, pure-Rust PDF processing pipeline using ONNX models and `pdfium-render`.
 Converts PDFs into structured JSON + Markdown + extracted images. Uses PP-DocLayoutV3 for
 25-class layout detection with built-in reading order via direct `ort` inference.
-Formula recognition uses custom split encoder/decoder ONNX models with CUDA EP.
-Table recognition uses `oar-ocr` (SLANet).
+Formula recognition uses GLM-OCR (vision-language model with GQA-fused decoder).
+Table recognition uses TableFormer or GLM-OCR.
 
 ## Architecture
 
@@ -47,8 +47,8 @@ PDF Input
 | `types.rs` | `ExtractionResult`, `Page`, `Region`, `RegionKind` (24 variants), `Metadata` |
 | `error.rs` | `ExtractError` enum |
 | `layout.rs` | `LayoutDetector` — direct ONNX inference on PP-DocLayoutV3, `DetectedRegion` |
-| `formula.rs` | `FormulaPredictor` — custom CUDA formula predictor using split encoder/decoder FP16 ONNX models. Persistent IoBinding with pre-allocated GPU buffers + CUDA graphs on decoder + cudarc D2D/H2D memcpy for zero-allocation decoding |
-| `pipeline.rs` | `Pipeline` struct — owns pdfium + LayoutDetector + FormulaPredictor + TableStructureRecognitionPredictor, orchestrates per-page processing |
+| `glm_ocr/` | `GlmOcrPredictor` — GLM-OCR with CUDA (IoBinding + CUDA graphs + GQA), CoreML, and CPU backends |
+| `pipeline.rs` | `Pipeline` struct — owns pdfium + LayoutDetector + GlmOcrPredictor + TableFormerPredictor, orchestrates per-page processing |
 | `models.rs` | Model download from GitHub releases, predictor + LayoutDetector builders, execution provider config |
 | `pdf.rs` | `PdfChar`, `load_pdfium()`, `render_page()`, `extract_page_chars()` |
 | `text.rs` | Match pdfium characters to layout regions, reconstruct text with word/paragraph detection. Splices inline formula LaTeX (`$...$`) at correct spatial positions, excluding pdfium chars under formula bboxes. Converts PdfChar Y-up coords to image Y-down space. Also provides `try_extract_inline_formula()` for char-based bypass of simple inline formulas. |
@@ -72,7 +72,7 @@ Seal, Chart, SidebarText
 Content routing by kind:
 - **Text-bearing** → `text` field (pdfium char extraction + inline formula splicing)
 - **Table** → `html` field (oar-ocr SLANet-Plus)
-- **DisplayFormula** → `latex` field (custom FormulaPredictor), rendered as `$$...$$`
+- **DisplayFormula** → `latex` field (GLM-OCR), rendered as `$$...$$`
 - **InlineFormula** → char-based bypass if all chars are known LaTeX tokens; otherwise ML OCR. Merged into parent text region as `$...$`; orphans emitted as standalone `$...$` regions
 - **Visual** (Image/Chart/Seal) → `image_path` field (cropped PNG)
 - **Caption** → `text` field + associated with parent via `caption`
@@ -82,7 +82,7 @@ Content routing by kind:
 - **Fast** (default): SLANet-Plus (7 MB) — fast table recognition
 - **Quality**: PP-LCNet classifier (6.5 MB) + SLANeXt-wired (351 MB) — better accuracy for complex tables
 
-Formula recognition uses the custom split encoder/decoder models (~365 MB total). Simple inline formulas (single variables, Greek letters, basic sub/superscripts) are bypassed via char-based extraction from the PDF text layer, avoiding ML inference.
+Formula recognition uses GLM-OCR (~3.3 GB total ONNX models). Simple inline formulas (single variables, Greek letters, basic sub/superscripts) are bypassed via char-based extraction from the PDF text layer, avoiding ML inference.
 
 ## Inline Formula Char-Based Bypass
 
@@ -122,9 +122,8 @@ Formula recognition uses the custom split encoder/decoder models (~365 MB total)
 
 ## Model Management
 
-Layout/table models auto-download from `github.com/GreatV/oar-ocr/releases` on first use.
-Formula models (`encoder_fp16.onnx`, `decoder_fp16_argmax.onnx`) must be pre-exported via
-`py/pp-formulanet/cuda/export.py` and placed in the model cache directory.
+Layout model auto-downloads from `github.com/GreatV/oar-ocr/releases` on first use.
+GLM-OCR models must be pre-exported via `py/glm-ocr/cuda/export.py` and placed in the model cache directory.
 Cache directory: `{dirs::cache_dir()}/papers/models/` (override: `PAPERS_MODEL_DIR` env var).
 
 ## Execution Providers

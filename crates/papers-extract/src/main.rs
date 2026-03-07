@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use papers_extract::{DebugMode, ExtractOptions, FormulaModel, TableModel};
+use papers_extract::{DebugMode, ExtractOptions, TableModel};
 
 #[derive(Parser)]
 #[command(
@@ -17,10 +17,6 @@ struct Cli {
     /// Output directory (default: same directory as the PDF)
     #[arg(short, long)]
     output: Option<PathBuf>,
-
-    /// Formula recognition model
-    #[arg(long, default_value = "pp-formulanet")]
-    formula: FormulaArg,
 
     /// Table recognition model
     #[arg(long, default_value = "table-former")]
@@ -60,14 +56,6 @@ struct Cli {
 }
 
 #[derive(ValueEnum, Clone, Debug)]
-enum FormulaArg {
-    /// pp-formulanet split encoder/decoder
-    PpFormulanet,
-    /// GLM-OCR vision-language model
-    GlmOcr,
-}
-
-#[derive(ValueEnum, Clone, Debug)]
 enum TableArg {
     /// GLM-OCR vision-language model
     GlmOcr,
@@ -97,10 +85,6 @@ fn main() {
         dpi: cli.dpi,
         confidence_threshold: cli.confidence,
         extract_images: !cli.no_images,
-        formula: match cli.formula {
-            FormulaArg::PpFormulanet => FormulaModel::PpFormulanet,
-            FormulaArg::GlmOcr => FormulaModel::GlmOcr,
-        },
         table: match cli.table {
             TableArg::GlmOcr => TableModel::GlmOcr,
             TableArg::TableFormer => TableModel::TableFormer,

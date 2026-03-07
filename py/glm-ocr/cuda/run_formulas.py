@@ -1,4 +1,4 @@
-"""Run GLM-OCR on formula images for comparison against PP-FormulaNet.
+"""Run GLM-OCR on formula images.
 
 Uses the official "Formula Recognition:" prompt.
 

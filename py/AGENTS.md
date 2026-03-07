@@ -2,13 +2,6 @@
 
 ## Structure
 
-### pp-formulanet/
-PyTorch re-implementation of PP-FormulaNet Plus-L for ONNX export and inference.
-
-- `common/` — shared library: model definitions (encoder, decoder), weight extraction, preprocessing, shared FP32 ONNX export logic
-- `cuda/` — uv project for CUDA: optimized FP16 export + CUDA graph inference (needs `onnxruntime-gpu`)
-- `other/` — uv project for CPU/CoreML: FP32 export + session.run inference (needs `onnxruntime`)
-
 ### glm-ocr/
 GLM-OCR (zai-org/GLM-OCR) ONNX export and inference. Uses HuggingFace transformers model directly (no re-implementation).
 

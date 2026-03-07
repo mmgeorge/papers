@@ -17,10 +17,6 @@ name = "find_gaps"
 path = "src/bin/find_gaps.rs"
 
 [[bin]]
-name = "bench_formulas"
-path = "src/bin/bench_formulas.rs"
-
-[[bin]]
 name = "run_glm_ocr"
 path = "src/bin/run_glm_ocr.rs"
 
