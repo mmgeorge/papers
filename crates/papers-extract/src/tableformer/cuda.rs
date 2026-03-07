@@ -122,7 +122,9 @@ pub(crate) fn build_decoder_state(
             .map_err(|e| ExtractError::Model(format!("bind kv_in {i}: {e}")))?;
     }
 
-    // Bind KV outputs to SAME buffers as inputs (in-place update via C API)
+    // Bind KV outputs to SAME buffers as inputs (in-place update).
+    // Register names via bind_output_to_device first (for Rust-side tracking),
+    // then overwrite ORT binding via raw C API to point at pre-allocated buffers.
     {
         use ort::AsPointer;
         let binding_ptr = binding.ptr() as *mut ort::sys::OrtIoBinding;
@@ -131,6 +133,11 @@ pub(crate) fn build_decoder_state(
             let layer = i / 2;
             let kv_type = if i % 2 == 0 { "key" } else { "value" };
             let name = format!("present_key_values.{layer}.{kv_type}");
+
+            binding
+                .bind_output_to_device(&name, cuda_mem)
+                .map_err(|e| ExtractError::Model(format!("bind_output_to_device kv {i}: {e}")))?;
+
             let c_name = std::ffi::CString::new(name.as_str())
                 .map_err(|e| ExtractError::Model(format!("CString kv_out {i}: {e}")))?;
             let status = unsafe {

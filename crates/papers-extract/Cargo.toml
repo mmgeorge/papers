@@ -39,6 +39,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 # not BPE training, so esaxx_fast is unnecessary. We still need a regex backend.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 half = "2"
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ort = { version = "=2.0.0-rc.11", features = ["cuda", "load-dynamic", "half"] }

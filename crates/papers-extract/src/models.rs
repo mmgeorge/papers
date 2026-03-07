@@ -1,59 +1,27 @@
 use std::path::{Path, PathBuf};
 
+use hf_hub::api::sync::{Api, ApiBuilder};
+
 use crate::error::ExtractError;
 use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
 use crate::tableformer::TableFormerPredictor;
 use crate::TableModel;
 
-/// Model file metadata for download.
+/// HuggingFace repo for GLM-OCR ONNX models.
+const GLM_OCR_REPO: &str = "mgeorge412/glm_ocr";
+/// HuggingFace repo for TableFormer ONNX models.
+const TABLEFORMER_REPO: &str = "mgeorge412/tableformer";
+
+/// Model file metadata for download (layout model from GitHub releases).
 struct ModelFile {
     filename: &'static str,
     url: &'static str,
 }
 
-// Layout detection (always required)
+// Layout detection (always required) — third-party, stays on GitHub releases
 const LAYOUT_MODEL: ModelFile = ModelFile {
     filename: "pp-doclayoutv3.onnx",
     url: "https://github.com/GreatV/oar-ocr/releases/download/v0.6.0/pp-doclayoutv3.onnx",
-};
-
-// GLM-OCR models (manual export, no auto-download)
-// Filenames match the output of py/glm-ocr/cuda/export.py.
-// ONNX external data files (*.onnx.data) reference relative paths, so
-// these files must stay in their export directory (use --model-cache-dir).
-const GLM_VISION_ENCODER: ModelFile = ModelFile {
-    filename: "vision_encoder_mha.onnx",
-    url: "",
-};
-const GLM_EMBEDDING: ModelFile = ModelFile {
-    filename: "embedding.onnx",
-    url: "",
-};
-const GLM_LLM: ModelFile = ModelFile {
-    filename: "llm.onnx",
-    url: "",
-};
-const GLM_LLM_DECODER: ModelFile = ModelFile {
-    filename: "llm_decoder_gqa.onnx",
-    url: "",
-};
-const GLM_TOKENIZER: ModelFile = ModelFile {
-    filename: "tokenizer.json",
-    url: "",
-};
-
-// TableFormer V1 — split encoder/decoder/bbox ONNX (manual export, no auto-download)
-const TABLEFORMER_ENCODER: ModelFile = ModelFile {
-    filename: "tableformer_encoder.onnx",
-    url: "", // No auto-download — must be pre-exported via py/table_former/export.py
-};
-const TABLEFORMER_DECODER: ModelFile = ModelFile {
-    filename: "tableformer_decoder.onnx",
-    url: "",
-};
-const TABLEFORMER_BBOX_DECODER: ModelFile = ModelFile {
-    filename: "tableformer_bbox_decoder.onnx",
-    url: "",
 };
 
 /// Resolved paths to all required model files.
@@ -70,7 +38,7 @@ pub struct TableFormerModelPaths {
     pub bbox_decoder: PathBuf,
 }
 
-/// Resolved paths for GLM-OCR models (separate from pipeline models).
+/// Resolved paths for GLM-OCR models.
 pub struct GlmOcrModelPaths {
     pub vision_encoder: PathBuf,
     pub embedding: PathBuf,
@@ -79,8 +47,12 @@ pub struct GlmOcrModelPaths {
     pub tokenizer: PathBuf,
 }
 
-/// Default model cache directory.
-pub fn default_cache_dir() -> PathBuf {
+/// Layout model cache directory (for GitHub releases download).
+/// Uses `PAPERS_MODEL_DIR` env var, `--model-cache-dir`, or platform default.
+pub fn layout_cache_dir(cli_override: Option<&Path>) -> PathBuf {
+    if let Some(dir) = cli_override {
+        return dir.to_path_buf();
+    }
     if let Ok(dir) = std::env::var("PAPERS_MODEL_DIR") {
         return PathBuf::from(dir);
     }
@@ -90,31 +62,101 @@ pub fn default_cache_dir() -> PathBuf {
         .join("models")
 }
 
-/// Ensure the layout model is downloaded and return its path.
-pub fn ensure_layout_model(cache_dir: &Path) -> Result<PathBuf, ExtractError> {
-    std::fs::create_dir_all(cache_dir)?;
-    ensure_model(cache_dir, &LAYOUT_MODEL)
+/// Local model override directory from CLI flag or env var.
+/// When set, local files are checked before downloading from HuggingFace.
+fn local_model_override(cli_override: Option<&Path>) -> Option<PathBuf> {
+    cli_override
+        .map(|p| p.to_path_buf())
+        .or_else(|| std::env::var("PAPERS_MODEL_DIR").ok().map(PathBuf::from))
 }
 
-/// Ensure all models for the selected table engine are downloaded.
+/// Create the HuggingFace Hub API client.
+fn create_hf_api() -> Result<Api, ExtractError> {
+    ApiBuilder::from_env()
+        .with_progress(true)
+        .build()
+        .map_err(|e| ExtractError::Download(format!("HuggingFace Hub init failed: {e}")))
+}
+
+/// Ensure a model file is available, checking local override first, then HuggingFace.
+fn ensure_hf_model(
+    local_override: Option<&Path>,
+    api: &Api,
+    repo_id: &str,
+    filename: &str,
+) -> Result<PathBuf, ExtractError> {
+    // Check local override directory first
+    if let Some(dir) = local_override {
+        let local_path = dir.join(filename);
+        if local_path.exists() {
+            return Ok(local_path);
+        }
+    }
+    // Download from HuggingFace (cached automatically)
+    let repo = api.model(repo_id.to_string());
+    repo.get(filename).map_err(|e| {
+        ExtractError::Download(format!("Failed to download {filename} from {repo_id}: {e}"))
+    })
+}
+
+/// Ensure the ONNX external data file (.onnx.data) is co-located with the .onnx file.
+/// ORT requires external data files in the same directory as the main ONNX file.
+fn ensure_data_colocated(onnx_path: &Path, data_path: &Path) -> Result<(), ExtractError> {
+    let onnx_dir = onnx_path.parent().unwrap();
+    let data_dir = data_path.parent().unwrap();
+    if onnx_dir != data_dir {
+        let target = onnx_dir.join(data_path.file_name().unwrap());
+        if !target.exists() {
+            tracing::info!(
+                "Copying {} alongside {}",
+                data_path.display(),
+                onnx_path.display()
+            );
+            std::fs::copy(data_path, &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Download an ONNX model and its companion .onnx.data file from HuggingFace.
+/// Returns the path to the .onnx file (data file is ensured co-located).
+fn ensure_hf_onnx_with_data(
+    local_override: Option<&Path>,
+    api: &Api,
+    repo_id: &str,
+    filename: &str,
+) -> Result<PathBuf, ExtractError> {
+    let onnx_path = ensure_hf_model(local_override, api, repo_id, filename)?;
+    let data_filename = format!("{filename}.data");
+    // Try to download the .onnx.data file; ignore errors (not all models have external data)
+    if let Ok(data_path) = ensure_hf_model(local_override, api, repo_id, &data_filename) {
+        ensure_data_colocated(&onnx_path, &data_path)?;
+    }
+    Ok(onnx_path)
+}
+
+/// Ensure all models for the selected table engine are available.
 pub fn ensure_models(
     table: TableModel,
-    cache_dir: &Path,
+    model_cache_dir: Option<&Path>,
 ) -> Result<ModelPaths, ExtractError> {
-    std::fs::create_dir_all(cache_dir)?;
+    let local_override = local_model_override(model_cache_dir);
+    let api = create_hf_api()?;
 
-    // Layout detection is always required
-    let layout = ensure_model(cache_dir, &LAYOUT_MODEL)?;
+    // Layout detection (always required) — downloaded from GitHub releases
+    let cache_dir = layout_cache_dir(model_cache_dir);
+    std::fs::create_dir_all(&cache_dir)?;
+    let layout = ensure_layout_model(&cache_dir)?;
 
-    // TableFormer models
+    // GLM-OCR models (always required for formula recognition)
+    let glm_ocr = ensure_glm_ocr_models(local_override.as_deref(), &api)?;
+
+    // TableFormer models (optional)
     let tableformer = if table == TableModel::TableFormer {
-        Some(ensure_tableformer_models(cache_dir)?)
+        Some(ensure_tableformer_models(local_override.as_deref(), &api)?)
     } else {
         None
     };
-
-    // GLM-OCR models (always required for formula recognition)
-    let glm_ocr = ensure_glm_ocr_models(cache_dir)?;
 
     Ok(ModelPaths {
         layout,
@@ -123,104 +165,55 @@ pub fn ensure_models(
     })
 }
 
-/// Ensure a single model file exists, downloading if necessary.
-fn ensure_model(cache_dir: &Path, model: &ModelFile) -> Result<PathBuf, ExtractError> {
-    let local_path = cache_dir.join(model.filename);
+/// Ensure the layout model is downloaded from GitHub releases.
+pub fn ensure_layout_model(cache_dir: &Path) -> Result<PathBuf, ExtractError> {
+    let local_path = cache_dir.join(LAYOUT_MODEL.filename);
     if local_path.exists() {
         return Ok(local_path);
     }
-
-    tracing::info!("Downloading {} from {}...", model.filename, model.url);
-    download_file(model.url, &local_path)?;
+    tracing::info!(
+        "Downloading {} from {}...",
+        LAYOUT_MODEL.filename,
+        LAYOUT_MODEL.url
+    );
+    download_file(LAYOUT_MODEL.url, &local_path)?;
     Ok(local_path)
 }
 
-/// Ensure a local-only model file exists (no download URL available).
-fn ensure_local_model(cache_dir: &Path, model: &ModelFile) -> Result<PathBuf, ExtractError> {
-    let local_path = cache_dir.join(model.filename);
-    if local_path.exists() {
-        return Ok(local_path);
-    }
-    Err(ExtractError::ModelNotFound {
-        path: local_path.display().to_string(),
-    })
-}
-
-/// Download a file from a URL to a local path, following redirects.
-fn download_file(url: &str, dest: &Path) -> Result<(), ExtractError> {
-    use std::io::Write;
-
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|e| ExtractError::Download(format!("Failed to create HTTP client: {e}")))?;
-
-    let mut response = client
-        .get(url)
-        .send()
-        .map_err(|e| ExtractError::Download(format!("Download request failed: {e}")))?;
-
-    if !response.status().is_success() {
-        return Err(ExtractError::Download(format!(
-            "Download failed: HTTP {}",
-            response.status()
-        )));
-    }
-
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Write to a temp file first, then rename (atomic-ish on same filesystem)
-    let tmp_path = dest.with_extension("tmp");
-    let mut file = std::fs::File::create(&tmp_path)?;
-    response
-        .copy_to(&mut file)
-        .map_err(|e| ExtractError::Download(format!("Failed to write model file: {e}")))?;
-    file.flush()?;
-    drop(file);
-
-    std::fs::rename(&tmp_path, dest)?;
-    tracing::info!("Downloaded {}", dest.display());
-    Ok(())
-}
-
-/// Ensure all GLM-OCR model files exist in the cache directory.
+/// Ensure all GLM-OCR model files are available.
 ///
 /// For vision encoder: tries `vision_encoder_mha.onnx` first (CUDA/MHA-fused),
 /// falls back to `vision_encoder.onnx` (CPU/CoreML FP32).
-/// For decoder: tries `llm_decoder_gqa.onnx` first, falls back to empty path
-/// (non-CUDA backends don't need it).
-pub fn ensure_glm_ocr_models(
-    cache_dir: &Path,
+/// For decoder: `llm_decoder_gqa.onnx` is optional (non-CUDA backends don't need it).
+fn ensure_glm_ocr_models(
+    local_override: Option<&Path>,
+    api: &Api,
 ) -> Result<GlmOcrModelPaths, ExtractError> {
-    std::fs::create_dir_all(cache_dir)?;
-
     // Vision encoder: prefer MHA-fused, fall back to raw
-    let vision_encoder = ensure_local_model(cache_dir, &GLM_VISION_ENCODER)
-        .or_else(|_| {
-            let raw = cache_dir.join("vision_encoder.onnx");
-            if raw.exists() {
-                Ok(raw)
-            } else {
-                Err(ExtractError::ModelNotFound {
-                    path: format!(
-                        "{} or {}",
-                        cache_dir.join("vision_encoder_mha.onnx").display(),
-                        raw.display()
-                    ),
-                })
-            }
-        })?;
+    let vision_encoder =
+        ensure_hf_onnx_with_data(local_override, api, GLM_OCR_REPO, "vision_encoder_mha.onnx")
+            .or_else(|_| {
+                ensure_hf_onnx_with_data(
+                    local_override,
+                    api,
+                    GLM_OCR_REPO,
+                    "vision_encoder.onnx",
+                )
+            })
+            .map_err(|_| ExtractError::ModelNotFound {
+                path: "vision_encoder_mha.onnx or vision_encoder.onnx".to_string(),
+            })?;
 
-    let embedding = ensure_local_model(cache_dir, &GLM_EMBEDDING)?;
-    let llm = ensure_local_model(cache_dir, &GLM_LLM)?;
+    let embedding =
+        ensure_hf_onnx_with_data(local_override, api, GLM_OCR_REPO, "embedding.onnx")?;
+    let llm = ensure_hf_onnx_with_data(local_override, api, GLM_OCR_REPO, "llm.onnx")?;
 
     // Decoder: optional (non-CUDA backends don't need it)
-    let llm_decoder = ensure_local_model(cache_dir, &GLM_LLM_DECODER)
-        .unwrap_or_else(|_| cache_dir.join("llm_decoder_gqa.onnx"));
+    let llm_decoder =
+        ensure_hf_onnx_with_data(local_override, api, GLM_OCR_REPO, "llm_decoder_gqa.onnx")
+            .unwrap_or_else(|_| PathBuf::from("llm_decoder_gqa.onnx"));
 
-    let tokenizer = ensure_local_model(cache_dir, &GLM_TOKENIZER)?;
+    let tokenizer = ensure_hf_model(local_override, api, GLM_OCR_REPO, "tokenizer.json")?;
 
     Ok(GlmOcrModelPaths {
         vision_encoder,
@@ -231,17 +224,47 @@ pub fn ensure_glm_ocr_models(
     })
 }
 
-/// Ensure all TableFormer model files exist in the cache directory.
-pub fn ensure_tableformer_models(
-    cache_dir: &Path,
+/// Ensure all TableFormer model files are available.
+/// HF repo uses bare names (encoder.onnx); local override checks both bare
+/// and legacy prefixed names (tableformer_encoder.onnx) for compatibility.
+fn ensure_tableformer_models(
+    local_override: Option<&Path>,
+    api: &Api,
 ) -> Result<TableFormerModelPaths, ExtractError> {
-    let encoder = ensure_local_model(cache_dir, &TABLEFORMER_ENCODER)?;
-    let decoder = ensure_local_model(cache_dir, &TABLEFORMER_DECODER)?;
-    let bbox_decoder = ensure_local_model(cache_dir, &TABLEFORMER_BBOX_DECODER)?;
+    let encoder = ensure_tableformer_file(local_override, api, "encoder.onnx")?;
+    let decoder = ensure_tableformer_file(local_override, api, "decoder.onnx")?;
+    let bbox_decoder = ensure_tableformer_file(local_override, api, "bbox_decoder.onnx")?;
     Ok(TableFormerModelPaths {
         encoder,
         decoder,
         bbox_decoder,
+    })
+}
+
+/// Try local override (bare name, then legacy tableformer_ prefix), then HF.
+fn ensure_tableformer_file(
+    local_override: Option<&Path>,
+    api: &Api,
+    bare_name: &str,
+) -> Result<PathBuf, ExtractError> {
+    if let Some(dir) = local_override {
+        // Try bare name first (matching HF repo)
+        let bare_path = dir.join(bare_name);
+        if bare_path.exists() {
+            return Ok(bare_path);
+        }
+        // Try legacy prefixed name (tableformer_encoder.onnx etc.)
+        let prefixed = dir.join(format!("tableformer_{bare_name}"));
+        if prefixed.exists() {
+            return Ok(prefixed);
+        }
+    }
+    // Download from HF
+    let repo = api.model(TABLEFORMER_REPO.to_string());
+    repo.get(bare_name).map_err(|e| {
+        ExtractError::Download(format!(
+            "Failed to download {bare_name} from {TABLEFORMER_REPO}: {e}"
+        ))
     })
 }
 
@@ -285,6 +308,63 @@ pub fn build_layout_detector(
     model_path: &Path,
 ) -> Result<crate::layout::LayoutDetector, ExtractError> {
     crate::layout::LayoutDetector::new(model_path)
+}
+
+/// Download a file from a URL to a local path, following redirects.
+fn download_file(url: &str, dest: &Path) -> Result<(), ExtractError> {
+    use std::io::Write;
+
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+        .map_err(|e| ExtractError::Download(format!("Failed to create HTTP client: {e}")))?;
+
+    let mut response = client
+        .get(url)
+        .send()
+        .map_err(|e| ExtractError::Download(format!("Download request failed: {e}")))?;
+
+    if !response.status().is_success() {
+        return Err(ExtractError::Download(format!(
+            "Download failed: HTTP {}",
+            response.status()
+        )));
+    }
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Write to a temp file first, then rename (atomic-ish on same filesystem)
+    let tmp_path = dest.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp_path)?;
+    response
+        .copy_to(&mut file)
+        .map_err(|e| ExtractError::Download(format!("Failed to write model file: {e}")))?;
+    file.flush()?;
+    drop(file);
+
+    std::fs::rename(&tmp_path, dest)?;
+    tracing::info!("Downloaded {}", dest.display());
+    Ok(())
+}
+
+/// Standalone GLM-OCR model loading (for binaries that don't use the full pipeline).
+pub fn ensure_glm_ocr_models_standalone(
+    model_cache_dir: Option<&Path>,
+) -> Result<GlmOcrModelPaths, ExtractError> {
+    let local_override = local_model_override(model_cache_dir);
+    let api = create_hf_api()?;
+    ensure_glm_ocr_models(local_override.as_deref(), &api)
+}
+
+/// Standalone TableFormer model loading (for binaries that don't use the full pipeline).
+pub fn ensure_tableformer_models_standalone(
+    model_cache_dir: Option<&Path>,
+) -> Result<TableFormerModelPaths, ExtractError> {
+    let local_override = local_model_override(model_cache_dir);
+    let api = create_hf_api()?;
+    ensure_tableformer_models(local_override.as_deref(), &api)
 }
 
 /// Initialize ORT with a dynamically loaded runtime library (Windows only).
@@ -342,5 +422,3 @@ pub fn init_ort_runtime() -> Result<(), ExtractError> {
         }
     }
 }
-
-

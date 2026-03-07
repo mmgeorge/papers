@@ -17,6 +17,7 @@ papers-core.workspace = true
 papers-zotero.workspace = true
 papers-datalab.workspace = true
 papers-db.workspace = true
+papers-extract.workspace = true
 papers-mcp.workspace = true
 clap.workspace = true
 dirs.workspace = true

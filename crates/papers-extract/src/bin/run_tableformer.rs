@@ -102,10 +102,8 @@ fn main() {
 
     // Init ORT runtime
     models::init_ort_runtime().expect("ORT runtime init");
-    let cache_dir = cli
-        .model_cache_dir
-        .unwrap_or_else(models::default_cache_dir);
-    let tf_paths = models::ensure_tableformer_models(&cache_dir).expect("TableFormer model files");
+    let tf_paths = models::ensure_tableformer_models_standalone(cli.model_cache_dir.as_deref())
+        .expect("TableFormer model files");
     let predictor =
         models::build_tableformer_predictor(&tf_paths).expect("TableFormer init");
 

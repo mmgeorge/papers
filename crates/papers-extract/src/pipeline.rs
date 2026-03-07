@@ -95,12 +95,7 @@ impl Pipeline {
         models::init_ort_runtime()?;
         let pdfium = pdf::load_pdfium(options.pdfium_path.as_deref())?;
 
-        let cache_dir = options
-            .model_cache_dir
-            .clone()
-            .unwrap_or_else(models::default_cache_dir);
-
-        let paths = models::ensure_models(options.table, &cache_dir)?;
+        let paths = models::ensure_models(options.table, options.model_cache_dir.as_deref())?;
         let layout = models::build_layout_detector(&paths.layout)?;
 
         let formula = models::build_glm_ocr_predictor(&paths.glm_ocr)?;

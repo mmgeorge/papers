@@ -151,10 +151,8 @@ fn main() {
 
     // Init ORT runtime
     models::init_ort_runtime().expect("ORT runtime init");
-    let cache_dir = cli
-        .model_cache_dir
-        .unwrap_or_else(models::default_cache_dir);
-    let model_paths = models::ensure_glm_ocr_models(&cache_dir).expect("GLM-OCR model files");
+    let model_paths = models::ensure_glm_ocr_models_standalone(cli.model_cache_dir.as_deref())
+        .expect("GLM-OCR model files");
 
     // Group entries by prompt, applying --limit per kind.
     let mut groups: Vec<(&'static str, Vec<&LayoutEntry>)> = Vec::new();

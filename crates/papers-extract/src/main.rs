@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use papers_extract::{DebugMode, ExtractOptions, TableModel};
+use papers_extract::{DebugMode, ExtractOptions};
 
 #[derive(Parser)]
 #[command(
@@ -18,49 +18,17 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Table recognition model
-    #[arg(long, default_value = "table-former")]
-    table: TableArg,
-
-    /// DPI for page rendering
-    #[arg(long, default_value = "144")]
-    dpi: u32,
-
-    /// Layout detection confidence threshold (0.0–1.0)
-    #[arg(long, default_value = "0.3")]
-    confidence: f32,
-
     /// Extract only this page (1-indexed)
     #[arg(long, short = 'p')]
     page: Option<u32>,
 
     /// Skip image extraction
     #[arg(long)]
-    no_images: bool,
-
-    /// Dump cropped formula images to formulas/ directory
-    #[arg(long)]
-    dump_formulas: bool,
-
-    /// Path to pdfium library (auto-detected if omitted)
-    #[arg(long)]
-    pdfium_path: Option<PathBuf>,
-
-    /// Directory for ONNX model cache
-    #[arg(long)]
-    model_cache_dir: Option<PathBuf>,
+    skip_images: bool,
 
     /// Write layout debug output: "images" for annotated PNGs, "pdf" for PNGs + debug PDF
     #[arg(long, value_name = "MODE")]
     write_layout: Option<LayoutDebugArg>,
-}
-
-#[derive(ValueEnum, Clone, Debug)]
-enum TableArg {
-    /// GLM-OCR vision-language model
-    GlmOcr,
-    /// TableFormer V1 — OTSL structure recognition (~203 MB)
-    TableFormer,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -82,22 +50,14 @@ fn main() {
     });
 
     let options = ExtractOptions {
-        dpi: cli.dpi,
-        confidence_threshold: cli.confidence,
-        extract_images: !cli.no_images,
-        table: match cli.table {
-            TableArg::GlmOcr => TableModel::GlmOcr,
-            TableArg::TableFormer => TableModel::TableFormer,
-        },
-        pdfium_path: cli.pdfium_path,
-        model_cache_dir: cli.model_cache_dir,
+        extract_images: !cli.skip_images,
         page: cli.page,
         debug: match cli.write_layout {
             Some(LayoutDebugArg::Images) => DebugMode::Images,
             Some(LayoutDebugArg::Pdf) => DebugMode::Pdf,
             None => DebugMode::Off,
         },
-        dump_formulas: cli.dump_formulas,
+        ..ExtractOptions::default()
     };
 
     eprintln!(

@@ -88,12 +88,11 @@ fn main() {
     // Init ORT
     models::init_ort_runtime().expect("ORT runtime init");
 
-    let cache_dir = cli
-        .model_cache_dir
-        .unwrap_or_else(models::default_cache_dir);
+    let cache_dir = models::layout_cache_dir(cli.model_cache_dir.as_deref());
 
     // Load layout model
     eprintln!("Loading layout model...");
+    std::fs::create_dir_all(&cache_dir).expect("create cache dir");
     let layout_path = models::ensure_layout_model(&cache_dir).expect("layout model file");
     let layout = models::build_layout_detector(&layout_path).expect("layout detector");
 

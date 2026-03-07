@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Quality level for DataLab Marker API extraction.
@@ -11,6 +13,15 @@ pub enum AdvancedMode {
     Fast,
     Balanced,
     Accurate,
+}
+
+/// Layout debug output mode for the extract command.
+#[derive(ValueEnum, Clone, Debug)]
+pub enum LayoutDebugArg {
+    /// Write annotated page PNGs to layout/
+    Images,
+    /// Write annotated page PNGs + a vector-overlay debug PDF
+    Pdf,
 }
 
 #[derive(Parser)]
@@ -90,6 +101,27 @@ pub enum EntityCommand {
     Db {
         #[command(subcommand)]
         cmd: DbCommand,
+    },
+    /// Extract structured content from a PDF using local ONNX models
+    Extract {
+        /// Path to the input PDF file
+        pdf: PathBuf,
+
+        /// Output directory (default: same directory as the PDF)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Extract only this page (1-indexed)
+        #[arg(long, short = 'p')]
+        page: Option<u32>,
+
+        /// Skip image extraction
+        #[arg(long)]
+        skip_images: bool,
+
+        /// Write layout debug output: "images" for annotated PNGs, "pdf" for PNGs + debug PDF
+        #[arg(long, value_name = "MODE")]
+        write_layout: Option<LayoutDebugArg>,
     },
     /// Manage papers CLI configuration
     Config {

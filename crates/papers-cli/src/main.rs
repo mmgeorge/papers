@@ -1850,6 +1850,50 @@ async fn papers_main() {
         EntityCommand::Db { cmd } => {
             handle_db_command(cmd).await;
         }
+        EntityCommand::Extract {
+            pdf,
+            output,
+            page,
+            skip_images,
+            write_layout,
+        } => {
+            let output_dir = output.unwrap_or_else(|| {
+                pdf.parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+            });
+
+            let options = papers_extract::ExtractOptions {
+                extract_images: !skip_images,
+                page,
+                debug: match write_layout {
+                    Some(cli::LayoutDebugArg::Images) => papers_extract::DebugMode::Images,
+                    Some(cli::LayoutDebugArg::Pdf) => papers_extract::DebugMode::Pdf,
+                    None => papers_extract::DebugMode::Off,
+                },
+                ..papers_extract::ExtractOptions::default()
+            };
+
+            eprintln!("Extracting {} → {}", pdf.display(), output_dir.display());
+
+            let result = tokio::task::spawn_blocking(move || {
+                papers_extract::extract(&pdf, &output_dir, &options)
+            })
+            .await
+            .unwrap();
+
+            match result {
+                Ok(result) => {
+                    eprintln!(
+                        "Done: {} pages, {} regions, {}ms",
+                        result.metadata.page_count,
+                        result.pages.iter().map(|p| p.regions.len()).sum::<usize>(),
+                        result.metadata.extraction_time_ms,
+                    );
+                }
+                Err(e) => exit_err(&format!("{e}")),
+            }
+        }
         EntityCommand::Config { cmd } => {
             handle_config_command(cmd);
         }
