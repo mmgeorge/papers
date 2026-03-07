@@ -424,6 +424,21 @@ impl Pipeline {
         // Group spatially close visual regions into FigureGroups
         figure::group_figure_regions(&mut regions);
 
+        // Assign composite image path to FigureGroups, clear member image paths
+        if self.options.extract_images {
+            for region in &mut regions {
+                if region.kind == RegionKind::FigureGroup {
+                    region.image_path =
+                        Some(format!("images/p{}_{}.png", page_idx + 1, region.order));
+                    if let Some(ref mut items) = region.items {
+                        for item in items.iter_mut() {
+                            item.image_path = None;
+                        }
+                    }
+                }
+            }
+        }
+
         // Attach formula numbers to their nearest display formula
         associate_formula_numbers(&mut regions);
 
@@ -462,6 +477,11 @@ impl Pipeline {
         // Track which inline formula detection indices have been consumed
         // (spliced into a parent text-bearing region).
         let mut consumed_inline: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        // Pre-pass: merge References detections in the same column into a single bbox.
+        // The layout model often detects overlapping References regions (one large +
+        // many small per-entry regions). Merging by column avoids duplicate text.
+        let ref_merged_bbox = merge_references_by_column(detected, scale);
 
         // Collect inline formula data for text merging (bbox in PDF points, image-space Y-down)
         let inline_formulas: Vec<(usize, text::InlineFormula)> = detected
@@ -512,9 +532,36 @@ impl Pipeline {
                 consumed: kind == RegionKind::InlineFormula && consumed_inline.contains(&idx),
             };
 
+            // For References, check if this index was merged into another region.
+            if kind == RegionKind::References {
+                if let Some(merged) = ref_merged_bbox.get(&idx) {
+                    match merged {
+                        Some(merged_bbox) => {
+                            // Primary region — extract text from the merged bbox
+                            region.bbox = *merged_bbox;
+                            region.text = Some(text::extract_region_text(
+                                chars,
+                                *merged_bbox,
+                                page_height_pt,
+                                &[],
+                                text::AssemblyMode::References,
+                            ));
+                        }
+                        None => {
+                            // Consumed duplicate — mark as consumed, skip text extraction
+                            region.consumed = true;
+                        }
+                    }
+                }
+            }
+
             // Populate text content, splicing inline formulas.
             // InlineFormula regions are not text-extracted — they get latex from crop recognition.
-            if (kind.is_text_bearing() || kind.is_caption()) && kind != RegionKind::InlineFormula {
+            if !region.consumed
+                && (kind.is_text_bearing() || kind.is_caption())
+                && kind != RegionKind::InlineFormula
+                && kind != RegionKind::References  // already handled above
+            {
                 // Find overlapping inline formulas (formula center inside this region bbox)
                 let overlapping: Vec<&text::InlineFormula> = inline_formulas
                     .iter()
@@ -691,6 +738,105 @@ fn associate_formula_numbers(regions: &mut [Region]) {
             }
         }
     }
+}
+
+/// Group References detections by column and merge their bounding boxes.
+///
+/// Returns a map from detection index to:
+/// - `Some(merged_bbox)` for the primary (first) region in each column group
+/// - `None` for duplicate regions that should be consumed
+///
+/// Two References regions are in the same column if their horizontal ranges
+/// overlap by more than 50% of the narrower region's width.
+fn merge_references_by_column(
+    detected: &[DetectedRegion],
+    scale: f32,
+) -> HashMap<usize, Option<[f32; 4]>> {
+    let ref_indices: Vec<usize> = detected
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.kind == RegionKind::References)
+        .map(|(i, _)| i)
+        .collect();
+
+    if ref_indices.is_empty() {
+        return HashMap::new();
+    }
+
+    // Convert to PDF-point bboxes
+    let ref_bboxes: Vec<(usize, [f32; 4])> = ref_indices
+        .iter()
+        .map(|&i| {
+            let d = &detected[i];
+            (
+                i,
+                [
+                    d.bbox_px[0] / scale,
+                    d.bbox_px[1] / scale,
+                    d.bbox_px[2] / scale,
+                    d.bbox_px[3] / scale,
+                ],
+            )
+        })
+        .collect();
+
+    // Group by column using union-find style grouping
+    let n = ref_bboxes.len();
+    let mut group: Vec<usize> = (0..n).collect();
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (_, a) = ref_bboxes[i];
+            let (_, b) = ref_bboxes[j];
+            // Horizontal overlap
+            let overlap_x1 = a[0].max(b[0]);
+            let overlap_x2 = a[2].min(b[2]);
+            let overlap = (overlap_x2 - overlap_x1).max(0.0);
+            let min_width = (a[2] - a[0]).min(b[2] - b[0]);
+            if min_width > 0.0 && overlap / min_width > 0.5 {
+                // Same column — merge groups
+                let gi = find(&mut group, i);
+                let gj = find(&mut group, j);
+                group[gi] = gj;
+            }
+        }
+    }
+
+    // Compute merged bbox per group
+    let mut group_bbox: HashMap<usize, [f32; 4]> = HashMap::new();
+    let mut group_primary: HashMap<usize, usize> = HashMap::new(); // group root → first det index
+    for (local_idx, &(det_idx, bbox)) in ref_bboxes.iter().enumerate() {
+        let root = find(&mut group, local_idx);
+        let merged = group_bbox.entry(root).or_insert(bbox);
+        merged[0] = merged[0].min(bbox[0]);
+        merged[1] = merged[1].min(bbox[1]);
+        merged[2] = merged[2].max(bbox[2]);
+        merged[3] = merged[3].max(bbox[3]);
+        group_primary.entry(root).or_insert(det_idx);
+    }
+
+    // Build result map
+    let mut result = HashMap::new();
+    for (local_idx, &(det_idx, _)) in ref_bboxes.iter().enumerate() {
+        let root = find(&mut group, local_idx);
+        let primary = group_primary[&root];
+        if det_idx == primary {
+            result.insert(det_idx, Some(group_bbox[&root]));
+        } else {
+            result.insert(det_idx, None);
+        }
+    }
+
+    result
+}
+
+/// Union-find helper
+fn find(parent: &mut [usize], mut i: usize) -> usize {
+    while parent[i] != i {
+        parent[i] = parent[parent[i]];
+        i = parent[i];
+    }
+    i
 }
 
 /// Returns true when `inner` bbox is fully contained within `outer` bbox

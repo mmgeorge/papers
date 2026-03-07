@@ -555,6 +555,20 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
             }
         }
 
+        // ── Composite bbox ──
+        // Extend the union bbox toward the caption so the composite image
+        // captures sub-labels (e.g. "(a) XPBD") that sit between the
+        // member images and the main caption text.
+        if let Some(ref caption) = group_caption {
+            let cb = caption.bbox;
+            // Extend horizontally to match caption width
+            union_bbox[0] = union_bbox[0].min(cb[0]);
+            union_bbox[2] = union_bbox[2].max(cb[2]);
+            // Extend vertically toward the caption (not including it)
+            union_bbox[3] = union_bbox[3].max(cb[1]);
+            union_bbox[1] = union_bbox[1].min(cb[3]);
+        }
+
         // Mark original members as consumed
         for &i in member_indices {
             regions[i].consumed = true;
@@ -579,6 +593,24 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
         };
 
         new_groups.push(group);
+    }
+
+    // Consume orphan caption-like regions that fall within a group's
+    // composite bbox, so they don't appear as separate output items.
+    for group in &new_groups {
+        let gb = group.bbox;
+        for r in regions.iter_mut() {
+            if r.consumed || !r.kind.is_caption() {
+                continue;
+            }
+            let rb = r.bbox;
+            // Check if region center falls within the group bbox
+            let cx = (rb[0] + rb[2]) / 2.0;
+            let cy = (rb[1] + rb[3]) / 2.0;
+            if cx >= gb[0] && cx <= gb[2] && cy >= gb[1] && cy <= gb[3] {
+                r.consumed = true;
+            }
+        }
     }
 
     regions.append(&mut new_groups);

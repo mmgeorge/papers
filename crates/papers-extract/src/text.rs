@@ -88,6 +88,11 @@ pub enum AssemblyMode {
     /// Reflow: join lines with spaces, detect paragraphs, dehyphenate.
     /// Used for normal prose text regions.
     Reflow,
+    /// Bibliography / reference list mode. Lines are reflowed within each
+    /// entry, and entries are separated by paragraph breaks detected via
+    /// hanging-indent boundaries (first line flush left, continuations
+    /// indented).
+    References,
     /// Preserve layout: keep each line separate (`\n`-joined) and compute
     /// leading indentation from character positions. Used for algorithm /
     /// pseudocode regions where line structure is meaningful.
@@ -140,7 +145,8 @@ pub fn extract_region_text(
 
     let lines = group_elements_into_lines(&elements);
     match mode {
-        AssemblyMode::Reflow => assemble_text(&lines),
+        AssemblyMode::Reflow => assemble_text(&lines, false),
+        AssemblyMode::References => assemble_text(&lines, true),
         AssemblyMode::PreserveLayout => assemble_preserving_layout(&lines, region_bbox[0]),
     }
 }
@@ -262,7 +268,7 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
 /// instead of "acceleration". To fix this, `pending_dehyphen` propagates
 /// the "join directly" intent through intervening lines until the
 /// continuation is reached.
-fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
+fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
     if lines.is_empty() {
         return String::new();
     }
@@ -285,6 +291,56 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
         sorted[sorted.len() / 2]
     };
     let para_threshold = median_spacing * 1.5;
+
+    // For hanging-indent mode (bibliographies): compute the left-margin X
+    // position and a threshold for detecting de-indentation.  A new entry
+    // starts when the next line begins at (near) the left margin.
+    //
+    // Only enabled when the region actually exhibits indentation variation
+    // (some lines flush-left, some indented).
+    let (margin_x, indent_threshold, use_hanging) = if hanging_indent {
+        // Collect the starting X of each line's first visible character.
+        let start_xs: Vec<f32> = lines
+            .iter()
+            .filter_map(|line| {
+                line.iter()
+                    .filter_map(|e| match e {
+                        LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' ' => {
+                            Some(e.bbox()[0])
+                        }
+                        _ => None,
+                    })
+                    .next()
+            })
+            .collect();
+        let min_x = start_xs.iter().copied().fold(f32::MAX, f32::min);
+        let max_x = start_xs.iter().copied().fold(f32::MIN, f32::max);
+        // Median character width → tolerance for "flush left"
+        let median_w = {
+            let mut widths: Vec<f32> = lines
+                .iter()
+                .flat_map(|l| l.iter())
+                .filter_map(|e| match e {
+                    LineElement::Char(c)
+                        if !c.codepoint.is_control() && c.codepoint != ' ' =>
+                    {
+                        let w = c.bbox[2] - c.bbox[0];
+                        if w > 0.0 { Some(w) } else { None }
+                    }
+                    _ => None,
+                })
+                .collect();
+            widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if widths.is_empty() { 4.0 } else { widths[widths.len() / 2] }
+        };
+        let threshold = median_w * 1.5;
+        // Only use hanging-indent detection if there's a meaningful
+        // indentation difference (more than the flush-left tolerance).
+        let has_indent_variation = (max_x - min_x) > threshold;
+        (min_x, threshold, has_indent_variation)
+    } else {
+        (0.0, 0.0, false)
+    };
 
     let mut result = String::new();
     // Propagates dehyphenation across non-adjacent lines — see doc comment.
@@ -329,6 +385,10 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
                 }
                 // else: short intermediate line (e.g., formula glyph) —
                 // keep propagating
+            } else if use_hanging && is_hanging_indent_break(
+                line, &lines[line_idx + 1], margin_x, indent_threshold,
+            ) {
+                result.push_str("\n\n"); // bibliography entry break
             } else {
                 result.push(' '); // reflow: join with space
             }
@@ -341,6 +401,34 @@ fn assemble_text(lines: &[Vec<&LineElement>]) -> String {
     }
 
     result
+}
+
+/// Detect a hanging-indent paragraph break between two lines.
+///
+/// Returns `true` when the next line starts at (near) the left margin while
+/// the current line is indented — indicating a new bibliography entry in a
+/// hanging-indent reference list.
+fn is_hanging_indent_break(
+    _current: &[&LineElement],
+    next: &[&LineElement],
+    margin_x: f32,
+    indent_threshold: f32,
+) -> bool {
+    // Find the starting X of the next line's first visible character.
+    let next_start_x = next
+        .iter()
+        .filter_map(|e| match e {
+            LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' ' => {
+                Some(e.bbox()[0])
+            }
+            _ => None,
+        })
+        .next();
+
+    match next_start_x {
+        Some(x) if (x - margin_x).abs() <= indent_threshold => true,
+        _ => false,
+    }
 }
 
 /// Assemble lines preserving their layout: each line becomes a separate `\n`-joined

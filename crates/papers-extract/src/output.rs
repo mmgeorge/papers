@@ -111,6 +111,7 @@ fn render_markdown(result: &ExtractionResult) -> String {
     struct Section {
         markdown: String,
         is_text: bool,
+        is_references: bool,
     }
 
     let mut sections: Vec<Section> = Vec::new();
@@ -125,17 +126,40 @@ fn render_markdown(result: &ExtractionResult) -> String {
             if section.is_empty() {
                 continue;
             }
-            let is_text = matches!(
-                region.kind,
-                RegionKind::Text
-                    | RegionKind::VerticalText
-                    | RegionKind::Abstract
-                    | RegionKind::SidebarText
-                    | RegionKind::References
-            );
+            let is_references = region.kind == RegionKind::References;
+            let is_text = is_references
+                || matches!(
+                    region.kind,
+                    RegionKind::Text
+                        | RegionKind::VerticalText
+                        | RegionKind::Abstract
+                        | RegionKind::SidebarText
+                );
+
+            // Merge all references sections into a single section, even
+            // when non-text regions (page headers/footers) sit between them.
+            // When the previous chunk ends mid-sentence (no terminal punctuation),
+            // join with a space so split entries like "ACM Transactions on" +
+            // "Graphics 31, 5 ..." reconnect properly.
+            if is_references {
+                if let Some(prev) = sections.iter_mut().rfind(|s| s.is_references) {
+                    let prev_trimmed = prev.markdown.trim_end();
+                    let ends_mid = prev_trimmed
+                        .ends_with(|c: char| !matches!(c, '.' | '!' | '?' | ':' | '"' | '\u{201D}'));
+                    if ends_mid {
+                        prev.markdown.push(' ');
+                    } else {
+                        prev.markdown.push_str("\n\n");
+                    }
+                    prev.markdown.push_str(section.trim());
+                    continue;
+                }
+            }
+
             sections.push(Section {
                 markdown: section,
                 is_text,
+                is_references,
             });
         }
     }
@@ -179,16 +203,31 @@ fn render_markdown(result: &ExtractionResult) -> String {
     }
 
     // Assemble with paragraph breaks between sections.
+    // Consecutive text sections that were split mid-paragraph (e.g. by a
+    // column break) are joined with a space instead of a paragraph break.
     let mut md = String::new();
+    let mut prev_is_text = false;
+    let mut prev_ends_mid_sentence = false;
     for sec in &sections {
         let text = sec.markdown.trim();
         if text.is_empty() {
             continue;
         }
         if !md.is_empty() {
-            md.push_str("\n\n");
+            // Merge when the previous text ended mid-sentence and this
+            // text section continues it (starts with a lowercase letter).
+            let starts_lower = text.starts_with(|c: char| c.is_lowercase());
+            if prev_is_text && sec.is_text && prev_ends_mid_sentence && starts_lower {
+                md.push(' ');
+            } else {
+                md.push_str("\n\n");
+            }
         }
         md.push_str(text);
+        prev_is_text = sec.is_text;
+        prev_ends_mid_sentence = sec.is_text
+            && text
+                .ends_with(|c: char| !matches!(c, '.' | '!' | '?' | ':' | '"' | '\u{201D}'));
     }
 
     md.trim_end().to_string()
@@ -340,16 +379,11 @@ fn region_to_markdown(region: &Region) -> String {
         }
         RegionKind::FigureGroup => {
             let mut parts = Vec::new();
-            // Render each member item
-            if let Some(ref items) = region.items {
-                for item in items {
-                    let item_md = region_to_markdown(item);
-                    if !item_md.is_empty() {
-                        parts.push(item_md);
-                    }
-                }
+            // Single composite image for the entire figure group
+            if let Some(ref path) = region.image_path {
+                parts.push(format!("![]({path})"));
             }
-            // Append group-level caption
+            // Group-level caption
             if let Some(ref cap) = region.caption {
                 if let Some(ref text) = cap.text {
                     parts.push(bold_caption_label(text));
@@ -850,39 +884,34 @@ mod tests {
     #[test]
     fn test_figure_group_to_markdown() {
         let mut group = make_region(RegionKind::FigureGroup);
-        let mut item1 = make_region(RegionKind::Image);
-        item1.image_path = Some("images/p1_0.png".into());
-        let mut sub_cap = make_region(RegionKind::FigureTitle);
-        sub_cap.text = Some("(a) Left".into());
-        item1.caption = Some(Box::new(sub_cap));
+        group.image_path = Some("images/p1_0_grp.png".into());
 
-        let mut item2 = make_region(RegionKind::Image);
-        item2.image_path = Some("images/p1_1.png".into());
-
+        let item1 = make_region(RegionKind::Image);
+        let item2 = make_region(RegionKind::Image);
         group.items = Some(vec![item1, item2]);
+
         let mut cap = make_region(RegionKind::FigureTitle);
         cap.text = Some("Fig. 5. Two panels".into());
         group.caption = Some(Box::new(cap));
 
         let md = region_to_markdown(&group);
-        assert!(md.contains("![](images/p1_0.png)"));
-        assert!(md.contains("(a) Left"));
-        assert!(md.contains("![](images/p1_1.png)"));
+        // Single composite image, not individual member images
+        assert!(md.contains("![](images/p1_0_grp.png)"));
         assert!(md.contains("**Fig. 5.** Two panels"));
     }
 
     #[test]
     fn test_figure_group_no_caption() {
         let mut group = make_region(RegionKind::FigureGroup);
-        let mut item1 = make_region(RegionKind::Image);
-        item1.image_path = Some("images/p1_0.png".into());
-        let mut item2 = make_region(RegionKind::Image);
-        item2.image_path = Some("images/p1_1.png".into());
+        group.image_path = Some("images/p1_0_grp.png".into());
+
+        let item1 = make_region(RegionKind::Image);
+        let item2 = make_region(RegionKind::Image);
         group.items = Some(vec![item1, item2]);
 
         let md = region_to_markdown(&group);
-        assert!(md.contains("![](images/p1_0.png)"));
-        assert!(md.contains("![](images/p1_1.png)"));
+        // Single composite image
+        assert!(md.contains("![](images/p1_0_grp.png)"));
         // No caption text
         assert!(!md.contains("Fig"));
     }
@@ -901,8 +930,7 @@ mod tests {
 
     #[test]
     fn test_figure_group_consumed_skipped_in_markdown() {
-        // FigureGroup's consumed member regions' individual entries are skipped
-        // because they're consumed, but the group renders them via items
+        // FigureGroup renders a single composite image; consumed originals are skipped
         let result = ExtractionResult {
             metadata: Metadata {
                 filename: "test.pdf".into(),
@@ -916,19 +944,18 @@ mod tests {
                 dpi: 144,
                 regions: vec![
                     {
-                        // Consumed original member
+                        // Consumed original member (no image_path in new design)
                         let mut r = make_region(RegionKind::Image);
-                        r.image_path = Some("images/p1_0.png".into());
                         r.consumed = true;
                         r.order = 0;
                         r
                     },
                     {
-                        // The group
+                        // The group with composite image
                         let mut group = make_region(RegionKind::FigureGroup);
                         group.order = 0;
-                        let mut item = make_region(RegionKind::Image);
-                        item.image_path = Some("images/p1_0.png".into());
+                        group.image_path = Some("images/p1_0.png".into());
+                        let item = make_region(RegionKind::Image);
                         group.items = Some(vec![item]);
                         group
                     },
@@ -937,7 +964,7 @@ mod tests {
         };
 
         let md = render_markdown(&result);
-        // The image should appear exactly once (from the group, not the consumed original)
+        // The composite image should appear exactly once
         let count = md.matches("![](images/p1_0.png)").count();
         assert_eq!(count, 1);
     }
