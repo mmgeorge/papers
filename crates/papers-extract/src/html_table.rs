@@ -374,4 +374,240 @@ mod tests {
         assert_eq!(lines[0], "| Name | Group A | Group B | C |");
         assert_eq!(lines[2], "| x | 1 | 2 | 3 |");
     }
+
+    // ── Multi-row headers with colspan ────────────────────────────────
+
+    #[test]
+    fn two_colspan_groups() {
+        let html = "<table><thead>\
+                     <tr><th colspan=\"2\">Info</th><th colspan=\"2\">Score</th></tr>\
+                     <tr><th>A</th><th>B</th><th>Min</th><th>Max</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td><td>4</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Info A | Info B | Score Min | Score Max |");
+    }
+
+    #[test]
+    fn three_colspan_groups() {
+        let html = "<table><thead>\
+                     <tr><th colspan=\"2\">G1</th><th colspan=\"3\">G2</th><th colspan=\"2\">G3</th></tr>\
+                     <tr><th>a</th><th>b</th><th>c</th><th>d</th><th>e</th><th>f</th><th>g</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td><td>7</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| G1 a | G1 b | G2 c | G2 d | G2 e | G3 f | G3 g |");
+    }
+
+    #[test]
+    fn large_colspan4() {
+        let html = "<table><thead>\
+                     <tr><th colspan=\"4\">Wide</th></tr>\
+                     <tr><th>W</th><th>X</th><th>Y</th><th>Z</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td><td>4</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Wide W | Wide X | Wide Y | Wide Z |");
+    }
+
+    #[test]
+    fn asymmetric_colspans() {
+        let html = "<table><thead>\
+                     <tr><th colspan=\"3\">Big</th><th colspan=\"2\">Small</th></tr>\
+                     <tr><th>a</th><th>b</th><th>c</th><th>d</th><th>e</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Big a | Big b | Big c | Small d | Small e |");
+    }
+
+    #[test]
+    fn colspan_plus_trailing_single() {
+        let html = "<table><thead>\
+                     <tr><th colspan=\"2\">Group</th><th>Solo</th></tr>\
+                     <tr><th>A</th><th>B</th><th>C</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Group A | Group B | Solo C |");
+    }
+
+    // ── Multi-row headers with rowspan ────────────────────────────────
+
+    #[test]
+    fn single_rowspan2_left() {
+        let html = "<table><thead>\
+                     <tr><th rowspan=\"2\">Name</th><th colspan=\"2\">Data</th></tr>\
+                     <tr><th>X</th><th>Y</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>foo</td><td>1</td><td>2</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Name | Data X | Data Y |");
+    }
+
+    #[test]
+    fn rowspan2_in_middle() {
+        let html = "<table><thead>\
+                     <tr><th>Left</th><th rowspan=\"2\">Mid</th><th>Right</th></tr>\
+                     <tr><th>L2</th><th>R2</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>a</td><td>b</td><td>c</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Left L2 | Mid | Right R2 |");
+    }
+
+    #[test]
+    fn rowspan2_at_right() {
+        let html = "<table><thead>\
+                     <tr><th colspan=\"2\">Group</th><th rowspan=\"2\">Fixed</th></tr>\
+                     <tr><th>A</th><th>B</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Group A | Group B | Fixed |");
+    }
+
+    #[test]
+    fn two_rowspan2_cells() {
+        let html = "<table><thead>\
+                     <tr><th rowspan=\"2\">L</th><th colspan=\"2\">Mid</th><th rowspan=\"2\">R</th></tr>\
+                     <tr><th>M1</th><th>M2</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>a</td><td>b</td><td>c</td><td>d</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| L | Mid M1 | Mid M2 | R |");
+    }
+
+    #[test]
+    fn rowspan2_plus_colspan2_same_cell() {
+        let html = "<table><thead>\
+                     <tr><th rowspan=\"2\" colspan=\"2\">Big</th><th>C</th></tr>\
+                     <tr><th>D</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Big | Big | C D |");
+    }
+
+    // ── Complex multi-row headers ─────────────────────────────────────
+
+    #[test]
+    fn rowspan2_left_plus_colspan_right() {
+        // Mirrors VBD structure: rowspan=2 + colspan groups
+        let html = "<table><thead>\
+                     <tr><th rowspan=\"2\">Name</th><th colspan=\"3\">Results</th></tr>\
+                     <tr><th>P</th><th>R</th><th>F1</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>x</td><td>1</td><td>2</td><td>3</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| Name | Results P | Results R | Results F1 |");
+    }
+
+    #[test]
+    fn vbd_full_structure() {
+        // Full VBD table: rowspan=2 + 4 colspan groups (3,3,2,2) + single
+        let html = "<table><thead>\
+                     <tr><th rowspan=\"2\">Exp</th>\
+                     <th colspan=\"3\">Num</th><th colspan=\"3\">Mat</th>\
+                     <th colspan=\"2\">Con</th><th colspan=\"2\">Sim</th>\
+                     <th>Note</th></tr>\
+                     <tr><th>a</th><th>b</th><th>c</th>\
+                     <th>d</th><th>e</th><th>f</th>\
+                     <th>g</th><th>h</th>\
+                     <th>i</th><th>j</th>\
+                     <th>k</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>v1</td><td>1</td><td>2</td><td>3</td>\
+                     <td>4</td><td>5</td><td>6</td>\
+                     <td>7</td><td>8</td>\
+                     <td>9</td><td>10</td>\
+                     <td>11</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(
+            lines[0],
+            "| Exp | Num a | Num b | Num c | Mat d | Mat e | Mat f | Con g | Con h | Sim i | Sim j | Note k |"
+        );
+        assert_eq!(lines.len(), 3); // header + separator + 1 data row
+    }
+
+    #[test]
+    fn three_header_rows() {
+        // 3-row thead with progressive subdivision
+        let html = "<table><thead>\
+                     <tr><th colspan=\"4\">All</th></tr>\
+                     <tr><th colspan=\"2\">Left</th><th colspan=\"2\">Right</th></tr>\
+                     <tr><th>A</th><th>B</th><th>C</th><th>D</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td><td>4</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| All Left A | All Left B | All Right C | All Right D |");
+    }
+
+    // ── Edge cases ────────────────────────────────────────────────────
+
+    #[test]
+    fn all_colspan1_two_row_header() {
+        // 2-row thead, same cells → deduplicates to single labels
+        let html = "<table><thead>\
+                     <tr><th>X</th><th>Y</th></tr>\
+                     <tr><th>X</th><th>Y</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        // Deduplication: "X X" → just "X"
+        assert_eq!(lines[0], "| X | Y |");
+    }
+
+    #[test]
+    fn empty_cells_in_header() {
+        let html = "<table><thead>\
+                     <tr><th></th><th>B</th><th></th></tr>\
+                     </thead><tbody>\
+                     <tr><td>1</td><td>2</td><td>3</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "|  | B |  |");
+    }
+
+    #[test]
+    fn rowspan_in_body() {
+        let html = "<table><thead><tr><th>A</th><th>B</th></tr></thead>\
+                     <tbody>\
+                     <tr><td rowspan=\"2\">tall</td><td>x</td></tr>\
+                     <tr><td>y</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[2], "| tall | x |");
+        assert_eq!(lines[3], "| tall | y |");
+    }
 }

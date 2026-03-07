@@ -213,6 +213,7 @@ mod tests {
             caption: None,
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         }
     }

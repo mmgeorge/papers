@@ -45,6 +45,9 @@ pub struct Region {
     /// Equation number tag for display formulas (e.g. "1", "2a").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// Member regions for a `FigureGroup`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<Region>>,
     /// True when this region's content has been spliced into a parent region
     /// (e.g. an InlineFormula consumed by an Algorithm or Text region).
     /// Consumed regions are kept in the JSON for debug/layout but skipped
@@ -80,6 +83,8 @@ pub enum RegionKind {
     Seal,
     Chart,
     SidebarText,
+    /// Synthetic group of spatially close visual regions sharing one caption.
+    FigureGroup,
 }
 
 impl RegionKind {
@@ -151,6 +156,17 @@ impl RegionKind {
     pub fn is_visual(&self) -> bool {
         matches!(self, Self::Image | Self::Chart | Self::Seal)
     }
+
+    /// Whether this region kind can be grouped into a `FigureGroup`.
+    ///
+    /// Includes Table (which `is_visual()` excludes) because composite figures
+    /// sometimes contain table sub-panels alongside images/charts.
+    pub fn is_groupable(&self) -> bool {
+        matches!(
+            self,
+            Self::Image | Self::Chart | Self::Table | Self::Seal
+        )
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +200,7 @@ mod tests {
             RegionKind::Seal,
             RegionKind::Chart,
             RegionKind::SidebarText,
+            RegionKind::FigureGroup,
         ];
 
         for kind in &kinds {
@@ -208,6 +225,7 @@ mod tests {
             caption: None,
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         };
 
@@ -232,6 +250,7 @@ mod tests {
             caption: None,
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         };
 
@@ -255,6 +274,7 @@ mod tests {
             caption: None,
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         };
 
@@ -277,6 +297,7 @@ mod tests {
             caption: None,
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         };
         let region = Region {
@@ -292,6 +313,7 @@ mod tests {
             caption: Some(Box::new(cap)),
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         };
 
@@ -327,6 +349,7 @@ mod tests {
                     caption: None,
                     chart_type: None,
                     tag: None,
+                    items: None,
                     consumed: false,
                 }],
             }],

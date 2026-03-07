@@ -93,28 +93,43 @@ pub fn associate_captions(regions: &mut [Region]) {
                 continue;
             }
 
-            // Check caption type compatibility
-            let compatible = match parent_kind {
-                RegionKind::Image => caption_data[cap_idx]
-                    .0
-                    .checked_sub(0) // just to access the region
-                    .map(|_| {
-                        matches!(
-                            regions[caption_data[cap_idx].0].kind,
-                            RegionKind::FigureTitle | RegionKind::FigureTableTitle
-                        )
-                    })
-                    .unwrap_or(false),
-                RegionKind::Table => matches!(
-                    regions[caption_data[cap_idx].0].kind,
-                    RegionKind::TableTitle | RegionKind::FigureTableTitle
-                ),
-                RegionKind::Chart => matches!(
-                    regions[caption_data[cap_idx].0].kind,
-                    RegionKind::ChartTitle | RegionKind::FigureTableTitle
-                ),
-                _ => false,
+            // Caption–parent compatibility.
+            //
+            // When the caption text has a clear prefix ("Table …" / "Fig …"),
+            // that is the authoritative signal — it overrides the model's kind
+            // label, which is often wrong (e.g. FigureTitle on "Table 1").
+            // Only when there is no recognisable prefix do we fall back to
+            // kind-based matching.
+            let cap_region_kind = regions[caption_data[cap_idx].0].kind;
+            let cap_text_lower = caption_data[cap_idx]
+                .2
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase();
+
+            let compatible = if cap_text_lower.starts_with("table") {
+                parent_kind == RegionKind::Table
+            } else if cap_text_lower.starts_with("fig") {
+                matches!(parent_kind, RegionKind::Image | RegionKind::Chart)
+            } else {
+                // No clear text prefix — use kind-based matching
+                match parent_kind {
+                    RegionKind::Image => matches!(
+                        cap_region_kind,
+                        RegionKind::FigureTitle | RegionKind::FigureTableTitle
+                    ),
+                    RegionKind::Table => matches!(
+                        cap_region_kind,
+                        RegionKind::TableTitle | RegionKind::FigureTableTitle
+                    ),
+                    RegionKind::Chart => matches!(
+                        cap_region_kind,
+                        RegionKind::ChartTitle | RegionKind::FigureTableTitle
+                    ),
+                    _ => false,
+                }
             };
+
             if !compatible {
                 continue;
             }
@@ -158,7 +173,7 @@ pub fn associate_captions(regions: &mut [Region]) {
 }
 
 /// Compute the minimum edge-to-edge distance between two bounding boxes.
-fn edge_distance(a: [f32; 4], b: [f32; 4]) -> f32 {
+pub(crate) fn edge_distance(a: [f32; 4], b: [f32; 4]) -> f32 {
     let dx = if a[2] < b[0] {
         b[0] - a[2]
     } else if b[2] < a[0] {
@@ -261,6 +276,199 @@ pub fn classify_chart_type(_image: &DynamicImage) -> &'static str {
     "other"
 }
 
+/// Maximum edge-to-edge gap (in PDF points) for grouping visual regions.
+const FIGURE_GROUP_MAX_GAP: f32 = 30.0;
+
+/// Group spatially close visual regions into `FigureGroup` containers.
+///
+/// Uses connected-component clustering: two groupable regions are connected
+/// if their edge-to-edge distance is less than [`FIGURE_GROUP_MAX_GAP`].
+/// Each component with 2+ members becomes a FigureGroup.
+///
+/// Should be called **after** `associate_captions` so that individual items
+/// already have their captions attached. The function then promotes a
+/// suitable caption (starting with "Fig" or "Table") to the group level
+/// and absorbs nearby orphaned captions.
+pub fn group_figure_regions(regions: &mut Vec<Region>) {
+    // Collect indices of non-consumed groupable regions
+    let groupable: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.consumed && r.kind.is_groupable())
+        .map(|(i, _)| i)
+        .collect();
+
+    if groupable.len() < 2 {
+        return;
+    }
+
+    // Union-Find
+    let n = groupable.len();
+    let mut parent: Vec<usize> = (0..n).collect();
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    }
+
+    // Build adjacency via pairwise distance
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let dist = edge_distance(regions[groupable[i]].bbox, regions[groupable[j]].bbox);
+            if dist < FIGURE_GROUP_MAX_GAP {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+
+    // Collect components
+    let mut components: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for i in 0..n {
+        let root = find(&mut parent, i);
+        components.entry(root).or_default().push(groupable[i]);
+    }
+
+    // Compute median height for orphaned caption absorption threshold
+    let median_height = {
+        let mut heights: Vec<f32> = regions
+            .iter()
+            .map(|r| (r.bbox[3] - r.bbox[1]).abs())
+            .collect();
+        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if heights.is_empty() {
+            20.0
+        } else {
+            heights[heights.len() / 2]
+        }
+    };
+    let caption_max_dist = median_height * 2.0;
+
+    let mut new_groups: Vec<Region> = Vec::new();
+
+    for (_root, member_indices) in &components {
+        if member_indices.len() < 2 {
+            continue;
+        }
+
+        // Clone members for the group's items vec
+        let mut items: Vec<Region> = member_indices
+            .iter()
+            .map(|&i| regions[i].clone())
+            .collect();
+
+        // Compute union bbox
+        let mut union_bbox = items[0].bbox;
+        let mut max_conf = items[0].confidence;
+        let mut min_order = items[0].order;
+        for item in &items[1..] {
+            union_bbox[0] = union_bbox[0].min(item.bbox[0]);
+            union_bbox[1] = union_bbox[1].min(item.bbox[1]);
+            union_bbox[2] = union_bbox[2].max(item.bbox[2]);
+            union_bbox[3] = union_bbox[3].max(item.bbox[3]);
+            max_conf = max_conf.max(item.confidence);
+            min_order = min_order.min(item.order);
+        }
+
+        // Caption promotion: find an item whose caption starts with "Fig" or "Table"
+        let mut group_caption: Option<Box<Region>> = None;
+
+        // First pass: look for an item whose caption starts with a main label
+        let promoted_idx = items.iter().position(|item| {
+            item.caption
+                .as_ref()
+                .and_then(|c| c.text.as_deref())
+                .map(|t| {
+                    let lower = t.to_lowercase();
+                    lower.starts_with("fig") || lower.starts_with("table")
+                })
+                .unwrap_or(false)
+        });
+
+        if let Some(idx) = promoted_idx {
+            group_caption = items[idx].caption.take();
+        } else {
+            // Fallback: if exactly 1 item has a caption, promote it
+            let with_caption: Vec<usize> = items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.caption.is_some())
+                .map(|(i, _)| i)
+                .collect();
+            if with_caption.len() == 1 {
+                group_caption = items[with_caption[0]].caption.take();
+            }
+        }
+
+        // Orphaned caption absorption: scan nearby non-consumed caption regions
+        if group_caption.is_none() {
+            let mut best_orphan: Option<(usize, f32)> = None;
+            for (ri, r) in regions.iter().enumerate() {
+                if r.consumed || !r.kind.is_caption() {
+                    continue;
+                }
+                // Skip captions that are members of the group
+                if member_indices.contains(&ri) {
+                    continue;
+                }
+                let dist = edge_distance(union_bbox, r.bbox);
+                if dist > caption_max_dist {
+                    continue;
+                }
+                let text_lower = r.text.as_deref().unwrap_or("").to_lowercase();
+                if !text_lower.starts_with("fig") && !text_lower.starts_with("table") {
+                    continue;
+                }
+                if best_orphan.map_or(true, |(_, d)| dist < d) {
+                    best_orphan = Some((ri, dist));
+                }
+            }
+            if let Some((orphan_idx, _)) = best_orphan {
+                group_caption = Some(Box::new(regions[orphan_idx].clone()));
+                regions[orphan_idx].consumed = true;
+            }
+        }
+
+        // Mark original members as consumed
+        for &i in member_indices {
+            regions[i].consumed = true;
+        }
+
+        let first_id = &regions[member_indices[0]].id;
+        let group = Region {
+            id: format!("{first_id}_grp"),
+            kind: RegionKind::FigureGroup,
+            bbox: union_bbox,
+            confidence: max_conf,
+            order: min_order,
+            text: None,
+            html: None,
+            latex: None,
+            image_path: None,
+            caption: group_caption,
+            chart_type: None,
+            tag: None,
+            items: Some(items),
+            consumed: false,
+        };
+
+        new_groups.push(group);
+    }
+
+    regions.append(&mut new_groups);
+    regions.sort_by_key(|r| r.order);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +487,7 @@ mod tests {
             caption: None,
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         }
     }
@@ -467,5 +676,644 @@ mod tests {
         assert!(regions[1].caption.is_none());
         // Caption region itself should be consumed
         assert!(regions[2].consumed);
+    }
+
+    // ── FigureGroup tests ────────────────────────────────────────────
+
+    fn make_groupable(id: &str, kind: RegionKind, bbox: [f32; 4], order: u32) -> Region {
+        Region {
+            id: id.into(),
+            kind,
+            bbox,
+            confidence: 0.9,
+            order,
+            text: None,
+            html: None,
+            latex: None,
+            image_path: Some(format!("images/{id}.png")),
+            caption: None,
+            chart_type: None,
+            tag: None,
+            items: None,
+            consumed: false,
+        }
+    }
+
+    #[test]
+    fn test_group_2x3_grid() {
+        // 6 visuals in a 2x3 grid, all < 30pt apart → single FigureGroup
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),  // 10pt gap
+            make_groupable("p1_2", RegionKind::Chart, [270.0, 50.0, 370.0, 150.0], 2),  // 10pt gap
+            make_groupable("p1_3", RegionKind::Chart, [50.0, 160.0, 150.0, 260.0], 3),  // 10pt vertical gap
+            make_groupable("p1_4", RegionKind::Chart, [160.0, 160.0, 260.0, 260.0], 4),
+            make_groupable("p1_5", RegionKind::Chart, [270.0, 160.0, 370.0, 260.0], 5),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items.as_ref().unwrap().len(), 6);
+        assert_eq!(groups[0].order, 0);
+
+        // Original members should be consumed
+        let consumed_count = regions.iter().filter(|r| r.consumed).count();
+        assert_eq!(consumed_count, 6);
+    }
+
+    #[test]
+    fn test_two_separate_clusters() {
+        // Two pairs with > 30pt gap between them → two groups
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),  // 10pt gap
+            make_groupable("p1_2", RegionKind::Image, [50.0, 250.0, 150.0, 350.0], 2),  // 90pt gap from row above
+            make_groupable("p1_3", RegionKind::Image, [160.0, 250.0, 260.0, 350.0], 3),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 2);
+        for g in &groups {
+            assert_eq!(g.items.as_ref().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_single_visual_no_group() {
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 0);
+        assert!(!regions[0].consumed);
+    }
+
+    #[test]
+    fn test_caption_promotion() {
+        // Two images, one with "Fig. 5" caption → promoted to group level
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 150.0, 170.0], Some("Fig. 5. Results"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            {
+                let mut r = make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1);
+                let mut cap = make_region(RegionKind::FigureTitle, [160.0, 155.0, 260.0, 170.0], Some("(a) Detail"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        // Group caption should be the "Fig. 5" one
+        let cap_text = group.caption.as_ref().unwrap().text.as_deref().unwrap();
+        assert!(cap_text.starts_with("Fig. 5"));
+        // The item that had "Fig. 5" should have its caption removed
+        let items = group.items.as_ref().unwrap();
+        let fig5_item = items.iter().find(|i| i.id == "p1_0").unwrap();
+        assert!(fig5_item.caption.is_none());
+        // The "(a) Detail" sub-label should still be on its item
+        let detail_item = items.iter().find(|i| i.id == "p1_1").unwrap();
+        assert!(detail_item.caption.is_some());
+    }
+
+    #[test]
+    fn test_orphaned_caption_absorption() {
+        // Two images + orphaned caption region near them
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+            {
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 160.0, 260.0, 180.0], Some("Fig. 7. Comparison"));
+                cap.order = 2;
+                cap
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        let cap_text = group.caption.as_ref().unwrap().text.as_deref().unwrap();
+        assert!(cap_text.starts_with("Fig. 7"));
+        // The orphaned caption should be consumed
+        assert!(regions.iter().any(|r| r.kind == RegionKind::FigureTitle && r.consumed));
+    }
+
+    #[test]
+    fn test_grouping_ignores_text_between() {
+        // Two images with a Text region between them in reading order
+        // but spatially close → CC clustering still groups them
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            {
+                let mut r = make_region(RegionKind::Text, [300.0, 50.0, 500.0, 150.0], Some("Some text"));
+                r.order = 1;
+                r
+            },
+            make_groupable("p1_2", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 2),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items.as_ref().unwrap().len(), 2);
+        // Text region should not be consumed
+        let text_r = regions.iter().find(|r| r.kind == RegionKind::Text).unwrap();
+        assert!(!text_r.consumed);
+    }
+
+    #[test]
+    fn test_empty_regions_no_panic() {
+        let mut regions: Vec<Region> = vec![];
+        group_figure_regions(&mut regions);
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn test_all_consumed_visuals_skipped() {
+        // Pre-consumed visuals should not be grouped
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
+                r.consumed = true;
+                r
+            },
+            {
+                let mut r = make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1);
+                r.consumed = true;
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_mixed_consumed_and_live() {
+        // One consumed + two live close together → group of 2
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
+                r.consumed = true;
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+            make_groupable("p1_2", RegionKind::Image, [270.0, 50.0, 370.0, 150.0], 2),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items.as_ref().unwrap().len(), 2);
+        // The pre-consumed region should still be consumed but NOT in the group
+        assert!(regions[0].consumed);
+    }
+
+    #[test]
+    fn test_group_union_bbox() {
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [10.0, 20.0, 100.0, 120.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [110.0, 30.0, 200.0, 130.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        assert_eq!(group.bbox[0], 10.0);  // min x1
+        assert_eq!(group.bbox[1], 20.0);  // min y1
+        assert_eq!(group.bbox[2], 200.0); // max x2
+        assert_eq!(group.bbox[3], 130.0); // max y2
+    }
+
+    #[test]
+    fn test_group_confidence_is_max() {
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
+                r.confidence = 0.8;
+                r
+            },
+            {
+                let mut r = make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1);
+                r.confidence = 0.95;
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        assert!((group.confidence - 0.95).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_group_order_is_min() {
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 5),
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 3),
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        assert_eq!(group.order, 3);
+    }
+
+    #[test]
+    fn test_group_id_format() {
+        let mut regions = vec![
+            make_groupable("p1_7", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_8", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        assert!(group.id.ends_with("_grp"));
+    }
+
+    #[test]
+    fn test_exactly_at_threshold_not_grouped() {
+        // Two regions exactly 30pt apart should NOT be grouped (< 30, not <=)
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [180.0, 50.0, 280.0, 150.0], 1), // 30pt gap
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_just_under_threshold_grouped() {
+        // Two regions 29pt apart → grouped
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [179.0, 50.0, 279.0, 150.0], 1), // 29pt gap
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn test_chain_connectivity() {
+        // A - B - C where A-B < 30pt, B-C < 30pt, but A-C > 30pt
+        // CC clustering should group all three via transitivity
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [0.0, 50.0, 100.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [125.0, 50.0, 225.0, 150.0], 1),   // 25pt from A
+            make_groupable("p1_2", RegionKind::Image, [250.0, 50.0, 350.0, 150.0], 2),   // 25pt from B, 150pt from A
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_table_caption_promotion() {
+        // Group with Table items: caption starting with "Table" should be promoted
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Table, [50.0, 50.0, 250.0, 200.0], 0);
+                let mut cap = make_region(RegionKind::TableTitle, [50.0, 205.0, 250.0, 225.0], Some("Table 3. Comparison"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Table, [260.0, 50.0, 460.0, 200.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        let cap_text = group.caption.as_ref().unwrap().text.as_deref().unwrap();
+        assert!(cap_text.starts_with("Table 3"));
+    }
+
+    #[test]
+    fn test_no_caption_promotion_when_no_fig_or_table_prefix() {
+        // Both items have sub-label captions like "(a)" and "(b)" — no promotion
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 150.0, 170.0], Some("(a) Left panel"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            {
+                let mut r = make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1);
+                let mut cap = make_region(RegionKind::FigureTitle, [160.0, 155.0, 260.0, 170.0], Some("(b) Right panel"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        // No group-level caption since none starts with Fig/Table
+        assert!(group.caption.is_none());
+        // Both items should keep their captions
+        let items = group.items.as_ref().unwrap();
+        assert!(items[0].caption.is_some());
+        assert!(items[1].caption.is_some());
+    }
+
+    #[test]
+    fn test_single_caption_fallback_promotion() {
+        // Only 1 item has a caption (not starting with Fig/Table) → still promoted
+        let mut regions = vec![
+            {
+                let mut r = make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0);
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 155.0, 150.0, 170.0], Some("(a) Only panel with label"));
+                cap.consumed = true;
+                r.caption = Some(Box::new(cap));
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        // Single caption should be promoted as fallback
+        let cap_text = group.caption.as_ref().unwrap().text.as_deref().unwrap();
+        assert!(cap_text.starts_with("(a)"));
+    }
+
+    #[test]
+    fn test_orphaned_caption_not_absorbed_when_too_far() {
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+            {
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 700.0, 260.0, 720.0], Some("Fig. 99. Very far away"));
+                cap.order = 2;
+                cap
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        assert!(group.caption.is_none());
+        // The far-away caption should NOT be consumed
+        let cap_r = regions.iter().find(|r| r.kind == RegionKind::FigureTitle).unwrap();
+        assert!(!cap_r.consumed);
+    }
+
+    #[test]
+    fn test_orphaned_caption_non_fig_prefix_not_absorbed() {
+        // Orphaned caption without Fig/Table prefix should not be absorbed
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+            {
+                let mut cap = make_region(RegionKind::FigureTitle, [50.0, 160.0, 260.0, 180.0], Some("(a) Some sub-label"));
+                cap.order = 2;
+                cap
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        assert!(group.caption.is_none());
+    }
+
+    #[test]
+    fn test_mixed_image_table_chart_seal_grouping() {
+        // All groupable kinds should be grouped together
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Chart, [160.0, 50.0, 260.0, 150.0], 1),
+            make_groupable("p1_2", RegionKind::Table, [270.0, 50.0, 370.0, 150.0], 2),
+            make_groupable("p1_3", RegionKind::Seal, [50.0, 160.0, 150.0, 260.0], 3),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].items.as_ref().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_non_groupable_kinds_ignored() {
+        // Text, DisplayFormula etc. are not groupable even if spatially close
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            {
+                let mut r = make_region(RegionKind::DisplayFormula, [160.0, 50.0, 260.0, 150.0], None);
+                r.order = 1;
+                r.id = "p1_1".into();
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        // No group should be formed (only 1 groupable region)
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_group_sorted_by_order() {
+        // Groups should appear at the correct reading order position
+        let mut regions = vec![
+            {
+                let mut r = make_region(RegionKind::Text, [50.0, 10.0, 500.0, 40.0], Some("Intro text"));
+                r.order = 0;
+                r.id = "p1_0".into();
+                r
+            },
+            make_groupable("p1_1", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 1),
+            make_groupable("p1_2", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 2),
+            {
+                let mut r = make_region(RegionKind::Text, [50.0, 300.0, 500.0, 330.0], Some("After figure"));
+                r.order = 3;
+                r.id = "p1_3".into();
+                r
+            },
+        ];
+        group_figure_regions(&mut regions);
+
+        // The group should be between the two text regions
+        let non_consumed: Vec<&Region> = regions.iter().filter(|r| !r.consumed).collect();
+        assert_eq!(non_consumed.len(), 3); // text, group, text
+        assert_eq!(non_consumed[0].kind, RegionKind::Text);
+        assert_eq!(non_consumed[1].kind, RegionKind::FigureGroup);
+        assert_eq!(non_consumed[2].kind, RegionKind::Text);
+    }
+
+    #[test]
+    fn test_diagonal_proximity() {
+        // Two regions diagonally placed — edge_distance uses Euclidean
+        // gap_x = 10, gap_y = 10, distance = sqrt(200) ≈ 14.14 < 30 → grouped
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [160.0, 160.0, 260.0, 260.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn test_diagonal_too_far() {
+        // gap_x = 25, gap_y = 25, distance = sqrt(1250) ≈ 35.4 > 30 → not grouped
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [175.0, 175.0, 275.0, 275.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 0);
+    }
+
+    #[test]
+    fn test_overlapping_visuals_grouped() {
+        // Overlapping regions have edge_distance = 0 → always grouped
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 200.0, 200.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [150.0, 150.0, 300.0, 300.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let groups: Vec<&Region> = regions
+            .iter()
+            .filter(|r| r.kind == RegionKind::FigureGroup)
+            .collect();
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn test_caption_text_crosscheck_table_on_image() {
+        // FigureTitle with "Table 1..." text should NOT match an Image
+        let mut regions = vec![
+            make_region(RegionKind::Image, [50.0, 100.0, 250.0, 300.0], None),
+            make_region(
+                RegionKind::FigureTitle,
+                [50.0, 310.0, 250.0, 330.0],
+                Some("Table 1. Performance results"),
+            ),
+        ];
+        associate_captions(&mut regions);
+        assert!(regions[0].caption.is_none());
+        assert!(!regions[1].consumed);
+    }
+
+    #[test]
+    fn test_caption_text_crosscheck_fig_on_table() {
+        // TableTitle with "Fig. 1..." text should NOT match a Table
+        let mut regions = vec![
+            make_region(RegionKind::Table, [50.0, 100.0, 250.0, 300.0], None),
+            make_region(
+                RegionKind::TableTitle,
+                [50.0, 310.0, 250.0, 330.0],
+                Some("Fig. 1. Overview"),
+            ),
+        ];
+        associate_captions(&mut regions);
+        assert!(regions[0].caption.is_none());
+        assert!(!regions[1].consumed);
+    }
+
+    #[test]
+    fn test_mislabeled_table_caption_matches_table() {
+        // FigureTitle with "Table 1..." text SHOULD match a Table (text overrides kind)
+        let mut regions = vec![
+            make_region(RegionKind::Table, [50.0, 100.0, 250.0, 300.0], None),
+            make_region(
+                RegionKind::FigureTitle,
+                [50.0, 310.0, 250.0, 330.0],
+                Some("Table 1. Performance results"),
+            ),
+        ];
+        associate_captions(&mut regions);
+        assert_eq!(caption_text(&regions[0]), Some("Table 1. Performance results"));
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn test_caption_text_crosscheck_with_nearby_table() {
+        // Image and Table both near a "Table 1" FigureTitle caption.
+        // Caption should go to the Table, not the Image.
+        let mut regions = vec![
+            make_region(RegionKind::Image, [50.0, 100.0, 250.0, 300.0], None),
+            make_region(
+                RegionKind::FigureTitle,
+                [50.0, 310.0, 250.0, 330.0],
+                Some("Table 1. Performance results"),
+            ),
+            make_region(RegionKind::Table, [50.0, 340.0, 250.0, 500.0], None),
+        ];
+        associate_captions(&mut regions);
+        assert!(regions[0].caption.is_none());
+        assert_eq!(caption_text(&regions[2]), Some("Table 1. Performance results"));
+        assert!(regions[1].consumed);
+    }
+
+    #[test]
+    fn test_items_preserve_image_paths() {
+        // Grouped items should retain their image_path for write_images
+        let mut regions = vec![
+            make_groupable("p1_0", RegionKind::Image, [50.0, 50.0, 150.0, 150.0], 0),
+            make_groupable("p1_1", RegionKind::Image, [160.0, 50.0, 260.0, 150.0], 1),
+        ];
+        group_figure_regions(&mut regions);
+
+        let group = regions.iter().find(|r| r.kind == RegionKind::FigureGroup).unwrap();
+        let items = group.items.as_ref().unwrap();
+        assert!(items[0].image_path.is_some());
+        assert!(items[1].image_path.is_some());
     }
 }

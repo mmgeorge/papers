@@ -22,6 +22,32 @@ pub fn write_markdown(result: &ExtractionResult, path: &Path) -> Result<(), Extr
     Ok(())
 }
 
+/// Save a single region's image if it has an `image_path`.
+fn save_region_image(
+    region: &Region,
+    page_img: &DynamicImage,
+    page: &Page,
+    images_dir: &Path,
+) -> Result<(), ExtractError> {
+    if let Some(ref rel_path) = region.image_path {
+        let full_path = images_dir
+            .parent()
+            .unwrap_or(images_dir)
+            .join(rel_path);
+
+        let cropped = crate::figure::crop_region(
+            page_img,
+            region.bbox,
+            page.width_pt,
+            page.height_pt,
+            page.dpi,
+        );
+
+        cropped.save(&full_path)?;
+    }
+    Ok(())
+}
+
 /// Save cropped region images to the output directory.
 pub fn write_images(
     pages: &[Page],
@@ -32,21 +58,12 @@ pub fn write_images(
 
     for (page, page_img) in pages.iter().zip(page_images.iter()) {
         for region in &page.regions {
-            if let Some(ref rel_path) = region.image_path {
-                let full_path = images_dir
-                    .parent()
-                    .unwrap_or(images_dir)
-                    .join(rel_path);
-
-                let cropped = crate::figure::crop_region(
-                    page_img,
-                    region.bbox,
-                    page.width_pt,
-                    page.height_pt,
-                    page.dpi,
-                );
-
-                cropped.save(&full_path)?;
+            save_region_image(region, page_img, page, images_dir)?;
+            // Also save images for FigureGroup member items
+            if let Some(ref items) = region.items {
+                for item in items {
+                    save_region_image(item, page_img, page, images_dir)?;
+                }
             }
         }
     }
@@ -307,6 +324,25 @@ fn region_to_markdown(region: &Region) -> String {
             // Formula numbers are inline metadata, skip
             String::new()
         }
+        RegionKind::FigureGroup => {
+            let mut parts = Vec::new();
+            // Render each member item
+            if let Some(ref items) = region.items {
+                for item in items {
+                    let item_md = region_to_markdown(item);
+                    if !item_md.is_empty() {
+                        parts.push(item_md);
+                    }
+                }
+            }
+            // Append group-level caption
+            if let Some(ref cap) = region.caption {
+                if let Some(ref text) = cap.text {
+                    parts.push(bold_caption_label(text));
+                }
+            }
+            parts.join("\n\n")
+        }
     }
 }
 
@@ -331,6 +367,7 @@ pub fn region_color_rgb(kind: RegionKind) -> [u8; 3] {
         | RegionKind::FigureTableTitle => [220, 200, 0],
         RegionKind::PageHeader | RegionKind::PageFooter | RegionKind::PageNumber => [150, 150, 150],
         RegionKind::Algorithm => [0, 160, 120],
+        RegionKind::FigureGroup => [0, 200, 200],
     }
 }
 
@@ -372,6 +409,93 @@ pub fn draw_region_box(
     }
 }
 
+/// Draw a colored bounding box on an RGBA image with a specific color.
+fn draw_box_rgba(
+    img: &mut image::RgbaImage,
+    bbox_px: [f32; 4],
+    color: image::Rgba<u8>,
+    thickness: u32,
+) {
+    let (iw, ih) = (img.width(), img.height());
+    let x1 = (bbox_px[0] as u32).min(iw.saturating_sub(1));
+    let y1 = (bbox_px[1] as u32).min(ih.saturating_sub(1));
+    let x2 = (bbox_px[2] as u32).min(iw.saturating_sub(1));
+    let y2 = (bbox_px[3] as u32).min(ih.saturating_sub(1));
+
+    for t in 0..thickness {
+        let yt = y1.saturating_add(t).min(y2);
+        let yb = y2.saturating_sub(t).max(y1);
+        for x in x1..=x2 {
+            img.put_pixel(x, yt, color);
+            img.put_pixel(x, yb, color);
+        }
+    }
+    for t in 0..thickness {
+        let xl = x1.saturating_add(t).min(x2);
+        let xr = x2.saturating_sub(t).max(x1);
+        for y in y1..=y2 {
+            img.put_pixel(xl, y, color);
+            img.put_pixel(xr, y, color);
+        }
+    }
+}
+
+/// Write table crop images with cell bbox overlays to `layout/tables/`.
+///
+/// For each table with a `TablePrediction`, draws cell bounding boxes on the
+/// cropped table image and saves it as a PNG.
+pub fn write_table_debug(
+    output_dir: &Path,
+    table_entries: &[(usize, DynamicImage)],
+    table_results: &std::collections::HashMap<usize, crate::pipeline::TableResult>,
+    page_idx: u32,
+) -> Result<(), ExtractError> {
+    use crate::pipeline::TableResult;
+
+    let tables_dir = output_dir.join("layout").join("tables");
+
+    let mut any_written = false;
+    for (idx, crop_image) in table_entries {
+        let pred = match table_results.get(idx) {
+            Some(TableResult::Prediction(p)) => p,
+            _ => continue,
+        };
+
+        if pred.cell_bboxes.is_empty() {
+            continue;
+        }
+
+        if !any_written {
+            std::fs::create_dir_all(&tables_dir)?;
+            any_written = true;
+        }
+
+        let mut img = crop_image.to_rgba8();
+        let (w, h) = (img.width() as f32, img.height() as f32);
+
+        // Alternate colors for adjacent cells
+        let colors = [
+            image::Rgba([0u8, 200, 0, 180]),   // green
+            image::Rgba([50, 100, 255, 180]),   // blue
+            image::Rgba([255, 140, 0, 180]),    // orange
+            image::Rgba([200, 0, 200, 180]),    // magenta
+        ];
+
+        for (cell_idx, bbox_opt) in pred.cell_bboxes.iter().enumerate() {
+            let Some(bbox) = bbox_opt else { continue };
+            let px = [bbox[0] * w, bbox[1] * h, bbox[2] * w, bbox[3] * h];
+            let color = colors[cell_idx % colors.len()];
+            draw_box_rgba(&mut img, px, color, 2);
+        }
+
+        let path = tables_dir.join(format!("p{}_{}.png", page_idx + 1, idx));
+        img.save(&path)
+            .map_err(|e| ExtractError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+    }
+
+    Ok(())
+}
+
 /// Map a RegionKind to a debug visualization color (pdfium).
 fn region_color(kind: RegionKind) -> PdfColor {
     match kind {
@@ -395,6 +519,7 @@ fn region_color(kind: RegionKind) -> PdfColor {
             PdfColor::new(150, 150, 150, 255)
         }
         RegionKind::Algorithm => PdfColor::new(0, 160, 120, 255),
+        RegionKind::FigureGroup => PdfColor::new(0, 200, 200, 255),
     }
 }
 
@@ -537,6 +662,7 @@ mod tests {
             caption: None,
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         }
     }
@@ -691,5 +817,100 @@ mod tests {
         let md = render_markdown(&result);
         assert!(md.contains("# Page 1 Title"));
         assert!(md.contains("Page 2 text."));
+    }
+
+    #[test]
+    fn test_figure_group_to_markdown() {
+        let mut group = make_region(RegionKind::FigureGroup);
+        let mut item1 = make_region(RegionKind::Image);
+        item1.image_path = Some("images/p1_0.png".into());
+        let mut sub_cap = make_region(RegionKind::FigureTitle);
+        sub_cap.text = Some("(a) Left".into());
+        item1.caption = Some(Box::new(sub_cap));
+
+        let mut item2 = make_region(RegionKind::Image);
+        item2.image_path = Some("images/p1_1.png".into());
+
+        group.items = Some(vec![item1, item2]);
+        let mut cap = make_region(RegionKind::FigureTitle);
+        cap.text = Some("Fig. 5. Two panels".into());
+        group.caption = Some(Box::new(cap));
+
+        let md = region_to_markdown(&group);
+        assert!(md.contains("![](images/p1_0.png)"));
+        assert!(md.contains("(a) Left"));
+        assert!(md.contains("![](images/p1_1.png)"));
+        assert!(md.contains("**Fig. 5.** Two panels"));
+    }
+
+    #[test]
+    fn test_figure_group_no_caption() {
+        let mut group = make_region(RegionKind::FigureGroup);
+        let mut item1 = make_region(RegionKind::Image);
+        item1.image_path = Some("images/p1_0.png".into());
+        let mut item2 = make_region(RegionKind::Image);
+        item2.image_path = Some("images/p1_1.png".into());
+        group.items = Some(vec![item1, item2]);
+
+        let md = region_to_markdown(&group);
+        assert!(md.contains("![](images/p1_0.png)"));
+        assert!(md.contains("![](images/p1_1.png)"));
+        // No caption text
+        assert!(!md.contains("Fig"));
+    }
+
+    #[test]
+    fn test_figure_group_empty_items() {
+        let mut group = make_region(RegionKind::FigureGroup);
+        group.items = Some(vec![]);
+        let mut cap = make_region(RegionKind::FigureTitle);
+        cap.text = Some("Fig. 1. Empty group".into());
+        group.caption = Some(Box::new(cap));
+
+        let md = region_to_markdown(&group);
+        assert!(md.contains("**Fig. 1.** Empty group"));
+    }
+
+    #[test]
+    fn test_figure_group_consumed_skipped_in_markdown() {
+        // FigureGroup's consumed member regions' individual entries are skipped
+        // because they're consumed, but the group renders them via items
+        let result = ExtractionResult {
+            metadata: Metadata {
+                filename: "test.pdf".into(),
+                page_count: 1,
+                extraction_time_ms: 0,
+            },
+            pages: vec![Page {
+                page: 1,
+                width_pt: 612.0,
+                height_pt: 792.0,
+                dpi: 144,
+                regions: vec![
+                    {
+                        // Consumed original member
+                        let mut r = make_region(RegionKind::Image);
+                        r.image_path = Some("images/p1_0.png".into());
+                        r.consumed = true;
+                        r.order = 0;
+                        r
+                    },
+                    {
+                        // The group
+                        let mut group = make_region(RegionKind::FigureGroup);
+                        group.order = 0;
+                        let mut item = make_region(RegionKind::Image);
+                        item.image_path = Some("images/p1_0.png".into());
+                        group.items = Some(vec![item]);
+                        group
+                    },
+                ],
+            }],
+        };
+
+        let md = render_markdown(&result);
+        // The image should appear exactly once (from the group, not the consumed original)
+        let count = md.matches("![](images/p1_0.png)").count();
+        assert_eq!(count, 1);
     }
 }

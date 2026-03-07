@@ -102,11 +102,6 @@ impl TableFormerPredictor {
             decoder_params.head_dim,
             backend_name,
         );
-        eprintln!(
-            "TableFormer: {} backend, {} layers, {} heads",
-            backend_name, decoder_params.num_layers, decoder_params.num_heads,
-        );
-
         Ok(Self {
             encoder: Mutex::new(encoder),
             bbox_decoder: Mutex::new(bbox_decoder),
@@ -314,11 +309,13 @@ impl TableFormerPredictor {
             }
 
             // Assign bboxes to HTML cells
-            otsl::assign_cell_bboxes(
+            let assigned = otsl::assign_cell_bboxes(
                 &decode_result.tokens,
                 &xyxy_bboxes,
                 &decode_result.bboxes_to_merge,
-            )
+            );
+
+            assigned
         } else {
             Vec::new()
         };
@@ -337,7 +334,8 @@ impl TableFormerPredictor {
 /// Fill empty HTML table cells with text extracted from PDF chars.
 ///
 /// For each cell with a bbox, converts the normalized bbox to PDF-point space,
-/// extracts text from matching chars, and inserts it into the HTML.
+/// extends edges to include nearby glyphs, extracts text, and inserts it into
+/// the HTML.
 pub fn fill_table_html(
     html: &str,
     cell_bboxes: &[Option<[f32; 4]>],
@@ -352,25 +350,51 @@ pub fn fill_table_html(
     let table_w = table_bbox_pt[2] - table_bbox_pt[0];
     let table_h = table_bbox_pt[3] - table_bbox_pt[1];
 
-    // Extract text for each cell
-    let cell_texts: Vec<String> = cell_bboxes
+    // Pre-convert chars to image-space (Y-down) for bbox matching
+    let img_chars: Vec<[f32; 4]> = chars
         .iter()
-        .map(|bbox_opt| {
-            let Some(bbox) = bbox_opt else {
+        .map(|c| {
+            // PdfChar bbox is bottom-left origin; convert to Y-down top-left
+            [c.bbox[0], page_height_pt - c.bbox[3], c.bbox[2], page_height_pt - c.bbox[1]]
+        })
+        .collect();
+
+    // Pre-compute all cell bboxes in PDF-point space (Y-down, image-space)
+    let all_cells_pt: Vec<Option<[f32; 4]>> = cell_bboxes
+        .iter()
+        .map(|b| {
+            b.map(|bbox| {
+                [
+                    bbox[0] * table_w + table_bbox_pt[0],
+                    bbox[1] * table_h + table_bbox_pt[1],
+                    bbox[2] * table_w + table_bbox_pt[0],
+                    bbox[3] * table_h + table_bbox_pt[1],
+                ]
+            })
+        })
+        .collect();
+
+    // Resolve vertical overlaps between cells in different rows that share
+    // column space. The model can produce bboxes where header cells extend
+    // into sub-header rows, causing duplicate text extraction.
+    let mut all_cells_pt = all_cells_pt;
+    resolve_vertical_overlaps(&mut all_cells_pt);
+
+    // Extract text for each cell
+    let cell_texts: Vec<String> = all_cells_pt
+        .iter()
+        .enumerate()
+        .map(|(idx, cell_opt)| {
+            let Some(cell_pt) = cell_opt else {
                 return String::new();
             };
 
-            // Convert normalized bbox → PDF point space (Y-down, image-space)
-            let cell_pt = [
-                bbox[0] * table_w + table_bbox_pt[0],
-                bbox[1] * table_h + table_bbox_pt[1],
-                bbox[2] * table_w + table_bbox_pt[0],
-                bbox[3] * table_h + table_bbox_pt[1],
-            ];
+            // Extend bbox edges to snap to nearby glyphs, clamped at neighbor cells.
+            let extended = snap_to_nearby_glyphs(*cell_pt, idx, &all_cells_pt, &img_chars);
 
             text::extract_region_text(
                 chars,
-                cell_pt,
+                extended,
                 page_height_pt,
                 &[],
                 text::AssemblyMode::Reflow,
@@ -378,19 +402,34 @@ pub fn fill_table_html(
         })
         .collect();
 
-    // Insert text into HTML by replacing `></td>` or `></th>` with `>text</td>` or `>text</th>`
-    let mut result = String::with_capacity(html.len() + cell_texts.iter().map(|t| t.len()).sum::<usize>());
+    // Build filled HTML.
+    let mut result = String::with_capacity(
+        html.len() + cell_texts.iter().map(|t| t.len()).sum::<usize>(),
+    );
     let mut cell_idx = 0;
     let mut i = 0;
-    let bytes = html.as_bytes();
 
-    while i < bytes.len() {
-        // Look for `></td>` or `></th>`
-        if i + 5 <= bytes.len() && bytes[i] == b'>' {
-            let rest = &html[i..];
-            if rest.starts_with("></td>") {
+    while i < html.len() {
+        let rest = &html[i..];
+
+        // Detect opening tag: <td or <th (but not <thead>)
+        let is_td = rest.starts_with("<td>") || rest.starts_with("<td ");
+        let is_th = rest.starts_with("<th>") || rest.starts_with("<th ");
+        if is_td || is_th {
+            let is_header = is_th;
+            let tag = if is_header { "th" } else { "td" };
+            let close_tag = if is_header { "</th>" } else { "</td>" };
+
+            // Find the end of this cell (closing </td> or </th>)
+            if let Some(close_pos) = rest.find(close_tag) {
+                let cell_html = &rest[..close_pos + close_tag.len()];
+
+                // Emit opening tag with attributes
+                let inner_close = rest.find('>').unwrap();
+                result.push_str(&rest[..inner_close]);
+                result.push('>');
+
                 // Insert cell text
-                result.push('>');
                 if cell_idx < cell_texts.len() {
                     let text = &cell_texts[cell_idx];
                     if !text.is_empty() {
@@ -398,28 +437,124 @@ pub fn fill_table_html(
                     }
                 }
                 cell_idx += 1;
-                result.push_str("</td>");
-                i += 6; // skip `></td>`
-                continue;
-            } else if rest.starts_with("></th>") {
+
+                result.push_str("</");
+                result.push_str(tag);
                 result.push('>');
-                if cell_idx < cell_texts.len() {
-                    let text = &cell_texts[cell_idx];
-                    if !text.is_empty() {
-                        html_escape_into(text, &mut result);
-                    }
-                }
-                cell_idx += 1;
-                result.push_str("</th>");
-                i += 6; // skip `></th>`
+                i += cell_html.len();
                 continue;
             }
         }
-        result.push(html[i..].chars().next().unwrap());
-        i += html[i..].chars().next().unwrap().len_utf8();
+
+        // Copy character as-is
+        let ch = rest.chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
     }
 
     result
+}
+
+/// Resolve vertical overlaps between cells in different rows.
+///
+/// For each pair of cells that overlap both horizontally (share column space)
+/// and vertically, clamp the upper cell's bottom edge to the lower cell's top
+/// edge. Same-row cells (similar center Y) are skipped.
+fn resolve_vertical_overlaps(cells: &mut [Option<[f32; 4]>]) {
+    let n = cells.len();
+    for i in 0..n {
+        let Some(a) = cells[i] else { continue };
+        for j in (i + 1)..n {
+            let Some(b) = cells[j] else { continue };
+
+            // Check horizontal overlap (x ranges intersect)
+            if a[2] <= b[0] || b[2] <= a[0] {
+                continue;
+            }
+
+            // Check vertical overlap (y ranges intersect)
+            if a[3] <= b[1] || b[3] <= a[1] {
+                continue;
+            }
+
+            // Skip same-row cells (centers at ~same Y)
+            let a_cy = (a[1] + a[3]) * 0.5;
+            let b_cy = (b[1] + b[3]) * 0.5;
+            let min_h = (a[3] - a[1]).min(b[3] - b[1]);
+            if (a_cy - b_cy).abs() < min_h * 0.3 {
+                continue;
+            }
+
+            // Clamp: upper cell's bottom = lower cell's top
+            if a_cy < b_cy {
+                cells[i] = Some([a[0], a[1], a[2], b[1]]);
+            } else {
+                cells[j] = Some([b[0], b[1], b[2], a[1]]);
+            }
+        }
+    }
+}
+
+/// Extend a cell bbox horizontally to include nearby glyphs just outside left/right edges.
+///
+/// Iterates until convergence to chain-snap adjacent glyphs. Expansion is
+/// clamped at neighboring cell boundaries to prevent bleeding into adjacent cells.
+fn snap_to_nearby_glyphs(
+    cell: [f32; 4],
+    cell_idx: usize,
+    all_cells_pt: &[Option<[f32; 4]>],
+    char_bboxes: &[[f32; 4]],
+) -> [f32; 4] {
+    let [mut x1, y1, mut x2, y2] = cell;
+
+    // Compute expansion limits from neighboring cells with vertical overlap.
+    let mut left_limit = f32::NEG_INFINITY;
+    let mut right_limit = f32::INFINITY;
+    for (j, other) in all_cells_pt.iter().enumerate() {
+        if j == cell_idx {
+            continue;
+        }
+        let Some(other) = other else { continue };
+        // Only consider cells with vertical overlap
+        if other[3] > y1 && other[1] < y2 {
+            // Neighbor is to the left — its right edge limits our left expansion
+            if other[2] <= cell[0] {
+                left_limit = left_limit.max(other[2]);
+            }
+            // Neighbor is to the right — its left edge limits our right expansion
+            if other[0] >= cell[2] {
+                right_limit = right_limit.min(other[0]);
+            }
+        }
+    }
+
+    loop {
+        let (ox1, ox2) = (x1, x2);
+
+        for &[cx1, cy1, cx2, cy2] in char_bboxes {
+            let char_cx = (cx1 + cx2) * 0.5;
+            let char_cy = (cy1 + cy2) * 0.5;
+            let char_w = (cx2 - cx1).abs().max(0.5);
+
+            // Only snap chars whose vertical center is inside the cell
+            if char_cy >= y1 && char_cy <= y2 {
+                // Just left of cell — don't cross left_limit
+                if char_cx < x1 && char_cx >= x1 - char_w && cx1 >= left_limit {
+                    x1 = cx1;
+                }
+                // Just right of cell — don't cross right_limit
+                if char_cx > x2 && char_cx <= x2 + char_w && cx2 <= right_limit {
+                    x2 = cx2;
+                }
+            }
+        }
+
+        if x1 == ox1 && x2 == ox2 {
+            break;
+        }
+    }
+
+    [x1, y1, x2, y2]
 }
 
 /// HTML-escape text into a string buffer.
@@ -449,4 +584,119 @@ fn build_session(
         .map_err(|e| ExtractError::Model(format!("EP: {e}")))?
         .commit_from_file(path)
         .map_err(|e| ExtractError::Model(format!("load {}: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── snap_to_nearby_glyphs ───────────────────────────────────────
+
+    #[test]
+    fn snap_extends_to_nearby_glyph() {
+        let cell = [10.0, 0.0, 20.0, 5.0];
+        let all_cells = vec![Some(cell)];
+        // Glyph just to the left of cell, vertical center inside
+        let chars = vec![[8.0, 1.0, 9.5, 4.0]];
+        let result = snap_to_nearby_glyphs(cell, 0, &all_cells, &chars);
+        assert_eq!(result[0], 8.0); // x1 extended left
+        assert_eq!(result[2], 20.0); // x2 unchanged
+    }
+
+    #[test]
+    fn snap_extends_right() {
+        let cell = [10.0, 0.0, 20.0, 5.0];
+        let all_cells = vec![Some(cell)];
+        let chars = vec![[20.5, 1.0, 22.0, 4.0]];
+        let result = snap_to_nearby_glyphs(cell, 0, &all_cells, &chars);
+        assert_eq!(result[0], 10.0); // x1 unchanged
+        assert_eq!(result[2], 22.0); // x2 extended right
+    }
+
+    #[test]
+    fn snap_blocked_by_neighbor() {
+        let cell = [10.0, 0.0, 20.0, 5.0];
+        let neighbor = [5.0, 0.0, 9.0, 5.0]; // left neighbor, right edge at 9.0
+        let all_cells = vec![Some(cell), Some(neighbor)];
+        // Glyph at x=7.0, inside neighbor territory
+        let chars = vec![[7.0, 1.0, 8.5, 4.0]];
+        let result = snap_to_nearby_glyphs(cell, 0, &all_cells, &chars);
+        // Should NOT extend past neighbor's right edge (9.0)
+        assert!(result[0] >= 9.0);
+    }
+
+    #[test]
+    fn snap_chain_extends_iteratively() {
+        let cell = [10.0, 0.0, 20.0, 5.0];
+        let all_cells = vec![Some(cell)];
+        // Two glyphs chained to the left: glyph A just left of cell, glyph B just left of A
+        let chars = vec![
+            [8.0, 1.0, 9.5, 4.0],  // just left of cell (within 1 char_w)
+            [6.0, 1.0, 7.5, 4.0],  // just left of glyph A
+        ];
+        let result = snap_to_nearby_glyphs(cell, 0, &all_cells, &chars);
+        assert_eq!(result[0], 6.0); // chain-snapped to glyph B
+    }
+
+    #[test]
+    fn snap_ignores_glyph_outside_vertical_range() {
+        let cell = [10.0, 0.0, 20.0, 5.0];
+        let all_cells = vec![Some(cell)];
+        // Glyph with vertical center at 7.0, outside cell Y range [0, 5]
+        let chars = vec![[8.0, 6.0, 9.5, 8.0]];
+        let result = snap_to_nearby_glyphs(cell, 0, &all_cells, &chars);
+        assert_eq!(result[0], 10.0); // unchanged
+    }
+
+    // ── resolve_vertical_overlaps ─────────────────────────────────────
+
+    #[test]
+    fn overlap_clamps_upper_cell() {
+        // Header cell extends into sub-header row
+        let mut cells = vec![
+            Some([10.0, 0.0, 50.0, 12.0]),  // header, y extends to 12
+            Some([10.0, 8.0, 50.0, 20.0]),  // sub-header, starts at 8
+        ];
+        resolve_vertical_overlaps(&mut cells);
+        // Upper cell's y2 should be clamped to lower cell's y1
+        assert_eq!(cells[0].unwrap()[3], 8.0);
+        // Lower cell unchanged
+        assert_eq!(cells[1].unwrap()[1], 8.0);
+    }
+
+    #[test]
+    fn overlap_skips_side_by_side() {
+        // Two cells in the same row, no horizontal overlap
+        let mut cells = vec![
+            Some([10.0, 0.0, 30.0, 10.0]),
+            Some([35.0, 0.0, 55.0, 10.0]),
+        ];
+        let before = cells.clone();
+        resolve_vertical_overlaps(&mut cells);
+        assert_eq!(cells, before);
+    }
+
+    #[test]
+    fn overlap_skips_same_row() {
+        // Two cells with same center Y but overlapping X (e.g. colspan)
+        let mut cells = vec![
+            Some([10.0, 0.0, 30.0, 10.0]),
+            Some([20.0, 0.0, 40.0, 10.0]),
+        ];
+        let before = cells.clone();
+        resolve_vertical_overlaps(&mut cells);
+        assert_eq!(cells, before);
+    }
+
+    #[test]
+    fn overlap_skips_non_overlapping_rows() {
+        // Two cells with horizontal overlap but no vertical overlap
+        let mut cells = vec![
+            Some([10.0, 0.0, 50.0, 8.0]),
+            Some([10.0, 10.0, 50.0, 20.0]),
+        ];
+        let before = cells.clone();
+        resolve_vertical_overlaps(&mut cells);
+        assert_eq!(cells, before);
+    }
 }

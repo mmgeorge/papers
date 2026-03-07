@@ -41,7 +41,7 @@ enum TableEngine {
 }
 
 /// Table prediction result — HTML skeleton + optional per-cell bboxes.
-enum TableResult {
+pub enum TableResult {
     /// HTML with cell text already filled (e.g. from GLM-OCR).
     Html(String),
     /// TableFormer prediction with cell bboxes for text filling.
@@ -210,7 +210,7 @@ impl Pipeline {
             let page = doc.pages().get(page_idx as u16).map_err(|e| {
                 ExtractError::Pdf(format!("Failed to get page {page_idx}: {e}"))
             })?;
-            let (result_page, page_img) = self.process_page(&page, page_idx)?;
+            let (result_page, page_img) = self.process_page(&page, page_idx, output_dir)?;
             page_images.push(page_img);
             pages.push(result_page);
         }
@@ -262,6 +262,7 @@ impl Pipeline {
         &self,
         page: &PdfPage,
         page_idx: u32,
+        output_dir: &Path,
     ) -> Result<(Page, DynamicImage), ExtractError> {
         let width_pt = page.width().value;
         let height_pt = page.height().value;
@@ -374,6 +375,16 @@ impl Pipeline {
 
         let table_results = self.table.predict(&table_entries)?;
 
+        // Write table debug overlays if layout debug is enabled
+        if self.options.debug.is_enabled() {
+            output::write_table_debug(
+                output_dir,
+                &table_entries,
+                &table_results,
+                page_idx,
+            )?;
+        }
+
         // Build regions from layout detection + formula/table results
         let mut regions = self.build_regions(
             &detected,
@@ -400,6 +411,9 @@ impl Pipeline {
 
         // Associate captions with their parent regions
         figure::associate_captions(&mut regions);
+
+        // Group spatially close visual regions into FigureGroups
+        figure::group_figure_regions(&mut regions);
 
         // Attach formula numbers to their nearest display formula
         associate_formula_numbers(&mut regions);
@@ -479,6 +493,7 @@ impl Pipeline {
                 caption: None,
                 chart_type: None,
                 tag: None,
+                items: None,
                 consumed: kind == RegionKind::InlineFormula && consumed_inline.contains(&idx),
             };
 
@@ -682,6 +697,7 @@ mod tests {
             caption: None,
             chart_type: None,
             tag: None,
+            items: None,
             consumed: false,
         }
     }
