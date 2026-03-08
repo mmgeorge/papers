@@ -1092,7 +1092,27 @@ fn char_to_latex(c: char) -> Option<&'static str> {
         '\u{00B7}' => Some("\\cdot"),  // middle dot
         '\u{221E}' => Some("\\infty"),
         '\u{2225}' => Some("\\|"),     // parallel / double vertical bar (norm)
-        '\u{02C6}' => Some("\\hat{}"), // modifier circumflex accent
+        // Modifier accents (standalone fallback — normally merged with base char)
+        '\u{02C6}' => Some("\\hat{}"),   // ˆ circumflex
+        '\u{02DC}' => Some("\\tilde{}"), // ˜ tilde
+        '\u{02C7}' => Some("\\check{}"), // ˇ caron
+        '\u{02D8}' => Some("\\breve{}"), // ˘ breve
+        '\u{02D9}' => Some("\\dot{}"),   // ˙ dot above
+        '\u{00AF}' => Some("\\bar{}"),   // ¯ macron
+        '\u{00B4}' => Some("\\acute{}"), // ´ acute
+        '\u{0060}' => Some("\\grave{}"), // ` grave
+        '\u{00A8}' => Some("\\ddot{}"),  // ¨ diaeresis
+        // Combining diacriticals (zero-width — normally merged with base char)
+        '\u{0302}' => Some("\\hat{}"),   // combining circumflex
+        '\u{0303}' => Some("\\tilde{}"), // combining tilde
+        '\u{030C}' => Some("\\check{}"), // combining caron
+        '\u{0306}' => Some("\\breve{}"), // combining breve
+        '\u{0307}' => Some("\\dot{}"),   // combining dot above
+        '\u{0304}' => Some("\\bar{}"),   // combining macron
+        '\u{0301}' => Some("\\acute{}"), // combining acute
+        '\u{0300}' => Some("\\grave{}"), // combining grave
+        '\u{0308}' => Some("\\ddot{}"),  // combining diaeresis
+        '\u{20D7}' => Some("\\vec{}"),   // combining right arrow above
         // Delimiters
         '(' => Some("("),
         ')' => Some(")"),
@@ -1317,6 +1337,228 @@ fn is_latex_command(s: &str) -> bool {
 
 /// Try to extract a LaTeX string for an inline formula directly from PDF characters.
 ///
+/// Expand formula bbox to include matching brackets that were clipped by layout detection.
+///
+/// When the bbox clips a bracket expression (e.g. `|det(G)| < ε` detected as `et(G)| < ε`),
+/// we look on the same line for the matching bracket and expand the bbox to cover it.
+///
+/// Handles: `|...|`, `(...)`, `[...]`, `{...}`, `‖...‖` (U+2016).
+/// Expand formula bbox horizontally to include matching brackets clipped by layout detection.
+///
+/// Public so the pipeline can also use the expanded bbox for OCR crops.
+pub fn expand_formula_bbox(chars: &[PdfChar], bbox: [f32; 4], page_height_pt: f32) -> [f32; 4] {
+    let image_chars: Vec<ImageChar> = chars
+        .iter()
+        .map(|c| to_image_char(c, page_height_pt))
+        .collect();
+    expand_for_brackets(&image_chars, bbox)
+}
+
+fn expand_for_brackets(chars: &[ImageChar], bbox: [f32; 4]) -> [f32; 4] {
+    let matched = match_chars_to_region(chars, bbox, &[]);
+
+    // Filter to visible chars
+    let visible: Vec<&ImageChar> = matched
+        .into_iter()
+        .filter(|c| {
+            !c.codepoint.is_control()
+                && c.codepoint != ' '
+                && (c.bbox[2] - c.bbox[0]) > 0.0
+                && c.font_size > 0.0
+        })
+        .collect();
+
+    if visible.is_empty() {
+        return bbox;
+    }
+
+    // Compute Y range of the matched chars for "same line" check
+    let y_center_min = visible
+        .iter()
+        .map(|c| (c.bbox[1] + c.bbox[3]) / 2.0)
+        .fold(f32::INFINITY, f32::min);
+    let y_center_max = visible
+        .iter()
+        .map(|c| (c.bbox[1] + c.bbox[3]) / 2.0)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let avg_height = visible
+        .iter()
+        .map(|c| c.bbox[3] - c.bbox[1])
+        .sum::<f32>()
+        / visible.len() as f32;
+    let y_tolerance = avg_height * 0.75;
+
+    let is_same_line = |c: &ImageChar| {
+        let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+        cy >= y_center_min - y_tolerance && cy <= y_center_max + y_tolerance
+    };
+
+    // Count brackets
+    let mut parens = 0i32; // +1 for '(', -1 for ')'
+    let mut squares = 0i32;
+    let mut curlies = 0i32;
+    let mut pipes = 0i32; // |
+    let mut double_pipes = 0i32; // ‖ (U+2016) and ∥ (U+2225)
+    for c in &visible {
+        match c.codepoint {
+            '(' => parens += 1,
+            ')' => parens -= 1,
+            '[' => squares += 1,
+            ']' => squares -= 1,
+            '{' => curlies += 1,
+            '}' => curlies -= 1,
+            '|' => pipes += 1,
+            '\u{2016}' | '\u{2225}' => double_pipes += 1,
+            _ => {}
+        }
+    }
+
+    let mut expanded = bbox;
+
+    // For paired brackets: negative balance means missing openers (look left),
+    // positive balance means missing closers (look right).
+    let bracket_needs: &[(char, char, i32)] = &[
+        ('(', ')', parens),
+        ('[', ']', squares),
+        ('{', '}', curlies),
+    ];
+
+    for &(opener, closer, balance) in bracket_needs {
+        if balance < 0 {
+            // Missing openers — scan left
+            let need = (-balance) as usize;
+            expanded = scan_for_bracket(chars, expanded, opener, need, true, &is_same_line);
+        } else if balance > 0 {
+            // Missing closers — scan right
+            let need = balance as usize;
+            expanded = scan_for_bracket(chars, expanded, closer, need, false, &is_same_line);
+        }
+    }
+
+    // For | and ‖: odd count means one is missing. Scan left first (more common
+    // for clipped left edge), then right if still odd.
+    if pipes % 2 != 0 {
+        expanded = scan_for_bracket(chars, expanded, '|', 1, true, &is_same_line);
+        // Re-check: if we found one on the left, we're balanced. If not, try right.
+        let new_matched = match_chars_to_region(chars, expanded, &[]);
+        let new_pipes = new_matched.iter().filter(|c| c.codepoint == '|').count();
+        if new_pipes % 2 != 0 {
+            expanded = scan_for_bracket(chars, expanded, '|', 1, false, &is_same_line);
+        }
+    }
+    if double_pipes % 2 != 0 {
+        // Try both U+2016 and U+2225 (∥)
+        expanded = scan_for_bracket(chars, expanded, '\u{2016}', 1, true, &is_same_line);
+        expanded = scan_for_bracket(chars, expanded, '\u{2225}', 1, true, &is_same_line);
+        let new_matched = match_chars_to_region(chars, expanded, &[]);
+        let new_dp = new_matched
+            .iter()
+            .filter(|c| c.codepoint == '\u{2016}' || c.codepoint == '\u{2225}')
+            .count();
+        if new_dp % 2 != 0 {
+            expanded = scan_for_bracket(chars, expanded, '\u{2016}', 1, false, &is_same_line);
+            expanded = scan_for_bracket(chars, expanded, '\u{2225}', 1, false, &is_same_line);
+        }
+    }
+
+    expanded
+}
+
+/// Scan for `count` occurrences of `target` char outside `bbox` on the same line.
+/// If `look_left` is true, scan chars to the left of bbox; otherwise to the right.
+/// Returns the expanded bbox if found.
+fn scan_for_bracket(
+    chars: &[ImageChar],
+    bbox: [f32; 4],
+    target: char,
+    count: usize,
+    look_left: bool,
+    is_same_line: &dyn Fn(&ImageChar) -> bool,
+) -> [f32; 4] {
+    let mut found = 0;
+    let mut expanded = bbox;
+
+    // Collect candidates: same-line chars of the target type outside the bbox
+    let mut candidates: Vec<&ImageChar> = chars
+        .iter()
+        .filter(|c| {
+            c.codepoint == target
+                && is_same_line(c)
+                && (c.bbox[2] - c.bbox[0]) > 0.0
+                && !c.codepoint.is_control()
+        })
+        .filter(|c| {
+            let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
+            if look_left {
+                cx < bbox[0]
+            } else {
+                cx > bbox[2]
+            }
+        })
+        .collect();
+
+    // Sort: if looking left, closest first (descending x); if right, closest first (ascending x)
+    if look_left {
+        candidates.sort_by(|a, b| {
+            let ax = (a.bbox[0] + a.bbox[2]) / 2.0;
+            let bx = (b.bbox[0] + b.bbox[2]) / 2.0;
+            bx.partial_cmp(&ax).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    } else {
+        candidates.sort_by(|a, b| {
+            let ax = (a.bbox[0] + a.bbox[2]) / 2.0;
+            let bx = (b.bbox[0] + b.bbox[2]) / 2.0;
+            ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    for c in candidates {
+        if found >= count {
+            break;
+        }
+        // Expand bbox horizontally only — vertical expansion pulls in other lines
+        expanded[0] = expanded[0].min(c.bbox[0]);
+        expanded[2] = expanded[2].max(c.bbox[2]);
+        found += 1;
+    }
+
+    expanded
+}
+
+/// Returns true if the character is a modifier accent that should be merged with its base char.
+/// Returns the LaTeX accent command for a modifier/combining accent character, if any.
+/// e.g. ˆ (U+02C6) → "hat", ˜ (U+02DC) → "tilde", etc.
+fn accent_command(c: char) -> Option<&'static str> {
+    match c {
+        // Modifier letters (spacing)
+        '\u{02C6}' => Some("hat"),       // ˆ circumflex
+        '\u{02DC}' => Some("tilde"),     // ˜ tilde
+        '\u{02C7}' => Some("check"),     // ˇ caron/háček
+        '\u{02D8}' => Some("breve"),     // ˘ breve
+        '\u{02D9}' => Some("dot"),       // ˙ dot above
+        '\u{00AF}' => Some("bar"),       // ¯ macron
+        '\u{00B4}' => Some("acute"),     // ´ acute
+        '\u{0060}' => Some("grave"),     // ` grave
+        '\u{00A8}' => Some("ddot"),      // ¨ diaeresis
+        // Combining diacriticals (zero-width, attached to preceding char)
+        '\u{0302}' => Some("hat"),       // combining circumflex
+        '\u{0303}' => Some("tilde"),     // combining tilde
+        '\u{030C}' => Some("check"),     // combining caron
+        '\u{0306}' => Some("breve"),     // combining breve
+        '\u{0307}' => Some("dot"),       // combining dot above
+        '\u{0304}' => Some("bar"),       // combining macron
+        '\u{0301}' => Some("acute"),     // combining acute
+        '\u{0300}' => Some("grave"),     // combining grave
+        '\u{0308}' => Some("ddot"),      // combining diaeresis
+        '\u{20D7}' => Some("vec"),       // combining right arrow above
+        _ => None,
+    }
+}
+
+fn is_modifier_accent(c: char) -> bool {
+    accent_command(c).is_some()
+}
+
 /// Returns `Some(latex)` if every character in the region maps to a known LaTeX token,
 /// `None` otherwise (the formula should be sent to ML OCR).
 ///
@@ -1332,8 +1574,16 @@ pub fn try_extract_inline_formula(
         .map(|c| to_image_char(c, page_height_pt))
         .collect();
 
-    // Match chars to the formula bbox (no excludes)
-    let matched = match_chars_to_region(&image_chars, formula_bbox, &[]);
+    // Match chars to the formula bbox, then expand if brackets are unbalanced
+    let bbox = expand_for_brackets(&image_chars, formula_bbox);
+
+    let matched = match_chars_to_region(&image_chars, bbox, &[]);
+
+    // Reject: CR/LF control chars between visible chars indicate fractions
+    // (PDF encodes fraction bars as \r\n with zero-width bboxes)
+    if matched.iter().any(|c| c.codepoint == '\r' || c.codepoint == '\n') {
+        return None;
+    }
 
     // Filter out control chars and zero-width chars
     let visible: Vec<&ImageChar> = matched
@@ -1348,6 +1598,22 @@ pub fn try_extract_inline_formula(
 
     // Reject: no chars matched
     if visible.is_empty() {
+        return None;
+    }
+
+
+
+    // Reject: ∂ (partial derivative) — almost always appears in fractions or complex
+    // expressions where char-based left-to-right reading produces garbage
+    if visible.iter().any(|c| c.codepoint == '\u{2202}' || c.codepoint == '\u{1D715}') {
+        return None;
+    }
+
+    // Reject: ∇ (nabla) with more than 2 chars — single "∇f" is fine,
+    // but longer expressions like "∇²f" or "∇·F" need spatial understanding
+    if visible.len() > 2
+        && visible.iter().any(|c| c.codepoint == '\u{2207}')
+    {
         return None;
     }
 
@@ -1374,15 +1640,60 @@ pub fn try_extract_inline_formula(
         }
     }
 
-    // Validate every char maps to a known LaTeX token
-    for c in &visible {
+    // Merge modifier accents (ˆ U+02C6, etc.) with their overlapping base characters.
+    // PDFs store e.g. n̂ as separate 'n' + 'ˆ' chars with overlapping bboxes.
+    // We identify which base char each accent belongs to (by horizontal overlap),
+    // then skip the accent char and wrap the base in \hat{} during LaTeX assembly.
+    let mut accented_bases: std::collections::HashMap<*const ImageChar, &str> = std::collections::HashMap::new();
+    let mut accent_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (i, c) in visible.iter().enumerate() {
+        if !is_modifier_accent(c.codepoint) {
+            continue;
+        }
+        // Find the base char with the most horizontal overlap
+        let accent_x1 = c.bbox[0];
+        let accent_x2 = c.bbox[2];
+        let mut best_idx = None;
+        let mut best_overlap = 0.0_f32;
+        for (j, base) in visible.iter().enumerate() {
+            if i == j || is_modifier_accent(base.codepoint) {
+                continue;
+            }
+            let overlap_x1 = accent_x1.max(base.bbox[0]);
+            let overlap_x2 = accent_x2.min(base.bbox[2]);
+            let overlap = (overlap_x2 - overlap_x1).max(0.0);
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best_idx = Some(j);
+            }
+        }
+        if let Some(j) = best_idx {
+            if best_overlap > 0.0 {
+                if let Some(cmd) = accent_command(c.codepoint) {
+                    accented_bases.insert(visible[j] as *const ImageChar, cmd);
+                    accent_indices.insert(i);
+                }
+            }
+        }
+    }
+
+    // Validate every non-accent char maps to a known LaTeX token
+    for (i, c) in visible.iter().enumerate() {
+        if accent_indices.contains(&i) {
+            continue;
+        }
         if !is_known_formula_char(c.codepoint) {
             return None;
         }
     }
 
-    // Build LineElement::Char entries for detect_scripts()
-    let elements: Vec<LineElement> = visible.iter().map(|c| LineElement::Char(c)).collect();
+    // Build LineElement::Char entries for detect_scripts(), excluding accent chars
+    let elements: Vec<LineElement> = visible
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !accent_indices.contains(i))
+        .map(|(_, c)| LineElement::Char(c))
+        .collect();
 
     // Sort left-to-right for line building
     let mut elem_refs: Vec<&LineElement> = elements.iter().collect();
@@ -1399,7 +1710,14 @@ pub fn try_extract_inline_formula(
     let mut tokens: Vec<String> = Vec::new();
     for elem in &processed {
         let token = match elem {
-            LineElement::Char(c) => get_latex_for_char(c.codepoint),
+            LineElement::Char(c) => {
+                let base = get_latex_for_char(c.codepoint);
+                if let Some(cmd) = accented_bases.get(&(*c as *const ImageChar)) {
+                    format!("\\{cmd}{{{base}}}")
+                } else {
+                    base
+                }
+            }
             LineElement::Formula { latex: f, .. } => {
                 // detect_scripts produces formula elements like "x_{t}" with raw Unicode
                 replace_greek_in_latex(f)
@@ -2891,7 +3209,8 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\partial x".to_string()));
+        // ∂ always goes to OCR now (needs spatial understanding for fractions)
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -3270,7 +3589,8 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\partial x".to_string()));
+        // 𝜕 (math italic partial) always goes to OCR now
+        assert_eq!(result, None);
     }
 
     #[test]
@@ -3321,15 +3641,15 @@ mod tests {
     }
 
     #[test]
-    fn test_bypass_combining_mark_rejects() {
-        // U+0300 (combining grave accent) — not in map → reject
+    fn test_bypass_combining_mark_merges() {
+        // U+0300 (combining grave accent) overlapping x → \grave{x}
         let chars = vec![
             make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
-            make_formula_char('\u{0300}', 108.0, 98.0, 3.0, 5.0, 5.0),
+            make_formula_char('\u{0300}', 100.0, 94.0, 4.0, 6.0, 5.0),
         ];
-        let bbox = [95.0, 93.0, 118.0, 115.0];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "Combining marks should reject");
+        assert_eq!(result, Some("\\grave{x}".to_string()), "Combining marks should merge with base");
     }
 
     #[test]
@@ -3608,5 +3928,448 @@ mod tests {
             "Line 1 should contain the formula: {:?}",
             lines[0]
         );
+    }
+
+    // --- Rejection rule tests: chars that force OCR ---
+
+    #[test]
+    fn test_reject_fraction_crlf() {
+        // PDF encodes fraction bars as \r\n control chars with zero-width bboxes.
+        // numerator chars, then \r\n (fraction bar), then denominator chars.
+        let chars = vec![
+            make_formula_char('E', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\r', 108.0, 100.0, 0.0, 0.0, 10.0),
+            make_formula_char('\n', 108.0, 100.0, 0.0, 0.0, 10.0),
+            make_formula_char('x', 108.0, 110.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 125.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "CR/LF fraction chars should force OCR");
+    }
+
+    #[test]
+    fn test_reject_partial_u2202() {
+        // ∂ (U+2202) always goes to OCR
+        let chars = vec![
+            make_formula_char('\u{2202}', 100.0, 100.0, 10.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "∂ should always force OCR");
+    }
+
+    #[test]
+    fn test_reject_math_italic_partial_u1d715() {
+        // 𝜕 (U+1D715) always goes to OCR
+        let chars = vec![
+            make_formula_char('\u{1D715}', 100.0, 100.0, 10.0, 10.0, 10.0),
+            make_formula_char('f', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "𝜕 (math italic partial) should always force OCR");
+    }
+
+    #[test]
+    fn test_reject_nabla_complex_expression() {
+        // ∇²f — nabla with >2 visible chars goes to OCR
+        let chars = vec![
+            make_formula_char('\u{2207}', 100.0, 100.0, 10.0, 10.0, 10.0),
+            make_formula_char('\u{00B2}', 110.0, 96.0, 6.0, 7.0, 10.0), // superscript 2
+            make_formula_char('f', 116.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 90.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, None, "∇ with >2 chars should force OCR");
+    }
+
+    #[test]
+    fn test_allow_nabla_simple() {
+        // ∇f — nabla with exactly 2 chars stays on fast path
+        let chars = vec![
+            make_formula_char('\u{2207}', 100.0, 100.0, 10.0, 10.0, 10.0),
+            make_formula_char('f', 110.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\nabla f".to_string()), "∇f should stay on fast path");
+    }
+
+    // --- Modifier accent (hat) merging tests ---
+    //
+    // PDFs store accented chars like n̂ as separate 'n' + 'ˆ' (U+02C6) characters
+    // with overlapping bounding boxes. We need to merge them into \hat{n}.
+
+    #[test]
+    fn test_hat_over_n() {
+        // n̂ — circumflex overlaps with n
+        let chars = vec![
+            make_formula_char('n', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{02C6}', 101.0, 94.0, 6.0, 6.0, 10.0), // ˆ above n
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\hat{n}".to_string()));
+    }
+
+    #[test]
+    fn test_hat_over_b() {
+        // b̂ — circumflex overlaps with b (from the avbd paper: ˆb)
+        let chars = vec![
+            make_formula_char('\u{02C6}', 101.0, 94.0, 6.0, 6.0, 10.0), // ˆ comes first in PDF
+            make_formula_char('b', 100.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\hat{b}".to_string()));
+    }
+
+    #[test]
+    fn test_hat_n_hat_t_comma_separated() {
+        // n̂, t̂ — two hatted chars with commas (from avbd p4_44)
+        let chars = vec![
+            make_formula_char('n', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{02C6}', 101.0, 94.0, 6.0, 6.0, 10.0),
+            make_formula_char(',', 109.0, 100.0, 3.0, 10.0, 10.0),
+            make_formula_char('\u{02C6}', 115.0, 94.0, 6.0, 6.0, 10.0),
+            make_formula_char('t', 114.0, 100.0, 6.0, 10.0, 10.0),
+            make_formula_char(',', 121.0, 100.0, 3.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\hat{n},\\hat{t},".to_string()));
+    }
+
+    #[test]
+    fn test_hat_not_overlapping() {
+        // ˆ that doesn't overlap any base char — should produce \hat{} as before
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{02C6}', 130.0, 94.0, 6.0, 6.0, 10.0), // far away from x
+        ];
+        let bbox = [95.0, 89.0, 145.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // No overlap: ˆ stays as standalone \hat{}
+        assert_eq!(result, Some("x\\hat{}".to_string()));
+    }
+
+    #[test]
+    fn test_hat_over_greek() {
+        // α̂ — hat over a Greek letter
+        let chars = vec![
+            make_formula_char('\u{1D6FC}', 100.0, 100.0, 8.0, 10.0, 10.0), // math italic alpha
+            make_formula_char('\u{02C6}', 101.0, 94.0, 6.0, 6.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\hat{\\alpha}".to_string()));
+    }
+
+    #[test]
+    fn test_hat_b_comma() {
+        // b̂, — hatted b followed by comma (from avbd p4_53)
+        let chars = vec![
+            make_formula_char('\u{02C6}', 101.0, 94.0, 6.0, 6.0, 10.0),
+            make_formula_char('b', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char(',', 109.0, 100.0, 3.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 118.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\hat{b},".to_string()));
+    }
+
+    #[test]
+    fn test_hat_between_other_chars() {
+        // x + n̂ + y — hat in the middle of an expression
+        let chars = vec![
+            make_formula_char('x', 80.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 92.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('n', 104.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{02C6}', 105.0, 94.0, 6.0, 6.0, 10.0),
+            make_formula_char('+', 116.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 128.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [75.0, 89.0, 142.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("x+\\hat{n}+y".to_string()));
+    }
+
+    #[test]
+    fn test_hat_combining_circumflex() {
+        // Combining circumflex U+0302 (zero-width, attached to preceding char)
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{0302}', 101.0, 94.0, 6.0, 6.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\hat{x}".to_string()));
+    }
+
+    #[test]
+    fn test_tilde_modifier() {
+        // ˜ (U+02DC) modifier tilde over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{02DC}', 101.0, 94.0, 6.0, 6.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\tilde{x}".to_string()));
+    }
+
+    #[test]
+    fn test_tilde_combining() {
+        // Combining tilde U+0303
+        let chars = vec![
+            make_formula_char('n', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{0303}', 101.0, 94.0, 6.0, 6.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\tilde{n}".to_string()));
+    }
+
+    #[test]
+    fn test_bar_modifier() {
+        // ¯ (U+00AF) macron over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{00AF}', 100.0, 94.0, 8.0, 3.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\bar{x}".to_string()));
+    }
+
+    #[test]
+    fn test_bar_combining() {
+        // Combining macron U+0304
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{0304}', 100.0, 94.0, 8.0, 3.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\bar{x}".to_string()));
+    }
+
+    #[test]
+    fn test_dot_modifier() {
+        // ˙ (U+02D9) dot above over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{02D9}', 102.0, 94.0, 4.0, 4.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\dot{x}".to_string()));
+    }
+
+    #[test]
+    fn test_dot_combining() {
+        // Combining dot above U+0307
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{0307}', 102.0, 94.0, 4.0, 4.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\dot{x}".to_string()));
+    }
+
+    #[test]
+    fn test_ddot_modifier() {
+        // ¨ (U+00A8) diaeresis over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{00A8}', 101.0, 94.0, 6.0, 4.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\ddot{x}".to_string()));
+    }
+
+    #[test]
+    fn test_ddot_combining() {
+        // Combining diaeresis U+0308
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{0308}', 101.0, 94.0, 6.0, 4.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\ddot{x}".to_string()));
+    }
+
+    #[test]
+    fn test_check_modifier() {
+        // ˇ (U+02C7) caron over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{02C7}', 101.0, 94.0, 6.0, 6.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\check{x}".to_string()));
+    }
+
+    #[test]
+    fn test_breve_modifier() {
+        // ˘ (U+02D8) breve over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{02D8}', 101.0, 94.0, 6.0, 6.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\breve{x}".to_string()));
+    }
+
+    #[test]
+    fn test_acute_modifier() {
+        // ´ (U+00B4) acute over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{00B4}', 104.0, 94.0, 4.0, 6.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\acute{x}".to_string()));
+    }
+
+    #[test]
+    fn test_grave_modifier() {
+        // ` (U+0060) grave over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{0060}', 100.0, 94.0, 4.0, 6.0, 10.0),
+        ];
+        let bbox = [95.0, 89.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\grave{x}".to_string()));
+    }
+
+    #[test]
+    fn test_vec_combining() {
+        // Combining right arrow U+20D7 over x
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{20D7}', 100.0, 93.0, 8.0, 5.0, 10.0),
+        ];
+        let bbox = [95.0, 88.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("\\vec{x}".to_string()));
+    }
+
+    // --- Bracket expansion tests ---
+
+    #[test]
+    fn test_expand_pipe_left() {
+        // |det(G)| < ε — bbox clips the left |, expansion should recover it
+        // Chars: | d e t ( G ) | < ε
+        let chars = vec![
+            make_formula_char('|', 80.0, 100.0, 3.0, 16.0, 10.0),
+            make_formula_char('d', 84.0, 100.0, 7.0, 10.0, 10.0),
+            make_formula_char('e', 91.0, 100.0, 6.0, 10.0, 10.0),
+            make_formula_char('t', 97.0, 100.0, 5.0, 10.0, 10.0),
+            make_formula_char('(', 102.0, 100.0, 4.0, 16.0, 10.0),
+            make_formula_char('G', 106.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char(')', 114.0, 100.0, 4.0, 16.0, 10.0),
+            make_formula_char('|', 118.0, 100.0, 3.0, 16.0, 10.0),
+            make_formula_char('<', 124.0, 100.0, 7.0, 10.0, 10.0),
+        ];
+        // Bbox starts at x=90 — clips | at x=80 and d at x=84
+        let bbox = [90.0, 95.0, 135.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert!(result.is_some(), "should expand left to find matching |");
+        let latex = result.unwrap();
+        assert!(latex.contains("det"), "should include 'det': got {latex}");
+        assert!(latex.starts_with('|'), "should start with |: got {latex}");
+    }
+
+    #[test]
+    fn test_expand_paren_left() {
+        // (x+1) — bbox clips the opening (
+        let chars = vec![
+            make_formula_char('(', 80.0, 100.0, 4.0, 16.0, 10.0),
+            make_formula_char('x', 85.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 94.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('1', 103.0, 100.0, 6.0, 10.0, 10.0),
+            make_formula_char(')', 110.0, 100.0, 4.0, 16.0, 10.0),
+        ];
+        // Bbox starts at x=83 — clips ( at x=80
+        let bbox = [83.0, 95.0, 118.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert!(result.is_some(), "should expand left to find matching (");
+        let latex = result.unwrap();
+        assert!(latex.starts_with('('), "should start with (: got {latex}");
+        assert!(latex.ends_with(')'), "should end with ): got {latex}");
+    }
+
+    #[test]
+    fn test_expand_paren_right() {
+        // (x+1) — bbox clips the closing )
+        let chars = vec![
+            make_formula_char('(', 80.0, 100.0, 4.0, 16.0, 10.0),
+            make_formula_char('x', 85.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 94.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('1', 103.0, 100.0, 6.0, 10.0, 10.0),
+            make_formula_char(')', 110.0, 100.0, 4.0, 16.0, 10.0),
+        ];
+        // Bbox ends at x=109 — clips ) at x=110
+        let bbox = [75.0, 95.0, 109.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert!(result.is_some(), "should expand right to find matching )");
+        let latex = result.unwrap();
+        assert!(latex.ends_with(')'), "should end with ): got {latex}");
+    }
+
+    #[test]
+    fn test_expand_no_false_match_other_line() {
+        // | on a different line should NOT be matched
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('|', 108.0, 100.0, 3.0, 16.0, 10.0),
+            // | on a completely different line (y=200)
+            make_formula_char('|', 80.0, 200.0, 3.0, 16.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 115.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // Should NOT expand to the other-line |, so | count stays odd → 2 chars, just "x|"
+        assert!(result.is_some());
+        let latex = result.unwrap();
+        assert_eq!(latex, "x|");
+    }
+
+    #[test]
+    fn test_expand_balanced_no_change() {
+        // (x+1) fully inside bbox — no expansion needed
+        let chars = vec![
+            make_formula_char('(', 100.0, 100.0, 4.0, 16.0, 10.0),
+            make_formula_char('x', 105.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char(')', 114.0, 100.0, 4.0, 16.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 125.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result, Some("(x)".to_string()));
+    }
+
+    #[test]
+    fn test_expand_square_brackets() {
+        // [0,1] — bbox clips the opening [
+        let chars = vec![
+            make_formula_char('[', 80.0, 100.0, 4.0, 16.0, 10.0),
+            make_formula_char('0', 85.0, 100.0, 6.0, 10.0, 10.0),
+            make_formula_char(',', 92.0, 100.0, 3.0, 10.0, 10.0),
+            make_formula_char('1', 96.0, 100.0, 6.0, 10.0, 10.0),
+            make_formula_char(']', 103.0, 100.0, 4.0, 16.0, 10.0),
+        ];
+        // Bbox starts at x=83 — clips [ at x=80
+        let bbox = [83.0, 95.0, 112.0, 120.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert!(result.is_some(), "should expand left to find matching [");
+        let latex = result.unwrap();
+        assert!(latex.starts_with('['), "should start with [: got {latex}");
     }
 }

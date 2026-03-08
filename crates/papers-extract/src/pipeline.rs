@@ -309,8 +309,10 @@ impl Pipeline {
 
         let scale = self.options.dpi as f32 / 72.0;
 
-        // Phase A: try char-based extraction for inline formulas (skip expensive ML OCR)
+        // Phase A: try char-based extraction for inline formulas (skip expensive ML OCR).
+        // Also compute expanded bboxes (bracket-aware) for formulas that fall through to OCR.
         let mut char_based_latex: HashMap<usize, String> = HashMap::new();
+        let mut expanded_bboxes: HashMap<usize, [f32; 4]> = HashMap::new();
         for (i, d) in detected.iter().enumerate() {
             if d.kind == RegionKind::InlineFormula {
                 let bbox_pt = [
@@ -324,11 +326,18 @@ impl Pipeline {
                         "Char-based bypass for inline formula {i}: {latex}"
                     );
                     char_based_latex.insert(i, latex);
+                } else {
+                    // Char-based failed — compute expanded bbox for the OCR crop
+                    let expanded = text::expand_formula_bbox(&chars, bbox_pt, height_pt);
+                    if expanded != bbox_pt {
+                        expanded_bboxes.insert(i, expanded);
+                    }
                 }
             }
         }
 
-        // Crop formula regions (display + inline not already handled) and run batched recognition
+        // Crop formula regions (display + inline not already handled) and run batched recognition.
+        // Use expanded bboxes (from bracket expansion) when available.
         let formula_entries: Vec<(usize, DynamicImage)> = detected
             .iter()
             .enumerate()
@@ -337,12 +346,12 @@ impl Pipeline {
                     && !char_based_latex.contains_key(i)
             })
             .map(|(i, d)| {
-                let bbox_pt = [
+                let bbox_pt = expanded_bboxes.get(&i).copied().unwrap_or([
                     d.bbox_px[0] / scale,
                     d.bbox_px[1] / scale,
                     d.bbox_px[2] / scale,
                     d.bbox_px[3] / scale,
-                ];
+                ]);
                 (
                     i,
                     figure::crop_region(
@@ -358,19 +367,21 @@ impl Pipeline {
 
         let mut formula_results: HashMap<usize, crate::types::FormulaResult> =
             if !formula_entries.is_empty() {
-                eprint!(
-                    "\r  Page {page_num}/{page_count}: formulas 0/{}",
+                let msg = format!(
+                    "  Page {page_num}/{page_count}: formulas 0/{}",
                     formula_entries.len(),
                 );
+                eprint!("\r{msg:<60}");
                 let crops: Vec<DynamicImage> =
                     formula_entries.iter().map(|(_, img)| img.clone()).collect();
                 let formula_count = crops.len();
                 let results = self
                     .formula
                     .predict_with_progress(&crops, |done| {
-                        eprint!(
-                            "\r  Page {page_num}/{page_count}: formulas {done}/{formula_count}",
+                        let msg = format!(
+                            "  Page {page_num}/{page_count}: formulas {done}/{formula_count}",
                         );
+                        eprint!("\r{msg:<60}");
                     })
                     .map_err(|e| {
                         ExtractError::Layout(format!("Formula prediction failed: {e}"))
@@ -384,13 +395,24 @@ impl Pipeline {
                 HashMap::new()
             };
 
-        // Merge char-based results into formula_results (confidence = 1.0 for char-based)
+        // Strip leading/trailing $ delimiters from OCR output — models sometimes
+        // emit them, but we add our own wrapping in the markdown renderer.
+        for fr in formula_results.values_mut() {
+            let stripped = fr.latex.trim().trim_matches('$').trim();
+            if stripped.len() != fr.latex.len() {
+                fr.latex = stripped.to_string();
+            }
+        }
+
+        // Merge char-based results into formula_results.
+        // Char-based extraction has no meaningful confidence signal, so we use NaN
+        // as a sentinel — downstream code will skip setting ocr_confidence for these.
         for (idx, latex) in char_based_latex {
             formula_results.insert(
                 idx,
                 crate::types::FormulaResult {
                     latex,
-                    confidence: 1.0,
+                    confidence: f32::NAN,
                 },
             );
         }
@@ -643,7 +665,9 @@ impl Pipeline {
             if kind == RegionKind::DisplayFormula || kind == RegionKind::InlineFormula {
                 if let Some(fr) = formula_results.get(&idx) {
                     region.latex = Some(fr.latex.clone());
-                    region.ocr_confidence = Some(fr.confidence);
+                    if fr.confidence.is_finite() {
+                        region.ocr_confidence = Some(fr.confidence);
+                    }
                 }
             }
 

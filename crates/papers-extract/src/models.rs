@@ -73,12 +73,10 @@ pub fn layout_cache_dir(cli_override: Option<&Path>) -> PathBuf {
         .join("models")
 }
 
-/// Local model override directory from CLI flag or env var.
-/// When set, local files are checked before downloading from HuggingFace.
+/// Local model directory: CLI flag, env var, or platform cache dir.
+/// Checked before downloading from HuggingFace.
 fn local_model_override(cli_override: Option<&Path>) -> Option<PathBuf> {
-    cli_override
-        .map(|p| p.to_path_buf())
-        .or_else(|| std::env::var("PAPERS_MODEL_DIR").ok().map(PathBuf::from))
+    Some(layout_cache_dir(cli_override))
 }
 
 /// Create the HuggingFace Hub API client.

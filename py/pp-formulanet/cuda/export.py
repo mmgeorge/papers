@@ -138,15 +138,17 @@ def add_argmax_output(input_path, output_path):
     graph.output.append(next_token_output)
 
     # --- token_log_prob branch (LogSoftmax of argmax, numerically stable) ---
-    # ReduceMax axis constant
-    axes_2_const = helper.make_tensor("axes_2", TensorProto.INT64, [1], [2])
-    graph.initializer.append(axes_2_const)
+    # ReduceMax: axes is attribute in opset ≤17
+    # ReduceSum: axes changed to input in opset 13+
+    reduce_axes_const = helper.make_tensor("reduce_axes_2", TensorProto.INT64, [1], [2])
+    graph.initializer.append(reduce_axes_const)
 
-    # ReduceMax(logits, axis=2, keepdims=1) → max_val [1, 1, 1]
+    # ReduceMax(logits, axes=[2], keepdims=1) → max_val [1, 1, 1]
     graph.node.append(helper.make_node(
         "ReduceMax",
-        inputs=["logits", "axes_2"],
+        inputs=["logits"],
         outputs=["max_val"],
+        axes=[2],
         keepdims=1,
     ))
 
@@ -160,10 +162,10 @@ def add_argmax_output(input_path, output_path):
         "Exp", inputs=["shifted"], outputs=["exp_shifted"],
     ))
 
-    # ReduceSum(exp_shifted, axis=2, keepdims=1) → sum_exp [1, 1, 1]
+    # ReduceSum(exp_shifted, axes_input, keepdims=1) → sum_exp [1, 1, 1]
     graph.node.append(helper.make_node(
         "ReduceSum",
-        inputs=["exp_shifted", "axes_2"],
+        inputs=["exp_shifted", "reduce_axes_2"],
         outputs=["sum_exp"],
         keepdims=1,
     ))
