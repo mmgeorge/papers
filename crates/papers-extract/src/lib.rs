@@ -29,6 +29,8 @@ pub struct ExtractOptions {
     pub extract_images: bool,
     /// Formula recognition model (default GLM-OCR).
     pub formula: FormulaModel,
+    /// Formula parse mode (default Hybrid).
+    pub formula_parse_mode: FormulaParseMode,
     /// Table recognition model (default TableFormer).
     pub table: TableModel,
     /// Path to the pdfium binary (auto-detected if None).
@@ -50,6 +52,7 @@ impl Default for ExtractOptions {
             confidence_threshold: 0.3,
             extract_images: true,
             formula: FormulaModel::default(),
+            formula_parse_mode: FormulaParseMode::default(),
             table: TableModel::default(),
             pdfium_path: None,
             model_cache_dir: None,
@@ -68,6 +71,18 @@ pub enum FormulaModel {
     /// GLM-OCR vision-language model with formula prompt (default).
     #[default]
     GlmOcr,
+}
+
+/// Formula parse mode — controls char-based vs OCR strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FormulaParseMode {
+    /// Try char-based extraction first, fall back to OCR (default).
+    #[default]
+    Hybrid,
+    /// Char-based only — skip formulas that can't be handled manually.
+    Manual,
+    /// Run OCR on every detected formula, skip char-based extraction.
+    Ocr,
 }
 
 /// Table recognition model selection.

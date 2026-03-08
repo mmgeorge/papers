@@ -17,7 +17,7 @@ use crate::reading_order;
 use crate::tableformer::TableFormerPredictor;
 use crate::text;
 use crate::types::*;
-use crate::{ExtractOptions, FormulaModel, TableModel};
+use crate::{ExtractOptions, FormulaModel, FormulaParseMode, TableModel};
 
 // ── Engine dispatch enums ────────────────────────────────────────────
 
@@ -111,6 +111,7 @@ struct PipelineOptions {
     confidence_threshold: f32,
     extract_images: bool,
     dump_formulas: bool,
+    formula_parse_mode: FormulaParseMode,
     page: Option<u32>,
     debug: crate::DebugMode,
 }
@@ -167,6 +168,7 @@ impl Pipeline {
                 confidence_threshold: options.confidence_threshold,
                 extract_images: options.extract_images,
                 dump_formulas: options.dump_formulas,
+                formula_parse_mode: options.formula_parse_mode,
                 page: options.page,
                 debug: options.debug,
             },
@@ -311,6 +313,7 @@ impl Pipeline {
 
         // Phase A: try char-based extraction for inline formulas (skip expensive ML OCR).
         // Also compute expanded bboxes (bracket-aware) for formulas that fall through to OCR.
+        let parse_mode = self.options.formula_parse_mode;
         let mut char_based_latex: HashMap<usize, String> = HashMap::new();
         let mut expanded_bboxes: HashMap<usize, [f32; 4]> = HashMap::new();
         for (i, d) in detected.iter().enumerate() {
@@ -321,24 +324,38 @@ impl Pipeline {
                     d.bbox_px[2] / scale,
                     d.bbox_px[3] / scale,
                 ];
-                if let Some(latex) = text::try_extract_inline_formula(&chars, bbox_pt, height_pt) {
-                    tracing::debug!(
-                        "Char-based bypass for inline formula {i}: {latex}"
-                    );
-                    char_based_latex.insert(i, latex);
-                } else {
-                    // Char-based failed — compute expanded bbox for the OCR crop
-                    let expanded = text::expand_formula_bbox(&chars, bbox_pt, height_pt);
-                    if expanded != bbox_pt {
-                        expanded_bboxes.insert(i, expanded);
+                // In OCR mode, skip char-based extraction entirely
+                if parse_mode != FormulaParseMode::Ocr {
+                    let attempt = text::try_extract_inline_formula(&chars, bbox_pt, height_pt);
+                    if let Some(latex) = attempt.latex {
+                        tracing::debug!(
+                            "Char-based bypass for inline formula {i}: {latex}"
+                        );
+                        char_based_latex.insert(i, latex);
+                        continue;
                     }
+                    // Char-based failed — use the adjusted bbox (may be expanded
+                    // for brackets or tightened to exclude stray edge chars)
+                    if attempt.adjusted_bbox != bbox_pt {
+                        expanded_bboxes.insert(i, attempt.adjusted_bbox);
+                    }
+                    continue;
+                }
+                // OCR mode — still compute expanded bbox for bracket recovery
+                let expanded = text::expand_formula_bbox(&chars, bbox_pt, height_pt);
+                if expanded != bbox_pt {
+                    expanded_bboxes.insert(i, expanded);
                 }
             }
         }
 
         // Crop formula regions (display + inline not already handled) and run batched recognition.
+        // In Manual mode, skip OCR entirely — only char-based results are used.
         // Use expanded bboxes (from bracket expansion) when available.
-        let formula_entries: Vec<(usize, DynamicImage)> = detected
+        let formula_entries: Vec<(usize, DynamicImage)> = if parse_mode == FormulaParseMode::Manual {
+            Vec::new()
+        } else {
+            detected
             .iter()
             .enumerate()
             .filter(|(i, d)| {
@@ -363,7 +380,8 @@ impl Pipeline {
                     ),
                 )
             })
-            .collect();
+            .collect()
+        };
 
         let mut formula_results: HashMap<usize, crate::types::FormulaResult> =
             if !formula_entries.is_empty() {
@@ -599,6 +617,7 @@ impl Pipeline {
                 chart_type: None,
                 tag: None,
                 items: None,
+                formula_source: None,
                 ocr_confidence: None,
                 consumed: kind == RegionKind::InlineFormula && consumed_inline.contains(&idx),
             };
@@ -661,12 +680,15 @@ impl Pipeline {
                 ));
             }
 
-            // Populate formula LaTeX + OCR confidence from crop-based prediction
+            // Populate formula LaTeX + confidence + source from prediction
             if kind == RegionKind::DisplayFormula || kind == RegionKind::InlineFormula {
                 if let Some(fr) = formula_results.get(&idx) {
                     region.latex = Some(fr.latex.clone());
                     if fr.confidence.is_finite() {
+                        region.formula_source = Some("ocr".into());
                         region.ocr_confidence = Some(fr.confidence);
+                    } else {
+                        region.formula_source = Some("char".into());
                     }
                 }
             }
@@ -977,6 +999,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         }

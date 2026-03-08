@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use papers_extract::{DebugMode, ExtractOptions, FormulaModel};
+use papers_extract::{DebugMode, ExtractOptions, FormulaModel, FormulaParseMode};
 
 #[derive(Parser)]
 #[command(
@@ -30,6 +30,10 @@ struct Cli {
     #[arg(long, value_name = "MODEL", default_value = "glm-ocr")]
     formula: FormulaModelArg,
 
+    /// Formula parse mode: "hybrid" (default), "manual", or "ocr"
+    #[arg(long, value_name = "MODE", default_value = "hybrid")]
+    formula_parse_mode: FormulaParseModeArg,
+
     /// Write layout debug output: "images" for annotated PNGs, "pdf" for PNGs + debug PDF
     #[arg(long, value_name = "MODE")]
     write_layout: Option<LayoutDebugArg>,
@@ -41,6 +45,16 @@ enum FormulaModelArg {
     PpFormulanet,
     /// GLM-OCR vision-language model (default)
     GlmOcr,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum FormulaParseModeArg {
+    /// Try char-based first, fall back to OCR (default)
+    Hybrid,
+    /// Char-based only — skip formulas that can't be handled
+    Manual,
+    /// Run OCR on every formula
+    Ocr,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -67,6 +81,11 @@ fn main() {
         formula: match cli.formula {
             FormulaModelArg::PpFormulanet => FormulaModel::PpFormulanet,
             FormulaModelArg::GlmOcr => FormulaModel::GlmOcr,
+        },
+        formula_parse_mode: match cli.formula_parse_mode {
+            FormulaParseModeArg::Hybrid => FormulaParseMode::Hybrid,
+            FormulaParseModeArg::Manual => FormulaParseMode::Manual,
+            FormulaParseModeArg::Ocr => FormulaParseMode::Ocr,
         },
         debug: match cli.write_layout {
             Some(LayoutDebugArg::Images) => DebugMode::Images,

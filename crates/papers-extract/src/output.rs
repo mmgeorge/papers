@@ -782,6 +782,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         }

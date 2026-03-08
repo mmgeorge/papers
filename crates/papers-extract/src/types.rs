@@ -44,7 +44,11 @@ pub struct Region {
     pub html: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latex: Option<String>,
+    /// How this formula's LaTeX was produced: "char" (char-based) or "ocr" (ML model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formula_source: Option<String>,
     /// OCR model confidence for formula LaTeX (sequence-level, 0–1).
+    /// Only present when `formula_source` is "ocr".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ocr_confidence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,6 +256,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         };
@@ -278,6 +283,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         };
@@ -303,6 +309,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         };
@@ -327,6 +334,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         };
@@ -344,6 +352,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         };
@@ -381,6 +390,7 @@ mod tests {
                     chart_type: None,
                     tag: None,
                     items: None,
+                    formula_source: None,
                     ocr_confidence: None,
                     consumed: false,
                 }],
@@ -479,6 +489,7 @@ mod tests {
             text: None,
             html: None,
             latex: Some("E = mc^2".into()),
+            formula_source: Some("ocr".into()),
             ocr_confidence: Some(0.85),
             image_path: None,
             caption: None,

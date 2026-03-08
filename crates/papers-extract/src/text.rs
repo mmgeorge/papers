@@ -315,6 +315,18 @@ fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
         return String::new();
     }
 
+    // Pre-compute accent merging across ALL lines (accents and base chars
+    // may end up on different lines due to Y-proximity grouping).
+    let all_chars: Vec<&ImageChar> = lines
+        .iter()
+        .flat_map(|line| line.iter())
+        .filter_map(|e| match e {
+            LineElement::Char(c) if !c.codepoint.is_control() => Some(*c),
+            _ => None,
+        })
+        .collect();
+    let accent_merge = compute_accent_merge(&all_chars);
+
     // Compute line spacings for paragraph detection
     let line_spacings: Vec<f32> = lines
         .windows(2)
@@ -391,7 +403,7 @@ fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
     for (line_idx, line) in lines.iter().enumerate() {
         let processed = detect_scripts(line);
         let processed_refs: Vec<&LineElement> = processed.iter().collect();
-        let line_text = build_line_text(&processed_refs);
+        let line_text = build_line_text(&processed_refs, &accent_merge);
         result.push_str(&line_text);
 
         let has_hyphen_marker = line.iter().any(|e| matches!(
@@ -495,6 +507,17 @@ fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -
         return String::new();
     }
 
+    // Pre-compute accent merging across all lines.
+    let all_chars: Vec<&ImageChar> = lines
+        .iter()
+        .flat_map(|line| line.iter())
+        .filter_map(|e| match e {
+            LineElement::Char(c) if !c.codepoint.is_control() => Some(*c),
+            _ => None,
+        })
+        .collect();
+    let accent_merge = compute_accent_merge(&all_chars);
+
     let median_char_width = compute_median_char_width(lines);
 
     // Split each line into optional line-number prefix and content start index.
@@ -578,7 +601,7 @@ fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -
             }
             let processed = detect_scripts(&line[content_idx..]);
             let processed_refs: Vec<&LineElement> = processed.iter().collect();
-            formatted.push_str(&build_line_text(&processed_refs));
+            formatted.push_str(&build_line_text(&processed_refs, &accent_merge));
         } else {
             // No line numbers: indent + full line text.
             for _ in 0..indent_count {
@@ -586,7 +609,7 @@ fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -
             }
             let processed = detect_scripts(line);
             let processed_refs: Vec<&LineElement> = processed.iter().collect();
-            formatted.push_str(&build_line_text(&processed_refs));
+            formatted.push_str(&build_line_text(&processed_refs, &accent_merge));
         }
 
         // In a numbered algorithm, a very short unnumbered line (after the
@@ -920,7 +943,55 @@ fn clone_element<'a>(elem: &LineElement<'a>) -> LineElement<'a> {
 ///   gap between surrounding chars is zero (no duplicate space inserted).
 /// - When pdfium DOESN'T emit spaces: the geometric gap exceeds the threshold,
 ///   and we insert a space ourselves.
-fn build_line_text(elements: &[&LineElement]) -> String {
+/// Accent-merging results: maps base char pointers to LaTeX commands,
+/// and collects accent char pointers to skip during output.
+struct AccentMerge<'a> {
+    /// Base char → accent command (e.g. "hat", "tilde")
+    accented_bases: std::collections::HashMap<*const ImageChar<'a>, &'static str>,
+    /// Accent chars to skip
+    accent_ptrs: std::collections::HashSet<*const ImageChar<'a>>,
+}
+
+/// Scan matched chars for modifier accents overlapping base chars.
+/// Uses the same horizontal overlap logic as try_extract_inline_formula.
+fn compute_accent_merge<'a>(chars: &[&'a ImageChar<'a>]) -> AccentMerge<'a> {
+    let mut accented_bases = std::collections::HashMap::new();
+    let mut accent_ptrs = std::collections::HashSet::new();
+
+    for (i, &c) in chars.iter().enumerate() {
+        if !is_modifier_accent(c.codepoint) {
+            continue;
+        }
+        let accent_x1 = c.bbox[0];
+        let accent_x2 = c.bbox[2];
+        let mut best_ptr: Option<*const ImageChar> = None;
+        let mut best_overlap = 0.0_f32;
+        for (j, &base) in chars.iter().enumerate() {
+            if i == j || is_modifier_accent(base.codepoint) {
+                continue;
+            }
+            let overlap_x1 = accent_x1.max(base.bbox[0]);
+            let overlap_x2 = accent_x2.min(base.bbox[2]);
+            let overlap = (overlap_x2 - overlap_x1).max(0.0);
+            if overlap > best_overlap {
+                best_overlap = overlap;
+                best_ptr = Some(base as *const ImageChar);
+            }
+        }
+        if let Some(ptr) = best_ptr {
+            if best_overlap > 0.0 {
+                if let Some(cmd) = accent_command(c.codepoint) {
+                    accented_bases.insert(ptr, cmd);
+                    accent_ptrs.insert(c as *const ImageChar);
+                }
+            }
+        }
+    }
+
+    AccentMerge { accented_bases, accent_ptrs }
+}
+
+fn build_line_text(elements: &[&LineElement], accent_merge: &AccentMerge) -> String {
     let mut text = String::new();
     let mut prev_right: Option<f32> = None;
 
@@ -938,6 +1009,8 @@ fn build_line_text(elements: &[&LineElement]) -> String {
         if widths.is_empty() { 0.0 }
         else { widths.iter().sum::<f32>() / widths.len() as f32 }
     };
+
+    let AccentMerge { ref accented_bases, ref accent_ptrs } = *accent_merge;
 
     let mut in_italic = false;
 
@@ -959,6 +1032,11 @@ fn build_line_text(elements: &[&LineElement]) -> String {
         match elem {
             LineElement::Char(c) => {
                 if c.codepoint.is_control() { continue; }
+
+                // Skip accent chars (merged into their base char)
+                if accent_ptrs.contains(&(*c as *const ImageChar)) {
+                    continue;
+                }
 
                 // Gap-based word boundary detection.
                 if c.codepoint != ' ' {
@@ -987,6 +1065,14 @@ fn build_line_text(elements: &[&LineElement]) -> String {
                         in_italic = false;
                     }
                     text.push(' ');
+                } else if let Some(cmd) = accented_bases.get(&(*c as *const ImageChar)) {
+                    // Accented base char — emit as inline math $\hat{x}$
+                    if in_italic {
+                        text.push('*');
+                        in_italic = false;
+                    }
+                    text.push_str(&format!("$\\{cmd}{{{}}}", c.codepoint));
+                    text.push('$');
                 } else {
                     if c.is_italic && !in_italic {
                         text.push('*');
@@ -1564,25 +1650,116 @@ fn is_modifier_accent(c: char) -> bool {
 ///
 /// `formula_bbox` is in image-space Y-down, PDF points.
 /// `page_height_pt` is used to convert PdfChar coords from PDF space (Y-up) to image space.
+/// Trim stray text characters from the edges of a formula's matched chars.
+///
+/// The layout model's bounding box sometimes clips a neighboring text character,
+/// causing its center to fall just inside the formula region. For example, in
+/// "form a 3×3 basis", the bbox might start slightly left of "3×3" and capture
+/// the article "a".
+///
+/// Detection: sort chars left-to-right, then check if the leftmost or rightmost
+/// char is separated from its nearest neighbor by a space-sized gap. If so, it's
+/// a stray text char — remove it and tighten the bbox to exclude it.
+///
+/// When chars are trimmed, `bbox` is tightened so downstream OCR crops also
+/// exclude the stray char.
+fn trim_stray_edge_chars<'a>(
+    mut visible: Vec<&'a ImageChar<'a>>,
+    bbox: &mut [f32; 4],
+) -> Vec<&'a ImageChar<'a>> {
+    // Need at least 3 chars: ≥2 real formula chars + 1 stray.
+    // With only 2 chars we can't distinguish stray from legitimate content.
+    if visible.len() < 3 {
+        return visible;
+    }
+
+    // Sort left-to-right by center X
+    visible.sort_by(|a, b| {
+        let ax = (a.bbox[0] + a.bbox[2]) / 2.0;
+        let bx = (b.bbox[0] + b.bbox[2]) / 2.0;
+        ax.partial_cmp(&bx).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Compute median char width as word-space threshold.
+    // A gap ≥ 1 full median character width between an edge char and its
+    // neighbor indicates a word boundary — the edge char is likely a stray
+    // text character captured by the layout bbox, not part of the formula.
+    // Intra-formula spacing (around operators, scripts) is typically < 1 char width.
+    let mut widths: Vec<f32> = visible
+        .iter()
+        .map(|c| (c.bbox[2] - c.bbox[0]).max(0.0))
+        .filter(|&w| w > 0.0)
+        .collect();
+    if widths.is_empty() {
+        return visible;
+    }
+    widths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_width = widths[widths.len() / 2];
+    let space_gap = median_width;
+
+    // Check leftmost char: gap between its right edge and the second char's left edge
+    let left_gap = visible[1].bbox[0] - visible[0].bbox[2];
+    if left_gap > space_gap {
+        // Stray char on the left — tighten bbox to start after it
+        let stray_right = visible[0].bbox[2];
+        // New left edge: midpoint between stray's right edge and next char's left edge
+        bbox[0] = (stray_right + visible[1].bbox[0]) / 2.0;
+        visible.remove(0);
+    }
+
+    // Check rightmost char: gap between second-to-last's right edge and last's left edge
+    if visible.len() >= 2 {
+        let n = visible.len();
+        let right_gap = visible[n - 1].bbox[0] - visible[n - 2].bbox[2];
+        if right_gap > space_gap {
+            // Stray char on the right — tighten bbox to end before it
+            let stray_left = visible[n - 1].bbox[0];
+            // New right edge: midpoint between prev char's right edge and stray's left edge
+            bbox[2] = (visible[n - 2].bbox[2] + stray_left) / 2.0;
+            visible.pop();
+        }
+    }
+
+    visible
+}
+
+/// Result of attempting char-based inline formula extraction.
+#[derive(Debug)]
+pub struct InlineFormulaAttempt {
+    /// The LaTeX string if char-based extraction succeeded.
+    pub latex: Option<String>,
+    /// The adjusted bounding box — may be expanded (bracket recovery) or
+    /// tightened (stray edge chars trimmed). Use this for OCR crops when
+    /// `latex` is `None`.
+    pub adjusted_bbox: [f32; 4],
+}
+
 pub fn try_extract_inline_formula(
     chars: &[PdfChar],
     formula_bbox: [f32; 4],
     page_height_pt: f32,
-) -> Option<String> {
+) -> InlineFormulaAttempt {
     let image_chars: Vec<ImageChar> = chars
         .iter()
         .map(|c| to_image_char(c, page_height_pt))
         .collect();
 
     // Match chars to the formula bbox, then expand if brackets are unbalanced
-    let bbox = expand_for_brackets(&image_chars, formula_bbox);
+    let mut bbox = expand_for_brackets(&image_chars, formula_bbox);
 
     let matched = match_chars_to_region(&image_chars, bbox, &[]);
+
+    // Helper: return early with no latex but the current adjusted bbox
+    macro_rules! reject {
+        () => {
+            return InlineFormulaAttempt { latex: None, adjusted_bbox: bbox };
+        };
+    }
 
     // Reject: CR/LF control chars between visible chars indicate fractions
     // (PDF encodes fraction bars as \r\n with zero-width bboxes)
     if matched.iter().any(|c| c.codepoint == '\r' || c.codepoint == '\n') {
-        return None;
+        reject!();
     }
 
     // Filter out control chars and zero-width chars
@@ -1598,15 +1775,22 @@ pub fn try_extract_inline_formula(
 
     // Reject: no chars matched
     if visible.is_empty() {
-        return None;
+        reject!();
     }
 
+    // Trim stray edge chars: if the leftmost or rightmost char is separated
+    // from its neighbor by a space-sized gap, it's a text char that the layout
+    // bbox accidentally captured. Remove it and tighten the bbox.
+    let visible = trim_stray_edge_chars(visible, &mut bbox);
 
+    if visible.is_empty() {
+        reject!();
+    }
 
     // Reject: ∂ (partial derivative) — almost always appears in fractions or complex
     // expressions where char-based left-to-right reading produces garbage
     if visible.iter().any(|c| c.codepoint == '\u{2202}' || c.codepoint == '\u{1D715}') {
-        return None;
+        reject!();
     }
 
     // Reject: ∇ (nabla) with more than 2 chars — single "∇f" is fine,
@@ -1614,12 +1798,12 @@ pub fn try_extract_inline_formula(
     if visible.len() > 2
         && visible.iter().any(|c| c.codepoint == '\u{2207}')
     {
-        return None;
+        reject!();
     }
 
     // Reject: too many chars (complex formula, send to OCR)
     if visible.len() > 20 {
-        return None;
+        reject!();
     }
 
     // Reject: chars span more than one text line.
@@ -1636,7 +1820,7 @@ pub fn try_extract_inline_formula(
         let vertical_span = y_max - y_min;
         // If the total vertical span exceeds 3× the tallest character, it's multi-line
         if vertical_span > max_height * 3.0 {
-            return None;
+            reject!();
         }
     }
 
@@ -1683,7 +1867,7 @@ pub fn try_extract_inline_formula(
             continue;
         }
         if !is_known_formula_char(c.codepoint) {
-            return None;
+            reject!();
         }
     }
 
@@ -1740,10 +1924,13 @@ pub fn try_extract_inline_formula(
     // Final sanity: reject empty results
     let trimmed = latex.trim();
     if trimmed.is_empty() {
-        return None;
+        reject!();
     }
 
-    Some(trimmed.to_string())
+    InlineFormulaAttempt {
+        latex: Some(trimmed.to_string()),
+        adjusted_bbox: bbox,
+    }
 }
 
 #[cfg(test)]
@@ -2936,7 +3123,7 @@ mod tests {
         let chars = vec![make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x".to_string()));
+        assert_eq!(result.latex, Some("x".to_string()));
     }
 
     #[test]
@@ -2944,7 +3131,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{03B1}', 100.0, 100.0, 8.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\alpha".to_string()));
+        assert_eq!(result.latex, Some("\\alpha".to_string()));
     }
 
     #[test]
@@ -2956,7 +3143,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 120.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x_{t}".to_string()));
+        assert_eq!(result.latex, Some("x_{t}".to_string()));
     }
 
     #[test]
@@ -2968,7 +3155,7 @@ mod tests {
         ];
         let bbox = [95.0, 90.0, 120.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x^{2}".to_string()));
+        assert_eq!(result.latex, Some("x^{2}".to_string()));
     }
 
     #[test]
@@ -2981,7 +3168,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 135.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x+y".to_string()));
+        assert_eq!(result.latex, Some("x+y".to_string()));
     }
 
     #[test]
@@ -2993,7 +3180,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 120.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\alpha_{t}".to_string()));
+        assert_eq!(result.latex, Some("\\alpha_{t}".to_string()));
     }
 
     #[test]
@@ -3004,7 +3191,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None);
+        assert_eq!(result.latex, None);
     }
 
     #[test]
@@ -3012,7 +3199,7 @@ mod tests {
         let chars: Vec<PdfChar> = vec![];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None);
+        assert_eq!(result.latex, None);
     }
 
     #[test]
@@ -3025,7 +3212,7 @@ mod tests {
             .collect();
         let bbox = [95.0, 95.0, 400.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None);
+        assert_eq!(result.latex, None);
     }
 
     // ── Edge case tests ────────────────────────────────────────────────
@@ -3040,8 +3227,8 @@ mod tests {
             .collect();
         let bbox = [95.0, 95.0, 400.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert!(result.is_some(), "20 chars should be accepted");
-        assert_eq!(result.unwrap().len(), 20); // 20 'a's
+        assert!(result.latex.is_some(), "20 chars should be accepted");
+        assert_eq!(result.latex.unwrap().len(), 20); // 20 'a's
     }
 
     #[test]
@@ -3054,7 +3241,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x".to_string()));
+        assert_eq!(result.latex, Some("x".to_string()));
     }
 
     #[test]
@@ -3074,8 +3261,8 @@ mod tests {
 
         let r1 = try_extract_inline_formula(&chars, bbox1, PAGE_H);
         let r2 = try_extract_inline_formula(&chars, bbox2, PAGE_H);
-        assert_eq!(r1, Some("ab".to_string()));
-        assert_eq!(r2, Some("cd".to_string()));
+        assert_eq!(r1.latex, Some("ab".to_string()));
+        assert_eq!(r2.latex, Some("cd".to_string()));
     }
 
     #[test]
@@ -3089,7 +3276,7 @@ mod tests {
         let bbox = [95.0, 95.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // Space is filtered; x and y are adjacent, no script detection → "xy"
-        assert_eq!(result, Some("xy".to_string()));
+        assert_eq!(result.latex, Some("xy".to_string()));
     }
 
     #[test]
@@ -3102,7 +3289,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("xy".to_string()));
+        assert_eq!(result.latex, Some("xy".to_string()));
     }
 
     #[test]
@@ -3110,7 +3297,7 @@ mod tests {
         let chars = vec![make_formula_char('0', 100.0, 100.0, 8.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("0".to_string()));
+        assert_eq!(result.latex, Some("0".to_string()));
     }
 
     #[test]
@@ -3125,7 +3312,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 140.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("(x+y)".to_string()));
+        assert_eq!(result.latex, Some("(x+y)".to_string()));
     }
 
     #[test]
@@ -3138,7 +3325,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\alpha+\\beta".to_string()));
+        assert_eq!(result.latex, Some("\\alpha+\\beta".to_string()));
     }
 
     #[test]
@@ -3151,7 +3338,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x_{12}".to_string()));
+        assert_eq!(result.latex, Some("x_{12}".to_string()));
     }
 
     #[test]
@@ -3166,7 +3353,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 135.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("a_{i}b_{j}".to_string()));
+        assert_eq!(result.latex, Some("a_{i}b_{j}".to_string()));
     }
 
     #[test]
@@ -3179,8 +3366,8 @@ mod tests {
         let bbox = [95.0, 93.0, 118.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // Prime is small font → detect_scripts sees it as superscript
-        assert!(result.is_some(), "Prime should be handled");
-        let latex = result.unwrap();
+        assert!(result.latex.is_some(), "Prime should be handled");
+        let latex = result.latex.unwrap();
         // Either x^{'} or x' depending on detect_scripts behavior
         assert!(
             latex.contains("x") && latex.contains("'"),
@@ -3197,7 +3384,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\nabla f".to_string()));
+        assert_eq!(result.latex, Some("\\nabla f".to_string()));
     }
 
     #[test]
@@ -3210,7 +3397,7 @@ mod tests {
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // ∂ always goes to OCR now (needs spatial understanding for fractions)
-        assert_eq!(result, None);
+        assert_eq!(result.latex, None);
     }
 
     #[test]
@@ -3223,7 +3410,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "Any unknown char should reject the whole formula");
+        assert_eq!(result.latex, None, "Any unknown char should reject the whole formula");
     }
 
     #[test]
@@ -3232,7 +3419,7 @@ mod tests {
         let chars = vec![make_formula_char('+', 100.0, 100.0, 8.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("+".to_string()));
+        assert_eq!(result.latex, Some("+".to_string()));
     }
 
     #[test]
@@ -3245,7 +3432,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x\\leq y".to_string()));
+        assert_eq!(result.latex, Some("x\\leq y".to_string()));
     }
 
     #[test]
@@ -3257,7 +3444,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 115.0, 215.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "Multi-line should be rejected");
+        assert_eq!(result.latex, None, "Multi-line should be rejected");
     }
 
     #[test]
@@ -3269,7 +3456,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None);
+        assert_eq!(result.latex, None);
     }
 
     #[test]
@@ -3281,7 +3468,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("y".to_string()));
+        assert_eq!(result.latex, Some("y".to_string()));
     }
 
     #[test]
@@ -3290,7 +3477,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{03A9}', 100.0, 100.0, 10.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\Omega".to_string()));
+        assert_eq!(result.latex, Some("\\Omega".to_string()));
     }
 
     #[test]
@@ -3303,7 +3490,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 135.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x+y".to_string()));
+        assert_eq!(result.latex, Some("x+y".to_string()));
     }
 
     #[test]
@@ -3317,7 +3504,7 @@ mod tests {
         let bbox = [95.0, 95.0, 107.0, 112.0]; // 't' center at (110.5, 108.5) is outside
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // Should get just "x" — partial but not wrong LaTeX
-        assert_eq!(result, Some("x".to_string()));
+        assert_eq!(result.latex, Some("x".to_string()));
     }
 
     #[test]
@@ -3326,7 +3513,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{221E}', 100.0, 100.0, 10.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\infty".to_string()));
+        assert_eq!(result.latex, Some("\\infty".to_string()));
     }
 
     // ── LaTeX spacing and more edge cases ──────────────────────────────
@@ -3340,7 +3527,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\alpha t".to_string()));
+        assert_eq!(result.latex, Some("\\alpha t".to_string()));
     }
 
     #[test]
@@ -3354,7 +3541,7 @@ mod tests {
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // Digits don't need space after commands
-        assert_eq!(result, Some("\\alpha0".to_string()));
+        assert_eq!(result.latex, Some("\\alpha0".to_string()));
     }
 
     #[test]
@@ -3367,7 +3554,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\alpha+\\beta".to_string()));
+        assert_eq!(result.latex, Some("\\alpha+\\beta".to_string()));
     }
 
     #[test]
@@ -3379,7 +3566,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\alpha\\beta".to_string()));
+        assert_eq!(result.latex, Some("\\alpha\\beta".to_string()));
     }
 
     #[test]
@@ -3393,7 +3580,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 120.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\alpha_{t}".to_string()));
+        assert_eq!(result.latex, Some("\\alpha_{t}".to_string()));
     }
 
     #[test]
@@ -3406,7 +3593,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x-y".to_string()));
+        assert_eq!(result.latex, Some("x-y".to_string()));
     }
 
     #[test]
@@ -3419,7 +3606,7 @@ mod tests {
         // bbox right edge = 105.0, bottom edge = 105.0 — center is exactly on boundary
         let bbox = [100.0, 100.0, 105.0, 105.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x".to_string()));
+        assert_eq!(result.latex, Some("x".to_string()));
     }
 
     #[test]
@@ -3432,7 +3619,7 @@ mod tests {
         // bbox right edge = 104.9 — center is outside
         let bbox = [100.0, 100.0, 104.9, 104.9];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "Char center outside bbox should not be matched");
+        assert_eq!(result.latex, None, "Char center outside bbox should not be matched");
     }
 
     #[test]
@@ -3446,8 +3633,8 @@ mod tests {
         let bbox = [95.0, 95.0, 140.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // Gap = 130.0 - 108.0 = 22.0 > space_threshold(1.5), so no script detection
-        assert!(result.is_some());
-        let latex = result.unwrap();
+        assert!(result.latex.is_some());
+        let latex = result.latex.unwrap();
         // Should be "xt" (no script folding) since gap is too large
         assert_eq!(latex, "xt", "Large gap should prevent script detection");
     }
@@ -3462,7 +3649,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x\\in S".to_string()));
+        assert_eq!(result.latex, Some("x\\in S".to_string()));
     }
 
     #[test]
@@ -3474,7 +3661,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 120.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x_{t}".to_string()));
+        assert_eq!(result.latex, Some("x_{t}".to_string()));
     }
 
     #[test]
@@ -3486,7 +3673,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 120.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("G_{i}".to_string()));
+        assert_eq!(result.latex, Some("G_{i}".to_string()));
     }
 
     #[test]
@@ -3495,7 +3682,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{1D6FF}', 100.0, 100.0, 10.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\delta".to_string()));
+        assert_eq!(result.latex, Some("\\delta".to_string()));
     }
 
     #[test]
@@ -3504,7 +3691,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{210E}', 100.0, 100.0, 8.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("h".to_string()));
+        assert_eq!(result.latex, Some("h".to_string()));
     }
 
     #[test]
@@ -3517,7 +3704,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\|x\\|".to_string()));
+        assert_eq!(result.latex, Some("\\|x\\|".to_string()));
     }
 
     #[test]
@@ -3529,7 +3716,7 @@ mod tests {
         ];
         let bbox = [95.0, 93.0, 118.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert!(result.is_some(), "Double prime should be handled");
+        assert!(result.latex.is_some(), "Double prime should be handled");
     }
 
     // ── Math-alphanumeric and spacing edge cases ───────────────────────
@@ -3540,7 +3727,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{1D400}', 100.0, 100.0, 8.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("A".to_string()));
+        assert_eq!(result.latex, Some("A".to_string()));
     }
 
     #[test]
@@ -3549,7 +3736,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{1D5A0}', 100.0, 100.0, 8.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("A".to_string()));
+        assert_eq!(result.latex, Some("A".to_string()));
     }
 
     #[test]
@@ -3563,7 +3750,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x_{\\epsilon v}".to_string()));
+        assert_eq!(result.latex, Some("x_{\\epsilon v}".to_string()));
     }
 
     #[test]
@@ -3577,7 +3764,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x_{\\delta\\epsilon}".to_string()));
+        assert_eq!(result.latex, Some("x_{\\delta\\epsilon}".to_string()));
     }
 
     #[test]
@@ -3590,7 +3777,7 @@ mod tests {
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // 𝜕 (math italic partial) always goes to OCR now
-        assert_eq!(result, None);
+        assert_eq!(result.latex, None);
     }
 
     #[test]
@@ -3604,7 +3791,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 132.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("E(x)".to_string()));
+        assert_eq!(result.latex, Some("E(x)".to_string()));
     }
 
     #[test]
@@ -3616,7 +3803,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 118.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("F_{i}".to_string()));
+        assert_eq!(result.latex, Some("F_{i}".to_string()));
     }
 
     #[test]
@@ -3625,7 +3812,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{211D}', 100.0, 100.0, 10.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "Double-struck R should reject (not in map)");
+        assert_eq!(result.latex, None, "Double-struck R should reject (not in map)");
     }
 
     #[test]
@@ -3637,7 +3824,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 122.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "Asterisk should reject");
+        assert_eq!(result.latex, None, "Asterisk should reject");
     }
 
     #[test]
@@ -3649,7 +3836,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\grave{x}".to_string()), "Combining marks should merge with base");
+        assert_eq!(result.latex, Some("\\grave{x}".to_string()), "Combining marks should merge with base");
     }
 
     #[test]
@@ -3662,7 +3849,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 132.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x\\to y".to_string()));
+        assert_eq!(result.latex, Some("x\\to y".to_string()));
     }
 
     #[test]
@@ -3674,7 +3861,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\forall x".to_string()));
+        assert_eq!(result.latex, Some("\\forall x".to_string()));
     }
 
     #[test]
@@ -3683,7 +3870,7 @@ mod tests {
         let chars = vec![make_formula_char('\u{2026}', 100.0, 100.0, 12.0, 10.0, 10.0)];
         let bbox = [95.0, 95.0, 118.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\ldots".to_string()));
+        assert_eq!(result.latex, Some("\\ldots".to_string()));
     }
 
     #[test]
@@ -3696,7 +3883,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("f:A".to_string()));
+        assert_eq!(result.latex, Some("f:A".to_string()));
     }
 
     #[test]
@@ -3714,8 +3901,8 @@ mod tests {
         ];
         let bbox = [95.0, 91.0, 152.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert!(result.is_some(), "Complex expression should be handled: {:?}", result);
-        let latex = result.unwrap();
+        assert!(result.latex.is_some(), "Complex expression should be handled: {:?}", result);
+        let latex = result.latex.unwrap();
         // Should contain H_{i}, ∈, R^{...}
         assert!(latex.contains("H_{i}"), "Should have H_{{i}}: {latex}");
         assert!(latex.contains("\\in"), "Should have \\in: {latex}");
@@ -3731,7 +3918,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 118.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("h,".to_string()));
+        assert_eq!(result.latex, Some("h,".to_string()));
     }
 
     #[test]
@@ -3744,7 +3931,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\|u\\|".to_string()));
+        assert_eq!(result.latex, Some("\\|u\\|".to_string()));
     }
 
     #[test]
@@ -3763,7 +3950,7 @@ mod tests {
         // After replace_greek_in_latex: "x_{c}"
         // And the \delta before it: is_latex_command("\delta") = true, "x" starts with letter → space
         // Result: "\delta x_{c}"
-        assert_eq!(result, Some("\\delta x_{c}".to_string()));
+        assert_eq!(result.latex, Some("\\delta x_{c}".to_string()));
     }
 
     #[test]
@@ -3788,8 +3975,8 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 195.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert!(result.is_some(), "Should handle realistic formula");
-        let latex = result.unwrap();
+        assert!(result.latex.is_some(), "Should handle realistic formula");
+        let latex = result.latex.unwrap();
         assert_eq!(latex, "v_{i}=(x_{i}-x_{ti})/h");
     }
 
@@ -3944,7 +4131,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 125.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "CR/LF fraction chars should force OCR");
+        assert_eq!(result.latex, None, "CR/LF fraction chars should force OCR");
     }
 
     #[test]
@@ -3955,7 +4142,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "∂ should always force OCR");
+        assert_eq!(result.latex, None, "∂ should always force OCR");
     }
 
     #[test]
@@ -3967,7 +4154,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "𝜕 (math italic partial) should always force OCR");
+        assert_eq!(result.latex, None, "𝜕 (math italic partial) should always force OCR");
     }
 
     #[test]
@@ -3980,7 +4167,7 @@ mod tests {
         ];
         let bbox = [95.0, 90.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, None, "∇ with >2 chars should force OCR");
+        assert_eq!(result.latex, None, "∇ with >2 chars should force OCR");
     }
 
     #[test]
@@ -3992,7 +4179,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\nabla f".to_string()), "∇f should stay on fast path");
+        assert_eq!(result.latex, Some("\\nabla f".to_string()), "∇f should stay on fast path");
     }
 
     // --- Modifier accent (hat) merging tests ---
@@ -4009,7 +4196,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\hat{n}".to_string()));
+        assert_eq!(result.latex, Some("\\hat{n}".to_string()));
     }
 
     #[test]
@@ -4021,7 +4208,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\hat{b}".to_string()));
+        assert_eq!(result.latex, Some("\\hat{b}".to_string()));
     }
 
     #[test]
@@ -4037,7 +4224,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 130.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\hat{n},\\hat{t},".to_string()));
+        assert_eq!(result.latex, Some("\\hat{n},\\hat{t},".to_string()));
     }
 
     #[test]
@@ -4050,7 +4237,7 @@ mod tests {
         let bbox = [95.0, 89.0, 145.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // No overlap: ˆ stays as standalone \hat{}
-        assert_eq!(result, Some("x\\hat{}".to_string()));
+        assert_eq!(result.latex, Some("x\\hat{}".to_string()));
     }
 
     #[test]
@@ -4062,7 +4249,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\hat{\\alpha}".to_string()));
+        assert_eq!(result.latex, Some("\\hat{\\alpha}".to_string()));
     }
 
     #[test]
@@ -4075,7 +4262,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 118.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\hat{b},".to_string()));
+        assert_eq!(result.latex, Some("\\hat{b},".to_string()));
     }
 
     #[test]
@@ -4091,7 +4278,7 @@ mod tests {
         ];
         let bbox = [75.0, 89.0, 142.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("x+\\hat{n}+y".to_string()));
+        assert_eq!(result.latex, Some("x+\\hat{n}+y".to_string()));
     }
 
     #[test]
@@ -4103,7 +4290,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\hat{x}".to_string()));
+        assert_eq!(result.latex, Some("\\hat{x}".to_string()));
     }
 
     #[test]
@@ -4115,7 +4302,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\tilde{x}".to_string()));
+        assert_eq!(result.latex, Some("\\tilde{x}".to_string()));
     }
 
     #[test]
@@ -4127,7 +4314,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\tilde{n}".to_string()));
+        assert_eq!(result.latex, Some("\\tilde{n}".to_string()));
     }
 
     #[test]
@@ -4139,7 +4326,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\bar{x}".to_string()));
+        assert_eq!(result.latex, Some("\\bar{x}".to_string()));
     }
 
     #[test]
@@ -4151,7 +4338,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\bar{x}".to_string()));
+        assert_eq!(result.latex, Some("\\bar{x}".to_string()));
     }
 
     #[test]
@@ -4163,7 +4350,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\dot{x}".to_string()));
+        assert_eq!(result.latex, Some("\\dot{x}".to_string()));
     }
 
     #[test]
@@ -4175,7 +4362,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\dot{x}".to_string()));
+        assert_eq!(result.latex, Some("\\dot{x}".to_string()));
     }
 
     #[test]
@@ -4187,7 +4374,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\ddot{x}".to_string()));
+        assert_eq!(result.latex, Some("\\ddot{x}".to_string()));
     }
 
     #[test]
@@ -4199,7 +4386,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\ddot{x}".to_string()));
+        assert_eq!(result.latex, Some("\\ddot{x}".to_string()));
     }
 
     #[test]
@@ -4211,7 +4398,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\check{x}".to_string()));
+        assert_eq!(result.latex, Some("\\check{x}".to_string()));
     }
 
     #[test]
@@ -4223,7 +4410,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\breve{x}".to_string()));
+        assert_eq!(result.latex, Some("\\breve{x}".to_string()));
     }
 
     #[test]
@@ -4235,7 +4422,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\acute{x}".to_string()));
+        assert_eq!(result.latex, Some("\\acute{x}".to_string()));
     }
 
     #[test]
@@ -4247,7 +4434,7 @@ mod tests {
         ];
         let bbox = [95.0, 89.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\grave{x}".to_string()));
+        assert_eq!(result.latex, Some("\\grave{x}".to_string()));
     }
 
     #[test]
@@ -4259,7 +4446,7 @@ mod tests {
         ];
         let bbox = [95.0, 88.0, 115.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("\\vec{x}".to_string()));
+        assert_eq!(result.latex, Some("\\vec{x}".to_string()));
     }
 
     // --- Bracket expansion tests ---
@@ -4282,8 +4469,8 @@ mod tests {
         // Bbox starts at x=90 — clips | at x=80 and d at x=84
         let bbox = [90.0, 95.0, 135.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert!(result.is_some(), "should expand left to find matching |");
-        let latex = result.unwrap();
+        assert!(result.latex.is_some(), "should expand left to find matching |");
+        let latex = result.latex.unwrap();
         assert!(latex.contains("det"), "should include 'det': got {latex}");
         assert!(latex.starts_with('|'), "should start with |: got {latex}");
     }
@@ -4301,8 +4488,8 @@ mod tests {
         // Bbox starts at x=83 — clips ( at x=80
         let bbox = [83.0, 95.0, 118.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert!(result.is_some(), "should expand left to find matching (");
-        let latex = result.unwrap();
+        assert!(result.latex.is_some(), "should expand left to find matching (");
+        let latex = result.latex.unwrap();
         assert!(latex.starts_with('('), "should start with (: got {latex}");
         assert!(latex.ends_with(')'), "should end with ): got {latex}");
     }
@@ -4320,8 +4507,8 @@ mod tests {
         // Bbox ends at x=109 — clips ) at x=110
         let bbox = [75.0, 95.0, 109.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert!(result.is_some(), "should expand right to find matching )");
-        let latex = result.unwrap();
+        assert!(result.latex.is_some(), "should expand right to find matching )");
+        let latex = result.latex.unwrap();
         assert!(latex.ends_with(')'), "should end with ): got {latex}");
     }
 
@@ -4337,8 +4524,8 @@ mod tests {
         let bbox = [95.0, 95.0, 115.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         // Should NOT expand to the other-line |, so | count stays odd → 2 chars, just "x|"
-        assert!(result.is_some());
-        let latex = result.unwrap();
+        assert!(result.latex.is_some());
+        let latex = result.latex.unwrap();
         assert_eq!(latex, "x|");
     }
 
@@ -4352,7 +4539,7 @@ mod tests {
         ];
         let bbox = [95.0, 95.0, 125.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert_eq!(result, Some("(x)".to_string()));
+        assert_eq!(result.latex, Some("(x)".to_string()));
     }
 
     #[test]
@@ -4368,8 +4555,355 @@ mod tests {
         // Bbox starts at x=83 — clips [ at x=80
         let bbox = [83.0, 95.0, 112.0, 120.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
-        assert!(result.is_some(), "should expand left to find matching [");
-        let latex = result.unwrap();
+        assert!(result.latex.is_some(), "should expand left to find matching [");
+        let latex = result.latex.unwrap();
         assert!(latex.starts_with('['), "should start with [: got {latex}");
+    }
+
+    // --- Text-region accent merging tests ---
+    // These test that modifier accents in regular text (not formula regions)
+    // are merged with their base chars and emitted as $\hat{x}$ etc.
+
+    #[test]
+    fn test_text_accent_hat_before_base() {
+        // ˆb in text → $\hat{b}$
+        let mut chars = Vec::new();
+        // "the " at y=100
+        for (i, c) in "the ".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // ˆ overlapping with b (both at x=140)
+        chars.push(make_char_image_space('\u{02C6}', 140.0, 95.0, 8.0, 5.0, PAGE_H));
+        chars.push(make_char_image_space('b', 140.0, 100.0, 8.0, 12.0, PAGE_H));
+        // " end"
+        for (i, c) in " end".chars().enumerate() {
+            chars.push(make_char_image_space(c, 150.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(text.contains("$\\hat{b}$"), "expected $\\hat{{b}}$ in: {text}");
+        // Should NOT contain raw ˆ
+        assert!(!text.contains('\u{02C6}'), "should not contain raw ˆ in: {text}");
+    }
+
+    #[test]
+    fn test_text_accent_hat_after_base() {
+        // nˆ in text → $\hat{n}$
+        let mut chars = Vec::new();
+        for (i, c) in "the ".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // n then ˆ overlapping
+        chars.push(make_char_image_space('n', 140.0, 100.0, 8.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('\u{02C6}', 140.0, 95.0, 8.0, 5.0, PAGE_H));
+        for (i, c) in " end".chars().enumerate() {
+            chars.push(make_char_image_space(c, 150.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(text.contains("$\\hat{n}$"), "expected $\\hat{{n}}$ in: {text}");
+        assert!(!text.contains('\u{02C6}'), "should not contain raw ˆ in: {text}");
+    }
+
+    #[test]
+    fn test_text_accent_tilde_in_prose() {
+        // ˜x in text → $\tilde{x}$
+        let mut chars = Vec::new();
+        for (i, c) in "the ".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space('\u{02DC}', 140.0, 95.0, 8.0, 5.0, PAGE_H));
+        chars.push(make_char_image_space('x', 140.0, 100.0, 8.0, 12.0, PAGE_H));
+        for (i, c) in " end".chars().enumerate() {
+            chars.push(make_char_image_space(c, 150.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(text.contains("$\\tilde{x}$"), "expected $\\tilde{{x}}$ in: {text}");
+    }
+
+    #[test]
+    fn test_text_accent_no_overlap_no_merge() {
+        // ˆ far from any base char — should appear raw (no merge)
+        let mut chars = Vec::new();
+        for (i, c) in "the ".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // ˆ at x=200, base 'b' at x=140 — no overlap
+        chars.push(make_char_image_space('\u{02C6}', 200.0, 95.0, 8.0, 5.0, PAGE_H));
+        chars.push(make_char_image_space('b', 140.0, 100.0, 8.0, 12.0, PAGE_H));
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        // No merge — both appear separately
+        assert!(!text.contains("$\\hat{b}$"), "should NOT merge without overlap: {text}");
+    }
+
+    #[test]
+    fn test_text_accent_combining_circumflex() {
+        // U+0302 combining circumflex overlapping 'n' → $\hat{n}$
+        let mut chars = Vec::new();
+        for (i, c) in "the ".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space('n', 140.0, 100.0, 8.0, 12.0, PAGE_H));
+        // Combining marks are zero-width, positioned at same x
+        chars.push(make_char_image_space('\u{0302}', 140.0, 95.0, 8.0, 5.0, PAGE_H));
+        for (i, c) in " end".chars().enumerate() {
+            chars.push(make_char_image_space(c, 150.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(text.contains("$\\hat{n}$"), "expected $\\hat{{n}}$ in: {text}");
+    }
+
+    #[test]
+    fn test_text_accent_vec_arrow() {
+        // U+20D7 combining right arrow over 'v' → $\vec{v}$
+        let mut chars = Vec::new();
+        for (i, c) in "the ".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space('v', 140.0, 100.0, 8.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('\u{20D7}', 140.0, 95.0, 8.0, 5.0, PAGE_H));
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(text.contains("$\\vec{v}$"), "expected $\\vec{{v}}$ in: {text}");
+    }
+
+    #[test]
+    fn test_text_accent_closes_italic() {
+        // Italic text followed by accented char should close italic before $\hat{}$
+        let mut chars = Vec::new();
+        // "the " normal
+        for (i, c) in "the ".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // italic 'x'
+        chars.push(make_char_image_space_italic('x', 140.0, 100.0, 8.0, 12.0, PAGE_H, true));
+        // ˆ overlapping 'n' (not italic)
+        chars.push(make_char_image_space('n', 160.0, 100.0, 8.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('\u{02C6}', 160.0, 95.0, 8.0, 5.0, PAGE_H));
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        // Should have *x* then $\hat{n}$, not *x$\hat{n}$*
+        assert!(text.contains("$\\hat{n}$"), "expected $\\hat{{n}}$ in: {text}");
+        // Italic x should be closed before the hat
+        assert!(!text.contains("*$"), "italic should close before $ in: {text}");
+    }
+
+    // ---------------------------------------------------------------
+    // trim_stray_edge_chars tests
+    //
+    // These verify that stray text characters accidentally captured by
+    // the layout bbox are trimmed, while legitimate formula content
+    // (even with spacing) is preserved.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_trim_stray_left_char_in_a_3x3() {
+        // "a 3×3" — 'a' is body text captured by the formula bbox.
+        // Chars: a(100-108), 3(120-128), ×(128-136), 3(136-144)
+        // Gap a→3 = 12pt, median_width = 8pt → trim 'a'
+        let chars = vec![
+            make_formula_char('a', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('3', 120.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{00D7}', 128.0, 100.0, 8.0, 10.0, 10.0), // ×
+            make_formula_char('3', 136.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 150.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("3\\times3".to_string()));
+        // Bbox should be tightened to exclude 'a'
+        assert!(result.adjusted_bbox[0] > 108.0, "left edge should be tightened past 'a'");
+    }
+
+    #[test]
+    fn test_trim_stray_right_char() {
+        // "3×3 b" — 'b' is body text captured on the right.
+        // Chars: 3(100-108), ×(108-116), 3(116-124), b(136-144)
+        // Gap 3→b = 12pt, median_width = 8pt → trim 'b'
+        let chars = vec![
+            make_formula_char('3', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{00D7}', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('3', 116.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('b', 136.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 150.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("3\\times3".to_string()));
+        // Bbox should be tightened to exclude 'b'
+        assert!(result.adjusted_bbox[2] < 136.0, "right edge should be tightened before 'b'");
+    }
+
+    #[test]
+    fn test_trim_stray_both_edges() {
+        // "a 3×3 b" — stray chars on both sides.
+        // Chars: a(80-88), 3(100-108), ×(108-116), 3(116-124), b(136-144)
+        let chars = vec![
+            make_formula_char('a', 80.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('3', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{00D7}', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('3', 116.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('b', 136.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [75.0, 95.0, 150.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("3\\times3".to_string()));
+        assert!(result.adjusted_bbox[0] > 88.0, "left edge tightened past 'a'");
+        assert!(result.adjusted_bbox[2] < 136.0, "right edge tightened before 'b'");
+    }
+
+    #[test]
+    fn test_trim_no_trim_when_only_two_chars() {
+        // Two chars with a gap — can't tell which is stray, so don't trim either.
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 120.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 135.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("xy".to_string()));
+    }
+
+    #[test]
+    fn test_trim_no_trim_when_all_chars_close() {
+        // "xyz" — all chars adjacent, no stray.
+        // Gaps: x→y = 0pt, y→z = 0pt. No trimming.
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 108.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('z', 116.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("xyz".to_string()));
+    }
+
+    #[test]
+    fn test_trim_no_trim_when_evenly_spaced() {
+        // "x + y" — even spacing around operator, no outlier gap.
+        // x(100-108), +(114-122), y(128-136) — gaps are 6pt each, median_width=8pt
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 114.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('y', 128.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 142.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("x+y".to_string()));
+    }
+
+    #[test]
+    fn test_trim_preserves_subscript_with_small_gap() {
+        // "x_t" — subscript t is smaller and shifted, but gap < median_width.
+        // x(100-108), t(110-115) — gap = 2pt, median_width ≈ 6.5pt → no trim
+        let chars = vec![
+            make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('t', 110.0, 105.0, 5.0, 7.0, 7.0),
+            make_formula_char('y', 118.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 130.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // All 3 chars preserved (t is subscript of x)
+        assert!(result.latex.is_some());
+        let latex = result.latex.unwrap();
+        assert!(latex.contains("x"), "should contain x");
+        assert!(latex.contains("t"), "should contain t");
+        assert!(latex.contains("y"), "should contain y");
+    }
+
+    #[test]
+    fn test_trim_bbox_midpoint_placement() {
+        // Verify the tightened bbox left edge is at the midpoint between
+        // the stray char's right edge and the next char's left edge.
+        // stray 'a'(100-108), formula '3'(120-128), '+'(128-136), '5'(136-144)
+        let chars = vec![
+            make_formula_char('a', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('3', 120.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('+', 128.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('5', 136.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 150.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // Midpoint between stray right (108) and next left (120) = 114
+        let expected_left = (108.0 + 120.0) / 2.0;
+        assert!(
+            (result.adjusted_bbox[0] - expected_left).abs() < 0.1,
+            "left edge should be at midpoint {expected_left}, got {}",
+            result.adjusted_bbox[0]
+        );
+    }
+
+    #[test]
+    fn test_trim_single_char_formula_not_trimmed() {
+        // Single char formula — only 1 visible char, no trimming possible.
+        let chars = vec![make_formula_char('x', 100.0, 100.0, 8.0, 10.0, 10.0)];
+        let bbox = [95.0, 95.0, 115.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("x".to_string()));
+    }
+
+    #[test]
+    fn test_trim_stray_char_with_tight_formula() {
+        // "a αβ" — stray 'a' before tightly-packed Greek formula.
+        // a(100-108), α(120-128), β(128-136) — gap a→α = 12 > median_width 8 → trim
+        let chars = vec![
+            make_formula_char('a', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{03B1}', 120.0, 100.0, 8.0, 10.0, 10.0), // α
+            make_formula_char('\u{03B2}', 128.0, 100.0, 8.0, 10.0, 10.0), // β
+        ];
+        let bbox = [95.0, 95.0, 142.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("\\alpha\\beta".to_string()));
+    }
+
+    #[test]
+    fn test_trim_adjusted_bbox_used_for_ocr_fallback() {
+        // When char-based extraction fails (unknown char), the adjusted_bbox
+        // should still be tightened from stray edge chars.
+        // stray 'a'(100-108), unknown(120-128), '+'(128-136), unknown(136-144)
+        let chars = vec![
+            make_formula_char('a', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2603}', 120.0, 100.0, 8.0, 10.0, 10.0), // snowman - unknown
+            make_formula_char('+', 128.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('\u{2603}', 136.0, 100.0, 8.0, 10.0, 10.0), // snowman - unknown
+        ];
+        let bbox = [95.0, 95.0, 150.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        // Char-based fails (unknown chars), but bbox should still be tightened
+        assert!(result.latex.is_none(), "should fail char-based extraction");
+        assert!(
+            result.adjusted_bbox[0] > 108.0,
+            "bbox should be tightened even when extraction fails, got left={}",
+            result.adjusted_bbox[0]
+        );
+    }
+
+    #[test]
+    fn test_trim_gap_exactly_at_threshold_no_trim() {
+        // Edge gap exactly equals median_width — should NOT trim (need strictly greater).
+        // a(100-108), b(116-124), c(124-132) — gap a→b = 8 = median_width(8). No trim.
+        let chars = vec![
+            make_formula_char('a', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('b', 116.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('c', 124.0, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 138.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("abc".to_string()));
+    }
+
+    #[test]
+    fn test_trim_gap_just_above_threshold_trims() {
+        // Edge gap just above median_width → trim.
+        // a(100-108), b(116.5-124.5), c(124.5-132.5) — gap a→b = 8.5 > median_width(8) → trim
+        let chars = vec![
+            make_formula_char('a', 100.0, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('b', 116.5, 100.0, 8.0, 10.0, 10.0),
+            make_formula_char('c', 124.5, 100.0, 8.0, 10.0, 10.0),
+        ];
+        let bbox = [95.0, 95.0, 138.0, 115.0];
+        let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
+        assert_eq!(result.latex, Some("bc".to_string()));
     }
 }
