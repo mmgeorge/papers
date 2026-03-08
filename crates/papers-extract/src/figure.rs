@@ -556,17 +556,15 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
         }
 
         // ── Composite bbox ──
-        // Extend the union bbox toward the caption so the composite image
-        // captures sub-labels (e.g. "(a) XPBD") that sit between the
-        // member images and the main caption text.
+        // Union the member bboxes with the full caption bbox so the
+        // composite image captures everything: sub-labels, parameter
+        // text, and the caption itself.
         if let Some(ref caption) = group_caption {
             let cb = caption.bbox;
-            // Extend horizontally to match caption width
             union_bbox[0] = union_bbox[0].min(cb[0]);
+            union_bbox[1] = union_bbox[1].min(cb[1]);
             union_bbox[2] = union_bbox[2].max(cb[2]);
-            // Extend vertically toward the caption (not including it)
-            union_bbox[3] = union_bbox[3].max(cb[1]);
-            union_bbox[1] = union_bbox[1].min(cb[3]);
+            union_bbox[3] = union_bbox[3].max(cb[3]);
         }
 
         // Mark original members as consumed
@@ -595,26 +593,69 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
         new_groups.push(group);
     }
 
-    // Consume orphan caption-like regions that fall within a group's
-    // composite bbox, so they don't appear as separate output items.
-    for group in &new_groups {
-        let gb = group.bbox;
-        for r in regions.iter_mut() {
-            if r.consumed || !r.kind.is_caption() {
-                continue;
+    regions.append(&mut new_groups);
+    regions.sort_by_key(|r| r.order);
+}
+
+/// Expand the bounding box of every captioned visual (standalone images,
+/// charts, and figure groups) to include its caption, then consume any
+/// text-like regions whose center falls within the expanded bbox.
+///
+/// This ensures sub-labels (e.g. "(a) Previous position") and parameter
+/// text that sit between member images and the main caption are captured
+/// in the cropped image rather than emitted as separate text.
+///
+/// Must be called **after** [`group_figure_regions`].
+pub fn expand_visual_bounds(regions: &mut Vec<Region>) {
+    // Phase 1: collect expanded bboxes for captioned visuals.
+    let expansions: Vec<(usize, [f32; 4])> = regions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            if r.consumed {
+                return None;
             }
-            let rb = r.bbox;
-            // Check if region center falls within the group bbox
-            let cx = (rb[0] + rb[2]) / 2.0;
-            let cy = (rb[1] + rb[3]) / 2.0;
-            if cx >= gb[0] && cx <= gb[2] && cy >= gb[1] && cy <= gb[3] {
+            if !r.kind.is_visual() && r.kind != RegionKind::FigureGroup {
+                return None;
+            }
+            let cap = r.caption.as_ref()?;
+            let cb = cap.bbox;
+            let mut bbox = r.bbox;
+            bbox[0] = bbox[0].min(cb[0]);
+            bbox[1] = bbox[1].min(cb[1]);
+            bbox[2] = bbox[2].max(cb[2]);
+            bbox[3] = bbox[3].max(cb[3]);
+            Some((i, bbox))
+        })
+        .collect();
+
+    // Phase 2: apply expanded bboxes.
+    for &(idx, bbox) in &expansions {
+        regions[idx].bbox = bbox;
+    }
+
+    // Phase 3: consume caption/text regions enclosed within any expanded bbox.
+    for r in regions.iter_mut() {
+        if r.consumed {
+            continue;
+        }
+        if !r.kind.is_caption() && r.kind != RegionKind::Text {
+            continue;
+        }
+        let rb = r.bbox;
+        let cx = (rb[0] + rb[2]) / 2.0;
+        let cy = (rb[1] + rb[3]) / 2.0;
+        for &(_, expanded_bbox) in &expansions {
+            if cx >= expanded_bbox[0]
+                && cx <= expanded_bbox[2]
+                && cy >= expanded_bbox[1]
+                && cy <= expanded_bbox[3]
+            {
                 r.consumed = true;
+                break;
             }
         }
     }
-
-    regions.append(&mut new_groups);
-    regions.sort_by_key(|r| r.order);
 }
 
 #[cfg(test)]

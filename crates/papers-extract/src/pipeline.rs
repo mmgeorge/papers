@@ -424,6 +424,10 @@ impl Pipeline {
         // Group spatially close visual regions into FigureGroups
         figure::group_figure_regions(&mut regions);
 
+        // Expand visual bboxes to include their captions, and consume
+        // sub-labels / text regions enclosed within the expanded bounds.
+        figure::expand_visual_bounds(&mut regions);
+
         // Assign composite image path to FigureGroups, clear member image paths
         if self.options.extract_images {
             for region in &mut regions {

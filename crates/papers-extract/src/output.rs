@@ -112,6 +112,9 @@ fn render_markdown(result: &ExtractionResult) -> String {
         markdown: String,
         is_text: bool,
         is_references: bool,
+        /// Display formulas are part of the paragraph flow — text before/after
+        /// them should NOT be rearranged across them.
+        is_formula: bool,
     }
 
     let mut sections: Vec<Section> = Vec::new();
@@ -156,10 +159,12 @@ fn render_markdown(result: &ExtractionResult) -> String {
                 }
             }
 
+            let is_formula = region.kind == RegionKind::DisplayFormula;
             sections.push(Section {
                 markdown: section,
                 is_text,
                 is_references,
+                is_formula,
             });
         }
     }
@@ -202,32 +207,86 @@ fn render_markdown(result: &ExtractionResult) -> String {
         i += 1;
     }
 
+    // Pre-pass 2: rejoin paragraphs split across non-formula, non-text
+    // elements (figures, algorithms, captions) or column breaks. For each
+    // text section, search backward for the previous text section. If that
+    // previous text ended mid-sentence AND no display formula sits between
+    // them, move the trailing sentence fragment forward.
+    //
+    // Display formulas are part of the paragraph flow — the surrounding text
+    // intentionally wraps around them, so we must not rearrange across them.
+    //
+    // Examples that DO merge:
+    //   "...method presented superior" "convergence behavior..."  (column break)
+    //   "...As expected, VBD" [Algorithm] "converges slower..."   (algorithm)
+    // Examples that do NOT merge:
+    //   "...Simo et al." [DisplayFormula] "1992] where Δt..."     (formula is inline)
+    {
+        let mut i = 1;
+        while i < sections.len() {
+            if !sections[i].is_text || sections[i].markdown.trim().is_empty() {
+                i += 1;
+                continue;
+            }
+            // Search backward for the previous text section, but stop if we
+            // hit a display formula — those are part of the paragraph flow.
+            let mut blocked_by_formula = false;
+            let mut prev_text = None;
+            for k in (0..i).rev() {
+                if sections[k].is_formula {
+                    blocked_by_formula = true;
+                    break;
+                }
+                if sections[k].is_text && !sections[k].markdown.trim().is_empty() {
+                    prev_text = Some(k);
+                    break;
+                }
+            }
+            if blocked_by_formula {
+                i += 1;
+                continue;
+            }
+            let Some(k) = prev_text else {
+                i += 1;
+                continue;
+            };
+            let prev_trimmed = sections[k].markdown.trim();
+            let ends_mid = prev_trimmed
+                .ends_with(|c: char| !matches!(c, '.' | '!' | '?' | ':' | '"' | '\u{201D}'));
+            if !ends_mid {
+                i += 1;
+                continue;
+            }
+            // Previous text ended mid-sentence — extract trailing fragment
+            let text = sections[k].markdown.trim_end().to_string();
+            let sentence_end = text.rfind(|c: char| matches!(c, '.' | '!' | '?'));
+            let (keep, fragment) = if let Some(pos) = sentence_end {
+                let split = pos + 1;
+                (text[..split].to_string(), text[split..].trim().to_string())
+            } else {
+                // Entire section is one incomplete sentence
+                (String::new(), text)
+            };
+            if !fragment.is_empty() {
+                sections[k].markdown = keep;
+                let next_md = sections[i].markdown.trim().to_string();
+                sections[i].markdown = format!("{fragment} {next_md}");
+            }
+            i += 1;
+        }
+    }
+
     // Assemble with paragraph breaks between sections.
-    // Consecutive text sections that were split mid-paragraph (e.g. by a
-    // column break) are joined with a space instead of a paragraph break.
     let mut md = String::new();
-    let mut prev_is_text = false;
-    let mut prev_ends_mid_sentence = false;
     for sec in &sections {
         let text = sec.markdown.trim();
         if text.is_empty() {
             continue;
         }
         if !md.is_empty() {
-            // Merge when the previous text ended mid-sentence and this
-            // text section continues it (starts with a lowercase letter).
-            let starts_lower = text.starts_with(|c: char| c.is_lowercase());
-            if prev_is_text && sec.is_text && prev_ends_mid_sentence && starts_lower {
-                md.push(' ');
-            } else {
-                md.push_str("\n\n");
-            }
+            md.push_str("\n\n");
         }
         md.push_str(text);
-        prev_is_text = sec.is_text;
-        prev_ends_mid_sentence = sec.is_text
-            && text
-                .ends_with(|c: char| !matches!(c, '.' | '!' | '?' | ':' | '"' | '\u{201D}'));
     }
 
     md.trim_end().to_string()
@@ -967,5 +1026,297 @@ mod tests {
         // The composite image should appear exactly once
         let count = md.matches("![](images/p1_0.png)").count();
         assert_eq!(count, 1);
+    }
+
+    /// Helper to build an ExtractionResult from a list of regions on one page.
+    fn make_result(regions: Vec<Region>) -> ExtractionResult {
+        ExtractionResult {
+            metadata: Metadata {
+                filename: "test.pdf".into(),
+                page_count: 1,
+                extraction_time_ms: 0,
+            },
+            pages: vec![Page {
+                page: 1,
+                width_pt: 612.0,
+                height_pt: 792.0,
+                dpi: 144,
+                regions,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_mid_sentence_merge_adjacent_text_sections() {
+        // Two adjacent text sections split at a column break
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("method presented superior".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("convergence behavior over prior techniques.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        assert!(
+            md.contains("presented superior convergence behavior"),
+            "adjacent text sections should merge mid-sentence, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_mid_sentence_merge_across_figure() {
+        // Text → Figure → Text where the text is split mid-sentence by a figure
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("coloring the nodes of the".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Image);
+                r.image_path = Some("images/p1_1.png".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("dual graph, which has more nodes.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        assert!(md.contains("![](images/p1_1.png)"), "figure should be present");
+        // The trailing fragment moves to the next text section
+        assert!(
+            md.contains("coloring the nodes of the dual graph"),
+            "text should rejoin across figure, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_at_sentence_boundary() {
+        // Two text sections where the first ends with a period — no merge
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("This is a complete sentence.".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("This starts a new paragraph.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        assert!(
+            md.contains("sentence.\n\nThis starts"),
+            "should have paragraph break, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_merge_when_prev_ends_mid_sentence_next_starts_uppercase() {
+        // Mid-sentence ending and next starts uppercase — still merges
+        // because the previous text clearly ended mid-sentence.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("some text ending with comma,".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("Another part of the same paragraph.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        assert!(
+            md.contains("comma, Another part"),
+            "should merge when prev ends mid-sentence, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_references_merge_mid_sentence() {
+        // References split across pages where entry is cut mid-sentence
+        let result = ExtractionResult {
+            metadata: Metadata {
+                filename: "test.pdf".into(),
+                page_count: 2,
+                extraction_time_ms: 0,
+            },
+            pages: vec![
+                Page {
+                    page: 1,
+                    width_pt: 612.0,
+                    height_pt: 792.0,
+                    dpi: 144,
+                    regions: vec![{
+                        let mut r = make_region(RegionKind::References);
+                        r.text = Some("ACM Transactions on".into());
+                        r
+                    }],
+                },
+                Page {
+                    page: 2,
+                    width_pt: 612.0,
+                    height_pt: 792.0,
+                    dpi: 144,
+                    regions: vec![{
+                        let mut r = make_region(RegionKind::References);
+                        r.text = Some("Graphics 31, 5 (Aug. 2012).".into());
+                        r
+                    }],
+                },
+            ],
+        };
+        let md = render_markdown(&result);
+        assert!(
+            md.contains("Transactions on Graphics"),
+            "should join with space across pages, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_references_merge_at_entry_boundary() {
+        // References across pages where first page ends at entry boundary
+        let result = ExtractionResult {
+            metadata: Metadata {
+                filename: "test.pdf".into(),
+                page_count: 2,
+                extraction_time_ms: 0,
+            },
+            pages: vec![
+                Page {
+                    page: 1,
+                    width_pt: 612.0,
+                    height_pt: 792.0,
+                    dpi: 144,
+                    regions: vec![{
+                        let mut r = make_region(RegionKind::References);
+                        r.text = Some("First reference entry.".into());
+                        r
+                    }],
+                },
+                Page {
+                    page: 2,
+                    width_pt: 612.0,
+                    height_pt: 792.0,
+                    dpi: 144,
+                    regions: vec![{
+                        let mut r = make_region(RegionKind::References);
+                        r.text = Some("Second reference entry.".into());
+                        r
+                    }],
+                },
+            ],
+        };
+        let md = render_markdown(&result);
+        assert!(
+            md.contains("entry.\n\nSecond"),
+            "should have paragraph break between complete entries, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_mid_sentence_merge_across_algorithm() {
+        // Text → Algorithm → Text: text split mid-sentence by an algorithm box.
+        // The trailing sentence fragment moves to the next text section.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("As expected, VBD".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Algorithm);
+                r.text = Some("Algorithm 1: VBD simulation".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("converges slower for stiffer materials.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        // The text should be rejoined in the continuation section
+        assert!(
+            md.contains("As expected, VBD converges slower"),
+            "sentence should rejoin across algorithm, got: {md}"
+        );
+        // Algorithm still appears as separate code block
+        assert!(
+            md.contains("```\nAlgorithm 1"),
+            "algorithm should be in code block, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_mid_sentence_partial_move_across_figure() {
+        // Only the incomplete trailing sentence moves, not the whole section.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("First sentence ends here. Second part of the".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Image);
+                r.image_path = Some("images/p1_1.png".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("paragraph continues.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        // "First sentence ends here." stays in the first section
+        assert!(
+            md.contains("ends here."),
+            "complete sentence should remain, got: {md}"
+        );
+        // "Second part of the" moves to join "paragraph continues."
+        assert!(
+            md.contains("Second part of the paragraph continues."),
+            "incomplete sentence should rejoin, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_across_display_formula() {
+        // Text → DisplayFormula → Text: formulas are part of the paragraph
+        // flow, so text should NOT be rearranged across them.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("VBD avoids this by minimizing the variational energy [Simo et al.".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::DisplayFormula);
+                r.latex = Some("x = argmin E(x)".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("1992] where the timestep size is used.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        // Text should NOT be rearranged — formula is inline to the paragraph
+        assert!(
+            md.contains("[Simo et al.\n\n$$x = argmin E(x)$$\n\n1992]"),
+            "text should stay in place around formula, got: {md}"
+        );
     }
 }
