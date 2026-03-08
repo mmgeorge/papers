@@ -419,9 +419,22 @@ fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
                 result.push_str("\n\n"); // paragraph break
                 pending_dehyphen = false;
             } else if has_hyphen_marker {
-                // This line ends with a hyphen split — join directly with
-                // the next line (no separator).
-                pending_dehyphen = true;
+                // This line ends with a hyphen marker (pdfium's STX).
+                // Distinguish compound-word hyphens ("Barrier-augmented")
+                // from line-break splits ("encoun-tering"):
+                // If the last word starts with uppercase, it's likely a
+                // compound word — keep the hyphen. Otherwise, join directly.
+                let last_word_start = result.rfind(|c: char| c == ' ' || c == '\n')
+                    .map(|p| p + 1)
+                    .unwrap_or(0);
+                let last_word = &result[last_word_start..];
+                if last_word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    result.push('-');
+                    // No pending_dehyphen — we kept the hyphen and the
+                    // next line will be joined with a normal reflow space.
+                } else {
+                    pending_dehyphen = true;
+                }
             } else if pending_dehyphen {
                 // Propagating dehyphenation across non-adjacent lines
                 // (e.g., when a formula sits between the two halves of a
@@ -448,9 +461,18 @@ fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
             }
         } else if has_hyphen_marker {
             // Last line of this region ends with a split word.
-            // Append STX sentinel so the output assembler can join
-            // this region's text directly with the next region.
-            result.push(PDFIUM_HYPHEN_MARKER);
+            // Same compound-word check as above: if the last word is
+            // capitalized, keep the hyphen instead of propagating the
+            // STX sentinel for cross-region dehyphenation.
+            let last_word_start = result.rfind(|c: char| c == ' ' || c == '\n')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let last_word = &result[last_word_start..];
+            if last_word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                result.push('-');
+            } else {
+                result.push(PDFIUM_HYPHEN_MARKER);
+            }
         }
     }
 
@@ -2393,6 +2415,55 @@ mod tests {
         let bbox = [50.0, 50.0, 600.0, 300.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "encountering");
+    }
+
+    #[test]
+    fn test_dehyphenation_compound_word_preserved() {
+        // "Barrier-augmented": the hyphen is a compound-word hyphen, not a
+        // line-break split. "Barrier" starts with uppercase → keep hyphen.
+        let mut chars = Vec::new();
+        // Line 1: "the Barrier" + STX marker at y=100
+        for (i, c) in "the".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // space gap
+        for (i, c) in "Barrier".chars().enumerate() {
+            chars.push(make_char_image_space(c, 145.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // STX marker
+        chars.push(make_char_image_space('\u{0002}', 218.5, 100.0, 3.0, 12.0, PAGE_H));
+        // Line 2: "augmented" at y=130
+        for (i, c) in "augmented".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("Barrier-augmented"),
+            "compound word hyphen should be preserved, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_dehyphenation_lowercase_still_joins() {
+        // "encoun-tering": lowercase word fragment → join directly.
+        let mut chars = Vec::new();
+        for (i, c) in "the".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        for (i, c) in "encoun".chars().enumerate() {
+            chars.push(make_char_image_space(c, 145.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space('\u{0002}', 208.0, 100.0, 3.0, 12.0, PAGE_H));
+        for (i, c) in "tering".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("encountering"),
+            "line-break split should be dehyphenated, got: {text}"
+        );
     }
 
     #[test]
