@@ -52,7 +52,7 @@ impl TableEngine {
                 Ok(entries
                     .iter()
                     .zip(results)
-                    .map(|((det_idx, _), html)| (*det_idx, TableResult::Html(html)))
+                    .map(|((det_idx, _), fr)| (*det_idx, TableResult::Html(fr.latex)))
                     .collect())
             }
             Self::TableFormer(predictor) => {
@@ -81,7 +81,7 @@ impl FormulaEngine {
         &self,
         images: &[DynamicImage],
         on_progress: impl Fn(usize),
-    ) -> Result<Vec<String>, ExtractError> {
+    ) -> Result<Vec<crate::types::FormulaResult>, ExtractError> {
         match self {
             Self::PpFormulanet(p) => {
                 let mut results = Vec::with_capacity(images.len());
@@ -356,34 +356,43 @@ impl Pipeline {
             })
             .collect();
 
-        let mut formula_latex: HashMap<usize, String> = if !formula_entries.is_empty() {
-            eprint!(
-                "\r  Page {page_num}/{page_count}: formulas 0/{}",
-                formula_entries.len(),
-            );
-            let crops: Vec<DynamicImage> =
-                formula_entries.iter().map(|(_, img)| img.clone()).collect();
-            let formula_count = crops.len();
-            let results = self
-                .formula
-                .predict_with_progress(&crops, |done| {
-                    eprint!(
-                        "\r  Page {page_num}/{page_count}: formulas {done}/{formula_count}",
-                    );
-                })
-                .map_err(|e| ExtractError::Layout(format!("Formula prediction failed: {e}")))?;
-            formula_entries
-                .iter()
-                .zip(results)
-                .map(|((det_idx, _), latex)| (*det_idx, latex))
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        let mut formula_results: HashMap<usize, crate::types::FormulaResult> =
+            if !formula_entries.is_empty() {
+                eprint!(
+                    "\r  Page {page_num}/{page_count}: formulas 0/{}",
+                    formula_entries.len(),
+                );
+                let crops: Vec<DynamicImage> =
+                    formula_entries.iter().map(|(_, img)| img.clone()).collect();
+                let formula_count = crops.len();
+                let results = self
+                    .formula
+                    .predict_with_progress(&crops, |done| {
+                        eprint!(
+                            "\r  Page {page_num}/{page_count}: formulas {done}/{formula_count}",
+                        );
+                    })
+                    .map_err(|e| {
+                        ExtractError::Layout(format!("Formula prediction failed: {e}"))
+                    })?;
+                formula_entries
+                    .iter()
+                    .zip(results)
+                    .map(|((det_idx, _), fr)| (*det_idx, fr))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
 
-        // Merge char-based results into formula_latex
+        // Merge char-based results into formula_results (confidence = 1.0 for char-based)
         for (idx, latex) in char_based_latex {
-            formula_latex.insert(idx, latex);
+            formula_results.insert(
+                idx,
+                crate::types::FormulaResult {
+                    latex,
+                    confidence: 1.0,
+                },
+            );
         }
 
         // Crop table regions and run batched recognition
@@ -432,7 +441,7 @@ impl Pipeline {
         // Build regions from layout detection + formula/table results
         let mut regions = self.build_regions(
             &detected,
-            &formula_latex,
+            &formula_results,
             &table_results,
             &chars,
             &page_image,
@@ -503,7 +512,7 @@ impl Pipeline {
     fn build_regions(
         &self,
         detected: &[DetectedRegion],
-        formula_latex: &HashMap<usize, String>,
+        formula_results: &HashMap<usize, crate::types::FormulaResult>,
         table_results: &HashMap<usize, TableResult>,
         chars: &[PdfChar],
         page_image: &DynamicImage,
@@ -528,14 +537,14 @@ impl Pipeline {
             .enumerate()
             .filter(|(_, d)| d.kind == RegionKind::InlineFormula)
             .filter_map(|(idx, d)| {
-                formula_latex.get(&idx).map(|latex| {
+                formula_results.get(&idx).map(|fr| {
                     let bbox = [
                         d.bbox_px[0] / scale,
                         d.bbox_px[1] / scale,
                         d.bbox_px[2] / scale,
                         d.bbox_px[3] / scale,
                     ];
-                    (idx, text::InlineFormula { bbox, latex: latex.clone() })
+                    (idx, text::InlineFormula { bbox, latex: fr.latex.clone() })
                 })
             })
             .collect();
@@ -568,6 +577,7 @@ impl Pipeline {
                 chart_type: None,
                 tag: None,
                 items: None,
+                ocr_confidence: None,
                 consumed: kind == RegionKind::InlineFormula && consumed_inline.contains(&idx),
             };
 
@@ -629,10 +639,11 @@ impl Pipeline {
                 ));
             }
 
-            // Populate formula LaTeX from crop-based prediction
+            // Populate formula LaTeX + OCR confidence from crop-based prediction
             if kind == RegionKind::DisplayFormula || kind == RegionKind::InlineFormula {
-                if let Some(latex) = formula_latex.get(&idx) {
-                    region.latex = Some(latex.clone());
+                if let Some(fr) = formula_results.get(&idx) {
+                    region.latex = Some(fr.latex.clone());
+                    region.ocr_confidence = Some(fr.confidence);
                 }
             }
 
@@ -942,6 +953,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            ocr_confidence: None,
             consumed: false,
         }
     }

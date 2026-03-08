@@ -27,11 +27,13 @@ pub(crate) fn decode_loop(
     _num_kv_heads: usize,
     _head_dim: usize,
     max_seq: usize,
-) -> Result<Vec<i64>, ExtractError> {
+) -> Result<(Vec<i64>, f32), ExtractError> {
     let mut tokens = vec![first_token];
+    let mut log_probs: Vec<f32> = Vec::new();
 
     if EOS_IDS.contains(&first_token) {
-        return Ok(tokens);
+        let confidence = crate::types::FormulaResult::sequence_confidence(&log_probs);
+        return Ok((tokens, confidence));
     }
 
     let mut kv_cache = prefill_kv;
@@ -90,7 +92,7 @@ pub(crate) fn decode_loop(
         }
 
         // Run LLM — extract everything we need while session guard is alive
-        let (next_token, new_kv) = {
+        let (next_token, token_log_prob, new_kv) = {
             let mut session = llm
                 .lock()
                 .map_err(|e| ExtractError::Formula(format!("llm lock: {e}")))?;
@@ -98,19 +100,30 @@ pub(crate) fn decode_loop(
                 .run(inputs)
                 .map_err(|e| ExtractError::Formula(format!("decode run: {e}")))?;
 
-            // Extract logits → argmax
+            // Extract logits → argmax + log-prob
             let logits = outputs
                 .get("logits")
                 .ok_or_else(|| ExtractError::Formula("No decode logits".into()))?;
             let logits_data = extract_f32(logits, "decode logits")?;
             let vocab = logits.shape()[2] as usize;
             let last_logits = &logits_data[logits_data.len() - vocab..];
-            let next_token = last_logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(idx, _)| idx as i64)
-                .unwrap_or(EOS_IDS[0]);
+            let (next_token, token_log_prob) = {
+                let (argmax_idx, &max_logit) = last_logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                    .unwrap_or((EOS_IDS[0] as usize, &0.0));
+                // Numerically stable log-softmax of the max logit
+                let log_sum_exp = {
+                    let max_val = max_logit;
+                    let sum_exp: f32 = last_logits
+                        .iter()
+                        .map(|&x| (x - max_val).exp())
+                        .sum();
+                    max_val + sum_exp.ln()
+                };
+                (argmax_idx as i64, max_logit - log_sum_exp)
+            };
 
             // Extract updated KV cache
             let mut new_kv = Vec::with_capacity(num_layers * 2);
@@ -123,10 +136,11 @@ pub(crate) fn decode_loop(
                     new_kv.push(kv_val);
                 }
             }
-            (next_token, new_kv)
+            (next_token, token_log_prob, new_kv)
         };
 
         tokens.push(next_token);
+        log_probs.push(token_log_prob);
         if EOS_IDS.contains(&next_token) {
             break;
         }
@@ -144,5 +158,6 @@ pub(crate) fn decode_loop(
         }
     }
 
-    Ok(tokens)
+    let confidence = crate::types::FormulaResult::sequence_confidence(&log_probs);
+    Ok((tokens, confidence))
 }

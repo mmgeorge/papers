@@ -280,13 +280,19 @@ class DecoderStepWrapper(nn.Module):
 
         logits = self.lm_head(outputs.last_hidden_state)  # [1, 1, VOCAB_SIZE]
 
+        # Cast to f32 for argmax + log-prob (CUDA EP has no BF16 ArgMax kernel)
+        logits_f32 = logits[:, -1, :].float()  # [1, V]
+
+        # Log-softmax → max log-prob (confidence for this token)
+        log_probs = torch.nn.functional.log_softmax(logits_f32, dim=-1)  # [1, V]
+        token_log_prob = log_probs.max(dim=-1)[0]  # [1]
+
         # ArgMax for next token — stays on GPU, only 8 bytes to copy per step
-        # Cast to f32 before argmax (CUDA EP has no BF16 ArgMax kernel)
-        next_token = logits[:, -1, :].float().argmax(dim=-1)  # [1]
+        next_token = logits_f32.argmax(dim=-1)  # [1]
 
         # Extract updated KV cache
         updated_cache = outputs.past_key_values
-        result = [next_token]
+        result = [next_token, token_log_prob]
         for layer_idx in range(NUM_LAYERS):
             result.append(updated_cache.layers[layer_idx].keys)
             result.append(updated_cache.layers[layer_idx].values)
@@ -329,7 +335,7 @@ def export_decoder(model, output_dir: Path, max_seq: int, export_dtype=torch.bfl
         past_kv.append(torch.randn(batch, NUM_KV_HEADS, max_seq, HEAD_DIM, dtype=export_dtype))
 
     input_names = ["input_ids", "step", "prefill_len"]
-    output_names = ["next_token"]
+    output_names = ["next_token", "token_log_prob"]
 
     for i in range(NUM_LAYERS):
         input_names.extend([f"past_key_{i}", f"past_value_{i}"])
@@ -391,11 +397,13 @@ def validate_decoder(output_dir: Path, max_seq: int):
 
     outputs = session.run(None, feed)
     next_token = outputs[0]
+    token_log_prob = outputs[1]
     print(f"  next_token: {next_token} (shape={next_token.shape}, dtype={next_token.dtype})")
+    print(f"  token_log_prob: {token_log_prob} (shape={token_log_prob.shape}, dtype={token_log_prob.dtype})")
 
     for i in range(NUM_LAYERS):
-        k = outputs[1 + i * 2]
-        v = outputs[2 + i * 2]
+        k = outputs[2 + i * 2]
+        v = outputs[3 + i * 2]
         assert k.shape == (1, NUM_KV_HEADS, max_seq, HEAD_DIM), \
             f"present_key_{i} shape mismatch: {k.shape}"
         assert v.shape == (1, NUM_KV_HEADS, max_seq, HEAD_DIM), \

@@ -96,9 +96,11 @@ impl Predictor {
                 };
                 let predictor =
                     models::build_glm_ocr_predictor_with_config(model_paths, config)?;
-                predictor.predict(images)
+                Ok(predictor.predict(images)?.into_iter().map(|fr| fr.latex).collect())
             }
-            Self::PpFormulanet(p) => p.predict(images),
+            Self::PpFormulanet(p) => {
+                Ok(p.predict(images)?.into_iter().map(|fr| fr.latex).collect())
+            }
         }
     }
 }

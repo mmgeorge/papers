@@ -534,7 +534,10 @@ impl GlmOcrPredictor {
     // ── Public API ────────────────────────────────────────────────────
 
     /// Predict LaTeX for a batch of cropped formula images.
-    pub fn predict(&self, images: &[DynamicImage]) -> Result<Vec<String>, ExtractError> {
+    pub fn predict(
+        &self,
+        images: &[DynamicImage],
+    ) -> Result<Vec<crate::types::FormulaResult>, ExtractError> {
         images.iter().map(|img| self.predict_one(img)).collect()
     }
 
@@ -543,7 +546,7 @@ impl GlmOcrPredictor {
         &self,
         images: &[DynamicImage],
         on_progress: impl Fn(usize),
-    ) -> Result<Vec<String>, ExtractError> {
+    ) -> Result<Vec<crate::types::FormulaResult>, ExtractError> {
         let mut results = Vec::with_capacity(images.len());
         for (i, img) in images.iter().enumerate() {
             results.push(self.predict_one(img)?);
@@ -553,7 +556,7 @@ impl GlmOcrPredictor {
     }
 
     /// Predict LaTeX for a single formula image.
-    fn predict_one(&self, image: &DynamicImage) -> Result<String, ExtractError> {
+    fn predict_one(&self, image: &DynamicImage) -> Result<crate::types::FormulaResult, ExtractError> {
         // 1. Preprocess image → RGB normalized
         let (pixel_values, grid_thw) = preprocess_image(image);
 
@@ -596,7 +599,7 @@ impl GlmOcrPredictor {
         let position_ids = build_position_ids(&input_ids, &grid_thw);
 
         // 7. Prefill + decode (backend-specific)
-        let token_ids = match &self.backend {
+        let (token_ids, confidence) = match &self.backend {
             #[cfg(target_os = "windows")]
             ActiveBackend::Cuda {
                 decoder,
@@ -659,7 +662,8 @@ impl GlmOcrPredictor {
             }
         };
 
-        Ok(decode_tokens(&self.tokenizer, &token_ids))
+        let latex = decode_tokens(&self.tokenizer, &token_ids);
+        Ok(crate::types::FormulaResult { latex, confidence })
     }
 }
 

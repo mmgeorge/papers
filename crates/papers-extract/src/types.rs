@@ -1,5 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+/// Per-formula prediction result with LaTeX and confidence score.
+pub struct FormulaResult {
+    pub latex: String,
+    /// Sequence-level confidence: `exp(mean(token_log_probs))`.
+    /// Range (0, 1] — higher means the model was more certain per-token on average.
+    pub confidence: f32,
+}
+
 /// Full extraction result for a PDF document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionResult {
@@ -36,6 +44,9 @@ pub struct Region {
     pub html: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latex: Option<String>,
+    /// OCR model confidence for formula LaTeX (sequence-level, 0–1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ocr_confidence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,6 +65,21 @@ pub struct Region {
     /// in markdown output to avoid duplication.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub consumed: bool,
+}
+
+impl FormulaResult {
+    /// Compute sequence-level confidence from per-token log-probabilities.
+    ///
+    /// Returns `exp(mean(log_probs))` — the geometric mean of per-token probabilities.
+    /// If `token_log_probs` is empty, returns 0.0.
+    pub fn sequence_confidence(token_log_probs: &[f32]) -> f32 {
+        if token_log_probs.is_empty() {
+            return 0.0;
+        }
+        let mean_log_prob: f32 =
+            token_log_probs.iter().sum::<f32>() / token_log_probs.len() as f32;
+        mean_log_prob.exp()
+    }
 }
 
 /// All 24 DocLayout V3 region classes.
@@ -226,6 +252,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            ocr_confidence: None,
             consumed: false,
         };
 
@@ -251,6 +278,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            ocr_confidence: None,
             consumed: false,
         };
 
@@ -275,6 +303,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            ocr_confidence: None,
             consumed: false,
         };
 
@@ -298,6 +327,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            ocr_confidence: None,
             consumed: false,
         };
         let region = Region {
@@ -314,6 +344,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            ocr_confidence: None,
             consumed: false,
         };
 
@@ -350,6 +381,7 @@ mod tests {
                     chart_type: None,
                     tag: None,
                     items: None,
+                    ocr_confidence: None,
                     consumed: false,
                 }],
             }],
@@ -416,5 +448,56 @@ mod tests {
         // Unknown
         assert_eq!(RegionKind::from_label("unknown"), None);
         assert_eq!(RegionKind::from_label("region"), None);
+    }
+
+    #[test]
+    fn test_sequence_confidence() {
+        // Empty → 0.0
+        assert_eq!(FormulaResult::sequence_confidence(&[]), 0.0);
+
+        // All zero log-probs → exp(0) = 1.0
+        assert!((FormulaResult::sequence_confidence(&[0.0, 0.0, 0.0]) - 1.0).abs() < 1e-6);
+
+        // Uniform negative log-probs → exp(mean) = exp(-0.5) ≈ 0.6065
+        let conf = FormulaResult::sequence_confidence(&[-0.5, -0.5]);
+        assert!((conf - 0.6065).abs() < 0.001);
+
+        // Mixed log-probs → exp(mean(-0.1, -0.9)) = exp(-0.5) ≈ 0.6065
+        let conf = FormulaResult::sequence_confidence(&[-0.1, -0.9]);
+        assert!((conf - 0.6065).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_region_json_ocr_confidence() {
+        // With ocr_confidence set
+        let region = Region {
+            id: "p1_5".into(),
+            kind: RegionKind::DisplayFormula,
+            bbox: [100.0, 420.0, 500.0, 460.0],
+            confidence: 0.92,
+            order: 5,
+            text: None,
+            html: None,
+            latex: Some("E = mc^2".into()),
+            ocr_confidence: Some(0.85),
+            image_path: None,
+            caption: None,
+            chart_type: None,
+            tag: None,
+            items: None,
+            consumed: false,
+        };
+
+        let json = serde_json::to_value(&region).unwrap();
+        let ocr_conf = json["ocr_confidence"].as_f64().unwrap();
+        assert!((ocr_conf - 0.85).abs() < 1e-6);
+
+        // Without ocr_confidence — should be omitted
+        let region2 = Region {
+            ocr_confidence: None,
+            ..region.clone()
+        };
+        let json2 = serde_json::to_value(&region2).unwrap();
+        assert!(json2.get("ocr_confidence").is_none());
     }
 }

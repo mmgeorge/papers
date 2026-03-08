@@ -81,8 +81,21 @@ def convert_fp16(input_path, output_path, keep_io_types=False):
 
 
 def add_argmax_output(input_path, output_path):
-    """Add ArgMax + Reshape to decoder for GPU-side token selection."""
-    print(f"\nAdding argmax: {input_path} -> {output_path}")
+    """Add ArgMax + token_log_prob to decoder for GPU-side token selection.
+
+    Computes both the argmax token and its log-probability from logits:
+      ArgMax(logits, axis=2) → next_token [1]
+      LogSoftmax(max) → token_log_prob [1]  (numerically stable)
+
+    The log-prob is computed as:
+      max_val = ReduceMax(logits, axis=2)        [1, 1]
+      shifted = Sub(logits, max_val)              [1, 1, V]
+      exp_shifted = Exp(shifted)                  [1, 1, V]
+      sum_exp = ReduceSum(exp_shifted, axis=2)    [1, 1]
+      log_sum_exp = Log(sum_exp)                  [1, 1]
+      token_log_prob = Sub(max_val, log_sum_exp)  [1, 1] → Reshape → [1]
+    """
+    print(f"\nAdding argmax + token_log_prob: {input_path} -> {output_path}")
     model = onnx.load(input_path)
     graph = model.graph
 
@@ -94,6 +107,7 @@ def add_argmax_output(input_path, output_path):
     if logits_output is None:
         raise ValueError("No 'logits' output found in model")
 
+    # --- ArgMax branch ---
     # ArgMax(logits, axis=2, keepdims=0) -> [1, 1]
     argmax_node = helper.make_node(
         "ArgMax",
@@ -122,6 +136,61 @@ def add_argmax_output(input_path, output_path):
         "next_token", TensorProto.INT64, [1]
     )
     graph.output.append(next_token_output)
+
+    # --- token_log_prob branch (LogSoftmax of argmax, numerically stable) ---
+    # ReduceMax axis constant
+    axes_2_const = helper.make_tensor("axes_2", TensorProto.INT64, [1], [2])
+    graph.initializer.append(axes_2_const)
+
+    # ReduceMax(logits, axis=2, keepdims=1) → max_val [1, 1, 1]
+    graph.node.append(helper.make_node(
+        "ReduceMax",
+        inputs=["logits", "axes_2"],
+        outputs=["max_val"],
+        keepdims=1,
+    ))
+
+    # Sub(logits, max_val) → shifted [1, 1, V]
+    graph.node.append(helper.make_node(
+        "Sub", inputs=["logits", "max_val"], outputs=["shifted"],
+    ))
+
+    # Exp(shifted) → exp_shifted [1, 1, V]
+    graph.node.append(helper.make_node(
+        "Exp", inputs=["shifted"], outputs=["exp_shifted"],
+    ))
+
+    # ReduceSum(exp_shifted, axis=2, keepdims=1) → sum_exp [1, 1, 1]
+    graph.node.append(helper.make_node(
+        "ReduceSum",
+        inputs=["exp_shifted", "axes_2"],
+        outputs=["sum_exp"],
+        keepdims=1,
+    ))
+
+    # Log(sum_exp) → log_sum_exp [1, 1, 1]
+    graph.node.append(helper.make_node(
+        "Log", inputs=["sum_exp"], outputs=["log_sum_exp"],
+    ))
+
+    # Sub(max_val, log_sum_exp) → token_log_prob_3d [1, 1, 1]
+    graph.node.append(helper.make_node(
+        "Sub", inputs=["max_val", "log_sum_exp"], outputs=["token_log_prob_3d"],
+    ))
+
+    # Reshape to [1] for easy D2H copy
+    graph.node.append(helper.make_node(
+        "Reshape",
+        inputs=["token_log_prob_3d", "argmax_shape"],
+        outputs=["token_log_prob"],
+    ))
+
+    # Note: logits are FP16, so token_log_prob will also be FP16 (matches logits dtype).
+    # We use FLOAT16 type here since the model has been converted to FP16.
+    token_log_prob_output = helper.make_tensor_value_info(
+        "token_log_prob", TensorProto.FLOAT16, [1]
+    )
+    graph.output.append(token_log_prob_output)
 
     onnx.save(model, output_path)
     onnx.checker.check_model(onnx.load(output_path))

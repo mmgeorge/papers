@@ -144,6 +144,44 @@ impl Drop for PinnedTokenBuf {
     }
 }
 
+/// Pinned host buffer for async D2H of f16 log-prob values (K slots).
+#[cfg(target_os = "windows")]
+struct PinnedLogProbBuf {
+    ptr: *mut f16,
+    len: usize,
+}
+
+#[cfg(target_os = "windows")]
+unsafe impl Send for PinnedLogProbBuf {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for PinnedLogProbBuf {}
+
+#[cfg(target_os = "windows")]
+impl PinnedLogProbBuf {
+    fn new(len: usize) -> Result<Self, ExtractError> {
+        let num_bytes = len * std::mem::size_of::<f16>();
+        let raw = unsafe { cudarc::driver::result::malloc_host(num_bytes, 0) }
+            .map_err(|e| ExtractError::Model(format!("cuMemAllocHost log_prob: {e}")))?;
+        Ok(Self {
+            ptr: raw as *mut f16,
+            len,
+        })
+    }
+
+    unsafe fn as_mut_slice(&self) -> &mut [f16] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for PinnedLogProbBuf {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cudarc::driver::result::free_host(self.ptr as *mut std::ffi::c_void);
+        }
+    }
+}
+
 /// Custom formula predictor with persistent IoBinding on the decoder.
 ///
 /// The encoder runs normally (one pass per formula). The decoder uses a
@@ -169,6 +207,9 @@ pub struct FormulaPredictor {
     /// Pinned host buffer for truly async D2H token reads (K slots).
     #[cfg(target_os = "windows")]
     pinned_tokens: PinnedTokenBuf,
+    /// Pinned host buffer for truly async D2H log-prob reads (K slots).
+    #[cfg(target_os = "windows")]
+    pinned_log_probs: PinnedLogProbBuf,
 }
 
 /// Pre-allocated decoder state with persistent IoBinding and external CUDA graph.
@@ -201,8 +242,9 @@ struct DecoderState {
     // KV cache pointers (in-place: same buffer is both input and output, memset between formulas)
     kv_ptrs: Vec<u64>,
     kv_buf_bytes: usize,
-    // Output pointer
+    // Output pointers
     next_token_ptr: u64,
+    token_log_prob_ptr: u64,
     // Allocator must outlive all Values (dropped last in struct drop order)
     _allocator: Allocator,
 }
@@ -393,6 +435,8 @@ impl FormulaPredictor {
 
         #[cfg(target_os = "windows")]
         let pinned_tokens = PinnedTokenBuf::new(BATCH_K)?;
+        #[cfg(target_os = "windows")]
+        let pinned_log_probs = PinnedLogProbBuf::new(BATCH_K)?;
 
         let predictor = Self {
             encoder: Mutex::new(encoder),
@@ -406,6 +450,8 @@ impl FormulaPredictor {
             d2h_stream,
             #[cfg(target_os = "windows")]
             pinned_tokens,
+            #[cfg(target_os = "windows")]
+            pinned_log_probs,
         };
 
         predictor.warmup()?;
@@ -466,6 +512,11 @@ impl FormulaPredictor {
             .map_err(|e| ExtractError::Model(format!("alloc next_token: {e}")))?;
         let next_token_ptr = next_token_t.data_ptr_mut() as u64;
 
+        // token_log_prob output (f16, [1] — log-probability of the argmax token)
+        let mut token_log_prob_t = ort::value::Tensor::<f16>::new(&allocator, [1usize])
+            .map_err(|e| ExtractError::Model(format!("alloc token_log_prob: {e}")))?;
+        let token_log_prob_ptr = token_log_prob_t.data_ptr_mut() as u64;
+
         // --- Create persistent IoBinding ---
         let mut binding = decoder_session
             .create_binding()
@@ -525,6 +576,9 @@ impl FormulaPredictor {
         binding
             .bind_output("next_token", next_token_t)
             .map_err(|e| ExtractError::Model(format!("bind next_token: {e}")))?;
+        binding
+            .bind_output("token_log_prob", token_log_prob_t)
+            .map_err(|e| ExtractError::Model(format!("bind token_log_prob: {e}")))?;
 
         // RunOptions with device sync disabled — prevents ORT from calling
         // cudaStreamSynchronize in OnRunEnd, which would break our graph capture
@@ -551,6 +605,7 @@ impl FormulaPredictor {
             kv_ptrs,
             kv_buf_bytes,
             next_token_ptr,
+            token_log_prob_ptr,
             _allocator: allocator,
         })
     }
@@ -668,21 +723,31 @@ impl FormulaPredictor {
     }
 
     /// Predict LaTeX for a batch of cropped formula images.
-    pub fn predict(&self, images: &[DynamicImage]) -> Result<Vec<String>, ExtractError> {
+    pub fn predict(
+        &self,
+        images: &[DynamicImage],
+    ) -> Result<Vec<crate::types::FormulaResult>, ExtractError> {
         images.iter().map(|img| self.predict_one(img)).collect()
     }
 
     /// Predict LaTeX for a single formula image.
-    fn predict_one(&self, image: &DynamicImage) -> Result<String, ExtractError> {
+    fn predict_one(
+        &self,
+        image: &DynamicImage,
+    ) -> Result<crate::types::FormulaResult, ExtractError> {
         let preprocessed = preprocess_image(image);
 
         // Run encoder — output stays on GPU via IoBinding
         let enc_hidden = self.run_encoder(preprocessed)?;
 
-        // Run decoder loop
-        let token_ids = self.decode_formula(enc_hidden)?;
+        // Run decoder loop — returns token IDs + per-token log-probs
+        let (token_ids, token_log_probs) = self.decode_formula(enc_hidden)?;
 
-        Ok(decode_tokens(&self.tokenizer, &token_ids))
+        let latex = decode_tokens(&self.tokenizer, &token_ids);
+        let confidence =
+            crate::types::FormulaResult::sequence_confidence(&token_log_probs);
+
+        Ok(crate::types::FormulaResult { latex, confidence })
     }
 
     /// Run encoder and return the hidden states as a GPU-resident Value.
@@ -741,7 +806,10 @@ impl FormulaPredictor {
     /// on the main stream, make `d2h_stream` wait on it, then enqueue the D2H.
     /// This lets the D2H transfer overlap with the next step's early GPU kernels.
     #[cfg(target_os = "windows")]
-    fn decode_formula(&self, enc_hidden_val: Value) -> Result<Vec<i64>, ExtractError> {
+    fn decode_formula(
+        &self,
+        enc_hidden_val: Value,
+    ) -> Result<(Vec<i64>, Vec<f32>), ExtractError> {
         let mut state = self
             .decoder
             .lock()
@@ -770,6 +838,7 @@ impl FormulaPredictor {
         }
 
         let mut tokens = vec![BOS_ID];
+        let mut log_probs: Vec<f32> = Vec::new();
 
         // Seed input_ids with BOS via H2D (only PCIe crossing for input_ids)
         unsafe {
@@ -781,14 +850,13 @@ impl FormulaPredictor {
         }
         .map_err(|e| ExtractError::Formula(format!("H2D input_ids init: {e}")))?;
 
-        // Pinned token buffer for truly async D2H — each slot receives one async
-        // D2H copy that returns immediately (no implicit sync). Without pinned
-        // memory, cuMemcpyDtoHAsync to pageable memory degrades to synchronous.
+        // Pinned buffers for truly async D2H — each slot receives one async
+        // D2H copy that returns immediately (no implicit sync).
         let token_buf = unsafe { self.pinned_tokens.as_mut_slice() };
+        let lp_buf = unsafe { self.pinned_log_probs.as_mut_slice() };
         let d2h_cu_stream = self.d2h_stream.cu_stream();
 
         // Reusable event for cross-stream synchronization (no timing — lighter weight).
-        // Recorded on main stream after D2D, waited on by d2h_stream before D2H.
         let d2h_event = cudarc::driver::result::event::create(
             cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
         )
@@ -796,9 +864,8 @@ impl FormulaPredictor {
 
         let mut s = 0usize;
 
-        let result = (|| -> Result<Vec<i64>, ExtractError> {
+        let result = (|| -> Result<(Vec<i64>, Vec<f32>), ExtractError> {
         while s < self.max_seq {
-            // Run up to BATCH_K steps without syncing
             let batch_end = (s + BATCH_K).min(self.max_seq);
             let batch_len = batch_end - s;
 
@@ -813,8 +880,7 @@ impl FormulaPredictor {
                 }
                 .map_err(|e| ExtractError::Formula(format!("H2D step: {e}")))?;
 
-                // Run decoder step — external CUDA graph replay (no ORT sync),
-                // or fallback to run_binding_with_options if graph capture failed
+                // Run decoder step
                 if let Some(ref graph) = state.cuda_graph {
                     graph.launch().map_err(|e| {
                         ExtractError::Formula(format!("graph launch step {}: {e}", s + k))
@@ -833,7 +899,7 @@ impl FormulaPredictor {
                         })?;
                 }
 
-                // D2D: next_token → input_ids for next step (GPU-only, on main stream)
+                // D2D: next_token → input_ids for next step
                 unsafe {
                     cudarc::driver::result::memcpy_dtod_async(
                         state.input_ids_ptr,
@@ -844,10 +910,7 @@ impl FormulaPredictor {
                 }
                 .map_err(|e| ExtractError::Formula(format!("D2D next→input: {e}")))?;
 
-                // Cross-stream sync: record event on main stream after D2D, then make
-                // d2h_stream wait on it before the D2H copy. This ensures the D2H reads
-                // the correct next_token, while letting the transfer overlap with the
-                // next step's early GPU kernels on the main stream.
+                // Cross-stream sync: record event, d2h_stream waits
                 unsafe {
                     cudarc::driver::result::event::record(d2h_event, cu_stream)
                         .map_err(|e| ExtractError::Formula(format!("event record: {e}")))?;
@@ -859,7 +922,7 @@ impl FormulaPredictor {
                     .map_err(|e| ExtractError::Formula(format!("stream wait_event: {e}")))?;
                 }
 
-                // Async D2H on d2h_stream: next_token → token_buf[k] (no sync yet)
+                // Async D2H: next_token + token_log_prob (same d2h_stream, no extra sync)
                 unsafe {
                     cudarc::driver::result::memcpy_dtoh_async(
                         &mut token_buf[k..k + 1],
@@ -868,27 +931,34 @@ impl FormulaPredictor {
                     )
                 }
                 .map_err(|e| ExtractError::Formula(format!("D2H next_token: {e}")))?;
+                unsafe {
+                    cudarc::driver::result::memcpy_dtoh_async(
+                        &mut lp_buf[k..k + 1],
+                        state.token_log_prob_ptr,
+                        d2h_cu_stream,
+                    )
+                }
+                .map_err(|e| ExtractError::Formula(format!("D2H token_log_prob: {e}")))?;
             }
 
-            // Sync d2h_stream — ensures all D2H copies in this batch are complete.
-            // This also implies main stream work up to the last recorded event is done
-            // (d2h_stream waited on it).
+            // Sync d2h_stream — all D2H copies in this batch are complete.
             self.d2h_stream
                 .synchronize()
                 .map_err(|e| ExtractError::Formula(format!("d2h stream sync: {e}")))?;
 
-            // Scan batch for EOS
+            // Scan batch for EOS, accumulate log probs
             for k in 0..batch_len {
                 tokens.push(token_buf[k]);
+                log_probs.push(lp_buf[k].to_f32());
                 if token_buf[k] == EOS_ID {
-                    return Ok(tokens);
+                    return Ok((tokens, log_probs));
                 }
             }
 
             s = batch_end;
         }
 
-        Ok(tokens)
+        Ok((tokens, log_probs))
         })(); // end closure
 
         // Clean up the reusable event
@@ -899,7 +969,10 @@ impl FormulaPredictor {
 
     /// Non-Windows fallback.
     #[cfg(not(target_os = "windows"))]
-    fn decode_formula(&self, _enc_hidden_val: Value) -> Result<Vec<i64>, ExtractError> {
+    fn decode_formula(
+        &self,
+        _enc_hidden_val: Value,
+    ) -> Result<(Vec<i64>, Vec<f32>), ExtractError> {
         Err(ExtractError::Formula(
             "CUDA decoder only supported on Windows".into(),
         ))

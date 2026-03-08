@@ -33,8 +33,9 @@ pub(crate) struct DecoderState {
     pub total_seq_len_ptr: u64,
     pub kv_ptrs: Vec<u64>,
     pub kv_buf_bytes: usize,
-    // Output pointer
+    // Output pointers
     pub next_token_ptr: u64,
+    pub token_log_prob_ptr: u64,
     pub _allocator: Allocator,
 }
 
@@ -88,6 +89,11 @@ pub(crate) fn build_decoder_state(
     let mut next_token_t = ort::value::Tensor::<i64>::new(&allocator, [1usize])
         .map_err(|e| ExtractError::Model(format!("alloc next_token: {e}")))?;
     let next_token_ptr = next_token_t.data_ptr_mut() as u64;
+
+    // token_log_prob output (f32, [1] — log-probability of the argmax token)
+    let mut token_log_prob_t = ort::value::Tensor::<f32>::new(&allocator, [1usize])
+        .map_err(|e| ExtractError::Model(format!("alloc token_log_prob: {e}")))?;
+    let token_log_prob_ptr = token_log_prob_t.data_ptr_mut() as u64;
 
     // Create persistent IoBinding
     let mut binding = decoder_session
@@ -167,6 +173,9 @@ pub(crate) fn build_decoder_state(
     binding
         .bind_output("next_token", next_token_t)
         .map_err(|e| ExtractError::Model(format!("bind next_token: {e}")))?;
+    binding
+        .bind_output("token_log_prob", token_log_prob_t)
+        .map_err(|e| ExtractError::Model(format!("bind token_log_prob: {e}")))?;
 
     let run_options = ort::session::RunOptions::new()
         .map_err(|e| ExtractError::Model(format!("RunOptions: {e}")))?;
@@ -189,6 +198,7 @@ pub(crate) fn build_decoder_state(
         kv_ptrs,
         kv_buf_bytes,
         next_token_ptr,
+        token_log_prob_ptr,
         _allocator: allocator,
     })
 }
@@ -206,7 +216,7 @@ pub(crate) fn decode_loop(
     num_kv_heads: usize,
     max_seq: usize,
     head_dim: usize,
-) -> Result<Vec<i64>, ExtractError> {
+) -> Result<(Vec<i64>, f32), ExtractError> {
     // Use null stream (default stream) for memcpy — synchronous with ORT's work
     let null_stream = std::ptr::null_mut();
 
@@ -249,6 +259,7 @@ pub(crate) fn decode_loop(
     .map_err(|e| ExtractError::Formula(format!("H2D prefill_len: {e}")))?;
 
     let mut tokens = vec![first_token];
+    let mut log_probs: Vec<f32> = Vec::new();
 
     // Seed input_ids with first token
     unsafe {
@@ -261,11 +272,13 @@ pub(crate) fn decode_loop(
     .map_err(|e| ExtractError::Formula(format!("H2D first token: {e}")))?;
 
     if EOS_IDS.contains(&first_token) {
-        return Ok(tokens);
+        let confidence = crate::types::FormulaResult::sequence_confidence(&log_probs);
+        return Ok((tokens, confidence));
     }
 
     // Decode loop: ORT CUDA graph handles compute, we update step/input_ids via memcpy
     let mut token_buf = [0i64; 1];
+    let mut lp_buf = [0f32; 1];
 
     for s in 0..max_seq {
         // H2D: update step counter
@@ -320,7 +333,7 @@ pub(crate) fn decode_loop(
         }
         .map_err(|e| ExtractError::Formula(format!("D2D next→input: {e}")))?;
 
-        // D2H: read next_token to check for EOS
+        // D2H: read next_token + token_log_prob to check for EOS
         unsafe {
             cudarc::driver::result::memcpy_dtoh_async(
                 &mut token_buf,
@@ -329,12 +342,22 @@ pub(crate) fn decode_loop(
             )
         }
         .map_err(|e| ExtractError::Formula(format!("D2H next_token: {e}")))?;
+        unsafe {
+            cudarc::driver::result::memcpy_dtoh_async(
+                &mut lp_buf,
+                state.token_log_prob_ptr,
+                null_stream,
+            )
+        }
+        .map_err(|e| ExtractError::Formula(format!("D2H token_log_prob: {e}")))?;
 
         tokens.push(token_buf[0]);
+        log_probs.push(lp_buf[0]);
         if EOS_IDS.contains(&token_buf[0]) {
             break;
         }
     }
 
-    Ok(tokens)
+    let confidence = crate::types::FormulaResult::sequence_confidence(&log_probs);
+    Ok((tokens, confidence))
 }
