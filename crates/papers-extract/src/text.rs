@@ -21,6 +21,14 @@ pub struct InlineFormula {
     pub latex: String,
 }
 
+/// An unresolved inline formula — detected but not parsed (e.g. manual mode).
+/// Gets spliced as `[[FORMULA <id>]]` placeholder in the text.
+pub struct UnresolvedFormula {
+    pub bbox: [f32; 4],
+    /// Region identifier (e.g. "p1_5") used in the `[[FORMULA p1_5]]` placeholder.
+    pub id: String,
+}
+
 /// A character with coordinates converted to image space (Y-down, top-left origin).
 struct ImageChar<'a> {
     codepoint: char,
@@ -36,10 +44,12 @@ struct ImageChar<'a> {
     _source: &'a PdfChar,
 }
 
-/// A line element: either a character or an inline formula placeholder.
+/// A line element: either a character, an inline formula, or an unresolved formula placeholder.
 enum LineElement<'a> {
     Char(&'a ImageChar<'a>),
     Formula { latex: Cow<'a, str>, bbox: [f32; 4] },
+    /// Placeholder for an unresolved inline formula (no LaTeX available).
+    FormulaPlaceholder { id: Cow<'a, str>, bbox: [f32; 4] },
 }
 
 impl LineElement<'_> {
@@ -47,6 +57,7 @@ impl LineElement<'_> {
         match self {
             LineElement::Char(c) => c.bbox,
             LineElement::Formula { bbox, .. } => *bbox,
+            LineElement::FormulaPlaceholder { bbox, .. } => *bbox,
         }
     }
 
@@ -115,6 +126,7 @@ pub fn extract_region_text(
     region_bbox: [f32; 4],
     page_height_pt: f32,
     inline_formulas: &[&InlineFormula],
+    unresolved_formulas: &[&UnresolvedFormula],
     mode: AssemblyMode,
 ) -> String {
     let image_chars: Vec<ImageChar> = chars
@@ -122,8 +134,9 @@ pub fn extract_region_text(
         .map(|c| to_image_char(c, page_height_pt))
         .collect();
 
-    // Collect exclude bboxes from inline formulas
-    let exclude_bboxes: Vec<[f32; 4]> = inline_formulas.iter().map(|f| f.bbox).collect();
+    // Collect exclude bboxes from inline formulas and unresolved formulas
+    let mut exclude_bboxes: Vec<[f32; 4]> = inline_formulas.iter().map(|f| f.bbox).collect();
+    exclude_bboxes.extend(unresolved_formulas.iter().map(|f| f.bbox));
 
     let matched = match_chars_to_region(&image_chars, region_bbox, &exclude_bboxes);
 
@@ -137,6 +150,18 @@ pub fn extract_region_text(
         if point_in_bbox(cx, cy, region_bbox) {
             elements.push(LineElement::Formula {
                 latex: Cow::Borrowed(&formula.latex),
+                bbox: formula.bbox,
+            });
+        }
+    }
+
+    // Add placeholder elements for unresolved formulas whose center falls within the region
+    for formula in unresolved_formulas {
+        let cx = (formula.bbox[0] + formula.bbox[2]) / 2.0;
+        let cy = (formula.bbox[1] + formula.bbox[3]) / 2.0;
+        if point_in_bbox(cx, cy, region_bbox) {
+            elements.push(LineElement::FormulaPlaceholder {
+                id: Cow::Borrowed(&formula.id),
                 bbox: formula.bbox,
             });
         }
@@ -256,7 +281,7 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
             .iter()
             .filter(|e| match e {
                 LineElement::Char(c) => !c.codepoint.is_whitespace() && !c.codepoint.is_control(),
-                LineElement::Formula { .. } => true,
+                LineElement::Formula { .. } | LineElement::FormulaPlaceholder { .. } => true,
             })
             .count();
         if visible_count <= 2 && !merged.is_empty() {
@@ -397,6 +422,7 @@ fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
     };
 
     let mut result = String::new();
+
     // Propagates dehyphenation across non-adjacent lines — see doc comment.
     let mut pending_dehyphen = false;
 
@@ -540,6 +566,7 @@ fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -
         .collect();
     let accent_merge = compute_accent_merge(&all_chars);
 
+
     let median_char_width = compute_median_char_width(lines);
 
     // Split each line into optional line-number prefix and content start index.
@@ -646,7 +673,7 @@ fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -
                     LineElement::Char(c) => {
                         !c.codepoint.is_whitespace() && !c.codepoint.is_control()
                     }
-                    LineElement::Formula { .. } => true,
+                    LineElement::Formula { .. } | LineElement::FormulaPlaceholder { .. } => true,
                 })
                 .count();
             if visible_chars <= 3 {
@@ -943,6 +970,10 @@ fn clone_element<'a>(elem: &LineElement<'a>) -> LineElement<'a> {
             latex: latex.clone(),
             bbox: *bbox,
         },
+        LineElement::FormulaPlaceholder { id, bbox } => LineElement::FormulaPlaceholder {
+            id: id.clone(),
+            bbox: *bbox,
+        },
     }
 }
 
@@ -1013,7 +1044,10 @@ fn compute_accent_merge<'a>(chars: &[&'a ImageChar<'a>]) -> AccentMerge<'a> {
     AccentMerge { accented_bases, accent_ptrs }
 }
 
-fn build_line_text(elements: &[&LineElement], accent_merge: &AccentMerge) -> String {
+fn build_line_text(
+    elements: &[&LineElement],
+    accent_merge: &AccentMerge,
+) -> String {
     let mut text = String::new();
     let mut prev_right: Option<f32> = None;
 
@@ -1043,7 +1077,7 @@ fn build_line_text(elements: &[&LineElement], accent_merge: &AccentMerge) -> Str
                 LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' ' => {
                     return c.is_italic;
                 }
-                LineElement::Formula { .. } => return false,
+                LineElement::Formula { .. } | LineElement::FormulaPlaceholder { .. } => return false,
                 _ => continue,
             }
         }
@@ -1133,6 +1167,18 @@ fn build_line_text(elements: &[&LineElement], accent_merge: &AccentMerge) -> Str
                     text.push('$');
                     text.push(' ');
                 }
+                prev_right = None;
+            }
+            LineElement::FormulaPlaceholder { id, .. } => {
+                if in_italic {
+                    text.push('*');
+                    in_italic = false;
+                }
+                if !text.is_empty() && !text.ends_with(' ') {
+                    text.push(' ');
+                }
+                text.push_str(&format!("[[FORMULA {id}]]"));
+                text.push(' ');
                 prev_right = None;
             }
         }
@@ -1928,6 +1974,10 @@ pub fn try_extract_inline_formula(
                 // detect_scripts produces formula elements like "x_{t}" with raw Unicode
                 replace_greek_in_latex(f)
             }
+            LineElement::FormulaPlaceholder { .. } => {
+                // Should not appear in inline formula extraction
+                continue;
+            }
         };
         tokens.push(token);
     }
@@ -1991,7 +2041,7 @@ mod tests {
         ];
         // Region bbox in image space (Y-down)
         let bbox = [50.0, 50.0, 550.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "A");
     }
 
@@ -2010,7 +2060,7 @@ mod tests {
             chars.push(make_char_image_space(c, space_x + 5.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hello World");
     }
 
@@ -2026,7 +2076,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         // Same-paragraph lines are reflowed with a space (not \n)
         assert_eq!(text, "First Second");
     }
@@ -2043,7 +2093,7 @@ mod tests {
             make_char_image_space('D', 140.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "AB CD");
     }
 
@@ -2057,7 +2107,7 @@ mod tests {
             make_char_image_space('B', 110.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "AB");
     }
 
@@ -2081,7 +2131,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 180.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("\n\n"),
             "Expected paragraph break in: {text:?}"
@@ -2095,7 +2145,7 @@ mod tests {
         ];
         // Region bbox that doesn't contain any chars
         let bbox = [500.0, 500.0, 600.0, 600.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(text.is_empty());
     }
 
@@ -2119,7 +2169,7 @@ mod tests {
             make_char_image_space('2', 110.5, 96.0, 8.0, 10.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(!text.contains('\n'), "Superscript should stay on same line: {text:?}");
     }
 
@@ -2180,7 +2230,7 @@ mod tests {
         };
         let formulas: Vec<&InlineFormula> = vec![&formula];
 
-        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, &[], AssemblyMode::Reflow);
         assert!(text.contains("$t$"), "Expected $t$ in: {text:?}");
         // The raw 't' glyph should be excluded (not duplicated)
         assert!(!text.contains("t $t$"), "Glyph 't' should be excluded: {text:?}");
@@ -2212,7 +2262,7 @@ mod tests {
             make_char_image_space('i', 110.5, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hi");
     }
 
@@ -2229,7 +2279,7 @@ mod tests {
             make_char_image_space('D', 135.0, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "AB CD");
     }
 
@@ -2245,7 +2295,7 @@ mod tests {
             make_char_image_space('o', 142.0, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hello");
     }
 
@@ -2263,7 +2313,7 @@ mod tests {
             chars.push(make_char_image_space_italic(c, 160.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H, true));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hello *World*");
     }
 
@@ -2274,7 +2324,7 @@ mod tests {
             chars.push(make_char_image_space_italic(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H, true));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "*AllItalic*");
     }
 
@@ -2285,7 +2335,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "Normal");
     }
 
@@ -2305,7 +2355,7 @@ mod tests {
             x += 10.5;
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "*Heading.* Regular");
     }
 
@@ -2337,7 +2387,7 @@ mod tests {
             x += 10.5;
         }
         let bbox = [50.0, 50.0, 800.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "*Approximating Constraints.* For hard");
     }
 
@@ -2364,7 +2414,7 @@ mod tests {
             x += 10.5;
         }
         let bbox = [50.0, 50.0, 800.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[&formula], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[&formula], &[], AssemblyMode::Reflow);
         assert!(text.contains("*Heading*"), "Expected italic markers around Heading, got: {text}");
         assert!(text.contains("$x$"), "Expected formula, got: {text}");
         // Italic should not leak into formula or regular text
@@ -2392,7 +2442,7 @@ mod tests {
             x += 10.5;
         }
         let bbox = [50.0, 50.0, 800.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "*word1* normal *word2*");
     }
 
@@ -2413,7 +2463,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "encountering");
     }
 
@@ -2437,7 +2487,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("Barrier-augmented"),
             "compound word hyphen should be preserved, got: {text}"
@@ -2459,7 +2509,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("encountering"),
             "line-break split should be dehyphenated, got: {text}"
@@ -2480,7 +2530,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "the system");
     }
 
@@ -2514,7 +2564,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         // The intermediate '~' is joined directly (no spaces around it),
         // producing "encoun~tering" — the key point is NO space before "tering".
         assert!(
@@ -2540,7 +2590,7 @@ mod tests {
             make_char_image_space('B', 115.0, 100.0, 10.0, 12.0, PAGE_H),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "A B");
     }
 
@@ -2558,7 +2608,7 @@ mod tests {
         }
         // Region left edge at 100.0 — same as where the chars start (no indent)
         let bbox = [100.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         assert_eq!(text, "Line1\nLine2");
     }
 
@@ -2575,7 +2625,7 @@ mod tests {
             chars.push(make_char_image_space(c, 80.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         // First line should have no leading spaces (starts at region edge)
@@ -2597,7 +2647,7 @@ mod tests {
             }
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         assert!(!text.contains('\n'), "Single line should have no newlines: {text:?}");
         assert!(text.contains("return"), "Should contain 'return': {text:?}");
     }
@@ -2622,7 +2672,7 @@ mod tests {
             latex: "x_0".into(),
         };
         let formulas: Vec<&InlineFormula> = vec![&formula];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, &[], AssemblyMode::PreserveLayout);
         assert!(text.contains("$x_0$"), "Expected $x_0$ in: {text:?}");
     }
 
@@ -2660,7 +2710,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         // Line 1: number "1" at start, then content "for x" (least indented → 0 indent)
@@ -2699,7 +2749,7 @@ mod tests {
         }
 
         let bbox = [40.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         // " 9" right-aligned to match "10"
@@ -2734,7 +2784,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         // Lines 1 and 3: no indent (at min content X)
@@ -2763,7 +2813,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
         // "3D" should be intact — not split into number "3" + content "D"
@@ -2781,7 +2831,7 @@ mod tests {
             chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hello World");
     }
 
@@ -2822,7 +2872,7 @@ mod tests {
             make_char_with_font('t', 120.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("$a_{ext}$"),
             "Expected $a_{{ext}}$ in: {text:?}"
@@ -2840,7 +2890,7 @@ mod tests {
             make_char_with_font('2', 108.0, 98.0, 6.0, 7.3, PAGE_H, 7.3),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("$x^{2}$"),
             "Expected $x^{{2}}$ in: {text:?}"
@@ -2856,7 +2906,7 @@ mod tests {
             make_char_with_font('c', 117.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert_eq!(text, "abc");
         assert!(!text.contains('$'), "No formulas expected: {text:?}");
     }
@@ -2870,7 +2920,7 @@ mod tests {
             make_char_with_font('x', 128.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(!text.contains('$'), "No formula expected for large gap: {text:?}");
     }
 
@@ -2893,7 +2943,7 @@ mod tests {
             make_char_with_font('x', 155.0, 103.0, 6.0, 7.3, PAGE_H, 7.3),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("a_{ext}") && text.contains("n_{max}"),
             "Expected both scripts in: {text:?}"
@@ -2930,7 +2980,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("$a_{ext}$"),
             "Expected $a_{{ext}}$ in: {text:?}"
@@ -2949,7 +2999,7 @@ mod tests {
             make_char_with_font('2', 108.0, 98.0, 6.0, 7.3, PAGE_H, 7.3),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("$h^{2}$"),
             "Expected $h^{{2}}$ in: {text:?}"
@@ -2977,7 +3027,7 @@ mod tests {
         };
         let formulas: Vec<&InlineFormula> = vec![&formula];
 
-        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, &[], AssemblyMode::Reflow);
         assert!(text.contains("$x_0$"), "Expected $x_0$ in: {text:?}");
     }
 
@@ -2989,7 +3039,7 @@ mod tests {
             make_char_with_font('i', 108.0, 103.0, 4.0, 7.3, PAGE_H, 7.3),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("$n_{i}$"),
             "Expected $n_{{i}}$ in: {text:?}"
@@ -3004,7 +3054,7 @@ mod tests {
             make_char_with_font('2', 108.0, 98.0, 6.0, 7.3, PAGE_H, 7.3),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         assert!(
             text.contains("$x^{2}$"),
             "Expected $x^{{2}}$ in PreserveLayout: {text:?}"
@@ -3029,7 +3079,7 @@ mod tests {
             make_char_with_font('t', 145.0, 102.0, 6.0, 7.3, PAGE_H, 7.3),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(
             text.contains("x^{2}") && text.contains("a_{ext}"),
             "Expected both scripts in: {text:?}"
@@ -3053,7 +3103,7 @@ mod tests {
             make_char_with_font('y', 112.0, 100.0, 8.0, 10.0, PAGE_H, 10.0),
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(!text.contains('$'), "No formula expected: {text:?}");
     }
 
@@ -3065,7 +3115,7 @@ mod tests {
             make_char_with_font('b', 108.5, 101.0, 8.0, 9.5, PAGE_H, 9.0), // 9.0/10.0 = 0.9 > 0.85
         ];
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(!text.contains('$'), "No formula for near-equal sizes: {text:?}");
     }
 
@@ -3093,7 +3143,7 @@ mod tests {
         };
         let formulas: Vec<&InlineFormula> = vec![&formula];
 
-        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, &[], AssemblyMode::Reflow);
         // The inline formula $h^{2}$ and the detected $a_{ext}$ should merge
         // into a single $h^{2} a_{ext}$ block.
         assert!(
@@ -3134,7 +3184,7 @@ mod tests {
         };
         let formulas: Vec<&InlineFormula> = vec![&f1, &f2];
 
-        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, &[], AssemblyMode::Reflow);
         assert!(
             text.contains("$x>0 \\land y<1$"),
             "Expected merged formula in: {text:?}"
@@ -3165,7 +3215,7 @@ mod tests {
         };
         let formulas: Vec<&InlineFormula> = vec![&f1, &f2];
 
-        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, &[], AssemblyMode::Reflow);
         // Should have two separate formulas with "and" between
         assert!(
             text.contains("$x$") && text.contains("$y$") && text.contains("and"),
@@ -4077,7 +4127,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "Should have 2 lines: {text:?}");
         // Colon should NOT appear in output
@@ -4133,7 +4183,7 @@ mod tests {
         }
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::PreserveLayout);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "Arrow should merge, not create extra line: {text:?}");
         assert!(
@@ -4174,7 +4224,7 @@ mod tests {
         let formulas: Vec<&InlineFormula> = vec![&formula];
 
         let bbox = [50.0, 50.0, 600.0, 300.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::PreserveLayout);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, &[], AssemblyMode::PreserveLayout);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
@@ -4651,7 +4701,7 @@ mod tests {
             chars.push(make_char_image_space(c, 150.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(text.contains("$\\hat{b}$"), "expected $\\hat{{b}}$ in: {text}");
         // Should NOT contain raw ˆ
         assert!(!text.contains('\u{02C6}'), "should not contain raw ˆ in: {text}");
@@ -4671,7 +4721,7 @@ mod tests {
             chars.push(make_char_image_space(c, 150.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(text.contains("$\\hat{n}$"), "expected $\\hat{{n}}$ in: {text}");
         assert!(!text.contains('\u{02C6}'), "should not contain raw ˆ in: {text}");
     }
@@ -4689,7 +4739,7 @@ mod tests {
             chars.push(make_char_image_space(c, 150.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(text.contains("$\\tilde{x}$"), "expected $\\tilde{{x}}$ in: {text}");
     }
 
@@ -4704,7 +4754,7 @@ mod tests {
         chars.push(make_char_image_space('\u{02C6}', 200.0, 95.0, 8.0, 5.0, PAGE_H));
         chars.push(make_char_image_space('b', 140.0, 100.0, 8.0, 12.0, PAGE_H));
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         // No merge — both appear separately
         assert!(!text.contains("$\\hat{b}$"), "should NOT merge without overlap: {text}");
     }
@@ -4723,7 +4773,7 @@ mod tests {
             chars.push(make_char_image_space(c, 150.0 + i as f32 * 10.0, 100.0, 10.0, 12.0, PAGE_H));
         }
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(text.contains("$\\hat{n}$"), "expected $\\hat{{n}}$ in: {text}");
     }
 
@@ -4737,7 +4787,7 @@ mod tests {
         chars.push(make_char_image_space('v', 140.0, 100.0, 8.0, 12.0, PAGE_H));
         chars.push(make_char_image_space('\u{20D7}', 140.0, 95.0, 8.0, 5.0, PAGE_H));
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         assert!(text.contains("$\\vec{v}$"), "expected $\\vec{{v}}$ in: {text}");
     }
 
@@ -4755,7 +4805,7 @@ mod tests {
         chars.push(make_char_image_space('n', 160.0, 100.0, 8.0, 12.0, PAGE_H));
         chars.push(make_char_image_space('\u{02C6}', 160.0, 95.0, 8.0, 5.0, PAGE_H));
         let bbox = [50.0, 50.0, 600.0, 200.0];
-        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
         // Should have *x* then $\hat{n}$, not *x$\hat{n}$*
         assert!(text.contains("$\\hat{n}$"), "expected $\\hat{{n}}$ in: {text}");
         // Italic x should be closed before the hat

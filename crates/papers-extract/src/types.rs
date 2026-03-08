@@ -25,9 +25,16 @@ pub enum ReflowNode {
         children: Vec<ReflowNode>,
     },
     /// A reflowed paragraph of text.
+    /// Unresolved inline formulas appear as `[[FORMULA <id>]]` placeholders.
     Text { content: String },
-    /// A display formula (content includes `$$` delimiters).
-    Formula { content: String },
+    /// A display formula. `content` holds `$$…$$` when parsed; `None` when unparsed.
+    /// `path` points to a cropped image when the formula could not be parsed.
+    Formula {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
     /// An image, chart, or seal with optional caption.
     Figure {
         path: String,

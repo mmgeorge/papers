@@ -43,6 +43,10 @@ fn save_region_image(
             .unwrap_or(images_dir)
             .join(rel_path);
 
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         let cropped = crate::figure::crop_region(
             page_img,
             region.bbox,
@@ -238,6 +242,8 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
         is_formula: bool,
         /// A short single-line text block that doesn't span the page width.
         is_short_line: bool,
+        /// Image path for formula regions (for unparsed formula fallback).
+        formula_path: Option<String>,
     }
 
     let mut sections: Vec<Section> = Vec::new();
@@ -249,7 +255,12 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
                 continue;
             }
             let section = region_to_markdown(region);
-            if section.is_empty() {
+            let has_formula_image = region.image_path.is_some()
+                && matches!(
+                    region.kind,
+                    RegionKind::DisplayFormula | RegionKind::InlineFormula
+                );
+            if section.is_empty() && !has_formula_image {
                 continue;
             }
             let is_references = region.kind == RegionKind::References;
@@ -289,6 +300,12 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
                 narrow && short_text
             };
 
+            let formula_path = if has_formula_image {
+                region.image_path.clone()
+            } else {
+                None
+            };
+
             sections.push(Section {
                 markdown: section,
                 kind: region.kind,
@@ -296,6 +313,7 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
                 is_references,
                 is_formula,
                 is_short_line,
+                formula_path,
             });
         }
     }
@@ -424,7 +442,7 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
 
     for sec in &sections {
         let text = sec.markdown.trim();
-        if text.is_empty() {
+        if text.is_empty() && sec.formula_path.is_none() {
             continue;
         }
 
@@ -487,8 +505,17 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
                 }
             }
             RegionKind::DisplayFormula | RegionKind::InlineFormula => {
-                ReflowNode::Formula {
-                    content: text.to_string(),
+                if text.is_empty() {
+                    // Unparsed formula — image fallback
+                    ReflowNode::Formula {
+                        content: None,
+                        path: sec.formula_path.clone(),
+                    }
+                } else {
+                    ReflowNode::Formula {
+                        content: Some(text.to_string()),
+                        path: None,
+                    }
                 }
             }
             RegionKind::Image | RegionKind::Chart | RegionKind::Seal => {
@@ -664,13 +691,17 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 parts.push(format!("{hashes} {title}"));
                 render_children(children, parts);
             }
-            ReflowNode::Text { content } => {
+            ReflowNode::Text { content, .. } => {
                 if !content.trim().is_empty() {
                     parts.push(content.trim().to_string());
                 }
             }
-            ReflowNode::Formula { content } => {
-                parts.push(content.clone());
+            ReflowNode::Formula { content, path } => {
+                if let Some(c) = content {
+                    parts.push(c.clone());
+                } else if let Some(p) = path {
+                    parts.push(format!("![formula]({p})"));
+                }
             }
             ReflowNode::Figure { path, caption } => {
                 if let Some(cap) = caption {

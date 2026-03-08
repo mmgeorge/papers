@@ -397,6 +397,7 @@ pub fn fill_table_html(
                 extended,
                 page_height_pt,
                 &[],
+                &[],
                 text::AssemblyMode::Reflow,
             )
         })

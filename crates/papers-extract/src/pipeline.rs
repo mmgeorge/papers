@@ -262,6 +262,19 @@ impl Pipeline {
             output::write_images(&result.pages, &page_images, &images_dir)?;
         }
 
+        // Save cropped images for formula regions that lack LaTeX (unparsed fallback)
+        let has_unresolved_formulas = result.pages.iter().any(|p| {
+            p.regions.iter().any(|r| {
+                matches!(r.kind, RegionKind::DisplayFormula | RegionKind::InlineFormula)
+                    && r.latex.is_none()
+                    && !r.consumed
+            })
+        });
+        if has_unresolved_formulas {
+            let formula_img_dir = output_dir.join("images/formulas");
+            output::write_formula_images(&result.pages, &page_images, &formula_img_dir)?;
+        }
+
         if self.options.dump_formulas {
             let formulas_dir = output_dir.join("formulas");
             output::write_formula_images(&result.pages, &page_images, &formulas_dir)?;
@@ -596,6 +609,26 @@ impl Pipeline {
             })
             .collect();
 
+        // Collect unresolved inline formulas (detected but no LaTeX available,
+        // e.g. in manual mode when char-based extraction fails).
+        let unresolved_inline: Vec<(usize, text::UnresolvedFormula)> = detected
+            .iter()
+            .enumerate()
+            .filter(|(idx, d)| {
+                d.kind == RegionKind::InlineFormula && !formula_results.contains_key(idx)
+            })
+            .map(|(idx, d)| {
+                let bbox = [
+                    d.bbox_px[0] / scale,
+                    d.bbox_px[1] / scale,
+                    d.bbox_px[2] / scale,
+                    d.bbox_px[3] / scale,
+                ];
+                let id = format!("p{}_{}", page_idx + 1, idx);
+                (idx, text::UnresolvedFormula { bbox, id })
+            })
+            .collect();
+
         for (idx, det) in detected.iter().enumerate() {
             let kind = det.kind;
 
@@ -641,6 +674,7 @@ impl Pipeline {
                                 *merged_bbox,
                                 page_height_pt,
                                 &[],
+                                &[],
                                 text::AssemblyMode::References,
                             ));
                         }
@@ -673,6 +707,20 @@ impl Pipeline {
                         }
                     })
                     .collect();
+                // Find overlapping unresolved inline formulas
+                let overlapping_unresolved: Vec<&text::UnresolvedFormula> = unresolved_inline
+                    .iter()
+                    .filter_map(|(det_idx, f)| {
+                        let cx = (f.bbox[0] + f.bbox[2]) / 2.0;
+                        let cy = (f.bbox[1] + f.bbox[3]) / 2.0;
+                        if cx >= bbox[0] && cx <= bbox[2] && cy >= bbox[1] && cy <= bbox[3] {
+                            consumed_inline.insert(*det_idx);
+                            Some(f)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 let mode = if kind == RegionKind::Algorithm {
                     text::AssemblyMode::PreserveLayout
                 } else {
@@ -683,6 +731,7 @@ impl Pipeline {
                     bbox,
                     page_height_pt,
                     &overlapping,
+                    &overlapping_unresolved,
                     mode,
                 ));
             }
@@ -733,6 +782,15 @@ impl Pipeline {
                     );
                     region.chart_type = Some(figure::classify_chart_type(&cropped).to_string());
                 }
+            }
+
+            // Set image path for formula regions that lack LaTeX (unparsed fallback)
+            if matches!(kind, RegionKind::DisplayFormula | RegionKind::InlineFormula)
+                && region.latex.is_none()
+                && !region.consumed
+            {
+                let rel_path = format!("images/formulas/{}.png", region.id);
+                region.image_path = Some(rel_path);
             }
 
             regions.push(region);
