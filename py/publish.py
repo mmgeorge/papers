@@ -109,9 +109,40 @@ def publish_tableformer(api: HfApi) -> None:
     print(f"  Done: https://huggingface.co/{TABLEFORMER_REPO}")
 
 
+PP_FORMULANET_REPO = "mgeorge412/pp_formulanet"
+PP_FORMULANET_DIR = SCRIPT_DIR / "pp-formulanet" / "cuda" / "output"
+PP_FORMULANET_FILES = [
+    "encoder_fp16.onnx",
+    "decoder_fp16_argmax.onnx",
+    "unimernet_tokenizer.json",
+]
+
+
+def publish_pp_formulanet(api: HfApi) -> None:
+    api.create_repo(PP_FORMULANET_REPO, exist_ok=True)
+    upload_model_card(
+        api, PP_FORMULANET_REPO,
+        MODEL_CARDS_DIR / "pp_formulanet_README.md",
+        MODEL_CARDS_DIR / "pp_formulanet_LICENSE",
+    )
+    for filename in PP_FORMULANET_FILES:
+        local_path = PP_FORMULANET_DIR / filename
+        if not local_path.exists():
+            print(f"  SKIP {filename} (not found at {local_path})")
+            continue
+        print(f"  Uploading {filename} ({local_path.stat().st_size / 1e6:.1f} MB)...")
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=filename,
+            repo_id=PP_FORMULANET_REPO,
+        )
+    print(f"  Done: https://huggingface.co/{PP_FORMULANET_REPO}")
+
+
 PUBLISHERS = {
     "glm-ocr": ("GLM-OCR", publish_glm_ocr),
     "tableformer": ("TableFormer", publish_tableformer),
+    "pp-formulanet": ("PP-FormulaNet", publish_pp_formulanet),
 }
 
 

@@ -15,6 +15,15 @@ pub enum AdvancedMode {
     Accurate,
 }
 
+/// Formula recognition model for the extract command.
+#[derive(ValueEnum, Clone, Debug)]
+pub enum FormulaModelArg {
+    /// PP-FormulaNet encoder/decoder (better at complex fractions)
+    PpFormulanet,
+    /// GLM-OCR vision-language model (default)
+    GlmOcr,
+}
+
 /// Layout debug output mode for the extract command.
 #[derive(ValueEnum, Clone, Debug)]
 pub enum LayoutDebugArg {
@@ -118,6 +127,10 @@ pub enum EntityCommand {
         /// Skip image extraction
         #[arg(long)]
         skip_images: bool,
+
+        /// Formula recognition model: "glm-ocr" (default) or "pp-formulanet"
+        #[arg(long, value_name = "MODEL", default_value = "glm-ocr")]
+        formula: FormulaModelArg,
 
         /// Write layout debug output: "images" for annotated PNGs, "pdf" for PNGs + debug PDF
         #[arg(long, value_name = "MODE")]

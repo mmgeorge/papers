@@ -7,6 +7,7 @@ use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
 use crate::figure;
+use crate::formula::FormulaPredictor;
 use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
 use crate::layout::{DetectedRegion, LayoutDetector};
 use crate::models;
@@ -16,7 +17,7 @@ use crate::reading_order;
 use crate::tableformer::TableFormerPredictor;
 use crate::text;
 use crate::types::*;
-use crate::{ExtractOptions, TableModel};
+use crate::{ExtractOptions, FormulaModel, TableModel};
 
 // ── Engine dispatch enums ────────────────────────────────────────────
 
@@ -70,11 +71,36 @@ impl TableEngine {
     }
 }
 
+enum FormulaEngine {
+    PpFormulanet(FormulaPredictor),
+    GlmOcr(GlmOcrPredictor),
+}
+
+impl FormulaEngine {
+    fn predict_with_progress(
+        &self,
+        images: &[DynamicImage],
+        on_progress: impl Fn(usize),
+    ) -> Result<Vec<String>, ExtractError> {
+        match self {
+            Self::PpFormulanet(p) => {
+                let mut results = Vec::with_capacity(images.len());
+                for (i, img) in images.iter().enumerate() {
+                    results.push(p.predict(&[img.clone()])?.pop().unwrap());
+                    on_progress(i + 1);
+                }
+                Ok(results)
+            }
+            Self::GlmOcr(p) => p.predict_with_progress(images, on_progress),
+        }
+    }
+}
+
 /// Reusable extraction pipeline — load models once, extract many PDFs.
 pub struct Pipeline {
     pdfium: Pdfium,
     layout: LayoutDetector,
-    formula: GlmOcrPredictor,
+    formula: FormulaEngine,
     table: TableEngine,
     options: PipelineOptions,
 }
@@ -96,12 +122,21 @@ impl Pipeline {
         models::init_ort_runtime()?;
         let pdfium = pdf::load_pdfium(options.pdfium_path.as_deref())?;
 
-        let paths = models::ensure_models(options.table, options.model_cache_dir.as_deref())?;
+        let paths = models::ensure_models(options.formula, options.table, options.model_cache_dir.as_deref())?;
         eprint!("\r  Loading models: layout");
         let layout = models::build_layout_detector(&paths.layout)?;
 
         eprint!("\r  Loading models: formula");
-        let formula = models::build_glm_ocr_predictor(&paths.glm_ocr)?;
+        let formula = match options.formula {
+            FormulaModel::PpFormulanet => {
+                let fp = paths.formula.as_ref()
+                    .ok_or_else(|| ExtractError::Model("PP-FormulaNet model paths missing".into()))?;
+                FormulaEngine::PpFormulanet(models::build_formula_predictor(fp)?)
+            }
+            FormulaModel::GlmOcr => {
+                FormulaEngine::GlmOcr(models::build_glm_ocr_predictor(&paths.glm_ocr)?)
+            }
+        };
 
         eprint!("\r  Loading models: table");
         let table = match options.table {

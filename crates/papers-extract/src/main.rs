@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use papers_extract::{DebugMode, ExtractOptions};
+use papers_extract::{DebugMode, ExtractOptions, FormulaModel};
 
 #[derive(Parser)]
 #[command(
@@ -26,9 +26,21 @@ struct Cli {
     #[arg(long)]
     skip_images: bool,
 
+    /// Formula recognition model: "glm-ocr" (default) or "pp-formulanet"
+    #[arg(long, value_name = "MODEL", default_value = "glm-ocr")]
+    formula: FormulaModelArg,
+
     /// Write layout debug output: "images" for annotated PNGs, "pdf" for PNGs + debug PDF
     #[arg(long, value_name = "MODE")]
     write_layout: Option<LayoutDebugArg>,
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum FormulaModelArg {
+    /// PP-FormulaNet encoder/decoder (better at complex fractions)
+    PpFormulanet,
+    /// GLM-OCR vision-language model (default)
+    GlmOcr,
 }
 
 #[derive(ValueEnum, Clone, Debug)]
@@ -52,6 +64,10 @@ fn main() {
     let options = ExtractOptions {
         extract_images: !cli.skip_images,
         page: cli.page,
+        formula: match cli.formula {
+            FormulaModelArg::PpFormulanet => FormulaModel::PpFormulanet,
+            FormulaModelArg::GlmOcr => FormulaModel::GlmOcr,
+        },
         debug: match cli.write_layout {
             Some(LayoutDebugArg::Images) => DebugMode::Images,
             Some(LayoutDebugArg::Pdf) => DebugMode::Pdf,

@@ -85,9 +85,25 @@ def export_tableformer(cache_dir: Path) -> None:
             print(f"  WARNING: {src} not found", file=sys.stderr)
 
 
+def export_pp_formulanet(cache_dir: Path) -> None:
+    """Export PP-FormulaNet models to cache_dir."""
+    export_script = SCRIPT_DIR / "pp-formulanet" / "cuda" / "export.py"
+    if not export_script.exists():
+        print(f"  ERROR: {export_script} not found", file=sys.stderr)
+        sys.exit(1)
+
+    cmd = [
+        sys.executable, str(export_script),
+        "--output-dir", str(cache_dir),
+    ]
+    print(f"  Running: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, cwd=str(export_script.parent))
+
+
 EXPORTERS = {
     "glm-ocr": ("GLM-OCR", export_glm_ocr),
     "tableformer": ("TableFormer", export_tableformer),
+    "pp-formulanet": ("PP-FormulaNet", export_pp_formulanet),
 }
 
 

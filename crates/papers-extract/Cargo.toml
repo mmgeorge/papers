@@ -20,6 +20,10 @@ path = "src/bin/find_gaps.rs"
 name = "run_glm_ocr"
 path = "src/bin/run_glm_ocr.rs"
 
+[[bin]]
+name = "run_formulas"
+path = "src/bin/run_formulas.rs"
+
 
 [dependencies]
 clap = { workspace = true }

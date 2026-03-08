@@ -1855,6 +1855,7 @@ async fn papers_main() {
             output,
             page,
             skip_images,
+            formula,
             write_layout,
         } => {
             let output_dir = output.unwrap_or_else(|| {
@@ -1866,6 +1867,10 @@ async fn papers_main() {
             let options = papers_extract::ExtractOptions {
                 extract_images: !skip_images,
                 page,
+                formula: match formula {
+                    cli::FormulaModelArg::PpFormulanet => papers_extract::FormulaModel::PpFormulanet,
+                    cli::FormulaModelArg::GlmOcr => papers_extract::FormulaModel::GlmOcr,
+                },
                 debug: match write_layout {
                     Some(cli::LayoutDebugArg::Images) => papers_extract::DebugMode::Images,
                     Some(cli::LayoutDebugArg::Pdf) => papers_extract::DebugMode::Pdf,

@@ -3,14 +3,17 @@ use std::path::{Path, PathBuf};
 use hf_hub::api::sync::{Api, ApiBuilder};
 
 use crate::error::ExtractError;
+use crate::formula::FormulaPredictor;
 use crate::glm_ocr::{GlmOcrConfig, GlmOcrPredictor};
 use crate::tableformer::TableFormerPredictor;
-use crate::TableModel;
+use crate::{FormulaModel, TableModel};
 
 /// HuggingFace repo for GLM-OCR ONNX models.
 const GLM_OCR_REPO: &str = "mgeorge412/glm_ocr";
 /// HuggingFace repo for TableFormer ONNX models.
 const TABLEFORMER_REPO: &str = "mgeorge412/tableformer";
+/// HuggingFace repo for PP-FormulaNet ONNX models.
+const PP_FORMULANET_REPO: &str = "mgeorge412/pp_formulanet";
 
 /// Model file metadata for download (layout model from GitHub releases).
 struct ModelFile {
@@ -29,6 +32,14 @@ pub struct ModelPaths {
     pub layout: PathBuf,
     pub glm_ocr: GlmOcrModelPaths,
     pub tableformer: Option<TableFormerModelPaths>,
+    pub formula: Option<FormulaModelPaths>,
+}
+
+/// Resolved paths for PP-FormulaNet models.
+pub struct FormulaModelPaths {
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    pub tokenizer: PathBuf,
 }
 
 /// Resolved paths for TableFormer models.
@@ -135,8 +146,9 @@ fn ensure_hf_onnx_with_data(
     Ok(onnx_path)
 }
 
-/// Ensure all models for the selected table engine are available.
+/// Ensure all models for the selected formula + table engines are available.
 pub fn ensure_models(
+    formula: FormulaModel,
     table: TableModel,
     model_cache_dir: Option<&Path>,
 ) -> Result<ModelPaths, ExtractError> {
@@ -148,8 +160,26 @@ pub fn ensure_models(
     std::fs::create_dir_all(&cache_dir)?;
     let layout = ensure_layout_model(&cache_dir)?;
 
-    // GLM-OCR models (always required for formula recognition)
-    let glm_ocr = ensure_glm_ocr_models(local_override.as_deref(), &api)?;
+    // GLM-OCR models — needed when formula==GlmOcr OR table==GlmOcr
+    let glm_ocr = if formula == FormulaModel::GlmOcr || table == TableModel::GlmOcr {
+        ensure_glm_ocr_models(local_override.as_deref(), &api)?
+    } else {
+        // Provide dummy paths — these won't be used
+        GlmOcrModelPaths {
+            vision_encoder: PathBuf::new(),
+            embedding: PathBuf::new(),
+            llm: PathBuf::new(),
+            llm_decoder: PathBuf::new(),
+            tokenizer: PathBuf::new(),
+        }
+    };
+
+    // PP-FormulaNet models (optional)
+    let formula_paths = if formula == FormulaModel::PpFormulanet {
+        Some(ensure_pp_formulanet_models(local_override.as_deref(), &api)?)
+    } else {
+        None
+    };
 
     // TableFormer models (optional)
     let tableformer = if table == TableModel::TableFormer {
@@ -162,6 +192,7 @@ pub fn ensure_models(
         layout,
         glm_ocr,
         tableformer,
+        formula: formula_paths,
     })
 }
 
@@ -301,6 +332,37 @@ pub fn build_glm_ocr_predictor_with_config(
         &paths.tokenizer,
         config,
     )
+}
+
+/// Ensure all PP-FormulaNet model files are available.
+fn ensure_pp_formulanet_models(
+    local_override: Option<&Path>,
+    api: &Api,
+) -> Result<FormulaModelPaths, ExtractError> {
+    let encoder = ensure_hf_model(local_override, api, PP_FORMULANET_REPO, "encoder_fp16.onnx")?;
+    let decoder = ensure_hf_model(local_override, api, PP_FORMULANET_REPO, "decoder_fp16_argmax.onnx")?;
+    let tokenizer = ensure_hf_model(local_override, api, PP_FORMULANET_REPO, "unimernet_tokenizer.json")?;
+    Ok(FormulaModelPaths {
+        encoder,
+        decoder,
+        tokenizer,
+    })
+}
+
+/// Build a PP-FormulaNet predictor from model paths.
+pub fn build_formula_predictor(
+    paths: &FormulaModelPaths,
+) -> Result<FormulaPredictor, ExtractError> {
+    FormulaPredictor::new(&paths.encoder, &paths.decoder, &paths.tokenizer)
+}
+
+/// Standalone PP-FormulaNet model loading (for binaries that don't use the full pipeline).
+pub fn ensure_pp_formulanet_models_standalone(
+    model_cache_dir: Option<&Path>,
+) -> Result<FormulaModelPaths, ExtractError> {
+    let local_override = local_model_override(model_cache_dir);
+    let api = create_hf_api()?;
+    ensure_pp_formulanet_models(local_override.as_deref(), &api)
 }
 
 /// Build a direct layout detector from the pp-doclayoutv3.onnx model.
