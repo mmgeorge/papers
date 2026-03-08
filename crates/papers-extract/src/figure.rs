@@ -1929,4 +1929,134 @@ mod tests {
         // Sub-label beyond base threshold should not be consumed
         assert!(!regions[1].consumed);
     }
+
+    // ── expand_visual_bounds tests ──────────────────────────────────
+
+    #[test]
+    fn test_expand_standalone_image_to_caption() {
+        // Standalone image with caption below: bbox should expand to include caption,
+        // and sub-labels between them should be consumed.
+        let mut regions = vec![
+            {
+                let mut img = make_region(RegionKind::Image, [50.0, 50.0, 500.0, 300.0], None);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [50.0, 350.0, 500.0, 380.0],
+                    Some("Fig. 5. Initialization options"),
+                );
+                cap.consumed = true;
+                img.caption = Some(Box::new(cap));
+                img
+            },
+            // Sub-label "(a) Previous position" between image and caption
+            make_region(
+                RegionKind::FigureTitle,
+                [60.0, 310.0, 150.0, 325.0],
+                Some("(a) Previous position"),
+            ),
+            // Text sub-label with parameters
+            make_region(
+                RegionKind::Text,
+                [160.0, 310.0, 300.0, 325.0],
+                Some("h = 1/120 sec."),
+            ),
+            // Body text outside the figure area (should NOT be consumed)
+            make_region(
+                RegionKind::Text,
+                [50.0, 400.0, 500.0, 450.0],
+                Some("Body text below the figure."),
+            ),
+        ];
+
+        expand_visual_bounds(&mut regions);
+
+        // Image bbox should now include caption
+        assert_eq!(regions[0].bbox[3], 380.0, "bottom should extend to caption bottom");
+        // Sub-label caption should be consumed
+        assert!(regions[1].consumed, "sub-label within expanded bbox should be consumed");
+        // Text sub-label should be consumed
+        assert!(regions[2].consumed, "text within expanded bbox should be consumed");
+        // Body text below should NOT be consumed
+        assert!(!regions[3].consumed, "body text outside expanded bbox should not be consumed");
+    }
+
+    #[test]
+    fn test_expand_preserves_uncaptioned_image() {
+        // Image without caption: no expansion should happen.
+        let mut regions = vec![
+            make_region(RegionKind::Image, [50.0, 50.0, 200.0, 150.0], None),
+            make_region(RegionKind::Text, [50.0, 100.0, 200.0, 120.0], Some("nearby text")),
+        ];
+
+        let original_bbox = regions[0].bbox;
+        expand_visual_bounds(&mut regions);
+
+        assert_eq!(regions[0].bbox, original_bbox, "uncaptioned image bbox unchanged");
+        assert!(!regions[1].consumed, "text near uncaptioned image not consumed");
+    }
+
+    #[test]
+    fn test_expand_figure_group_consumes_text() {
+        // FigureGroup already has expanded bbox from grouping; expand_visual_bounds
+        // should still consume Text regions within it.
+        let mut regions = vec![
+            {
+                let mut grp = make_region(RegionKind::FigureGroup, [50.0, 50.0, 500.0, 400.0], None);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [50.0, 350.0, 500.0, 400.0],
+                    Some("Fig. 19. Squishy ball"),
+                );
+                cap.consumed = true;
+                grp.caption = Some(Box::new(cap));
+                grp
+            },
+            // Parameter text inside group bounds
+            make_region(
+                RegionKind::Text,
+                [60.0, 310.0, 200.0, 325.0],
+                Some("(0.32 sec./frame)"),
+            ),
+            // Caption sub-label inside group bounds
+            make_region(
+                RegionKind::FigureTitle,
+                [210.0, 310.0, 350.0, 325.0],
+                Some("(c) XPBD"),
+            ),
+        ];
+
+        expand_visual_bounds(&mut regions);
+
+        assert!(regions[1].consumed, "text within group bounds should be consumed");
+        assert!(regions[2].consumed, "sub-label within group bounds should be consumed");
+    }
+
+    #[test]
+    fn test_expand_caption_above_image() {
+        // Caption above image: bbox should expand upward.
+        let mut regions = vec![
+            {
+                let mut img = make_region(RegionKind::Image, [50.0, 150.0, 500.0, 400.0], None);
+                let mut cap = make_region(
+                    RegionKind::FigureTitle,
+                    [50.0, 100.0, 500.0, 130.0],
+                    Some("Fig. 1. Caption above"),
+                );
+                cap.consumed = true;
+                img.caption = Some(Box::new(cap));
+                img
+            },
+            // Sub-label between caption and image
+            make_region(
+                RegionKind::FigureTitle,
+                [60.0, 135.0, 150.0, 145.0],
+                Some("(a) Detail"),
+            ),
+        ];
+
+        expand_visual_bounds(&mut regions);
+
+        assert_eq!(regions[0].bbox[1], 100.0, "top should extend to caption top");
+        assert!(regions[1].consumed, "sub-label between caption and image consumed");
+    }
 }
