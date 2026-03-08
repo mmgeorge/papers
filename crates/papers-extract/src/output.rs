@@ -5,7 +5,7 @@ use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
 use crate::pdf;
-use crate::types::{ExtractionResult, Page, Region, RegionKind};
+use crate::types::{ExtractionResult, Page, Region, RegionKind, ReflowDocument, ReflowNode};
 use crate::DebugMode;
 
 /// Write the extraction result as pretty-printed JSON.
@@ -15,10 +15,18 @@ pub fn write_json(result: &ExtractionResult, path: &Path) -> Result<(), ExtractE
     Ok(())
 }
 
-/// Write the extraction result as Markdown.
+/// Write the extraction result as Markdown (via reflow intermediate).
 pub fn write_markdown(result: &ExtractionResult, path: &Path) -> Result<(), ExtractError> {
-    let md = render_markdown(result);
+    let doc = reflow(result);
+    let md = render_markdown_from_reflow(&doc);
     std::fs::write(path, md)?;
+    Ok(())
+}
+
+/// Write the reflow document as pretty-printed JSON.
+pub fn write_reflow_json(doc: &ReflowDocument, path: &Path) -> Result<(), ExtractError> {
+    let json = serde_json::to_string_pretty(doc)?;
+    std::fs::write(path, json)?;
     Ok(())
 }
 
@@ -105,8 +113,120 @@ pub fn write_formula_images(
     Ok(())
 }
 
-/// Render the full extraction result as Markdown.
-fn render_markdown(result: &ExtractionResult) -> String {
+/// Infer the heading depth from a heading's text based on numbering patterns.
+///
+/// Returns the depth (1-based: 1 = top-level section, 2 = sub-section, etc.).
+/// The document title uses depth 0 but that is handled separately.
+fn infer_heading_depth(text: &str) -> u32 {
+    let text = text.trim();
+
+    // Labeled blocks (Example, Tip, Algorithm) are not structural headings.
+    // The caller should check this before calling, but guard here too.
+    let label_prefixes = ["Example ", "Tip ", "Algorithm "];
+    for prefix in label_prefixes {
+        if text.starts_with(prefix) {
+            // These get depth 0 as a sentinel — caller treats them as content.
+            return 0;
+        }
+    }
+
+    // Try dotted-decimal patterns: "1.2.3 ...", "1.2 ...", "1 ..."
+    // Also handles appendix patterns: "A.1.2", "A.1", "A ..."
+    if let Some(first_ch) = text.chars().next() {
+        if first_ch.is_ascii_digit() || (first_ch.is_ascii_uppercase() && text.len() > 1) {
+            // Find the end of the numbering prefix
+            let num_end = text
+                .find(|c: char| c == ' ' || c == '\t')
+                .unwrap_or(text.len());
+            let prefix = &text[..num_end];
+
+            // Count dots to determine depth
+            // Single uppercase letter followed by space: appendix chapter (depth 1)
+            // But NOT if it looks like a word (more than 1 char before space)
+            if first_ch.is_ascii_uppercase()
+                && !first_ch.is_ascii_digit()
+                && prefix.len() == 1
+            {
+                return 1;
+            }
+
+            // Check if it's actually a number pattern (digits and dots, possibly
+            // starting with a letter for appendix)
+            let is_number_pattern = prefix.chars().all(|c| {
+                c.is_ascii_digit() || c == '.' || c.is_ascii_lowercase() || c.is_ascii_uppercase()
+            }) && prefix.chars().any(|c| c.is_ascii_digit() || (c.is_ascii_uppercase() && prefix.len() <= 2));
+
+            if is_number_pattern {
+                // Trailing dot doesn't count: "1." is same as "1"
+                let trimmed = prefix.trim_end_matches('.');
+                let effective_dots = trimmed.chars().filter(|&c| c == '.').count();
+                return (effective_dots as u32) + 1;
+            }
+        }
+
+        // Roman numeral patterns (I, II, III, IV, V, VI, VII, VIII, IX, X, etc.)
+        if first_ch.is_ascii_uppercase() {
+            let num_end = text
+                .find(|c: char| c == ' ' || c == '\t')
+                .unwrap_or(text.len());
+            let prefix = &text[..num_end];
+            if is_roman_numeral(prefix) {
+                return 1;
+            }
+        }
+    }
+
+    // Named sections with no number: return 0 as sentinel.
+    // The caller uses context (last numbered heading depth) to assign the
+    // actual depth, defaulting to 1 when no prior numbered heading exists.
+    0
+}
+
+/// Check if a string is a valid uppercase Roman numeral.
+fn is_roman_numeral(s: &str) -> bool {
+    if s.is_empty() || s.len() > 8 {
+        return false;
+    }
+    // Must be all valid Roman numeral characters
+    s.chars().all(|c| matches!(c, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+}
+
+/// If a heading starts with an appendix-style prefix (e.g. "A.1", "B.3.2"),
+/// return the leading letter. Returns None for numeric prefixes like "1.2".
+fn appendix_letter(text: &str) -> Option<char> {
+    let first = text.trim().chars().next()?;
+    if first.is_ascii_uppercase() && !first.is_ascii_digit() {
+        // Must be followed by a dot and digit: "A.1", "B.3"
+        let rest = &text.trim()[1..];
+        if rest.starts_with('.') && rest.len() > 1 && rest[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return Some(first);
+        }
+    }
+    None
+}
+
+/// Check if a heading text is a labeled block (Example, Tip, Algorithm)
+/// that should be treated as content rather than a structural heading.
+fn is_labeled_block(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("Example ") || text.starts_with("Tip ") || text.starts_with("Algorithm ")
+}
+
+/// Check if a heading text is a back-matter section (references, index, etc.)
+/// that should be promoted to top-level when it appears exactly once.
+fn is_back_matter_heading(text: &str) -> bool {
+    let norm = text.trim().to_ascii_uppercase();
+    matches!(
+        norm.as_str(),
+        "REFERENCES" | "BIBLIOGRAPHY" | "WORKS CITED" | "INDEX" | "GLOSSARY"
+    )
+}
+
+/// Build a reflow document from the extraction result.
+///
+/// This performs all reflow logic (dehyphenation, paragraph merging, references
+/// merging) and organizes the result into a heading-based tree.
+pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
     // Collect rendered sections with metadata for cross-region dehyphenation.
     struct Section {
         markdown: String,
@@ -117,9 +237,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
         /// them should NOT be rearranged across them.
         is_formula: bool,
         /// A short single-line text block that doesn't span the page width.
-        /// These are typically author names, affiliations, or other metadata
-        /// that the PDF intentionally places on separate lines. They should
-        /// not be merged with neighboring text via the mid-sentence heuristic.
         is_short_line: bool,
     }
 
@@ -147,9 +264,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
 
             // Merge all references sections into a single section, even
             // when non-text regions (page headers/footers) sit between them.
-            // When the previous chunk ends mid-sentence (no terminal punctuation),
-            // join with a space so split entries like "ACM Transactions on" +
-            // "Graphics 31, 5 ..." reconnect properly.
             if is_references {
                 if let Some(prev) = sections.iter_mut().rfind(|s| s.is_references) {
                     let prev_trimmed = prev.markdown.trim_end();
@@ -167,18 +281,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
 
             let is_formula = region.kind == RegionKind::DisplayFormula;
 
-            // Detect short single-line text blocks: narrow region AND short
-            // text content. These are typically author names, affiliations,
-            // sub-figure labels, or other metadata that the PDF intentionally
-            // places on separate lines — NOT paragraph fragments.
-            //
-            // Width threshold is 35% of page width. This cleanly separates:
-            //   - Author lines / labels: ~20-30% of page width → narrow
-            //   - Two-column paragraph blocks: ~40%+ of page width → not narrow
-            //   - Single-column paragraphs: ~85%+ → not narrow
-            //
-            // The text-length check (< 80 chars) further guards against
-            // paragraph fragments that happen to be narrow.
             let is_short_line = is_text && {
                 let region_width = region.bbox[2] - region.bbox[0];
                 let has_bbox = region_width > 0.0;
@@ -199,12 +301,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
     }
 
     // --- Dehyphenation across region boundaries ---
-    //
-    // When a text region ends with STX (U+0002), the last word was split by
-    // a hyphen at a region boundary (e.g., "approx-" at end of one column,
-    // "imation" at the top of the next). Move the trailing word fragment
-    // to the front of the next text section, rejoining the hyphenated word.
-    // Non-text sections between them (figures, formulas) are skipped over.
     let mut i = 0;
     while i < sections.len() {
         if sections[i].is_text && sections[i].markdown.ends_with('\u{0002}') {
@@ -236,32 +332,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
     }
 
     // --- Rejoin paragraphs split across column/page breaks ---
-    //
-    // In multi-column layouts, a paragraph may be split across two text
-    // regions with non-text elements between them (figures, algorithms,
-    // footnotes, captions). We detect this by checking if the previous
-    // text section ends mid-sentence (no terminal punctuation). If so,
-    // the two sections are halves of the same paragraph — merge them.
-    //
-    // Skip conditions (these should never participate in paragraph merging):
-    //   - Abstract regions: structurally distinct from preceding metadata
-    //   - Short single-line blocks (bbox < 35% page width AND < 80 chars):
-    //     author names, affiliations, sub-figure labels like "(a) Reference"
-    //
-    // Backward search blockers (structural boundaries):
-    //   - Display formulas: part of paragraph flow, text wraps around them
-    //   - Titles / paragraph titles: new document sections
-    //
-    // The backward search also skips over short single-line blocks
-    // transparently, so paragraph halves find each other even when
-    // separated by sub-figure labels and figures.
-    //
-    // Examples:
-    //   DO merge:  "...method presented superior"  +  "convergence behavior..."
-    //   DO merge:  "...constraints" [Footnote] "and produce stable..."
-    //   DO merge:  "...shows a" [(a) Ref] [Fig] [(b) AVBD] [Fig] "delicate card..."
-    //   NO merge:  "...et al." [DisplayFormula] "1992] where..."
-    //   NO merge:  "CHRIS GILES, USA"  +  "ELIE DIAZ, University..."
     {
         let mut i = 1;
         while i < sections.len() {
@@ -273,18 +343,11 @@ fn render_markdown(result: &ExtractionResult) -> String {
                 i += 1;
                 continue;
             }
-            // Short single-line blocks (sub-figure labels, author lines)
-            // are standalone — they should not merge into paragraphs.
             if sections[i].is_short_line {
                 i += 1;
                 continue;
             }
 
-            // Search backward for the nearest paragraph-like text section,
-            // skipping over short single-line blocks (sub-figure labels,
-            // author lines, etc.) which are neither merge candidates nor
-            // structural boundaries. Stop at actual boundaries (formulas,
-            // titles) that mark distinct document sections.
             let mut blocked = false;
             let mut prev_text = None;
             for k in (0..i).rev() {
@@ -314,7 +377,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
                 continue;
             };
 
-            // Check if the previous text ends mid-sentence.
             let prev_trimmed = sections[k].markdown.trim();
             let ends_mid = prev_trimmed
                 .ends_with(|c: char| !matches!(c, '.' | '!' | '?' | ':' | '"' | '\u{201D}'));
@@ -323,8 +385,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
                 continue;
             }
 
-            // Two halves of the same paragraph — merge continuation into
-            // the previous section and clear the current one.
             let text = sections[k].markdown.trim_end().to_string();
             let next_md = sections[i].markdown.trim().to_string();
             if !next_md.is_empty() {
@@ -335,20 +395,315 @@ fn render_markdown(result: &ExtractionResult) -> String {
         }
     }
 
-    // Assemble with paragraph breaks between sections.
-    let mut md = String::new();
+    // --- Convert sections to ReflowNodes and build heading tree ---
+
+    // Count occurrences of each back-matter heading name. When a name
+    // appears exactly once (e.g. one "References", one "Index"), it's a
+    // document-level section — promote it to depth 1 rather than nesting
+    // it under whatever numbered section precedes it.
+    let mut back_matter_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for s in &sections {
+        if s.kind == RegionKind::ParagraphTitle && !s.markdown.is_empty() {
+            let title = s.markdown.trim().strip_prefix("## ").unwrap_or(s.markdown.trim());
+            if is_back_matter_heading(title) {
+                let key = title.trim().to_ascii_uppercase();
+                *back_matter_counts.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut flat_nodes: Vec<ReflowNode> = Vec::new();
+    // Track last numbered heading depth so unnumbered headings can nest
+    // under the current section rather than breaking to top-level.
+    let mut last_numbered_depth: u32 = 0;
+    // Track which appendix letters we've seen so we can synthesize parent
+    // headings (e.g. "Appendix A") when the PDF omits them.
+    let mut seen_appendix_letters: std::collections::HashSet<char> =
+        std::collections::HashSet::new();
+
     for sec in &sections {
         let text = sec.markdown.trim();
         if text.is_empty() {
             continue;
         }
-        if !md.is_empty() {
-            md.push_str("\n\n");
-        }
-        md.push_str(text);
+
+        let node = match sec.kind {
+            RegionKind::Title => {
+                // Document title — strip the "# " prefix added by region_to_markdown
+                let title = text.strip_prefix("# ").unwrap_or(text).to_string();
+                last_numbered_depth = 0;
+                ReflowNode::Heading {
+                    depth: 0,
+                    title,
+                    children: Vec::new(),
+                }
+            }
+            RegionKind::ParagraphTitle => {
+                // Section heading — strip the "## " prefix
+                let title = text.strip_prefix("## ").unwrap_or(text).to_string();
+                if is_labeled_block(&title) {
+                    // Labeled blocks (Example, Tip, Algorithm headings) are content
+                    ReflowNode::Text {
+                        content: format!("## {title}"),
+                    }
+                } else {
+                    let mut depth = infer_heading_depth(&title);
+                    if depth == 0 {
+                        // Unnumbered heading: nest under current section.
+                        let key = title.trim().to_ascii_uppercase();
+                        if is_back_matter_heading(&title)
+                            && back_matter_counts.get(&key).copied() == Some(1)
+                        {
+                            // Sole occurrence of this back-matter heading → top-level.
+                            depth = 1;
+                        } else if last_numbered_depth > 0 {
+                            depth = last_numbered_depth + 1;
+                        } else {
+                            depth = 1;
+                        }
+                    } else {
+                        // Synthesize appendix parent heading when we first
+                        // encounter "A.1", "B.2", etc. without a prior "A"
+                        // or "B" heading.
+                        if depth >= 2 {
+                            if let Some(letter) = appendix_letter(&title) {
+                                if seen_appendix_letters.insert(letter) {
+                                    flat_nodes.push(ReflowNode::Heading {
+                                        depth: 1,
+                                        title: format!("Appendix {letter}"),
+                                        children: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
+                        last_numbered_depth = depth;
+                    }
+                    ReflowNode::Heading {
+                        depth,
+                        title,
+                        children: Vec::new(),
+                    }
+                }
+            }
+            RegionKind::DisplayFormula | RegionKind::InlineFormula => {
+                ReflowNode::Formula {
+                    content: text.to_string(),
+                }
+            }
+            RegionKind::Image | RegionKind::Chart | RegionKind::Seal => {
+                // Parse image markdown: "![](path)\n\ncaption"
+                let (path, caption) = parse_figure_markdown(text);
+                ReflowNode::Figure { path, caption }
+            }
+            RegionKind::Table => {
+                // Table may have caption appended after \n\n
+                let (content, caption) = split_table_caption(text);
+                ReflowNode::Table { content, caption }
+            }
+            RegionKind::Algorithm => {
+                ReflowNode::Algorithm {
+                    content: text.to_string(),
+                }
+            }
+            RegionKind::FigureGroup => {
+                let (path, caption) = parse_figure_markdown(text);
+                ReflowNode::FigureGroup { path, caption }
+            }
+            RegionKind::References => {
+                ReflowNode::References {
+                    content: text.to_string(),
+                }
+            }
+            _ => {
+                // Text, Abstract, VerticalText, SidebarText, orphan captions, etc.
+                ReflowNode::Text {
+                    content: text.to_string(),
+                }
+            }
+        };
+
+        flat_nodes.push(node);
     }
 
+    // Build the heading tree from the flat list using a depth stack.
+    build_heading_tree(flat_nodes)
+}
+
+/// Parse figure markdown like `"![](path)\n\ncaption"` into (path, caption).
+fn parse_figure_markdown(md: &str) -> (String, Option<String>) {
+    // Split on first double newline
+    let parts: Vec<&str> = md.splitn(2, "\n\n").collect();
+    let img_line = parts[0];
+    let caption = parts.get(1).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    // Extract path from ![](path)
+    let path = if let Some(start) = img_line.find("](") {
+        let after = &img_line[start + 2..];
+        after.strip_suffix(')').unwrap_or(after).to_string()
+    } else {
+        img_line.to_string()
+    };
+
+    (path, caption)
+}
+
+/// Split table markdown from its trailing caption (separated by \n\n).
+fn split_table_caption(md: &str) -> (String, Option<String>) {
+    // Find the last \n\n — caption comes after it if it looks like a caption
+    if let Some(pos) = md.rfind("\n\n") {
+        let table_part = md[..pos].trim().to_string();
+        let after = md[pos + 2..].trim();
+        // Check if the trailing part is a caption (starts with bold label)
+        if after.starts_with("**Fig.") || after.starts_with("**Figure")
+            || after.starts_with("**Table") || after.starts_with("**Algorithm")
+        {
+            return (table_part, Some(after.to_string()));
+        }
+    }
+    (md.to_string(), None)
+}
+
+/// Build a heading tree from a flat list of reflow nodes.
+///
+/// Heading nodes nest subsequent content until a heading of equal or lesser depth
+/// is encountered.
+fn build_heading_tree(flat: Vec<ReflowNode>) -> ReflowDocument {
+    let mut doc = ReflowDocument {
+        title: None,
+        children: Vec::new(),
+    };
+
+    // Stack: (depth, node) for open headings. Deepest heading is at the top.
+    let mut stack: Vec<(u32, ReflowNode)> = Vec::new();
+
+    /// Pop all stack entries with depth >= the given depth, nesting each
+    /// popped entry into its parent (or into doc.children if no parent).
+    fn flush_to_depth(
+        stack: &mut Vec<(u32, ReflowNode)>,
+        root: &mut Vec<ReflowNode>,
+        min_depth: u32,
+    ) {
+        while let Some((d, _)) = stack.last() {
+            if *d >= min_depth {
+                let (_, entry) = stack.pop().unwrap();
+                if let Some((_, parent)) = stack.last_mut() {
+                    if let ReflowNode::Heading { children, .. } = parent {
+                        children.push(entry);
+                    }
+                } else {
+                    root.push(entry);
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    for node in flat {
+        match &node {
+            ReflowNode::Heading { depth, title, .. } => {
+                let depth = *depth;
+
+                // Document title (depth 0): set as doc title
+                if depth == 0 {
+                    flush_to_depth(&mut stack, &mut doc.children, 1);
+                    doc.title = Some(title.clone());
+                    continue;
+                }
+
+                // Pop headings with depth >= current
+                flush_to_depth(&mut stack, &mut doc.children, depth);
+                stack.push((depth, node));
+            }
+            _ => {
+                // Content node — append to current heading or root
+                if let Some((_, top)) = stack.last_mut() {
+                    if let ReflowNode::Heading { children, .. } = top {
+                        children.push(node);
+                    }
+                } else {
+                    doc.children.push(node);
+                }
+            }
+        }
+    }
+
+    // Flush remaining stack
+    flush_to_depth(&mut stack, &mut doc.children, 1);
+
+    doc
+}
+
+/// Render a reflow document as Markdown.
+pub fn render_markdown_from_reflow(doc: &ReflowDocument) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Document title
+    if let Some(ref title) = doc.title {
+        parts.push(format!("# {title}"));
+    }
+
+    // Render children
+    render_children(&doc.children, &mut parts);
+
+    let md = parts.join("\n\n");
     md.trim_end().to_string()
+}
+
+/// Recursively render reflow nodes into markdown parts.
+fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
+    for node in children {
+        match node {
+            ReflowNode::Heading {
+                depth,
+                title,
+                children,
+            } => {
+                let hashes = "#".repeat((*depth as usize) + 1);
+                parts.push(format!("{hashes} {title}"));
+                render_children(children, parts);
+            }
+            ReflowNode::Text { content } => {
+                if !content.trim().is_empty() {
+                    parts.push(content.trim().to_string());
+                }
+            }
+            ReflowNode::Formula { content } => {
+                parts.push(content.clone());
+            }
+            ReflowNode::Figure { path, caption } => {
+                if let Some(cap) = caption {
+                    parts.push(format!("![]({path})\n\n{cap}"));
+                } else {
+                    parts.push(format!("![]({path})"));
+                }
+            }
+            ReflowNode::Table { content, caption } => {
+                if let Some(cap) = caption {
+                    parts.push(format!("{content}\n\n{cap}"));
+                } else {
+                    parts.push(content.clone());
+                }
+            }
+            ReflowNode::Algorithm { content } => {
+                parts.push(content.clone());
+            }
+            ReflowNode::FigureGroup { path, caption } => {
+                if let Some(cap) = caption {
+                    parts.push(format!("![]({path})\n\n{cap}"));
+                } else {
+                    parts.push(format!("![]({path})"));
+                }
+            }
+            ReflowNode::References { content } => {
+                parts.push(content.clone());
+            }
+            ReflowNode::FootnoteBlock { content } => {
+                parts.push(content.clone());
+            }
+        }
+    }
 }
 
 /// Bold the label prefix in a figure/table caption.
@@ -811,6 +1166,12 @@ pub fn write_debug(
 mod tests {
     use super::*;
     use crate::types::{ExtractionResult, Metadata, Page, Region, RegionKind};
+
+    /// Convenience wrapper: reflow + render, replacing the old `render_markdown`.
+    fn render_markdown(result: &ExtractionResult) -> String {
+        let doc = reflow(result);
+        render_markdown_from_reflow(&doc)
+    }
 
     fn make_region(kind: RegionKind) -> Region {
         Region {
@@ -1445,10 +1806,10 @@ mod tests {
             },
         ]);
         let md = render_markdown(&result);
-        // Should NOT merge across the title
+        // Should NOT merge across the title — texts must remain separate
         assert!(
-            md.contains("some text ending mid\n\n# Section 2"),
-            "text before title should stay separate, got: {md}"
+            md.contains("some text ending mid\n\nsentence that continues here."),
+            "text blocks should not merge across title boundary, got: {md}"
         );
     }
 

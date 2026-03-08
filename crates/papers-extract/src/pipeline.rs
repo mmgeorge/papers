@@ -252,6 +252,10 @@ impl Pipeline {
         let images_dir = output_dir.join("images");
 
         output::write_json(&result, &json_path)?;
+
+        let reflow_doc = output::reflow(&result);
+        let reflow_path = output_dir.join(format!("{stem}.reflow.json"));
+        output::write_reflow_json(&reflow_doc, &reflow_path)?;
         output::write_markdown(&result, &md_path)?;
 
         if self.options.extract_images {
@@ -492,6 +496,9 @@ impl Pipeline {
 
         // Suppress sub-panel detections contained within a larger visual region
         figure::suppress_contained_visuals(&mut regions);
+
+        // Suppress duplicate Abstract/Text regions sharing the same bbox
+        figure::suppress_duplicate_abstract_text(&mut regions);
 
         // The model provides reading order via order_key; use XY-Cut as fallback
         let has_model_order = regions.iter().any(|r| r.order > 0);

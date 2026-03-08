@@ -1,5 +1,61 @@
 use serde::{Deserialize, Serialize};
 
+// ── Reflow document types ───────────────────────────────────────────
+
+/// A reflowed document organized as a heading-based tree.
+///
+/// Content appears in reading order, nested under headings by depth.
+/// This is the intermediate representation between raw extraction JSON
+/// and final markdown output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReflowDocument {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub children: Vec<ReflowNode>,
+}
+
+/// A node in the reflow document tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReflowNode {
+    /// A structural heading that nests child content.
+    Heading {
+        depth: u32,
+        title: String,
+        children: Vec<ReflowNode>,
+    },
+    /// A reflowed paragraph of text.
+    Text { content: String },
+    /// A display formula (content includes `$$` delimiters).
+    Formula { content: String },
+    /// An image, chart, or seal with optional caption.
+    Figure {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    /// A markdown table with optional caption.
+    Table {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    /// Preserved-layout text (e.g. algorithm pseudocode).
+    Algorithm { content: String },
+    /// A composite figure group with optional caption.
+    FigureGroup {
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caption: Option<String>,
+    },
+    /// Merged references block.
+    References { content: String },
+    /// Footnote text block.
+    FootnoteBlock { content: String },
+}
+
+// ── Extraction types ────────────────────────────────────────────────
+
 /// Per-formula prediction result with LaTeX and confidence score.
 pub struct FormulaResult {
     pub latex: String,

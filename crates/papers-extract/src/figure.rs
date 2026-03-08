@@ -3,6 +3,7 @@
 //! ## Processing pipeline (called from `pipeline.rs`)
 //!
 //! 1. [`suppress_contained_visuals`] — remove redundant overlapping detections.
+//! 1b. [`suppress_duplicate_abstract_text`] — deduplicate Abstract/Text for same bbox.
 //! 2. [`associate_captions`] — match caption regions to their parent figures.
 //! 3. [`group_figure_regions`] — cluster nearby visuals into `FigureGroup`s.
 //!
@@ -334,6 +335,80 @@ pub fn suppress_contained_visuals(regions: &mut [Region]) {
                 } else {
                     to_consume.push(bi);
                 }
+            }
+        }
+    }
+
+    for idx in to_consume {
+        regions[idx].consumed = true;
+    }
+}
+
+/// Suppress duplicate Abstract/Text regions that share the same bounding box.
+///
+/// The layout model sometimes detects the same region as both `Abstract` and `Text`.
+/// When two unconsumed regions have the same bbox and one is Abstract while the other
+/// is Text, keep Abstract if its confidence > 0.5, otherwise keep Text.
+pub fn suppress_duplicate_abstract_text(regions: &mut [Region]) {
+    let candidates: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            !r.consumed && matches!(r.kind, RegionKind::Abstract | RegionKind::Text)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if candidates.len() < 2 {
+        return;
+    }
+
+    let mut to_consume: Vec<usize> = Vec::new();
+
+    for i in 0..candidates.len() {
+        let ai = candidates[i];
+        if to_consume.contains(&ai) {
+            continue;
+        }
+        for j in (i + 1)..candidates.len() {
+            let bi = candidates[j];
+            if to_consume.contains(&bi) {
+                continue;
+            }
+
+            let a = &regions[ai];
+            let b = &regions[bi];
+
+            // Must be one Abstract and one Text
+            if a.kind == b.kind {
+                continue;
+            }
+
+            // Check same bbox (within tolerance)
+            let a_area = (a.bbox[2] - a.bbox[0]) * (a.bbox[3] - a.bbox[1]);
+            let b_area = (b.bbox[2] - b.bbox[0]) * (b.bbox[3] - b.bbox[1]);
+            if (a_area - b_area).abs() >= 1.0 {
+                continue;
+            }
+            let intersection = bbox_intersection_area(a.bbox, b.bbox);
+            let max_area = a_area.max(b_area);
+            if max_area <= 0.0 || intersection / max_area < 0.95 {
+                continue;
+            }
+
+            // Same bbox, one Abstract and one Text — decide which to keep
+            let (abstract_idx, text_idx) = if a.kind == RegionKind::Abstract {
+                (ai, bi)
+            } else {
+                (bi, ai)
+            };
+
+            if regions[abstract_idx].confidence > 0.5 {
+                // Keep Abstract, consume Text
+                to_consume.push(text_idx);
+            } else {
+                // Keep Text, consume Abstract
+                to_consume.push(abstract_idx);
             }
         }
     }
