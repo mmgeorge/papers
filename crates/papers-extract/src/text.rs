@@ -31,6 +31,8 @@ struct ImageChar<'a> {
     space_threshold: f32,
     /// Rendered font size in PDF points (from PdfChar).
     font_size: f32,
+    /// Whether the character is rendered in an italic font.
+    is_italic: bool,
     _source: &'a PdfChar,
 }
 
@@ -73,6 +75,7 @@ fn to_image_char<'a>(c: &'a PdfChar, page_height_pt: f32) -> ImageChar<'a> {
         ],
         space_threshold: c.space_threshold,
         font_size: c.font_size,
+        is_italic: c.is_italic,
         _source: c,
     }
 }
@@ -936,7 +939,23 @@ fn build_line_text(elements: &[&LineElement]) -> String {
         else { widths.iter().sum::<f32>() / widths.len() as f32 }
     };
 
-    for elem in elements {
+    let mut in_italic = false;
+
+    // Helper: find the next non-space, non-control element's italic status.
+    let next_non_space_italic = |from: usize| -> bool {
+        for e in &elements[from..] {
+            match e {
+                LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' ' => {
+                    return c.is_italic;
+                }
+                LineElement::Formula { .. } => return false,
+                _ => continue,
+            }
+        }
+        false
+    };
+
+    for (ei, elem) in elements.iter().enumerate() {
         match elem {
             LineElement::Char(c) => {
                 if c.codepoint.is_control() { continue; }
@@ -948,30 +967,49 @@ fn build_line_text(elements: &[&LineElement]) -> String {
                         let threshold = if c.space_threshold > 0.0 {
                             c.space_threshold
                         } else {
-                            // Last-resort fallback when no font info at all
                             avg_width * 0.3
                         };
                         if threshold > 0.0 && gap >= threshold && !text.ends_with(' ') {
+                            if in_italic && !c.is_italic {
+                                text.push('*');
+                                in_italic = false;
+                            }
                             text.push(' ');
                         }
                     }
                 }
 
-                text.push(c.codepoint);
-                // Track the right edge of the last non-zero-width character.
-                // Zero-width chars (pdfium's generated spaces) are skipped so they
-                // don't reset prev_right and interfere with gap measurement.
+                // Handle italic transitions.
+                if c.codepoint == ' ' {
+                    if in_italic && !next_non_space_italic(ei + 1) {
+                        // Next real char is not italic — close before the space.
+                        text.push('*');
+                        in_italic = false;
+                    }
+                    text.push(' ');
+                } else {
+                    if c.is_italic && !in_italic {
+                        text.push('*');
+                        in_italic = true;
+                    } else if !c.is_italic && in_italic {
+                        text.push('*');
+                        in_italic = false;
+                    }
+                    text.push(c.codepoint);
+                }
+
                 let w = c.bbox[2] - c.bbox[0];
                 if w > 0.0 {
                     prev_right = Some(c.bbox[2]);
                 }
             }
             LineElement::Formula { latex, .. } => {
-                // Merge adjacent formulas: if the text already ends with a
-                // formula (`$` or `$ `), reopen it instead of starting a new one.
+                if in_italic {
+                    text.push('*');
+                    in_italic = false;
+                }
                 let trimmed = text.trim_end();
                 if trimmed.ends_with('$') && trimmed.len() > 1 {
-                    // Remove the trailing `$` and any space after it
                     let dollar_pos = trimmed.len() - 1;
                     text.truncate(dollar_pos);
                     text.push(' ');
@@ -990,6 +1028,9 @@ fn build_line_text(elements: &[&LineElement]) -> String {
                 prev_right = None;
             }
         }
+    }
+    if in_italic {
+        text.push('*');
     }
     collapse_spaces(&text)
 }
@@ -1395,6 +1436,10 @@ mod tests {
     /// Converts to PDF space internally using page_height_pt.
     /// Uses a default space_threshold of 1.5 (≈ 10pt font × 0.3 ratio / 2).
     fn make_char_image_space(c: char, x: f32, y_top_img: f32, w: f32, h: f32, page_h: f32) -> PdfChar {
+        make_char_image_space_italic(c, x, y_top_img, w, h, page_h, false)
+    }
+
+    fn make_char_image_space_italic(c: char, x: f32, y_top_img: f32, w: f32, h: f32, page_h: f32, is_italic: bool) -> PdfChar {
         // In image space: y_top_img is the top of the char (small value = near top of page)
         // In PDF space: top = page_h - y_top_img, bottom = page_h - (y_top_img + h)
         let pdf_top = page_h - y_top_img;
@@ -1405,6 +1450,7 @@ mod tests {
             space_threshold: 1.5,
             font_name: String::new(),
             font_size: 10.0,
+            is_italic,
         }
     }
 
@@ -1561,6 +1607,7 @@ mod tests {
             space_threshold: 0.0,
             font_name: String::new(),
             font_size: 10.0,
+            is_italic: false,
         };
         let img = to_image_char(&top_char, page_h);
         // In image space, this should be near y=0 (top of page)
@@ -1574,6 +1621,7 @@ mod tests {
             space_threshold: 0.0,
             font_name: String::new(),
             font_size: 10.0,
+            is_italic: false,
         };
         let img = to_image_char(&bottom_char, page_h);
         // In image space, this should be near y=790 (bottom of page)
@@ -1672,6 +1720,153 @@ mod tests {
         let bbox = [50.0, 50.0, 600.0, 200.0];
         let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
         assert_eq!(text, "Hello");
+    }
+
+    // ── Italic marker tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_italic_run_produces_markers() {
+        // "Hello *World*" — World is italic
+        let mut chars = Vec::new();
+        for (i, c) in "Hello".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // Gap-based space (wide gap > threshold)
+        for (i, c) in "World".chars().enumerate() {
+            chars.push(make_char_image_space_italic(c, 160.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H, true));
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert_eq!(text, "Hello *World*");
+    }
+
+    #[test]
+    fn test_italic_whole_line() {
+        let mut chars = Vec::new();
+        for (i, c) in "AllItalic".chars().enumerate() {
+            chars.push(make_char_image_space_italic(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H, true));
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert_eq!(text, "*AllItalic*");
+    }
+
+    #[test]
+    fn test_no_italic_markers_for_regular_text() {
+        let mut chars = Vec::new();
+        for (i, c) in "Normal".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert_eq!(text, "Normal");
+    }
+
+    #[test]
+    fn test_italic_mixed_with_regular() {
+        // "*Heading.* Regular text"
+        let mut chars = Vec::new();
+        let mut x = 100.0;
+        for c in "Heading.".chars() {
+            chars.push(make_char_image_space_italic(c, x, 100.0, 10.0, 12.0, PAGE_H, true));
+            x += 10.5;
+        }
+        // Gap-based space
+        x += 10.0;
+        for c in "Regular".chars() {
+            chars.push(make_char_image_space(c, x, 100.0, 10.0, 12.0, PAGE_H));
+            x += 10.5;
+        }
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert_eq!(text, "*Heading.* Regular");
+    }
+
+    #[test]
+    fn test_italic_multi_word_span() {
+        // "*Approximating Constraints.* For hard" — italic spans multiple words
+        let mut chars = Vec::new();
+        let mut x = 100.0;
+        for c in "Approximating".chars() {
+            chars.push(make_char_image_space_italic(c, x, 100.0, 10.0, 12.0, PAGE_H, true));
+            x += 10.5;
+        }
+        // pdfium zero-width space between italic words
+        chars.push(make_char_image_space_italic(' ', x, 100.0, 0.0, 12.0, PAGE_H, true));
+        x += 5.0;
+        for c in "Constraints.".chars() {
+            chars.push(make_char_image_space_italic(c, x, 100.0, 10.0, 12.0, PAGE_H, true));
+            x += 10.5;
+        }
+        // Gap-based space before non-italic text
+        x += 10.0;
+        for c in "For".chars() {
+            chars.push(make_char_image_space(c, x, 100.0, 10.0, 12.0, PAGE_H));
+            x += 10.5;
+        }
+        x += 10.0;
+        for c in "hard".chars() {
+            chars.push(make_char_image_space(c, x, 100.0, 10.0, 12.0, PAGE_H));
+            x += 10.5;
+        }
+        let bbox = [50.0, 50.0, 800.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert_eq!(text, "*Approximating Constraints.* For hard");
+    }
+
+    #[test]
+    fn test_italic_does_not_leak_across_formula() {
+        // "*Heading* $x$ regular" — italic closes before formula
+        let mut chars = Vec::new();
+        let mut x = 100.0;
+        for c in "Heading".chars() {
+            chars.push(make_char_image_space_italic(c, x, 100.0, 10.0, 12.0, PAGE_H, true));
+            x += 10.5;
+        }
+        // Formula region starting after a gap
+        let formula_start = x + 10.0;
+        let formula = InlineFormula {
+            bbox: [formula_start, 95.0, formula_start + 15.0, 115.0],
+            latex: "x".to_string(),
+        };
+        // Chars under the formula (would be excluded by interleave)
+        // Just put regular chars after formula position
+        x = formula_start + 25.0;
+        for c in "regular".chars() {
+            chars.push(make_char_image_space(c, x, 100.0, 10.0, 12.0, PAGE_H));
+            x += 10.5;
+        }
+        let bbox = [50.0, 50.0, 800.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[&formula], AssemblyMode::Reflow);
+        assert!(text.contains("*Heading*"), "Expected italic markers around Heading, got: {text}");
+        assert!(text.contains("$x$"), "Expected formula, got: {text}");
+        // Italic should not leak into formula or regular text
+        assert!(!text.contains("*$"), "Italic should not touch formula: {text}");
+        assert!(!text.contains("*regular"), "Italic should not leak into regular: {text}");
+    }
+
+    #[test]
+    fn test_italic_multiple_separate_runs() {
+        // "*word1* normal *word2*" — two separate italic runs
+        let mut chars = Vec::new();
+        let mut x = 100.0;
+        for c in "word1".chars() {
+            chars.push(make_char_image_space_italic(c, x, 100.0, 10.0, 12.0, PAGE_H, true));
+            x += 10.5;
+        }
+        x += 10.0;
+        for c in "normal".chars() {
+            chars.push(make_char_image_space(c, x, 100.0, 10.0, 12.0, PAGE_H));
+            x += 10.5;
+        }
+        x += 10.0;
+        for c in "word2".chars() {
+            chars.push(make_char_image_space_italic(c, x, 100.0, 10.0, 12.0, PAGE_H, true));
+            x += 10.5;
+        }
+        let bbox = [50.0, 50.0, 800.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::Reflow);
+        assert_eq!(text, "*word1* normal *word2*");
     }
 
     #[test]
@@ -2035,6 +2230,7 @@ mod tests {
             space_threshold: 1.5,
             font_name: String::new(),
             font_size,
+            is_italic: false,
         }
     }
 
@@ -2413,6 +2609,7 @@ mod tests {
             space_threshold: 1.5,
             font_name: String::new(),
             font_size,
+            is_italic: false,
         }
     }
 

@@ -30,6 +30,8 @@ pub struct PdfChar {
     pub font_name: String,
     /// Rendered font size in PDF points.
     pub font_size: f32,
+    /// Whether the font is italic (excluding symbolic/math fonts).
+    pub is_italic: bool,
 }
 
 /// Render a page to an RGB image at the given DPI.
@@ -124,6 +126,12 @@ fn push_char(
         .entry(font_name.clone())
         .or_insert_with(|| compute_space_width_ratio(char_info, &font_name));
 
+    // Italic detection: trust font_is_italic() but skip math/symbol fonts
+    // that report italic as a side effect (e.g. CMMI, CMSY, MathPI).
+    // We can't use font_is_symbolic() alone because TeX-embedded text fonts
+    // (like LinLibertineTI) also set the symbolic flag due to custom encodings.
+    let is_italic = char_info.font_is_italic() && !is_math_font(&font_name);
+
     chars.push(PdfChar {
         codepoint: c,
         bbox: [
@@ -135,7 +143,23 @@ fn push_char(
         space_threshold: font_size * space_ratio / 2.0,
         font_name: font_name.clone(),
         font_size,
+        is_italic,
     });
+}
+
+/// Check if a font name matches known math/symbol font patterns.
+/// These fonts report italic as a side effect but are not text italic fonts.
+fn is_math_font(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    // TeX math fonts: CMMI (math italic), CMSY (math symbols), CMEX (extensions)
+    // Also catch LMMI (Latin Modern Math Italic), MathPI, etc.
+    n.starts_with("CMMI") || n.starts_with("CMSY") || n.starts_with("CMEX")
+        || n.starts_with("LMMI") || n.starts_with("LMSY")
+        || n.contains("MATHPI") || n.contains("MATH-")
+        || n == "SYMBOL" || n.starts_with("SYMBOL-")
+        || n.contains("DINGBAT")
+        // Libertine/Stix math variants (not text italic)
+        || n.contains("LIBERTINEMATH") || n.contains("MATHMI")
 }
 
 fn is_high_surrogate(raw: u32) -> bool {

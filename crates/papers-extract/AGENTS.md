@@ -140,3 +140,5 @@ CLI: `--backend cuda|coreml|cpu|auto` (default: `auto`)
 
 Unit tests use synthetic data — no models or pdfium required.
 Integration tests (manual): need pdfium binary + downloaded models + formula ONNX models.
+
+**Always add unit tests** when adding or modifying functionality. If existing tests pass but don't cover the new behavior, add tests that specifically exercise the new code paths. Missing coverage means bugs can slip through undetected. If tests pass but running the actual extraction produces incorrect output, that's a signal that test coverage is insufficient — add tests that reproduce the real-world failure before fixing it.

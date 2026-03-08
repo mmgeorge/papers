@@ -257,20 +257,32 @@ fn render_markdown(result: &ExtractionResult) -> String {
                 i += 1;
                 continue;
             }
-            // Previous text ended mid-sentence — extract trailing fragment
+            // Previous text ended mid-sentence — merge with continuation.
+            // Try to split section k at the last sentence boundary and move
+            // only the trailing fragment forward.  If the portion before the
+            // last sentence end is very short (< 40 chars), it is likely a
+            // run-in heading (e.g. "Approximating Constraints."), not a
+            // standalone paragraph — merge the continuation backward instead.
             let text = sections[k].markdown.trim_end().to_string();
             let sentence_end = text.rfind(|c: char| matches!(c, '.' | '!' | '?'));
-            let (keep, fragment) = if let Some(pos) = sentence_end {
-                let split = pos + 1;
-                (text[..split].to_string(), text[split..].trim().to_string())
+            let can_split = sentence_end
+                .map(|pos| text[..=pos].trim().len() >= 40)
+                .unwrap_or(false);
+            if can_split {
+                let split = sentence_end.unwrap() + 1;
+                let fragment = text[split..].trim().to_string();
+                if !fragment.is_empty() {
+                    sections[k].markdown = text[..split].to_string();
+                    let next_md = sections[i].markdown.trim().to_string();
+                    sections[i].markdown = format!("{fragment} {next_md}");
+                }
             } else {
-                // Entire section is one incomplete sentence
-                (String::new(), text)
-            };
-            if !fragment.is_empty() {
-                sections[k].markdown = keep;
+                // Merge continuation backward into section k.
                 let next_md = sections[i].markdown.trim().to_string();
-                sections[i].markdown = format!("{fragment} {next_md}");
+                if !next_md.is_empty() {
+                    sections[k].markdown = format!("{text} {next_md}");
+                    sections[i].markdown = String::new();
+                }
             }
             i += 1;
         }
