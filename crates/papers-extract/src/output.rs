@@ -110,11 +110,17 @@ fn render_markdown(result: &ExtractionResult) -> String {
     // Collect rendered sections with metadata for cross-region dehyphenation.
     struct Section {
         markdown: String,
+        kind: RegionKind,
         is_text: bool,
         is_references: bool,
         /// Display formulas are part of the paragraph flow — text before/after
         /// them should NOT be rearranged across them.
         is_formula: bool,
+        /// A short single-line text block that doesn't span the page width.
+        /// These are typically author names, affiliations, or other metadata
+        /// that the PDF intentionally places on separate lines. They should
+        /// not be merged with neighboring text via the mid-sentence heuristic.
+        is_short_line: bool,
     }
 
     let mut sections: Vec<Section> = Vec::new();
@@ -160,26 +166,50 @@ fn render_markdown(result: &ExtractionResult) -> String {
             }
 
             let is_formula = region.kind == RegionKind::DisplayFormula;
+
+            // Detect short single-line text blocks: narrow region AND short
+            // text content. These are typically author names, affiliations,
+            // sub-figure labels, or other metadata that the PDF intentionally
+            // places on separate lines — NOT paragraph fragments.
+            //
+            // Width threshold is 35% of page width. This cleanly separates:
+            //   - Author lines / labels: ~20-30% of page width → narrow
+            //   - Two-column paragraph blocks: ~40%+ of page width → not narrow
+            //   - Single-column paragraphs: ~85%+ → not narrow
+            //
+            // The text-length check (< 80 chars) further guards against
+            // paragraph fragments that happen to be narrow.
+            let is_short_line = is_text && {
+                let region_width = region.bbox[2] - region.bbox[0];
+                let has_bbox = region_width > 0.0;
+                let narrow = has_bbox && region_width < page.width_pt * 0.35;
+                let short_text = section.trim().len() < 80;
+                narrow && short_text
+            };
+
             sections.push(Section {
                 markdown: section,
+                kind: region.kind,
                 is_text,
                 is_references,
                 is_formula,
+                is_short_line,
             });
         }
     }
 
-    // Pre-pass: when a text section ends with STX (U+0002), the last word was
-    // split by a hyphen at a region boundary. Move the trailing word fragment
-    // from this section to the front of the next text section, joining the word.
-    // This handles intervening non-text regions (figures, formulas) correctly.
+    // --- Dehyphenation across region boundaries ---
+    //
+    // When a text region ends with STX (U+0002), the last word was split by
+    // a hyphen at a region boundary (e.g., "approx-" at end of one column,
+    // "imation" at the top of the next). Move the trailing word fragment
+    // to the front of the next text section, rejoining the hyphenated word.
+    // Non-text sections between them (figures, formulas) are skipped over.
     let mut i = 0;
     while i < sections.len() {
         if sections[i].is_text && sections[i].markdown.ends_with('\u{0002}') {
-            // Remove STX sentinel
-            sections[i].markdown.pop();
+            sections[i].markdown.pop(); // remove STX sentinel
 
-            // Find the trailing word fragment (chars after the last space/newline)
             let split_pos = sections[i]
                 .markdown
                 .rfind(|c: char| c == ' ' || c == '\n')
@@ -188,7 +218,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
             let fragment = sections[i].markdown[split_pos..].to_string();
             sections[i].markdown.truncate(split_pos);
 
-            // Find the next text section and prepend the fragment
             if !fragment.is_empty() {
                 let mut found = false;
                 for j in (i + 1)..sections.len() {
@@ -199,7 +228,6 @@ fn render_markdown(result: &ExtractionResult) -> String {
                     }
                 }
                 if !found {
-                    // No next text section found; put fragment back
                     sections[i].markdown.push_str(&fragment);
                 }
             }
@@ -207,20 +235,33 @@ fn render_markdown(result: &ExtractionResult) -> String {
         i += 1;
     }
 
-    // Pre-pass 2: rejoin paragraphs split across non-formula, non-text
-    // elements (figures, algorithms, captions) or column breaks. For each
-    // text section, search backward for the previous text section. If that
-    // previous text ended mid-sentence AND no display formula sits between
-    // them, move the trailing sentence fragment forward.
+    // --- Rejoin paragraphs split across column/page breaks ---
     //
-    // Display formulas are part of the paragraph flow — the surrounding text
-    // intentionally wraps around them, so we must not rearrange across them.
+    // In multi-column layouts, a paragraph may be split across two text
+    // regions with non-text elements between them (figures, algorithms,
+    // footnotes, captions). We detect this by checking if the previous
+    // text section ends mid-sentence (no terminal punctuation). If so,
+    // the two sections are halves of the same paragraph — merge them.
     //
-    // Examples that DO merge:
-    //   "...method presented superior" "convergence behavior..."  (column break)
-    //   "...As expected, VBD" [Algorithm] "converges slower..."   (algorithm)
-    // Examples that do NOT merge:
-    //   "...Simo et al." [DisplayFormula] "1992] where Δt..."     (formula is inline)
+    // Skip conditions (these should never participate in paragraph merging):
+    //   - Abstract regions: structurally distinct from preceding metadata
+    //   - Short single-line blocks (bbox < 35% page width AND < 80 chars):
+    //     author names, affiliations, sub-figure labels like "(a) Reference"
+    //
+    // Backward search blockers (structural boundaries):
+    //   - Display formulas: part of paragraph flow, text wraps around them
+    //   - Titles / paragraph titles: new document sections
+    //
+    // The backward search also skips over short single-line blocks
+    // transparently, so paragraph halves find each other even when
+    // separated by sub-figure labels and figures.
+    //
+    // Examples:
+    //   DO merge:  "...method presented superior"  +  "convergence behavior..."
+    //   DO merge:  "...constraints" [Footnote] "and produce stable..."
+    //   DO merge:  "...shows a" [(a) Ref] [Fig] [(b) AVBD] [Fig] "delicate card..."
+    //   NO merge:  "...et al." [DisplayFormula] "1992] where..."
+    //   NO merge:  "CHRIS GILES, USA"  +  "ELIE DIAZ, University..."
     {
         let mut i = 1;
         while i < sections.len() {
@@ -228,21 +269,43 @@ fn render_markdown(result: &ExtractionResult) -> String {
                 i += 1;
                 continue;
             }
-            // Search backward for the previous text section, but stop if we
-            // hit a display formula — those are part of the paragraph flow.
-            let mut blocked_by_formula = false;
+            if sections[i].kind == RegionKind::Abstract {
+                i += 1;
+                continue;
+            }
+            // Short single-line blocks (sub-figure labels, author lines)
+            // are standalone — they should not merge into paragraphs.
+            if sections[i].is_short_line {
+                i += 1;
+                continue;
+            }
+
+            // Search backward for the nearest paragraph-like text section,
+            // skipping over short single-line blocks (sub-figure labels,
+            // author lines, etc.) which are neither merge candidates nor
+            // structural boundaries. Stop at actual boundaries (formulas,
+            // titles) that mark distinct document sections.
+            let mut blocked = false;
             let mut prev_text = None;
             for k in (0..i).rev() {
-                if sections[k].is_formula {
-                    blocked_by_formula = true;
+                if sections[k].is_formula
+                    || matches!(
+                        sections[k].kind,
+                        RegionKind::Title | RegionKind::ParagraphTitle
+                    )
+                {
+                    blocked = true;
                     break;
                 }
-                if sections[k].is_text && !sections[k].markdown.trim().is_empty() {
+                if sections[k].is_text
+                    && !sections[k].markdown.trim().is_empty()
+                    && !sections[k].is_short_line
+                {
                     prev_text = Some(k);
                     break;
                 }
             }
-            if blocked_by_formula {
+            if blocked {
                 i += 1;
                 continue;
             }
@@ -250,6 +313,8 @@ fn render_markdown(result: &ExtractionResult) -> String {
                 i += 1;
                 continue;
             };
+
+            // Check if the previous text ends mid-sentence.
             let prev_trimmed = sections[k].markdown.trim();
             let ends_mid = prev_trimmed
                 .ends_with(|c: char| !matches!(c, '.' | '!' | '?' | ':' | '"' | '\u{201D}'));
@@ -257,32 +322,14 @@ fn render_markdown(result: &ExtractionResult) -> String {
                 i += 1;
                 continue;
             }
-            // Previous text ended mid-sentence — merge with continuation.
-            // Try to split section k at the last sentence boundary and move
-            // only the trailing fragment forward.  If the portion before the
-            // last sentence end is very short (< 40 chars), it is likely a
-            // run-in heading (e.g. "Approximating Constraints."), not a
-            // standalone paragraph — merge the continuation backward instead.
+
+            // Two halves of the same paragraph — merge continuation into
+            // the previous section and clear the current one.
             let text = sections[k].markdown.trim_end().to_string();
-            let sentence_end = text.rfind(|c: char| matches!(c, '.' | '!' | '?'));
-            let can_split = sentence_end
-                .map(|pos| text[..=pos].trim().len() >= 40)
-                .unwrap_or(false);
-            if can_split {
-                let split = sentence_end.unwrap() + 1;
-                let fragment = text[split..].trim().to_string();
-                if !fragment.is_empty() {
-                    sections[k].markdown = text[..split].to_string();
-                    let next_md = sections[i].markdown.trim().to_string();
-                    sections[i].markdown = format!("{fragment} {next_md}");
-                }
-            } else {
-                // Merge continuation backward into section k.
-                let next_md = sections[i].markdown.trim().to_string();
-                if !next_md.is_empty() {
-                    sections[k].markdown = format!("{text} {next_md}");
-                    sections[i].markdown = String::new();
-                }
+            let next_md = sections[i].markdown.trim().to_string();
+            if !next_md.is_empty() {
+                sections[k].markdown = format!("{text} {next_md}");
+                sections[i].markdown = String::new();
             }
             i += 1;
         }
@@ -420,11 +467,9 @@ fn region_to_markdown(region: &Region) -> String {
             }
         }
         RegionKind::Footnote => {
-            if let Some(ref text) = region.text {
-                format!("[^]: {text}")
-            } else {
-                String::new()
-            }
+            // Footnotes are metadata (author addresses, permissions, etc.)
+            // — omit from the main markdown body.
+            String::new()
         }
         RegionKind::FigureTitle
         | RegionKind::TableTitle
@@ -1331,6 +1376,218 @@ mod tests {
         assert!(
             md.contains("[Simo et al.\n\n$$x = argmin E(x)$$\n\n1992]"),
             "text should stay in place around formula, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_authors_into_abstract() {
+        // Title → author Text blocks → Image → Abstract: the author lines
+        // end without terminal punctuation ("USA"), but should NOT merge
+        // with the abstract that follows.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Title);
+                r.text = Some("Augmented Vertex Block Descent".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("CHRIS GILES, Roblox, USA".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("CEM YUKSEL, University of Utah, USA".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Image);
+                r.image_path = Some("images/p1_4.png".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Abstract);
+                r.text = Some("Vertex Block Descent is a fast physics-based simulation method.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        // Authors should remain separate from the abstract
+        assert!(
+            md.contains("University of Utah, USA\n\n"),
+            "authors should not merge into abstract, got: {md}"
+        );
+        assert!(
+            md.contains("Vertex Block Descent is a fast"),
+            "abstract should be present, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_across_title_boundary() {
+        // Text → Title → Text: a Title between text blocks should prevent
+        // backward merge even when the first text ends mid-sentence.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("some text ending mid".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Title);
+                r.text = Some("Section 2".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("sentence that continues here.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        // Should NOT merge across the title
+        assert!(
+            md.contains("some text ending mid\n\n# Section 2"),
+            "text before title should stay separate, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_text_into_abstract_even_when_text_kind() {
+        // When the abstract is detected as RegionKind::Abstract,
+        // it should never absorb the previous text block.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("Author Name, Institution".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Abstract);
+                r.text = Some("We present a novel approach to solving.".into());
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        assert!(
+            md.contains("Author Name, Institution\n\nWe present"),
+            "abstract should not merge with preceding text, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_no_merge_short_line_author_blocks() {
+        // Three narrow author lines (< 50% of 612pt page) should NOT be merged
+        // even though they end without terminal punctuation.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Title);
+                r.text = Some("Augmented Vertex Block Descent".into());
+                r.bbox = [49.0, 76.0, 289.0, 95.0]; // ~240pt wide
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("CHRIS GILES, Roblox, USA".into());
+                r.bbox = [49.0, 104.0, 178.0, 117.0]; // ~129pt wide (21% of 612)
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("ELIE DIAZ, University of Utah, USA".into());
+                r.bbox = [49.0, 118.0, 211.0, 132.0]; // ~162pt wide (26% of 612)
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("CEM YUKSEL, University of Utah, USA".into());
+                r.bbox = [49.0, 132.0, 228.0, 146.0]; // ~179pt wide (29% of 612)
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        // Each author should be a separate paragraph, not merged together
+        assert!(
+            md.contains("CHRIS GILES, Roblox, USA\n\nELIE DIAZ"),
+            "author lines should stay separate, got: {md}"
+        );
+        assert!(
+            md.contains("ELIE DIAZ, University of Utah, USA\n\nCEM YUKSEL"),
+            "author lines should stay separate, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_wide_text_blocks_still_merge() {
+        // Two wide text blocks (> 50% of page) that end mid-sentence should
+        // still merge — these are paragraph splits, not metadata lines.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("method presented superior".into());
+                r.bbox = [49.0, 300.0, 560.0, 320.0]; // ~511pt wide (83% of 612)
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("convergence behavior over prior techniques.".into());
+                r.bbox = [49.0, 400.0, 560.0, 420.0]; // ~511pt wide
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        assert!(
+            md.contains("presented superior convergence behavior"),
+            "wide text blocks should still merge mid-sentence, got: {md}"
+        );
+    }
+
+    #[test]
+    fn test_merge_across_subfigure_labels() {
+        // Paragraph split across multiple figures with short sub-figure labels.
+        // The backward search should skip over the short labels to find the
+        // real paragraph text and merge the two halves.
+        let result = make_result(vec![
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("Figure 6 shows a".into());
+                r.bbox = [49.0, 300.0, 300.0, 400.0]; // column-width paragraph
+                r
+            },
+            {
+                // Sub-figure label: short + narrow → is_short_line
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("(a) Reference".into());
+                r.bbox = [49.0, 410.0, 140.0, 425.0]; // narrow, 13 chars
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Image);
+                r.image_path = Some("images/p8_5.png".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("(b) AVBD, 5 iter.".into());
+                r.bbox = [49.0, 500.0, 160.0, 515.0]; // narrow, 17 chars
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Image);
+                r.image_path = Some("images/p8_9.png".into());
+                r
+            },
+            {
+                let mut r = make_region(RegionKind::Text);
+                r.text = Some("delicate card tower with very lightweight bodies.".into());
+                r.bbox = [49.0, 600.0, 300.0, 700.0]; // column-width paragraph
+                r
+            },
+        ]);
+        let md = render_markdown(&result);
+        assert!(
+            md.contains("shows a delicate card tower"),
+            "paragraph should merge across sub-figure labels, got: {md}"
         );
     }
 }
