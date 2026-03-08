@@ -174,6 +174,12 @@ fn match_chars_to_region<'a>(
         .collect()
 }
 
+/// Average center Y of all elements in a line.
+fn line_center_y(line: &[&LineElement]) -> f32 {
+    let sum: f32 = line.iter().map(|e| e.center_y()).sum();
+    sum / line.len() as f32
+}
+
 /// Group line elements into lines by Y-proximity.
 ///
 /// Elements with center Y within `avg_height * 0.5` of each other
@@ -236,7 +242,40 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
         lines.push(current_line);
     }
 
-    lines
+    // Post-pass: merge orphan lines (≤2 visible chars) into the nearest adjacent
+    // line when the Y gap is within avg_height (a looser threshold than the
+    // initial grouping). This rescues stray characters like '←' that are rendered
+    // at a slightly different vertical position in the PDF.
+    let merge_threshold = avg_height;
+    let mut merged: Vec<Vec<&LineElement>> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let visible_count = line
+            .iter()
+            .filter(|e| match e {
+                LineElement::Char(c) => !c.codepoint.is_whitespace() && !c.codepoint.is_control(),
+                LineElement::Formula { .. } => true,
+            })
+            .count();
+        if visible_count <= 2 && !merged.is_empty() {
+            // Check Y gap to the previous line
+            let prev_y = line_center_y(merged.last().unwrap());
+            let this_y = line_center_y(&line);
+            if (this_y - prev_y).abs() <= merge_threshold {
+                // Merge into previous line, then re-sort by X
+                let prev = merged.last_mut().unwrap();
+                prev.extend(line);
+                prev.sort_by(|a, b| {
+                    a.center_x()
+                        .partial_cmp(&b.center_x())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                continue;
+            }
+        }
+        merged.push(line);
+    }
+
+    merged
 }
 
 /// Assemble lines of elements into flowing text with paragraph detection.
@@ -547,6 +586,33 @@ fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -
             formatted.push_str(&build_line_text(&processed_refs));
         }
 
+        // In a numbered algorithm, a very short unnumbered line (after the
+        // title) is likely a continuation of the previous numbered line —
+        // formula glyphs that landed on a different Y band in the PDF.
+        // Only merge when the line has ≤3 visible characters (stray arrows,
+        // subscripts, etc.), not legitimate unnumbered lines like comments.
+        if has_line_numbers && num.is_none() && !output_lines.is_empty() && i > 0 {
+            let visible_chars = line
+                .iter()
+                .filter(|e| match e {
+                    LineElement::Char(c) => {
+                        !c.codepoint.is_whitespace() && !c.codepoint.is_control()
+                    }
+                    LineElement::Formula { .. } => true,
+                })
+                .count();
+            if visible_chars <= 3 {
+                let prev = output_lines.last_mut().unwrap();
+                let trimmed = formatted.trim();
+                if !trimmed.is_empty() {
+                    if !prev.ends_with(' ') {
+                        prev.push(' ');
+                    }
+                    prev.push_str(trimmed);
+                }
+                continue;
+            }
+        }
         output_lines.push(formatted);
     }
 
@@ -612,6 +678,26 @@ fn split_line_number_prefix(line: &[&LineElement]) -> (Option<String>, usize) {
                 idx += 1;
             }
             _ => break,
+        }
+    }
+
+    // Phase 3: skip optional ':' separator (common in algorithm pseudocode: "4: x ← ...")
+    if idx < line.len() {
+        if let LineElement::Char(c) = &line[idx] {
+            if c.codepoint == ':' {
+                idx += 1;
+                // Skip whitespace after the colon
+                while idx < line.len() {
+                    match &line[idx] {
+                        LineElement::Char(c)
+                            if c.codepoint == ' ' || c.codepoint.is_control() =>
+                        {
+                            idx += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
         }
     }
 
@@ -3188,5 +3274,142 @@ mod tests {
         assert!(result.is_some(), "Should handle realistic formula");
         let latex = result.unwrap();
         assert_eq!(latex, "v_{i}=(x_{i}-x_{ti})/h");
+    }
+
+    #[test]
+    fn test_line_number_colon_separator_stripped() {
+        // Algorithm format "4: x ← ..." — the colon after the line number
+        // should be stripped so indentation is measured from the content after
+        // the colon, not from the colon itself.
+        let mut chars = Vec::new();
+
+        // Line 1: "1: for x" at (number at x=55, colon at x=65, content at x=75)
+        chars.push(make_char_image_space('1', 55.0, 100.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 61.0, 100.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(':', 65.0, 100.0, 4.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 69.0, 100.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "for".chars().enumerate() {
+            chars.push(make_char_image_space(c, 75.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+
+        // Line 2: "2:   y=0" at (number at x=55, colon at x=65, content at x=95 — indented)
+        chars.push(make_char_image_space('2', 55.0, 130.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 61.0, 130.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(':', 65.0, 130.0, 4.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 69.0, 130.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "y=0".chars().enumerate() {
+            chars.push(make_char_image_space(c, 95.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "Should have 2 lines: {text:?}");
+        // Colon should NOT appear in output
+        assert!(
+            !lines[0].contains(':'),
+            "Colon should be stripped from line 1: {:?}",
+            lines[0]
+        );
+        assert!(
+            !lines[1].contains(':'),
+            "Colon should be stripped from line 2: {:?}",
+            lines[1]
+        );
+        // Line 2 should have indentation (content at x=95 vs x=75)
+        let for_col = lines[0].find("for").unwrap();
+        let y_col = lines[1].find("y=0").unwrap();
+        assert!(
+            y_col > for_col,
+            "Line 2 should be indented deeper than line 1: {:?} vs {:?}",
+            lines[0],
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn test_orphan_arrow_merged_into_line() {
+        // A stray '←' at a slightly different Y should merge back into the
+        // nearest line rather than forming its own output line.
+        let mut chars = Vec::new();
+
+        // Line 1: "1: x" at y=100
+        chars.push(make_char_image_space('1', 55.0, 100.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 61.0, 100.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(':', 65.0, 100.0, 4.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 69.0, 100.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('x', 75.0, 100.0, 10.0, 12.0, PAGE_H));
+
+        // Stray '←' at slightly different Y (y=104, within avg_height but outside 0.5*avg_height)
+        chars.push(make_char_image_space('←', 90.0, 104.0, 10.0, 12.0, PAGE_H));
+
+        // "init" continues on line 1's Y
+        for (i, c) in "init".chars().enumerate() {
+            chars.push(make_char_image_space(c, 105.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+
+        // Line 2: "2: end" at y=130
+        chars.push(make_char_image_space('2', 55.0, 130.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 61.0, 130.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(':', 65.0, 130.0, 4.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 69.0, 130.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "end".chars().enumerate() {
+            chars.push(make_char_image_space(c, 75.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], AssemblyMode::PreserveLayout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "Arrow should merge, not create extra line: {text:?}");
+        assert!(
+            lines[0].contains('←'),
+            "Line 1 should contain the arrow: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn test_unnumbered_formula_continuation_merged() {
+        // When a Formula element lands on a different Y band in a numbered
+        // algorithm, it should be merged into the preceding numbered line
+        // rather than creating a separate unnumbered output line.
+        let mut chars = Vec::new();
+
+        // Line 1: "1: x" at y=100
+        chars.push(make_char_image_space('1', 55.0, 100.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 61.0, 100.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(':', 65.0, 100.0, 4.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 69.0, 100.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space('x', 75.0, 100.0, 10.0, 12.0, PAGE_H));
+
+        // Line 2: "2: end" at y=160 (well-separated)
+        chars.push(make_char_image_space('2', 55.0, 160.0, 6.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 61.0, 160.0, 0.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(':', 65.0, 160.0, 4.0, 12.0, PAGE_H));
+        chars.push(make_char_image_space(' ', 69.0, 160.0, 0.0, 12.0, PAGE_H));
+        for (i, c) in "end".chars().enumerate() {
+            chars.push(make_char_image_space(c, 75.0 + i as f32 * 10.5, 160.0, 10.0, 12.0, PAGE_H));
+        }
+
+        // InlineFormula at y=130 (between the two text lines — different Y band)
+        let formula = InlineFormula {
+            bbox: [85.0, 126.0, 150.0, 142.0], // center y ≈ 134 (image space)
+            latex: "f(x)".into(),
+        };
+        let formulas: Vec<&InlineFormula> = vec![&formula];
+
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &formulas, AssemblyMode::PreserveLayout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "Formula should merge into line 1, not create extra line: {text:?}"
+        );
+        assert!(
+            lines[0].contains("$f(x)$"),
+            "Line 1 should contain the formula: {:?}",
+            lines[0]
+        );
     }
 }

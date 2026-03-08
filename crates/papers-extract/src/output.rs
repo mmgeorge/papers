@@ -402,7 +402,7 @@ fn region_to_markdown(region: &Region) -> String {
         }
         RegionKind::Algorithm => {
             if let Some(ref text) = region.text {
-                format!("```\n{text}\n```")
+                text.clone()
             } else {
                 String::new()
             }
@@ -850,7 +850,7 @@ mod tests {
     fn test_algorithm_to_markdown() {
         let mut r = make_region(RegionKind::Algorithm);
         r.text = Some("for i in range(n):".into());
-        assert_eq!(region_to_markdown(&r), "```\nfor i in range(n):\n```");
+        assert_eq!(region_to_markdown(&r), "for i in range(n):");
     }
 
     #[test]
@@ -1251,10 +1251,10 @@ mod tests {
             md.contains("As expected, VBD converges slower"),
             "sentence should rejoin across algorithm, got: {md}"
         );
-        // Algorithm still appears as separate code block
+        // Algorithm still appears as its own section
         assert!(
-            md.contains("```\nAlgorithm 1"),
-            "algorithm should be in code block, got: {md}"
+            md.contains("Algorithm 1"),
+            "algorithm should be present, got: {md}"
         );
     }
 
