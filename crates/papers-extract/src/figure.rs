@@ -587,6 +587,7 @@ pub fn group_figure_regions(regions: &mut Vec<Region>) {
             chart_type: None,
             tag: None,
             items: Some(items),
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         };
@@ -678,6 +679,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         }
@@ -917,6 +919,7 @@ mod tests {
             chart_type: None,
             tag: None,
             items: None,
+            formula_source: None,
             ocr_confidence: None,
             consumed: false,
         }
