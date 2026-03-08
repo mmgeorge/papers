@@ -17,12 +17,8 @@ name = "find_gaps"
 path = "src/bin/find_gaps.rs"
 
 [[bin]]
-name = "run_glm_ocr"
-path = "src/bin/run_glm_ocr.rs"
-
-[[bin]]
-name = "run_formulas"
-path = "src/bin/run_formulas.rs"
+name = "run_ocr"
+path = "src/bin/run_ocr.rs"
 
 
 [dependencies]
