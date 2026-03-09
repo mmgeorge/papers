@@ -773,7 +773,14 @@ pub fn assign_heading_levels(
 
 // ── Phase 5: Merge and Cross-Validate ───────────────────────────────
 
-/// Merge adjacent heading segments on the same line into single headings.
+/// Merge adjacent heading segments into single headings.
+///
+/// Two segments are merged when they are:
+///   - On the same page
+///   - At the same heading depth (same font group in level_map)
+///   - Vertically adjacent: same baseline (horizontal merge) or consecutive
+///     lines within 1.5× font height (multi-line title merge)
+///   - No intervening segment from a *different* heading depth between them
 pub fn merge_heading_segments(
     candidates: &[&TextSegment],
     level_map: &HashMap<FontGroupKey, u32>,
@@ -782,49 +789,140 @@ pub fn merge_heading_segments(
         return Vec::new();
     }
 
-    // Sort candidates by (page, y_center descending — higher Y = higher on page = earlier)
+    // Sort candidates by (page, y_center descending — higher Y = higher on page = earlier,
+    // then x_left ascending for left-to-right on the same line)
     let mut sorted: Vec<&TextSegment> = candidates.to_vec();
     sorted.sort_by(|a, b| {
         a.page
             .cmp(&b.page)
-            .then(b.y_center.partial_cmp(&a.y_center).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.x_left.partial_cmp(&b.x_left).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                b.y_center
+                    .partial_cmp(&a.y_center)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(
+                a.x_left
+                    .partial_cmp(&b.x_left)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
 
     let mut headings: Vec<DetectedHeading> = Vec::new();
 
     for seg in &sorted {
         let Some(depth) = level_map.get(&seg.font_group).copied() else {
-            continue; // Font group not in level map (e.g., capped out) — skip
+            continue;
         };
 
-        // Try to merge with previous heading if on the same line
-        if let Some(last) = headings.last_mut() {
+        // Try to merge with previous heading on the same page at the same depth
+        let merged = if let Some(last) = headings.last_mut() {
             let same_page = last.page == seg.page + 1; // last.page is 1-indexed
-            let _y_tol = seg.median_height * 0.6;
-            // We need to check Y proximity — but we've already converted to 1-indexed page
-            // Use a simple heuristic: if previous heading was on same page and text is short,
-            // check if they're on the same baseline
-            if same_page {
-                // For simplicity in first version: check if last heading title is short
-                // and this segment continues on the same line
-                // We stored y_center in the segment but not in DetectedHeading,
-                // so we'll merge by checking if the gap between segments is small
-                // For now, skip merging — handle in a future refinement
-            }
-        }
+            let same_depth = last.depth == depth;
 
-        headings.push(DetectedHeading {
-            depth,
-            title: seg.text.clone(),
-            page: seg.page + 1, // 1-indexed
-            contained_chars: 0,
-            y_center: seg.y_center,
-            x_right: seg.x_right,
-        });
+            if same_page && same_depth {
+                // Y distance: last.y_center is from the previous segment (PDF coords,
+                // Y-up). Current seg has lower y_center (further down the page).
+                let y_gap = (last.y_center - seg.y_center).abs();
+                // Same baseline (horizontal neighbors): y_gap < 0.6 × height
+                // Multi-line title: y_gap < 1.5 × height (one line spacing)
+                let max_y_gap = seg.median_height * 1.5;
+
+                if y_gap < max_y_gap {
+                    // Merge: append text with space separator
+                    if y_gap < seg.median_height * 0.6 {
+                        // Same line — append with space
+                        last.title.push(' ');
+                    } else {
+                        // Next line — append with space
+                        last.title.push(' ');
+                    }
+                    last.title.push_str(&seg.text);
+                    // Update y_center and x_right to track the latest segment
+                    last.y_center = seg.y_center;
+                    last.x_right = seg.x_right;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !merged {
+            headings.push(DetectedHeading {
+                depth,
+                title: seg.text.clone(),
+                page: seg.page + 1, // 1-indexed
+                contained_chars: 0,
+                y_center: seg.y_center,
+                x_right: seg.x_right,
+            });
+        }
+    }
+
+    // Clean up spaced-out titles like "C h a p t e r 4 . T r u s t - R e g i o n"
+    for h in &mut headings {
+        h.title = collapse_spaced_title(&h.title);
     }
 
     headings
+}
+
+/// Detect and collapse letter-spaced titles.
+///
+/// Some PDFs render decorative headings with each character individually placed,
+/// producing text like "C h a p t e r 4 . T r u s t - R e g i o n M e t h o d s".
+/// This function detects the pattern (majority single-char tokens separated by
+/// spaces) and collapses it to "Chapter 4. Trust-Region Methods".
+fn collapse_spaced_title(text: &str) -> String {
+    let tokens: Vec<&str> = text.split(' ').collect();
+    if tokens.len() < 5 {
+        return text.to_string();
+    }
+
+    // Count single-char tokens (letters, digits, punctuation)
+    let single_count = tokens.iter().filter(|t| t.chars().count() == 1).count();
+    let non_empty_count = tokens.iter().filter(|t| !t.is_empty()).count();
+
+    // If fewer than 60% of non-empty tokens are single chars, not spaced-out
+    if non_empty_count == 0 || (single_count as f32 / non_empty_count as f32) < 0.6 {
+        return text.to_string();
+    }
+
+    // Collapse: join all single-char tokens directly, then re-insert word
+    // boundaries by detecting case/category transitions:
+    //   lowercase → uppercase  ("r" "T" → "r T")
+    //   letter → digit         ("r" "4" → "r 4")
+    //   digit → letter         ("4" "T" → "4 T" — but "." after digit stays: "4." → "4.")
+    //   punctuation → letter   ("." "T" → ". T")
+    //   letter → punctuation that isn't hyphen/dot  (rare)
+    let chars: Vec<char> = tokens
+        .iter()
+        .filter(|t| !t.is_empty())
+        .flat_map(|t| t.chars())
+        .collect();
+
+    let mut result = String::new();
+    for (i, &ch) in chars.iter().enumerate() {
+        if i > 0 {
+            let prev = chars[i - 1];
+            let need_space = (prev.is_lowercase() && ch.is_uppercase())
+                || (prev.is_alphabetic() && ch.is_ascii_digit())
+                || (prev.is_ascii_digit() && ch.is_alphabetic())
+                || (prev == '.' && ch.is_alphabetic())
+                || (prev == ')' && ch.is_alphanumeric())
+                || (prev.is_alphanumeric() && ch == '(');
+            if need_space {
+                result.push(' ');
+            }
+        }
+        result.push(ch);
+    }
+
+    result.trim().to_string()
 }
 
 /// Cross-validate heading depths using numbering patterns.
@@ -1932,5 +2030,31 @@ mod tests {
         ];
         filter_sequence_interrupters(&mut headings);
         assert_eq!(headings.len(), 3);
+    }
+
+    #[test]
+    fn test_collapse_spaced_title() {
+        // Spaced-out chapter heading
+        assert_eq!(
+            collapse_spaced_title("C h a p t e r 4 . T r u s t - R e g i o n M e t h o d s"),
+            "Chapter 4. Trust-Region Methods"
+        );
+        // Spaced-out section number
+        assert_eq!(
+            collapse_spaced_title("4 . 1 . T h e C a u c h y P o i n t"),
+            "4.1. The Cauchy Point"
+        );
+        // Normal text — no collapse
+        assert_eq!(
+            collapse_spaced_title("Trust-Region Methods"),
+            "Trust-Region Methods"
+        );
+        // Short text — no collapse
+        assert_eq!(collapse_spaced_title("A B"), "A B");
+        // All single chars
+        assert_eq!(
+            collapse_spaced_title("A B C D E"),
+            "ABCDE"
+        );
     }
 }
