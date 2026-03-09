@@ -561,9 +561,17 @@ pub fn filter_heading_candidates<'a>(
         if seg.text.chars().count() > 200 {
             return false;
         }
-        // Must have meaningful text content (not just symbols/punctuation/short labels)
+        // Must have meaningful text content (not just symbols/punctuation/short labels).
+        // Exempt multi-char roman numerals (II, III, IV, VI, etc.) which are valid
+        // heading prefixes. Single "I" is too ambiguous (could be pronoun).
+        let trimmed_text = seg.text.trim();
         let meaningful_chars = seg.text.chars().filter(|c| c.is_alphanumeric()).count();
-        if meaningful_chars < 3 {
+        if meaningful_chars < 3
+            && !(trimmed_text.len() >= 2 && is_roman_numeral(trimmed_text))
+            // Single-char roman numerals V, X, L are valid Part headings.
+            // "I" is excluded — too common as pronoun/running header.
+            && !matches!(trimmed_text, "V" | "X" | "L")
+        {
             return false;
         }
         // Must be predominantly alphabetic — filters out figure axis tick labels
@@ -584,8 +592,10 @@ pub fn filter_heading_candidates<'a>(
         // scattered across a figure. For continuous text, average width per char
         // is ~0.45× font height. Scattered diagram labels average ~0.75×.
         // Threshold 0.65× separates continuous headings from spread-out labels.
+        // Skip very short segments (≤3 chars): "II", "IV" etc. are naturally
+        // wide per character in large fonts and aren't diagram labels.
         let char_count = seg.text.chars().count();
-        if char_count > 1 {
+        if char_count > 3 {
             let width = seg.x_right - seg.x_left;
             let avg_width_per_char = width / char_count as f32;
             if avg_width_per_char > seg.median_height * 0.65 {
@@ -609,9 +619,30 @@ pub fn filter_heading_candidates<'a>(
             }
             let diff_family = seg.font_group.family != body_key.family;
             let taller = seg.median_height > body_height * 1.1;
-            diff_family || taller
+            // Multi-level numbering (e.g. "1.2 Background") is reliable structural
+            // evidence — allow these even when font matches body (e.g. bold variant
+            // at nearly the same size: LucidaBright-Demi @ 11pt vs body @ 10.2pt).
+            // Require slightly taller than body (>3%) to exclude exercise/problem
+            // numbers that use exact body font size. Exclude TOC leader dots.
+            let has_multi_level = {
+                let (depth, is_multi) = infer_depth_from_numbering(&seg.text);
+                let slightly_taller = seg.median_height > body_height * 1.03;
+                depth > 0 && is_multi && slightly_taller && !has_leader_dots(&seg.text)
+            };
+            diff_family || taller || has_multi_level
         })
         .collect()
+}
+
+/// Check if text contains TOC-style leader dots ("......9" or ". . . 15").
+fn has_leader_dots(text: &str) -> bool {
+    // Three or more consecutive dots
+    if text.contains("...") {
+        return true;
+    }
+    // Dot-space leader pattern: ". . ." (at least 3 dots separated by spaces)
+    let dot_space_count = text.matches(". .").count();
+    dot_space_count >= 2
 }
 
 // ── Phase 4: Assign Heading Levels ──────────────────────────────────
@@ -684,8 +715,11 @@ pub fn assign_heading_levels(
     let min_instances = if total_pages < 50 { 5 } else { 10 };
 
     // Split groups into taller-than-body and shorter-than-body.
+    // Groups that pass min_pages but fail min_instances are deferred — they may
+    // be promoted if they're taller than all accepted groups (Part-level headings).
     let mut taller: Vec<(FontGroupKey, usize, f32)> = Vec::new();
     let mut shorter: Vec<(FontGroupKey, usize, f32)> = Vec::new();
+    let mut deferred: Vec<(FontGroupKey, usize, usize, f32, usize)> = Vec::new(); // key, chars, segs, height, pages
 
     for (k, acc) in group_stats {
         if acc.pages.len() < min_pages {
@@ -699,19 +733,31 @@ pub fn assign_heading_levels(
             continue;
         }
         if acc.segment_count < min_instances {
-            skipped.push(SkippedFontEntry {
-                font: k.family.clone(),
-                height: acc.median_height,
-                char_count: acc.char_count,
-                pages: acc.pages.len(),
-                reason: format!("too few instances ({}<{min_instances})", acc.segment_count),
-            });
+            deferred.push((k, acc.char_count, acc.segment_count, acc.median_height, acc.pages.len()));
             continue;
         }
         if acc.median_height > body_height {
             taller.push((k, acc.char_count, acc.median_height));
         } else {
             shorter.push((k, acc.char_count, acc.median_height));
+        }
+    }
+
+    // Promote deferred groups that are taller than body AND taller than all
+    // accepted groups. These are rare but visually dominant fonts like Part
+    // titles (e.g., "II. Parallel Patterns" at 31.8pt when chapters are 21.9pt).
+    let tallest_accepted = taller.iter().map(|(_, _, h)| *h).fold(0.0f32, f32::max);
+    for (k, chars, segs, height, pages) in deferred {
+        if height > body_height && height > tallest_accepted {
+            taller.push((k, chars, height));
+        } else {
+            skipped.push(SkippedFontEntry {
+                font: k.family.clone(),
+                height,
+                char_count: chars,
+                pages,
+                reason: format!("too few instances ({segs}<{min_instances})"),
+            });
         }
     }
 
@@ -871,6 +917,31 @@ pub fn merge_heading_segments(
     headings
 }
 
+/// Merge lone roman numeral headings with the next heading on the same page.
+///
+/// Part divider pages often have "II" at the top and "Lighting" much lower,
+/// too far apart for the standard multi-line merge (1.5× height). This pass
+/// detects headings consisting of only a roman numeral and merges them with
+/// the immediately following heading if it's on the same page at the same depth.
+fn merge_lone_roman_numerals(headings: &mut Vec<DetectedHeading>) {
+    let mut i = 0;
+    while i + 1 < headings.len() {
+        let title = headings[i].title.trim();
+        if is_roman_numeral(title) && headings[i].page == headings[i + 1].page {
+            // Merge: prepend roman numeral to the next heading's title,
+            // keeping the roman numeral's depth (shallowest = most prominent).
+            let prefix = headings[i].title.clone();
+            let depth = headings[i].depth.min(headings[i + 1].depth);
+            headings[i + 1].title = format!("{} {}", prefix.trim(), headings[i + 1].title);
+            headings[i + 1].depth = depth;
+            headings[i + 1].y_center = headings[i].y_center;
+            headings.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Detect and collapse letter-spaced titles.
 ///
 /// Some PDFs render decorative headings with each character individually placed,
@@ -931,17 +1002,29 @@ fn collapse_spaced_title(text: &str) -> String {
 /// the numbering depth overrides the font-based depth.
 pub fn cross_validate_depths(headings: &mut [DetectedHeading]) {
     for h in headings.iter_mut() {
-        let numbering_depth = infer_depth_from_numbering(&h.title);
+        let (numbering_depth, is_multi_level) = infer_depth_from_numbering(&h.title);
         if numbering_depth > 0 {
-            h.depth = numbering_depth;
+            if is_multi_level {
+                // Multi-level numbering ("1.2", "A.1", "1.2.3") is structurally
+                // reliable — the dots encode hierarchy. Always override font depth.
+                h.depth = numbering_depth;
+            } else {
+                // Single-level numbering ("1", "2", "II") is ambiguous about
+                // absolute depth — "1" could be Chapter 1 at depth 1 or Chapter 1
+                // within Part I at depth 2. Only deepen, never promote.
+                if numbering_depth > h.depth {
+                    h.depth = numbering_depth;
+                }
+            }
         }
     }
 }
 
 /// Infer heading depth from numbering patterns in the heading text.
 ///
-/// Returns depth (1-based) or 0 if no numbering pattern is detected.
-fn infer_depth_from_numbering(text: &str) -> u32 {
+/// Returns `(depth, is_multi_level)` where depth is 1-based (0 = no pattern)
+/// and `is_multi_level` is true for dot-separated patterns like "1.2", "A.1".
+fn infer_depth_from_numbering(text: &str) -> (u32, bool) {
     let text = text.trim();
 
     if let Some(first_ch) = text.chars().next() {
@@ -967,31 +1050,49 @@ fn infer_depth_from_numbering(text: &str) -> u32 {
             if is_number_pattern {
                 let trimmed = prefix.trim_end_matches('.');
                 let dots = trimmed.chars().filter(|&c| c == '.').count();
-                return (dots as u32) + 1;
+                let depth = (dots as u32) + 1;
+                let is_multi_level = dots > 0;
+                return (depth, is_multi_level);
             }
         }
 
-        // Roman numerals
+        // Roman numerals — always single-level
         if first_ch.is_ascii_uppercase() {
             let num_end = text
                 .find(|c: char| c == ' ' || c == '\t')
                 .unwrap_or(text.len());
             let prefix = &text[..num_end];
             if is_roman_numeral(prefix) {
-                return 1;
+                return (1, false);
             }
         }
     }
 
-    0
+    (0, false)
 }
 
 fn is_roman_numeral(s: &str) -> bool {
     if s.is_empty() || s.len() > 8 {
         return false;
     }
-    s.chars()
+    if !s
+        .chars()
         .all(|c| matches!(c, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+    {
+        return false;
+    }
+    // Validate structure: convert to number and back. Invalid combinations
+    // like "VC" (should be "XCV") will not round-trip correctly.
+    let Some(val) = roman_to_u32(s) else {
+        return false;
+    };
+    // Reject implausibly large heading numbers
+    if val > 100 {
+        return false;
+    }
+    // Round-trip check: convert back and verify
+    let canonical = u32_to_roman(val);
+    canonical == s
 }
 
 /// Check if heading text starts with a structured numbering prefix.
@@ -1104,6 +1205,33 @@ fn roman_to_u32(s: &str) -> Option<u32> {
     if total == 0 { None } else { Some(total) }
 }
 
+/// Convert an integer to its canonical roman numeral string.
+fn u32_to_roman(mut n: u32) -> String {
+    const TABLE: &[(u32, &str)] = &[
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut result = String::new();
+    for &(val, sym) in TABLE {
+        while n >= val {
+            result.push_str(sym);
+            n -= val;
+        }
+    }
+    result
+}
+
 /// Remove headings that interrupt a proven numbering sequence.
 ///
 /// If we see headings numbered X.Y.1 ... X.Y.3 (same parent prefix, increasing
@@ -1135,10 +1263,10 @@ fn filter_sequence_interrupters(headings: &mut Vec<DetectedHeading>) {
     // a shallower depth.
     let mut to_remove: HashSet<usize> = HashSet::new();
 
-    for (ai, (idx_a, parent_a, _num_a, depth_a)) in numbered.iter().enumerate() {
+    for (ai, (idx_a, parent_a, num_a, depth_a)) in numbered.iter().enumerate() {
         // Find the next heading with the same parent and higher sequence number
-        for (idx_b, parent_b, _num_b, depth_b) in &numbered[ai + 1..] {
-            if parent_b != parent_a {
+        for (idx_b, parent_b, num_b, depth_b) in &numbered[ai + 1..] {
+            if parent_b != parent_a || *num_b <= *num_a {
                 continue;
             }
             // Same parent, later in sequence — check everything between idx_a and idx_b
@@ -1149,7 +1277,10 @@ fn filter_sequence_interrupters(headings: &mut Vec<DetectedHeading>) {
                     continue;
                 }
                 let mid = &headings[mid_idx];
-                if mid.depth < seq_depth {
+                // Don't remove numbered headings — they're legitimate
+                // structural elements (e.g. Part "II Lighting" between
+                // chapters "1..." and "2...").
+                if mid.depth < seq_depth && !has_numbering_prefix(&mid.title) {
                     to_remove.insert(mid_idx);
                 }
             }
@@ -1230,6 +1361,12 @@ fn filter_no_content_below(headings: &mut Vec<DetectedHeading>, segments: &[Text
     }
 
     headings.retain(|h| {
+        // Exempt headings with numbering prefixes (Part titles like "II Lighting"
+        // often appear on divider pages with no body text below) and front-matter
+        // headings (Contents, Preface, Index on their own page).
+        if has_numbering_prefix(&h.title) || is_frontmatter_heading(&h.title) {
+            return true;
+        }
         let page_0 = h.page - 1;
         if let Some(ys) = page_y.get(&page_0) {
             // "Below" = lower y_center in PDF coords (Y goes up from bottom).
@@ -1328,17 +1465,54 @@ fn is_frontmatter_heading(title: &str) -> bool {
     )
 }
 
+/// Check if a heading title is specifically a "Contents" / "Table of Contents" heading.
+fn is_contents_heading(title: &str) -> bool {
+    let t = title.trim().to_ascii_lowercase();
+    let t = if let Some(pos) = t.find(|c: char| c.is_ascii_alphabetic()) {
+        t[pos..].trim()
+    } else {
+        return false;
+    };
+    matches!(t, "contents" | "table of contents")
+}
+
 /// Remove all sub-headings that fall under a front-matter heading.
 ///
 /// Keeps the front-matter heading itself but drops every heading after it that
 /// has a strictly deeper depth, stopping when we reach:
 ///   - a heading with depth ≤ the front-matter heading's depth, OR
 ///   - a heading with a numbering prefix (signals start of real content)
+///
+/// Special case for "Contents": TOC entries are listed in the same (or larger)
+/// font as the "Contents" title, so depth-based collapse doesn't work. Instead,
+/// we remove all headings on consecutive pages after "Contents", stopping when
+/// there's a page gap > 1 or we hit another front-matter heading.
 fn collapse_frontmatter_children(headings: &mut Vec<DetectedHeading>) {
     let mut to_remove: HashSet<usize> = HashSet::new();
     let mut i = 0;
     while i < headings.len() {
-        if is_frontmatter_heading(&headings[i].title) {
+        if is_contents_heading(&headings[i].title) {
+            // TOC collapse: remove headings on consecutive pages after Contents.
+            // TOC entries are on pages immediately following the Contents heading.
+            // Stop when there's a page gap > 1 or we hit another front-matter heading.
+            let mut last_page = headings[i].page;
+            let mut j = i + 1;
+            while j < headings.len() {
+                let h = &headings[j];
+                // Stop at other front-matter headings (Preface, Foreword, etc.)
+                if is_frontmatter_heading(&h.title) {
+                    break;
+                }
+                // Stop if page gap > 1 from previous entry
+                if h.page > last_page + 1 {
+                    break;
+                }
+                to_remove.insert(j);
+                last_page = last_page.max(h.page);
+                j += 1;
+            }
+            i = j;
+        } else if is_frontmatter_heading(&headings[i].title) {
             let fm_depth = headings[i].depth;
             // Remove everything after i that is deeper, but stop at numbered headings
             let mut j = i + 1;
@@ -1491,6 +1665,11 @@ pub fn extract_headings(page_chars: &[(Vec<PdfChar>, f32)]) -> HeadingExtraction
     // Phase 5: Merge segments and build headings
     let mut headings = merge_heading_segments(&candidates, &level_map);
 
+    // Phase 5a: Merge lone roman numerals with the next heading on the same page.
+    // Part divider pages have "II" and "Lighting" far apart vertically, too far
+    // for the standard multi-line merge. Join them here.
+    merge_lone_roman_numerals(&mut headings);
+
     // Phase 5b: Cross-validate with numbering patterns
     cross_validate_depths(&mut headings);
 
@@ -1505,11 +1684,22 @@ pub fn extract_headings(page_chars: &[(Vec<PdfChar>, f32)]) -> HeadingExtraction
     // Phase 5d: Compute contained chars and filter headings
     compute_contained_chars(&mut headings, &all_segments);
     // Require at least 2000 chars of content under a heading, unless the
-    // heading has a well-known numbering prefix (1, 1.1, A, I, etc.).
+    // heading has a well-known numbering prefix (1, 1.1, A, I, etc.) or
+    // is a front-matter heading (Contents, Preface, Index, etc.).
     const MIN_CONTAINED_CHARS: usize = 2000;
     headings.retain(|h| {
-        h.contained_chars >= MIN_CONTAINED_CHARS || has_numbering_prefix(&h.title)
+        h.contained_chars >= MIN_CONTAINED_CHARS
+            || has_numbering_prefix(&h.title)
+            || is_frontmatter_heading(&h.title)
     });
+
+    // Promote front-matter headings to depth 1: Contents, Preface, Index etc.
+    // are always top-level structural sections regardless of their font size.
+    for h in headings.iter_mut() {
+        if is_frontmatter_heading(&h.title) && h.depth > 1 {
+            h.depth = 1;
+        }
+    }
 
     // Phase 5e: Collapse front-matter sections (TOC, preface, index) — keep the
     // top-level heading but remove all sub-headings underneath it.
@@ -1736,14 +1926,15 @@ mod tests {
 
     #[test]
     fn test_infer_depth_from_numbering() {
-        assert_eq!(infer_depth_from_numbering("1 Introduction"), 1);
-        assert_eq!(infer_depth_from_numbering("1.1 Background"), 2);
-        assert_eq!(infer_depth_from_numbering("1.2.3 Details"), 3);
-        assert_eq!(infer_depth_from_numbering("A Appendix"), 0); // bare letter → use font-based depth
-        assert_eq!(infer_depth_from_numbering("A.1 First Section"), 2);
-        assert_eq!(infer_depth_from_numbering("III Methods"), 1);
-        assert_eq!(infer_depth_from_numbering("Introduction"), 0);
-        assert_eq!(infer_depth_from_numbering("References"), 0);
+        // (depth, is_multi_level)
+        assert_eq!(infer_depth_from_numbering("1 Introduction"), (1, false));
+        assert_eq!(infer_depth_from_numbering("1.1 Background"), (2, true));
+        assert_eq!(infer_depth_from_numbering("1.2.3 Details"), (3, true));
+        assert_eq!(infer_depth_from_numbering("A Appendix"), (0, false)); // bare letter → use font-based depth
+        assert_eq!(infer_depth_from_numbering("A.1 First Section"), (2, true));
+        assert_eq!(infer_depth_from_numbering("III Methods"), (1, false));
+        assert_eq!(infer_depth_from_numbering("Introduction"), (0, false));
+        assert_eq!(infer_depth_from_numbering("References"), (0, false));
     }
 
     #[test]
@@ -1752,11 +1943,94 @@ mod tests {
         assert!(is_roman_numeral("II"));
         assert!(is_roman_numeral("III"));
         assert!(is_roman_numeral("IV"));
+        assert!(is_roman_numeral("V"));
         assert!(is_roman_numeral("IX"));
+        assert!(is_roman_numeral("X"));
         assert!(is_roman_numeral("XIV"));
+        assert!(is_roman_numeral("XL"));
+        assert!(is_roman_numeral("L"));
+        assert!(is_roman_numeral("C"));
         assert!(!is_roman_numeral(""));
         assert!(!is_roman_numeral("ABCDEFGHI")); // too long
-        assert!(!is_roman_numeral("ABC")); // not roman chars
+        assert!(!is_roman_numeral("ABC")); // not valid roman
+        // Non-canonical roman numerals rejected by round-trip check
+        assert!(!is_roman_numeral("VC")); // should be XCV (95)
+        assert!(!is_roman_numeral("IC")); // should be XCIX (99)
+        assert!(!is_roman_numeral("IL")); // should be XLIX (49)
+        assert!(!is_roman_numeral("VX")); // not valid
+        assert!(!is_roman_numeral("DM")); // not valid
+        // Value > 100 rejected
+        assert!(!is_roman_numeral("CCI")); // 201
+    }
+
+    #[test]
+    fn test_u32_to_roman() {
+        assert_eq!(u32_to_roman(1), "I");
+        assert_eq!(u32_to_roman(4), "IV");
+        assert_eq!(u32_to_roman(9), "IX");
+        assert_eq!(u32_to_roman(14), "XIV");
+        assert_eq!(u32_to_roman(40), "XL");
+        assert_eq!(u32_to_roman(49), "XLIX");
+        assert_eq!(u32_to_roman(50), "L");
+        assert_eq!(u32_to_roman(90), "XC");
+        assert_eq!(u32_to_roman(95), "XCV");
+        assert_eq!(u32_to_roman(99), "XCIX");
+        assert_eq!(u32_to_roman(100), "C");
+    }
+
+    #[test]
+    fn test_has_leader_dots() {
+        assert!(has_leader_dots("1.2.4 Code Generation...............9"));
+        assert!(has_leader_dots("3.1 Methods . . . . . . . . . 15"));
+        assert!(!has_leader_dots("1.1 What Is Machine Learning?"));
+        assert!(!has_leader_dots("A.1 Proofs"));
+    }
+
+    #[test]
+    fn test_cross_validate_depths_multi_level_overrides() {
+        // Multi-level numbering should always override font depth
+        let mut headings = vec![heading(1, "1.2 Background", 10)];
+        cross_validate_depths(&mut headings);
+        assert_eq!(headings[0].depth, 2); // deepened from 1 to 2
+
+        // Single-level numbering should only deepen, never promote
+        let mut headings = vec![heading(3, "2 Methods", 20)];
+        cross_validate_depths(&mut headings);
+        assert_eq!(headings[0].depth, 3); // stays at 3 (would be promoted to 1)
+
+        // Single-level numbering can deepen
+        let mut headings = vec![heading(1, "I Introduction", 5)];
+        cross_validate_depths(&mut headings);
+        assert_eq!(headings[0].depth, 1); // same, no deepening needed
+
+        // Roman numeral at font depth 2 stays at 2 (not promoted to 1)
+        let mut headings = vec![heading(2, "II Stable Indirect Illumination", 45)];
+        cross_validate_depths(&mut headings);
+        assert_eq!(headings[0].depth, 2); // not promoted
+    }
+
+    #[test]
+    fn test_filter_seq_int_preserves_numbered_interlopers() {
+        // Part headings between chapter sequences should be preserved
+        let mut headings = vec![
+            heading(2, "1.3 Applications", 17),
+            heading(1, "II Lighting", 43),
+            heading(2, "2.1 Overview", 45),
+        ];
+        filter_sequence_interrupters(&mut headings);
+        assert_eq!(headings.len(), 3); // "II Lighting" kept (has numbering prefix)
+    }
+
+    #[test]
+    fn test_filter_seq_int_requires_increasing_seq() {
+        // Two headings with same parent but non-increasing seq: no removal
+        let mut headings = vec![
+            heading(2, "3.2 Methods", 30),
+            heading(1, "BOGUS", 35),
+            heading(2, "3.1 Background", 40), // seq 1 < seq 2 — not increasing
+        ];
+        filter_sequence_interrupters(&mut headings);
+        assert_eq!(headings.len(), 3); // all kept
     }
 
     #[test]
@@ -1951,12 +2225,20 @@ mod tests {
         // depth 2 is deeper than 1, not shallower — keep all
         assert_eq!(headings.len(), 3);
 
-        // Now test with a shallower interloper (impossible in practice but tests logic)
-        // Actually roman at depth 1, interloper can't be depth 0, so this case
-        // doesn't apply for romans at depth 1. Test at depth 2 level:
+        // Numbered interloper (roman numeral "II") is preserved — it's a
+        // legitimate structural element like a Part heading.
         let mut headings = vec![
             heading(2, "2.1 First", 10),
-            heading(1, "II BOGUS ROMAN", 15),
+            heading(1, "II Lighting", 15),
+            heading(2, "2.2 Second", 20),
+        ];
+        filter_sequence_interrupters(&mut headings);
+        assert_eq!(headings.len(), 3); // "II Lighting" kept
+
+        // Un-numbered interloper IS removed
+        let mut headings = vec![
+            heading(2, "2.1 First", 10),
+            heading(1, "BOGUS HEADING", 15),
             heading(2, "2.2 Second", 20),
         ];
         filter_sequence_interrupters(&mut headings);
