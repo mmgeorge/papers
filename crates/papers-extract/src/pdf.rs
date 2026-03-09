@@ -149,7 +149,7 @@ fn push_char(
 
 /// Check if a font name matches known math/symbol font patterns.
 /// These fonts report italic as a side effect but are not text italic fonts.
-fn is_math_font(name: &str) -> bool {
+pub fn is_math_font(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
     // TeX math fonts: CMMI (math italic), CMSY (math symbols), CMEX (extensions)
     // Also catch LMMI (Latin Modern Math Italic), MathPI, etc.

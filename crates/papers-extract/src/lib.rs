@@ -2,6 +2,7 @@ pub mod error;
 pub mod figure;
 pub mod formula;
 pub mod glm_ocr;
+pub mod headings;
 pub mod html_table;
 pub mod layout;
 pub mod models;

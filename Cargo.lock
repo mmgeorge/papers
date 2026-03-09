@@ -5167,6 +5167,7 @@ dependencies = [
  "ndarray 0.17.2",
  "ort",
  "pdfium-render",
+ "regex",
  "reqwest 0.13.2",
  "serde",
  "serde_json",

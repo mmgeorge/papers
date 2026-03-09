@@ -20,6 +20,10 @@ path = "src/bin/find_gaps.rs"
 name = "run_ocr"
 path = "src/bin/run_ocr.rs"
 
+[[bin]]
+name = "extract_headings"
+path = "src/bin/extract_headings.rs"
+
 
 [dependencies]
 clap = { workspace = true }
@@ -39,6 +43,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 # not BPE training, so esaxx_fast is unnecessary. We still need a regex backend.
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 half = "2"
+regex = "1"
 hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
