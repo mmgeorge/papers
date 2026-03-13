@@ -5,6 +5,7 @@ use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
 use crate::pdf;
+use crate::toc::TocEntry;
 use crate::types::{ExtractionResult, Page, Region, RegionKind, ReflowDocument, ReflowNode};
 use crate::DebugMode;
 
@@ -226,29 +227,31 @@ fn is_back_matter_heading(text: &str) -> bool {
     )
 }
 
-/// Build a reflow document from the extraction result.
-///
-/// This performs all reflow logic (dehyphenation, paragraph merging, references
-/// merging) and organizes the result into a heading-based tree.
-pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
-    // Collect rendered sections with metadata for cross-region dehyphenation.
-    struct Section {
-        markdown: String,
-        kind: RegionKind,
-        is_text: bool,
-        is_references: bool,
-        /// Display formulas are part of the paragraph flow — text before/after
-        /// them should NOT be rearranged across them.
-        is_formula: bool,
-        /// A short single-line text block that doesn't span the page width.
-        is_short_line: bool,
-        /// Image path for formula regions (for unparsed formula fallback).
-        formula_path: Option<String>,
-    }
+/// A rendered section with metadata for cross-region processing.
+struct Section {
+    markdown: String,
+    kind: RegionKind,
+    /// 0-indexed PDF page this region came from.
+    page_idx: u32,
+    is_text: bool,
+    is_references: bool,
+    /// Display formulas are part of the paragraph flow — text before/after
+    /// them should NOT be rearranged across them.
+    is_formula: bool,
+    /// A short single-line text block that doesn't span the page width.
+    is_short_line: bool,
+    /// Image path for formula regions (for unparsed formula fallback).
+    formula_path: Option<String>,
+}
 
+/// Build sections from extraction result: render regions to markdown,
+/// merge references, dehyphenate across region boundaries, and rejoin
+/// paragraphs split across column/page breaks.
+fn build_sections(result: &ExtractionResult) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
 
     for page in &result.pages {
+        let page_idx = page.page.saturating_sub(1);
         for region in &page.regions {
             // Skip regions whose content was spliced into a parent region.
             if region.consumed {
@@ -309,6 +312,7 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
             sections.push(Section {
                 markdown: section,
                 kind: region.kind,
+                page_idx,
                 is_text,
                 is_references,
                 is_formula,
@@ -413,6 +417,57 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
         }
     }
 
+    sections
+}
+
+/// Convert a section to a ReflowNode for non-heading types.
+fn section_to_content_node(sec: &Section) -> ReflowNode {
+    let text = sec.markdown.trim();
+    match sec.kind {
+        RegionKind::DisplayFormula | RegionKind::InlineFormula => {
+            if text.is_empty() {
+                ReflowNode::Formula {
+                    content: None,
+                    path: sec.formula_path.clone(),
+                }
+            } else {
+                ReflowNode::Formula {
+                    content: Some(text.to_string()),
+                    path: None,
+                }
+            }
+        }
+        RegionKind::Image | RegionKind::Chart | RegionKind::Seal => {
+            let (path, caption) = parse_figure_markdown(text);
+            ReflowNode::Figure { path, caption }
+        }
+        RegionKind::Table => {
+            let (content, caption) = split_table_caption(text);
+            ReflowNode::Table { content, caption }
+        }
+        RegionKind::Algorithm => ReflowNode::Algorithm {
+            content: text.to_string(),
+        },
+        RegionKind::FigureGroup => {
+            let (path, caption) = parse_figure_markdown(text);
+            ReflowNode::FigureGroup { path, caption }
+        }
+        RegionKind::References => ReflowNode::References {
+            content: text.to_string(),
+        },
+        _ => ReflowNode::Text {
+            content: text.to_string(),
+        },
+    }
+}
+
+/// Build a reflow document from the extraction result.
+///
+/// This performs all reflow logic (dehyphenation, paragraph merging, references
+/// merging) and organizes the result into a heading-based tree.
+pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
+    let sections = build_sections(result);
+
     // --- Convert sections to ReflowNodes and build heading tree ---
 
     // Count occurrences of each back-matter heading name. When a name
@@ -504,50 +559,7 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
                     }
                 }
             }
-            RegionKind::DisplayFormula | RegionKind::InlineFormula => {
-                if text.is_empty() {
-                    // Unparsed formula — image fallback
-                    ReflowNode::Formula {
-                        content: None,
-                        path: sec.formula_path.clone(),
-                    }
-                } else {
-                    ReflowNode::Formula {
-                        content: Some(text.to_string()),
-                        path: None,
-                    }
-                }
-            }
-            RegionKind::Image | RegionKind::Chart | RegionKind::Seal => {
-                // Parse image markdown: "![](path)\n\ncaption"
-                let (path, caption) = parse_figure_markdown(text);
-                ReflowNode::Figure { path, caption }
-            }
-            RegionKind::Table => {
-                // Table may have caption appended after \n\n
-                let (content, caption) = split_table_caption(text);
-                ReflowNode::Table { content, caption }
-            }
-            RegionKind::Algorithm => {
-                ReflowNode::Algorithm {
-                    content: text.to_string(),
-                }
-            }
-            RegionKind::FigureGroup => {
-                let (path, caption) = parse_figure_markdown(text);
-                ReflowNode::FigureGroup { path, caption }
-            }
-            RegionKind::References => {
-                ReflowNode::References {
-                    content: text.to_string(),
-                }
-            }
-            _ => {
-                // Text, Abstract, VerticalText, SidebarText, orphan captions, etc.
-                ReflowNode::Text {
-                    content: text.to_string(),
-                }
-            }
+            _ => section_to_content_node(sec),
         };
 
         flat_nodes.push(node);
@@ -555,6 +567,358 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
 
     // Build the heading tree from the flat list using a depth stack.
     build_heading_tree(flat_nodes)
+}
+
+// ── Outline-driven reflow ────────────────────────────────────────────
+
+/// Normalize a title for fuzzy comparison: lowercase, collapse whitespace,
+/// strip leading numbering ("1.2 " or "Chapter 3 "), and trailing punctuation.
+fn normalize_title(s: &str) -> String {
+    let s = s.trim().to_lowercase();
+    // Collapse whitespace
+    let s: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Strip trailing punctuation
+    s.trim_end_matches(|c: char| matches!(c, '.' | ':' | ',' | ';')).to_string()
+}
+
+/// Strip leading numbering prefix from a title for content-only comparison.
+/// "1.2.3 Foo Bar" → "foo bar", "Chapter 3 Foo" → "foo", "Foo Bar" → "foo bar"
+fn strip_numbering(s: &str) -> String {
+    let s = s.trim();
+    // Skip "Chapter N ", "CHAPTER N ", "Part N " prefixes
+    let after_label = s
+        .strip_prefix("chapter ")
+        .or_else(|| s.strip_prefix("Chapter "))
+        .or_else(|| s.strip_prefix("CHAPTER "))
+        .or_else(|| s.strip_prefix("part "))
+        .or_else(|| s.strip_prefix("Part "))
+        .or_else(|| s.strip_prefix("PART "))
+        .unwrap_or(s);
+
+    // Skip leading number+dots: "1.2.3 " or "A.1 " or "IV "
+    let trimmed = after_label.trim();
+    if let Some(space_pos) = trimmed.find(' ') {
+        let prefix = &trimmed[..space_pos];
+        let is_numbering = prefix.chars().all(|c| {
+            c.is_ascii_digit() || c == '.' || c.is_ascii_uppercase()
+        }) && prefix.chars().any(|c| c.is_ascii_digit() || c.is_ascii_uppercase());
+        if is_numbering {
+            return trimmed[space_pos + 1..].trim().to_lowercase();
+        }
+    }
+    trimmed.to_lowercase()
+}
+
+/// Compute the offset mapping printed page numbers to 0-indexed PDF pages.
+///
+/// Returns `offset` such that `pdf_page = (page_value - 1) + offset` for body pages.
+fn compute_page_offset(
+    toc_entries: &[TocEntry],
+    toc_pages: &[u32],
+    result: &ExtractionResult,
+) -> i32 {
+    // Find the first body TOC entry (positive page_value)
+    let first_body = toc_entries.iter().find(|e| e.page_value > 0);
+    let Some(first) = first_body else {
+        // No body entries — use toc_pages end as estimate
+        return toc_pages.last().map(|&p| p as i32 + 1).unwrap_or(0);
+    };
+
+    let target_norm = normalize_title(&first.title);
+    let target_stripped = strip_numbering(&first.title);
+
+    // Search ParagraphTitle regions for a text match
+    for page in &result.pages {
+        let page_idx = page.page.saturating_sub(1);
+        for region in &page.regions {
+            if region.kind != RegionKind::ParagraphTitle {
+                continue;
+            }
+            let Some(ref text) = region.text else { continue };
+            let region_norm = normalize_title(text);
+            let region_stripped = strip_numbering(text);
+
+            let matched = region_norm == target_norm
+                || region_stripped == target_stripped
+                || (!target_stripped.is_empty()
+                    && region_stripped.starts_with(&target_stripped));
+
+            if matched {
+                // offset = pdf_page_idx - (page_value - 1)
+                return page_idx as i32 - (first.page_value - 1) as i32;
+            }
+        }
+    }
+
+    // Fallback: body starts right after last TOC page
+    toc_pages.last().map(|&p| p as i32 + 1).unwrap_or(0)
+}
+
+/// Map a printed page value to a 0-indexed PDF page.
+fn toc_page_to_pdf_page(page_value: i32, offset: i32, total_pages: u32) -> Option<u32> {
+    let idx = if page_value > 0 {
+        (page_value - 1) as i32 + offset
+    } else {
+        // Front matter: rough estimate, offset backwards from body start
+        offset + page_value
+    };
+    if idx >= 0 && (idx as u32) < total_pages {
+        Some(idx as u32)
+    } else {
+        None
+    }
+}
+
+/// Match a TOC entry title to a ParagraphTitle region's text.
+/// Returns true if they match by exact, prefix, or fuzzy criteria.
+fn titles_match(toc_title: &str, region_text: &str) -> bool {
+    let toc_norm = normalize_title(toc_title);
+    let region_norm = normalize_title(region_text);
+
+    // Exact match
+    if toc_norm == region_norm {
+        return true;
+    }
+
+    // Content-only match (ignoring numbering differences)
+    let toc_stripped = strip_numbering(toc_title);
+    let region_stripped = strip_numbering(region_text);
+    if !toc_stripped.is_empty() && toc_stripped == region_stripped {
+        return true;
+    }
+
+    // Prefix match: TOC title is prefix of region text
+    if !toc_norm.is_empty() && region_norm.starts_with(&toc_norm) {
+        return true;
+    }
+    // Region text is prefix of TOC title (truncated region text)
+    if !region_norm.is_empty() && region_norm.len() >= 8 && toc_norm.starts_with(&region_norm) {
+        return true;
+    }
+
+    // Fuzzy: >80% of TOC title words appear in region text
+    if !toc_stripped.is_empty() {
+        let toc_words: Vec<&str> = toc_stripped.split_whitespace().collect();
+        if toc_words.len() >= 2 {
+            let matched = toc_words
+                .iter()
+                .filter(|w| region_stripped.contains(**w))
+                .count();
+            if matched as f32 / toc_words.len() as f32 > 0.8 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Build an outline-driven reflow document using TOC entries as the
+/// authoritative heading structure.
+///
+/// TOC entries determine heading depths. ParagraphTitle regions matched to
+/// TOC entries use the TOC depth; unmatched ParagraphTitles are demoted to
+/// text. Missing TOC headings are injected as synthetic heading nodes.
+pub fn reflow_with_outline(
+    result: &ExtractionResult,
+    toc_entries: &[TocEntry],
+    toc_pages: &[u32],
+    total_pages: u32,
+) -> ReflowDocument {
+    let sections = build_sections(result);
+
+    // Step 1: Compute page offset
+    let offset = compute_page_offset(toc_entries, toc_pages, result);
+
+    // Step 2: Check if Parts exist — if so, shift all depths +1
+    let has_parts = toc_entries.iter().any(|e| e.depth == 0);
+
+    // Step 3: Pre-match TOC entries to ParagraphTitle sections.
+    // For each TOC entry, find the best matching section index.
+    // matched_sections[section_idx] = Some(toc_entry_idx)
+    let mut section_to_toc: Vec<Option<usize>> = vec![None; sections.len()];
+    let mut toc_matched: Vec<bool> = vec![false; toc_entries.len()];
+
+    for (toc_idx, entry) in toc_entries.iter().enumerate() {
+        let expected_pdf_page =
+            toc_page_to_pdf_page(entry.page_value, offset, total_pages);
+
+        let mut best_section: Option<usize> = None;
+        let mut best_score: u32 = 0;
+
+        for (sec_idx, sec) in sections.iter().enumerate() {
+            if sec.kind != RegionKind::ParagraphTitle {
+                continue;
+            }
+            if section_to_toc[sec_idx].is_some() {
+                continue; // already claimed
+            }
+
+            let title = sec
+                .markdown
+                .trim()
+                .strip_prefix("## ")
+                .unwrap_or(sec.markdown.trim());
+
+            if !titles_match(&entry.title, title) {
+                continue;
+            }
+
+            // Page proximity scoring
+            let page_ok = match expected_pdf_page {
+                Some(expected) => {
+                    let diff = (sec.page_idx as i32 - expected as i32).unsigned_abs();
+                    diff <= 3
+                }
+                None => true, // can't verify page, accept any match
+            };
+
+            if !page_ok {
+                continue;
+            }
+
+            // Score: exact normalized match > prefix > fuzzy
+            let toc_norm = normalize_title(&entry.title);
+            let sec_norm = normalize_title(title);
+            let score = if toc_norm == sec_norm {
+                3
+            } else if sec_norm.starts_with(&toc_norm) || toc_norm.starts_with(&sec_norm) {
+                2
+            } else {
+                1
+            };
+
+            if score > best_score {
+                best_score = score;
+                best_section = Some(sec_idx);
+            }
+        }
+
+        if let Some(sec_idx) = best_section {
+            section_to_toc[sec_idx] = Some(toc_idx);
+            toc_matched[toc_idx] = true;
+        }
+    }
+
+    // Step 4: Build flat nodes with outline-aware heading assignment.
+    let mut flat_nodes: Vec<ReflowNode> = Vec::new();
+    // Track current position by page for injecting missing headings.
+    // We'll inject missing headings between sections based on page order.
+    let mut next_inject_check: usize = 0;
+
+    for (sec_idx, sec) in sections.iter().enumerate() {
+        let text = sec.markdown.trim();
+        if text.is_empty() && sec.formula_path.is_none() {
+            continue;
+        }
+
+        // Before processing this section, inject any missing TOC headings
+        // that should appear before this section's page position.
+        inject_missing_headings(
+            &mut flat_nodes,
+            toc_entries,
+            &toc_matched,
+            offset,
+            total_pages,
+            has_parts,
+            sec.page_idx,
+            &mut next_inject_check,
+        );
+
+        let node = match sec.kind {
+            RegionKind::Title => {
+                let title = text.strip_prefix("# ").unwrap_or(text).to_string();
+                ReflowNode::Heading {
+                    depth: 0,
+                    title,
+                    children: Vec::new(),
+                }
+            }
+            RegionKind::ParagraphTitle => {
+                let title = text.strip_prefix("## ").unwrap_or(text).to_string();
+
+                if let Some(toc_idx) = section_to_toc[sec_idx] {
+                    // Matched to TOC entry — use its depth
+                    let mut depth = toc_entries[toc_idx].depth;
+                    if has_parts {
+                        depth += 1;
+                    }
+                    // Depth 0 entries (Parts) become depth 1 when shifted
+                    let depth = depth.max(1);
+                    ReflowNode::Heading {
+                        depth,
+                        title,
+                        children: Vec::new(),
+                    }
+                } else if is_labeled_block(&title) {
+                    // Labeled blocks are content, not headings
+                    ReflowNode::Text {
+                        content: format!("## {title}"),
+                    }
+                } else {
+                    // Not matched to TOC — demote to text
+                    ReflowNode::Text {
+                        content: text.to_string(),
+                    }
+                }
+            }
+            _ => section_to_content_node(sec),
+        };
+
+        flat_nodes.push(node);
+    }
+
+    // Inject any remaining unmatched TOC headings that go after all sections.
+    inject_missing_headings(
+        &mut flat_nodes,
+        toc_entries,
+        &toc_matched,
+        offset,
+        total_pages,
+        has_parts,
+        u32::MAX,
+        &mut next_inject_check,
+    );
+
+    build_heading_tree(flat_nodes)
+}
+
+/// Inject synthetic heading nodes for TOC entries that weren't matched to any
+/// ParagraphTitle region and whose expected PDF page is <= `up_to_page`.
+fn inject_missing_headings(
+    flat_nodes: &mut Vec<ReflowNode>,
+    toc_entries: &[TocEntry],
+    toc_matched: &[bool],
+    offset: i32,
+    total_pages: u32,
+    has_parts: bool,
+    up_to_page: u32,
+    next_check: &mut usize,
+) {
+    while *next_check < toc_entries.len() {
+        let entry = &toc_entries[*next_check];
+        let expected = toc_page_to_pdf_page(entry.page_value, offset, total_pages)
+            .unwrap_or(u32::MAX);
+
+        if expected > up_to_page {
+            break;
+        }
+
+        if !toc_matched[*next_check] {
+            let mut depth = entry.depth;
+            if has_parts {
+                depth += 1;
+            }
+            let depth = depth.max(1);
+            flat_nodes.push(ReflowNode::Heading {
+                depth,
+                title: entry.title.clone(),
+                children: Vec::new(),
+            });
+        }
+
+        *next_check += 1;
+    }
 }
 
 /// Parse figure markdown like `"![](path)\n\ncaption"` into (path, caption).

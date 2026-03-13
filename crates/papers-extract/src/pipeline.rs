@@ -16,6 +16,7 @@ use crate::pdf::{self, PdfChar};
 use crate::reading_order;
 use crate::tableformer::TableFormerPredictor;
 use crate::text;
+use crate::toc;
 use crate::types::*;
 use crate::{ExtractOptions, FormulaModel, FormulaParseMode, TableModel};
 
@@ -201,6 +202,25 @@ impl Pipeline {
             .map_err(|e| ExtractError::Pdf(format!("Failed to load PDF: {e}")))?;
 
         let total_pages = doc.pages().len() as u32;
+
+        // Quick first pass: extract text layer chars from all pages for TOC parsing.
+        let page_chars: Vec<(Vec<PdfChar>, f32)> = (0..total_pages)
+            .map(|i| {
+                let page = doc.pages().get(i as u16).unwrap();
+                let chars = pdf::extract_page_chars(&page, i).unwrap_or_default();
+                let height = page.height().value;
+                (chars, height)
+            })
+            .collect();
+        let toc_result = toc::parse_toc(&page_chars);
+        if let Some(ref toc) = toc_result {
+            eprintln!(
+                "  TOC: {} entries from {} pages",
+                toc.entries.len(),
+                toc.toc_pages.len(),
+            );
+        }
+
         let mut pages = Vec::new();
         let mut page_images = Vec::new();
 
@@ -253,10 +273,16 @@ impl Pipeline {
 
         output::write_json(&result, &json_path)?;
 
-        let reflow_doc = output::reflow(&result);
+        let reflow_doc = if let Some(ref toc) = toc_result {
+            output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages)
+        } else {
+            output::reflow(&result)
+        };
         let reflow_path = output_dir.join(format!("{stem}.reflow.json"));
         output::write_reflow_json(&reflow_doc, &reflow_path)?;
-        output::write_markdown(&result, &md_path)?;
+
+        let md = output::render_markdown_from_reflow(&reflow_doc);
+        std::fs::write(&md_path, md)?;
 
         if self.options.extract_images {
             output::write_images(&result.pages, &page_images, &images_dir)?;
