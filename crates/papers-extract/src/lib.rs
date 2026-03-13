@@ -12,6 +12,7 @@ pub mod pipeline;
 pub mod reading_order;
 pub mod tableformer;
 pub mod text;
+pub mod toc;
 pub mod types;
 
 pub use error::ExtractError;

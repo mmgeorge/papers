@@ -1,4 +1,4 @@
-//! Extract document headings from a PDF using font-signal analysis.
+//! Extract document headings from a PDF using font-signal analysis or TOC parsing.
 //!
 //! Analyzes font families, rendered glyph heights, and character frequency
 //! to identify heading hierarchy without relying on a layout detection model.
@@ -7,6 +7,7 @@
 //!   extract_headings <pdf_path>
 //!   extract_headings <pdf_path> --json
 //!   extract_headings <pdf_path> --pages 1,2,5-10 --verbose
+//!   extract_headings <pdf_path> --toc --verbose
 
 use std::path::PathBuf;
 
@@ -15,7 +16,7 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(
     name = "extract_headings",
-    about = "Extract document headings from PDF using font analysis"
+    about = "Extract document headings from PDF using font analysis or TOC parsing"
 )]
 struct Cli {
     /// Path to the input PDF file.
@@ -32,6 +33,10 @@ struct Cli {
     /// Show detailed font group table in human-readable mode.
     #[arg(long, short)]
     verbose: bool,
+
+    /// Use TOC parser instead of font-based heading extraction.
+    #[arg(long)]
+    toc: bool,
 }
 
 fn main() {
@@ -70,19 +75,118 @@ fn main() {
         page_chars.push((chars, height));
     }
 
-    let result = papers_extract::headings::extract_headings(&page_chars);
+    if cli.toc {
+        run_toc_mode(&page_chars, cli.json, cli.verbose);
+    } else {
+        run_font_mode(&page_chars, cli.json, cli.verbose);
+    }
+}
 
-    if cli.json {
+fn run_toc_mode(
+    page_chars: &[(Vec<papers_extract::pdf::PdfChar>, f32)],
+    json: bool,
+    verbose: bool,
+) {
+    match papers_extract::toc::parse_toc(page_chars) {
+        Some(result) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("Failed to serialize JSON")
+                );
+            } else {
+                print_toc_human_readable(&result, verbose);
+            }
+        }
+        None => {
+            if json {
+                println!("null");
+            } else {
+                println!("No Table of Contents detected.");
+            }
+        }
+    }
+}
+
+fn print_toc_human_readable(
+    result: &papers_extract::toc::TocResult,
+    verbose: bool,
+) {
+    // TOC pages
+    let page_list: Vec<String> = result.toc_pages.iter().map(|p| format!("{}", p + 1)).collect();
+    println!("TOC Pages: {}", page_list.join(", "));
+    println!();
+
+    // Font profile
+    if verbose && !result.font_profile.levels.is_empty() {
+        println!("Learned Font Profile:");
+        for level in &result.font_profile.levels {
+            println!(
+                "  Depth {}: {} @ {:.1}pt{}{}  e.g. \"{}\"",
+                level.depth,
+                if level.font.is_empty() {
+                    "(no name)"
+                } else {
+                    &level.font
+                },
+                level.size,
+                if level.is_bold { " bold" } else { "" },
+                if level.is_all_caps { " ALL_CAPS" } else { "" },
+                truncate_str(&level.example, 50),
+            );
+        }
+        println!();
+    }
+
+    // Entries
+    if result.entries.is_empty() {
+        println!("No TOC entries found.");
+    } else {
+        println!("TOC Entries ({}):", result.entries.len());
+        for entry in &result.entries {
+            let indent = "  ".repeat(entry.depth as usize);
+            let kind_tag = match entry.kind {
+                papers_extract::toc::TocEntryKind::Part => " [Part]",
+                papers_extract::toc::TocEntryKind::FrontMatter => " [FM]",
+                papers_extract::toc::TocEntryKind::BackMatter => " [BM]",
+                papers_extract::toc::TocEntryKind::SubEntry => " [sub]",
+                papers_extract::toc::TocEntryKind::Appendix => " [App]",
+                _ => "",
+            };
+            println!(
+                "  [{}] {}{}{} → p.{}",
+                entry.depth, indent, entry.title, kind_tag, entry.page_label,
+            );
+        }
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max.saturating_sub(3)])
+    }
+}
+
+fn run_font_mode(
+    page_chars: &[(Vec<papers_extract::pdf::PdfChar>, f32)],
+    json: bool,
+    verbose: bool,
+) {
+    let result = papers_extract::headings::extract_headings(page_chars);
+
+    if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&result).expect("Failed to serialize JSON")
         );
     } else {
-        print_human_readable(&result, cli.verbose);
+        print_font_human_readable(&result, verbose);
     }
 }
 
-fn print_human_readable(
+fn print_font_human_readable(
     result: &papers_extract::headings::HeadingExtractionResult,
     verbose: bool,
 ) {

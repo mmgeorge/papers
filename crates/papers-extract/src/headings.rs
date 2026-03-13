@@ -635,7 +635,7 @@ pub fn filter_heading_candidates<'a>(
 }
 
 /// Check if text contains TOC-style leader dots ("......9" or ". . . 15").
-fn has_leader_dots(text: &str) -> bool {
+pub fn has_leader_dots(text: &str) -> bool {
     // Three or more consecutive dots
     if text.contains("...") {
         return true;
@@ -1024,7 +1024,7 @@ pub fn cross_validate_depths(headings: &mut [DetectedHeading]) {
 ///
 /// Returns `(depth, is_multi_level)` where depth is 1-based (0 = no pattern)
 /// and `is_multi_level` is true for dot-separated patterns like "1.2", "A.1".
-fn infer_depth_from_numbering(text: &str) -> (u32, bool) {
+pub fn infer_depth_from_numbering(text: &str) -> (u32, bool) {
     let text = text.trim();
 
     if let Some(first_ch) = text.chars().next() {
@@ -1071,7 +1071,7 @@ fn infer_depth_from_numbering(text: &str) -> (u32, bool) {
     (0, false)
 }
 
-fn is_roman_numeral(s: &str) -> bool {
+pub fn is_roman_numeral(s: &str) -> bool {
     if s.is_empty() || s.len() > 8 {
         return false;
     }
@@ -1106,7 +1106,7 @@ fn is_roman_numeral(s: &str) -> bool {
 ///
 /// Used as an exception to the minimum contained_chars threshold — numbered
 /// headings are kept even if they contain little text.
-fn has_numbering_prefix(text: &str) -> bool {
+pub fn has_numbering_prefix(text: &str) -> bool {
     use std::sync::LazyLock;
     // Prefix: a single identifier token, then whitespace, then alphabetic title.
     //
@@ -1146,7 +1146,7 @@ fn has_numbering_prefix(text: &str) -> bool {
 /// "A.1.2 Lemma"               → Some(("A.1", 2))
 /// "II Background"             → Some(("", 2))   (roman → ordinal)
 /// "Convex functions"          → None
-fn parse_numbering_prefix(text: &str) -> Option<(String, u32)> {
+pub fn parse_numbering_prefix(text: &str) -> Option<(String, u32)> {
     let text = text.trim();
     let num_end = text.find(|c: char| c == ' ' || c == '\t')?;
     let prefix = &text[..num_end];
@@ -1181,7 +1181,7 @@ fn parse_numbering_prefix(text: &str) -> Option<(String, u32)> {
 }
 
 /// Convert a roman numeral string to its numeric value.
-fn roman_to_u32(s: &str) -> Option<u32> {
+pub fn roman_to_u32(s: &str) -> Option<u32> {
     let mut total: u32 = 0;
     let mut prev = 0u32;
     for c in s.chars().rev() {
@@ -1206,7 +1206,7 @@ fn roman_to_u32(s: &str) -> Option<u32> {
 }
 
 /// Convert an integer to its canonical roman numeral string.
-fn u32_to_roman(mut n: u32) -> String {
+pub fn u32_to_roman(mut n: u32) -> String {
     const TABLE: &[(u32, &str)] = &[
         (1000, "M"),
         (900, "CM"),
@@ -1431,7 +1431,7 @@ fn filter_inline_headings(
 
 /// Check if a heading title matches a front-matter / back-matter section name
 /// whose sub-headings are noise (e.g. TOC entries, index letters).
-fn is_frontmatter_heading(title: &str) -> bool {
+pub fn is_frontmatter_heading(title: &str) -> bool {
     let t = title.trim().to_ascii_lowercase();
     // Strip a leading numbering prefix if present (e.g. "1 Contents")
     let t = if let Some(pos) = t.find(|c: char| c.is_ascii_alphabetic()) {
