@@ -247,14 +247,25 @@ struct Section {
 /// Build sections from extraction result: render regions to markdown,
 /// merge references, dehyphenate across region boundaries, and rejoin
 /// paragraphs split across column/page breaks.
-fn build_sections(result: &ExtractionResult) -> Vec<Section> {
+fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
 
     for page in &result.pages {
         let page_idx = page.page.saturating_sub(1);
+        if skip_pages.contains(&page_idx) {
+            continue;
+        }
         for region in &page.regions {
             // Skip regions whose content was spliced into a parent region.
             if region.consumed {
+                continue;
+            }
+            // Skip text-like regions with no text content (layout model false positives).
+            if matches!(
+                region.kind,
+                RegionKind::Text | RegionKind::ParagraphTitle | RegionKind::Abstract
+            ) && region.text.as_ref().map_or(true, |t| t.trim().is_empty())
+            {
                 continue;
             }
             let section = region_to_markdown(region);
@@ -466,7 +477,7 @@ fn section_to_content_node(sec: &Section) -> ReflowNode {
 /// This performs all reflow logic (dehyphenation, paragraph merging, references
 /// merging) and organizes the result into a heading-based tree.
 pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
-    let sections = build_sections(result);
+    let sections = build_sections(result, &[]);
 
     // --- Convert sections to ReflowNodes and build heading tree ---
 
@@ -571,12 +582,46 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
 
 // ── Outline-driven reflow ────────────────────────────────────────────
 
+/// Collapse spaces around dots in leading section numbers.
+/// "1. 2. 3 Foo Bar" → "1.2.3 Foo Bar"
+fn collapse_section_number_spaces(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_number = true;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_number {
+            if c.is_ascii_digit() || c == '.' {
+                result.push(c);
+            } else if c == ' ' {
+                // Check if next char continues the section number
+                if chars
+                    .peek()
+                    .map_or(false, |&nc| nc.is_ascii_digit() || nc == '.')
+                {
+                    // Skip the space — it's inside a section number
+                } else {
+                    in_number = false;
+                    result.push(c);
+                }
+            } else {
+                in_number = false;
+                result.push(c);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 /// Normalize a title for fuzzy comparison: lowercase, collapse whitespace,
-/// strip leading numbering ("1.2 " or "Chapter 3 "), and trailing punctuation.
+/// collapse section number spaces, and strip trailing punctuation.
 fn normalize_title(s: &str) -> String {
     let s = s.trim().to_lowercase();
     // Collapse whitespace
     let s: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Collapse "1. 2. 3" → "1.2.3" in leading section numbers
+    let s = collapse_section_number_spaces(&s);
     // Strip trailing punctuation
     s.trim_end_matches(|c: char| matches!(c, '.' | ':' | ',' | ';')).to_string()
 }
@@ -585,15 +630,18 @@ fn normalize_title(s: &str) -> String {
 /// "1.2.3 Foo Bar" → "foo bar", "Chapter 3 Foo" → "foo", "Foo Bar" → "foo bar"
 fn strip_numbering(s: &str) -> String {
     let s = s.trim();
-    // Skip "Chapter N ", "CHAPTER N ", "Part N " prefixes
-    let after_label = s
+    // Collapse "1. 2. 3" → "1.2.3" before parsing
+    let s = collapse_section_number_spaces(s);
+    // Skip "Chapter N ", "CHAPTER N ", "Part N " prefixes (case-insensitive)
+    let lower = s.to_lowercase();
+    let after_label = if let Some(rest) = lower
         .strip_prefix("chapter ")
-        .or_else(|| s.strip_prefix("Chapter "))
-        .or_else(|| s.strip_prefix("CHAPTER "))
-        .or_else(|| s.strip_prefix("part "))
-        .or_else(|| s.strip_prefix("Part "))
-        .or_else(|| s.strip_prefix("PART "))
-        .unwrap_or(s);
+        .or_else(|| lower.strip_prefix("part "))
+    {
+        rest.to_string()
+    } else {
+        s.to_string()
+    };
 
     // Skip leading number+dots: "1.2.3 " or "A.1 " or "IV "
     let trimmed = after_label.trim();
@@ -612,40 +660,35 @@ fn strip_numbering(s: &str) -> String {
 /// Compute the offset mapping printed page numbers to 0-indexed PDF pages.
 ///
 /// Returns `offset` such that `pdf_page = (page_value - 1) + offset` for body pages.
-fn compute_page_offset(
+pub(crate) fn compute_page_offset(
     toc_entries: &[TocEntry],
     toc_pages: &[u32],
     result: &ExtractionResult,
 ) -> i32 {
-    // Find the first body TOC entry (positive page_value)
-    let first_body = toc_entries.iter().find(|e| e.page_value > 0);
-    let Some(first) = first_body else {
-        // No body entries — use toc_pages end as estimate
+    // Try to match body TOC entries to ParagraphTitle regions to compute offset.
+    // Try the first several body entries — the first one may not be detected.
+    let body_entries: Vec<&TocEntry> = toc_entries
+        .iter()
+        .filter(|e| e.page_value > 0)
+        .take(20)
+        .collect();
+
+    if body_entries.is_empty() {
         return toc_pages.last().map(|&p| p as i32 + 1).unwrap_or(0);
-    };
+    }
 
-    let target_norm = normalize_title(&first.title);
-    let target_stripped = strip_numbering(&first.title);
+    for entry in &body_entries {
+        for page in &result.pages {
+            let page_idx = page.page.saturating_sub(1);
+            for region in &page.regions {
+                if region.kind != RegionKind::ParagraphTitle {
+                    continue;
+                }
+                let Some(ref text) = region.text else { continue };
 
-    // Search ParagraphTitle regions for a text match
-    for page in &result.pages {
-        let page_idx = page.page.saturating_sub(1);
-        for region in &page.regions {
-            if region.kind != RegionKind::ParagraphTitle {
-                continue;
-            }
-            let Some(ref text) = region.text else { continue };
-            let region_norm = normalize_title(text);
-            let region_stripped = strip_numbering(text);
-
-            let matched = region_norm == target_norm
-                || region_stripped == target_stripped
-                || (!target_stripped.is_empty()
-                    && region_stripped.starts_with(&target_stripped));
-
-            if matched {
-                // offset = pdf_page_idx - (page_value - 1)
-                return page_idx as i32 - (first.page_value - 1) as i32;
+                if titles_match(&entry.title, text) {
+                    return page_idx as i32 - (entry.page_value - 1) as i32;
+                }
             }
         }
     }
@@ -655,7 +698,7 @@ fn compute_page_offset(
 }
 
 /// Map a printed page value to a 0-indexed PDF page.
-fn toc_page_to_pdf_page(page_value: i32, offset: i32, total_pages: u32) -> Option<u32> {
+pub(crate) fn toc_page_to_pdf_page(page_value: i32, offset: i32, total_pages: u32) -> Option<u32> {
     let idx = if page_value > 0 {
         (page_value - 1) as i32 + offset
     } else {
@@ -725,7 +768,7 @@ pub fn reflow_with_outline(
     toc_pages: &[u32],
     total_pages: u32,
 ) -> ReflowDocument {
-    let sections = build_sections(result);
+    let sections = build_sections(result, toc_pages);
 
     // Step 1: Compute page offset
     let offset = compute_page_offset(toc_entries, toc_pages, result);
@@ -838,27 +881,31 @@ pub fn reflow_with_outline(
                 let title = text.strip_prefix("## ").unwrap_or(text).to_string();
 
                 if let Some(toc_idx) = section_to_toc[sec_idx] {
-                    // Matched to TOC entry — use its depth
+                    // Matched to TOC entry — use its depth and title
                     let mut depth = toc_entries[toc_idx].depth;
                     if has_parts {
                         depth += 1;
                     }
                     // Depth 0 entries (Parts) become depth 1 when shifted
                     let depth = depth.max(1);
+                    let toc_title = toc_entries[toc_idx].title.clone();
                     ReflowNode::Heading {
                         depth,
-                        title,
+                        title: toc_title,
                         children: Vec::new(),
                     }
                 } else if is_labeled_block(&title) {
-                    // Labeled blocks are content, not headings
+                    // Labeled blocks are content, not headings — bold the label
                     ReflowNode::Text {
-                        content: format!("## {title}"),
+                        content: format!("**{title}**"),
                     }
+                } else if title.is_empty() {
+                    // Empty heading — skip entirely
+                    continue;
                 } else {
                     // Not matched to TOC — demote to text
                     ReflowNode::Text {
-                        content: text.to_string(),
+                        content: title.clone(),
                     }
                 }
             }
@@ -1032,7 +1079,10 @@ pub fn render_markdown_from_reflow(doc: &ReflowDocument) -> String {
 
     // Document title
     if let Some(ref title) = doc.title {
-        parts.push(format!("# {title}"));
+        let t = title.trim();
+        if !t.is_empty() && t != "#" {
+            parts.push(format!("# {t}"));
+        }
     }
 
     // Render children
@@ -1051,13 +1101,16 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 title,
                 children,
             } => {
-                let hashes = "#".repeat((*depth as usize) + 1);
+                let depth = (*depth as usize).min(5); // cap at h6
+                let hashes = "#".repeat(depth + 1);
+                let title = collapse_spaced_letters(title);
+                let title = fix_missing_spaces_in_title(&title);
                 parts.push(format!("{hashes} {title}"));
                 render_children(children, parts);
             }
             ReflowNode::Text { content, .. } => {
                 if !content.trim().is_empty() {
-                    parts.push(content.trim().to_string());
+                    parts.push(escape_leading_hashes(content.trim()));
                 }
             }
             ReflowNode::Formula { content, path } => {
@@ -1082,7 +1135,7 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 }
             }
             ReflowNode::Algorithm { content } => {
-                parts.push(content.clone());
+                parts.push(escape_leading_hashes(content));
             }
             ReflowNode::FigureGroup { path, caption } => {
                 if let Some(cap) = caption {
@@ -1099,6 +1152,99 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
             }
         }
     }
+}
+
+/// Collapse decorative per-letter spacing in heading titles.
+///
+/// Some PDFs use `C H A P T E R  3` style headings. Detects runs of ≥4
+/// single-letter words separated by single spaces and collapses them.
+fn collapse_spaced_letters(title: &str) -> String {
+    // Split into words by double-space (which separates logical words in these titles)
+    // or detect the pattern: ≥4 consecutive single-char tokens separated by single space.
+    let chars: Vec<char> = title.chars().collect();
+    if chars.len() < 7 {
+        return title.to_string();
+    }
+
+    // Check if this title has the spaced-letter pattern:
+    // Count single-letter tokens (letter followed by space followed by letter)
+    let tokens: Vec<&str> = title.split_whitespace().collect();
+    let single_count = tokens.iter().filter(|t| t.len() == 1 && t.chars().next().map_or(false, |c| c.is_alphabetic())).count();
+
+    // If majority of tokens are single letters (≥4 and >50% of alpha tokens), collapse
+    if single_count < 4 {
+        return title.to_string();
+    }
+    let alpha_tokens = tokens.iter().filter(|t| t.chars().any(|c| c.is_alphabetic())).count();
+    if alpha_tokens == 0 || (single_count as f32 / alpha_tokens as f32) < 0.5 {
+        return title.to_string();
+    }
+
+    // Collapse: join consecutive single-letter tokens into words,
+    // separated by double-space boundaries or non-single-letter tokens.
+    let mut result = String::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if !result.is_empty() {
+            result.push(' ');
+        }
+        if tokens[i].len() == 1 && tokens[i].chars().next().map_or(false, |c| c.is_alphabetic()) {
+            // Start of a spaced-letter word — collect consecutive single letters
+            let start = i;
+            while i < tokens.len() && tokens[i].len() == 1 && tokens[i].chars().next().map_or(false, |c| c.is_alphabetic()) {
+                result.push_str(tokens[i]);
+                i += 1;
+            }
+            // If we only got one letter, it was just a short word — that's fine
+            let _ = start; // already pushed
+        } else {
+            result.push_str(tokens[i]);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// Fix missing spaces in heading titles where words run together.
+///
+/// Detects `lowercaseUppercase` boundaries (e.g. "OrbitSatellites" → "Orbit Satellites")
+/// and `letterOf`/`letterThe` patterns (e.g. "ofa" → "of a").
+fn fix_missing_spaces_in_title(title: &str) -> String {
+    let chars: Vec<char> = title.chars().collect();
+    if chars.len() < 3 {
+        return title.to_string();
+    }
+    let mut result = String::with_capacity(title.len() + 8);
+    for (i, &ch) in chars.iter().enumerate() {
+        if i > 0 {
+            let prev = chars[i - 1];
+            // Insert space at lowercase→uppercase boundary
+            // but not for patterns like "MHz", "kHz", "pH", "iPhone"
+            if prev.is_lowercase() && ch.is_uppercase() {
+                result.push(' ');
+            }
+        }
+        result.push(ch);
+    }
+    result
+}
+
+/// Escape lines that start with `#` so they aren't parsed as markdown headings.
+///
+/// C/C++/GLSL preprocessor directives (`#include`, `#define`, `#version`, etc.)
+/// and other code lines starting with `#` would otherwise be rendered as headings.
+fn escape_leading_hashes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if line.starts_with('#') {
+            out.push('\\');
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// Bold the label prefix in a figure/table caption.
@@ -1152,7 +1298,12 @@ fn region_to_markdown(region: &Region) -> String {
         }
         RegionKind::ParagraphTitle => {
             if let Some(ref text) = region.text {
-                format!("## {text}")
+                let t = text.trim();
+                if t.is_empty() {
+                    String::new()
+                } else {
+                    format!("## {t}")
+                }
             } else {
                 String::new()
             }

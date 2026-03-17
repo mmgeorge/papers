@@ -114,6 +114,9 @@ struct PipelineOptions {
     dump_formulas: bool,
     formula_parse_mode: FormulaParseMode,
     page: Option<u32>,
+    pages: Option<Vec<u32>>,
+    chapter: Option<String>,
+    section: Option<String>,
     debug: crate::DebugMode,
 }
 
@@ -171,6 +174,9 @@ impl Pipeline {
                 dump_formulas: options.dump_formulas,
                 formula_parse_mode: options.formula_parse_mode,
                 page: options.page,
+                pages: options.pages.clone(),
+                chapter: options.chapter.clone(),
+                section: options.section.clone(),
                 debug: options.debug,
             },
         })
@@ -225,7 +231,20 @@ impl Pipeline {
         let mut page_images = Vec::new();
 
         // Determine which pages to process
-        let page_indices: Vec<u32> = if let Some(p) = self.options.page {
+        let page_indices: Vec<u32> = if let Some(ref pages) = self.options.pages {
+            pages
+                .iter()
+                .map(|p| p - 1)
+                .filter(|&p| p < total_pages)
+                .collect()
+        } else if self.options.chapter.is_some() || self.options.section.is_some() {
+            resolve_toc_page_range(
+                &toc_result,
+                total_pages,
+                self.options.chapter.as_deref(),
+                self.options.section.as_deref(),
+            )?
+        } else if let Some(p) = self.options.page {
             if p == 0 || p > total_pages {
                 return Err(ExtractError::Pdf(format!(
                     "Page {p} out of range (document has {total_pages} pages)"
@@ -353,6 +372,9 @@ impl Pipeline {
             .detect(&page_image, self.options.confidence_threshold)?;
 
         let scale = self.options.dpi as f32 / 72.0;
+
+        // Split wide text regions that span both columns in two-column layouts.
+        let detected = split_cross_column_regions(detected, &chars, width_pt, height_pt, scale);
 
         // Phase A: try char-based extraction for inline formulas (skip expensive ML OCR).
         // Also compute expanded bboxes (bracket-aware) for formulas that fall through to OCR.
@@ -927,6 +949,155 @@ fn associate_formula_numbers(regions: &mut [Region]) {
     }
 }
 
+/// Detect two-column page layout and split text regions that span both columns.
+///
+/// Many textbooks use two-column layouts. The layout model sometimes produces
+/// a single wide bounding box that covers both columns. When text is extracted
+/// from such a region, chars from both columns at the same Y position get merged
+/// into one garbled line (e.g. "The software systems th This book is about how").
+///
+/// This function:
+/// 1. Detects a vertical gutter by analyzing char X-positions for a gap in the
+///    middle third of the page
+/// 2. Splits any text-bearing region that spans the gutter into two regions
+///    (left column, right column)
+fn split_cross_column_regions(
+    mut detected: Vec<DetectedRegion>,
+    chars: &[PdfChar],
+    page_width_pt: f32,
+    _page_height_pt: f32,
+    scale: f32,
+) -> Vec<DetectedRegion> {
+    // Need enough chars to analyze
+    if chars.len() < 20 || page_width_pt < 100.0 {
+        return detected;
+    }
+
+    // Collect non-space char X centers in PDF points
+    let mut x_positions: Vec<f32> = chars
+        .iter()
+        .filter(|c| !c.codepoint.is_whitespace() && (c.bbox[2] - c.bbox[0]) > 0.1)
+        .map(|c| (c.bbox[0] + c.bbox[2]) / 2.0)
+        .collect();
+    if x_positions.len() < 20 {
+        return detected;
+    }
+    x_positions.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Look for a gap in the middle third of the page.
+    // Bin X positions and find a region with very few chars.
+    let left_bound = page_width_pt * 0.3;
+    let right_bound = page_width_pt * 0.7;
+    let bin_width = 3.0; // 3pt bins
+    let num_bins = ((right_bound - left_bound) / bin_width) as usize;
+    if num_bins < 5 {
+        return detected;
+    }
+    let mut bins = vec![0u32; num_bins];
+    for &x in &x_positions {
+        if x >= left_bound && x < right_bound {
+            let idx = ((x - left_bound) / bin_width) as usize;
+            if idx < num_bins {
+                bins[idx] += 1;
+            }
+        }
+    }
+
+    // Find the widest contiguous run of empty/near-empty bins (≤1 char)
+    let mut best_start = 0;
+    let mut best_len = 0;
+    let mut cur_start = 0;
+    let mut cur_len = 0;
+    for (i, &count) in bins.iter().enumerate() {
+        if count <= 1 {
+            if cur_len == 0 {
+                cur_start = i;
+            }
+            cur_len += 1;
+        } else {
+            if cur_len > best_len {
+                best_start = cur_start;
+                best_len = cur_len;
+            }
+            cur_len = 0;
+        }
+    }
+    if cur_len > best_len {
+        best_start = cur_start;
+        best_len = cur_len;
+    }
+
+    // Need at least ~6pt gap (2 bins) to consider it a column gutter
+    if best_len < 2 {
+        return detected;
+    }
+
+    // Gutter center in PDF points
+    let gutter_left_pt = left_bound + best_start as f32 * bin_width;
+    let gutter_right_pt = gutter_left_pt + best_len as f32 * bin_width;
+    let gutter_center_pt = (gutter_left_pt + gutter_right_pt) / 2.0;
+
+    // Verify: enough chars on both sides of the gutter
+    let left_chars = x_positions.iter().filter(|&&x| x < gutter_left_pt).count();
+    let right_chars = x_positions.iter().filter(|&&x| x > gutter_right_pt).count();
+    tracing::debug!(
+        gutter_left = gutter_left_pt,
+        gutter_right = gutter_right_pt,
+        left_chars,
+        right_chars,
+        "Column gutter candidate"
+    );
+    if left_chars < 10 || right_chars < 10 {
+        return detected;
+    }
+
+    // Convert gutter to pixel space for bbox comparison
+    let gutter_center_px = gutter_center_pt * scale;
+    let gutter_margin_px = (best_len as f32 * bin_width * scale) / 2.0;
+
+    // Split regions that span the gutter
+    let mut result = Vec::with_capacity(detected.len() + 10);
+    for det in detected.drain(..) {
+        let x1 = det.bbox_px[0];
+        let x2 = det.bbox_px[2];
+        let region_width = x2 - x1;
+        let page_width_px = page_width_pt * scale;
+
+        // Only split text-bearing regions that are wider than ~55% of page width
+        // and span the gutter
+        let spans_gutter = x1 < (gutter_center_px - gutter_margin_px)
+            && x2 > (gutter_center_px + gutter_margin_px);
+        let is_wide = region_width > page_width_px * 0.55;
+        let is_splittable = det.kind.is_text_bearing()
+            || det.kind == RegionKind::ParagraphTitle
+            || det.kind == RegionKind::Abstract;
+
+        if spans_gutter && is_wide && is_splittable {
+            // Split into left and right column regions
+            let mut left = DetectedRegion {
+                kind: det.kind,
+                bbox_px: [x1, det.bbox_px[1], gutter_center_px - gutter_margin_px, det.bbox_px[3]],
+                confidence: det.confidence,
+                order_key: det.order_key,
+            };
+            let mut right = DetectedRegion {
+                kind: det.kind,
+                bbox_px: [gutter_center_px + gutter_margin_px, det.bbox_px[1], x2, det.bbox_px[3]],
+                confidence: det.confidence,
+                order_key: det.order_key + 0.001, // right column after left
+            };
+            // Adjust order: left column first (lower Y = earlier), right column second
+            // For same Y range, left comes first
+            result.push(left);
+            result.push(right);
+        } else {
+            result.push(det);
+        }
+    }
+
+    result
+}
+
 /// Group References detections by column and merge their bounding boxes.
 ///
 /// Returns a map from detection index to:
@@ -1068,6 +1239,67 @@ fn strip_structural_regions(regions: &mut Vec<Region>) {
 
         true
     });
+}
+
+/// Resolve `--chapter` or `--section` to a set of 0-indexed PDF page indices.
+fn resolve_toc_page_range(
+    toc_result: &Option<toc::TocResult>,
+    total_pages: u32,
+    chapter: Option<&str>,
+    section: Option<&str>,
+) -> Result<Vec<u32>, ExtractError> {
+    let toc = toc_result.as_ref().ok_or_else(|| {
+        ExtractError::Pdf("No TOC found in this PDF; use --pages instead".into())
+    })?;
+
+    let spec = chapter.or(section).unwrap();
+    let entries = &toc.entries;
+
+    // Find matching TOC entry
+    let entry_idx = entries
+        .iter()
+        .position(|e| {
+            // Match by number prefix: "3" matches "3 Introduction"
+            let title_lower = e.title.to_lowercase();
+            let spec_lower = spec.to_lowercase();
+            title_lower.starts_with(&format!("{spec_lower} "))
+                || title_lower.starts_with(&format!("{spec_lower}."))
+                || title_lower == spec_lower
+        })
+        .ok_or_else(|| {
+            ExtractError::Pdf(format!("TOC entry not found for: {spec}"))
+        })?;
+
+    let entry = &entries[entry_idx];
+    let entry_depth = entry.depth;
+
+    // Find start page
+    let start_page_value = entry.page_value;
+
+    // Find next entry at same or shallower depth → end boundary
+    let end_page_value = entries[entry_idx + 1..]
+        .iter()
+        .find(|e| e.depth <= entry_depth)
+        .map(|e| e.page_value);
+
+    // Compute page offset using fallback (toc_pages end)
+    let offset = toc.toc_pages.last().map(|&p| p as i32 + 1).unwrap_or(0);
+
+    let start = output::toc_page_to_pdf_page(start_page_value, offset, total_pages)
+        .unwrap_or(0);
+    let end = end_page_value
+        .and_then(|pv| output::toc_page_to_pdf_page(pv, offset, total_pages))
+        .unwrap_or(total_pages);
+
+    eprintln!(
+        "  Chapter/section \"{spec}\": pages {}-{} (PDF pages {}-{})",
+        start + 1,
+        end,
+        start,
+        end.saturating_sub(1)
+    );
+
+    Ok((start..end).collect())
 }
 
 #[cfg(test)]

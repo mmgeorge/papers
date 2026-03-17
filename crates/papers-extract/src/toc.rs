@@ -111,9 +111,13 @@ impl TocRawLine {
                 // Insert space if gap exceeds threshold OR a pdfium space
                 // exists between these two chars (for tight-kerned fonts where
                 // the physical gap is below our threshold).
-                let has_pdfium_space = self.pdfium_space_xs.iter().any(|&sx| {
-                    sx >= prev.bbox[2] - 0.5 && sx <= ch.bbox[0] + 0.5
-                });
+                // Guard: only trust a pdfium space if the physical gap is at
+                // least 15% of the threshold — some PDFs have space chars at
+                // wrong x-positions that land between adjacent glyphs.
+                let has_pdfium_space = gap >= threshold * 0.15
+                    && self.pdfium_space_xs.iter().any(|&sx| {
+                        sx >= prev.bbox[2] - 0.5 && sx <= ch.bbox[0] + 0.5
+                    });
                 if gap > threshold || has_pdfium_space {
                     result.push(' ');
                 }

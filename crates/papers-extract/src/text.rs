@@ -186,20 +186,143 @@ fn match_chars_to_region<'a>(
     bbox: [f32; 4],
     exclude_bboxes: &[[f32; 4]],
 ) -> Vec<&'a ImageChar<'a>> {
+    match_chars_to_region_inner(chars, bbox, exclude_bboxes, true)
+}
+
+fn match_chars_to_region_strict<'a>(
+    chars: &'a [ImageChar],
+    bbox: [f32; 4],
+    exclude_bboxes: &[[f32; 4]],
+) -> Vec<&'a ImageChar<'a>> {
+    match_chars_to_region_inner(chars, bbox, exclude_bboxes, false)
+}
+
+fn match_chars_to_region_inner<'a>(
+    chars: &'a [ImageChar],
+    bbox: [f32; 4],
+    exclude_bboxes: &[[f32; 4]],
+    expand_horizontally: bool,
+) -> Vec<&'a ImageChar<'a>> {
     let [x1, y1, x2, y2] = bbox;
-    chars
+
+    // First pass: collect chars strictly inside the bbox
+    let strict: Vec<&ImageChar> = chars
         .iter()
         .filter(|c| {
             let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
             let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
-            // Must be inside region
-            if !(cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2) {
-                return false;
-            }
-            // Must not be inside any exclude bbox
-            !exclude_bboxes.iter().any(|eb| point_in_bbox(cx, cy, *eb))
+            cx >= x1 && cx <= x2 && cy >= y1 && cy <= y2
+                && !exclude_bboxes.iter().any(|eb| point_in_bbox(cx, cy, *eb))
         })
-        .collect()
+        .collect();
+
+    if !expand_horizontally {
+        return strict;
+    }
+
+    // Compute average char height for Y-proximity grouping
+    let avg_h = if strict.is_empty() {
+        return strict;
+    } else {
+        let sum: f32 = strict.iter().map(|c| (c.bbox[3] - c.bbox[1]).abs()).sum();
+        sum / strict.len() as f32
+    };
+    if avg_h < 0.5 {
+        return strict;
+    }
+    let y_thresh = avg_h * 0.5;
+
+    // Collect the Y-centers of lines that have chars inside the bbox
+    let mut line_ys: Vec<f32> = Vec::new();
+    for c in &strict {
+        let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+        if !line_ys.iter().any(|&ly| (ly - cy).abs() < y_thresh) {
+            line_ys.push(cy);
+        }
+    }
+
+    // Second pass: expand bbox to include chars on the same lines that are
+    // near the bbox boundary but outside it. This recovers chars that the
+    // layout model's bbox missed horizontally.
+    //
+    // For each line, find the rightmost and leftmost strictly-matched char,
+    // then include nearby chars that are within a small gap of those edges.
+    // This avoids pulling in chars from adjacent regions/columns.
+
+    // Compute per-line X extents of strictly matched chars
+    struct LineExtent {
+        y: f32,
+        min_x: f32,
+        max_x: f32,
+    }
+    let mut extents: Vec<LineExtent> = Vec::new();
+    for c in &strict {
+        let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
+        let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+        if let Some(ext) = extents.iter_mut().find(|e| (e.y - cy).abs() < y_thresh) {
+            ext.min_x = ext.min_x.min(cx);
+            ext.max_x = ext.max_x.max(cx);
+        } else {
+            extents.push(LineExtent { y: cy, min_x: cx, max_x: cx });
+        }
+    }
+
+    // Max gap to bridge: 2x average char width (catches a few missed chars
+    // at line edges, but won't jump across columns)
+    let avg_char_w = if strict.is_empty() {
+        10.0
+    } else {
+        let sum: f32 = strict.iter().map(|c| (c.bbox[2] - c.bbox[0]).abs()).sum();
+        (sum / strict.len() as f32).max(1.0)
+    };
+    // Iteratively expand: include nearby chars, then repeat to chain
+    // along continuous text. Max 20 iterations to handle wide bbox underdetection.
+    let mut result: Vec<&ImageChar> = strict;
+    for _ in 0..20 {
+        let prev_count = result.len();
+        // Update extents from current result
+        extents.clear();
+        for c in &result {
+            let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
+            let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+            if let Some(ext) = extents.iter_mut().find(|e| (e.y - cy).abs() < y_thresh) {
+                ext.min_x = ext.min_x.min(cx);
+                ext.max_x = ext.max_x.max(cx);
+            } else {
+                extents.push(LineExtent { y: cy, min_x: cx, max_x: cx });
+            }
+        }
+
+        let new_result: Vec<&ImageChar> = chars
+            .iter()
+            .filter(|c| {
+                let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
+                let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+                if cy < y1 || cy > y2 {
+                    return false;
+                }
+                if exclude_bboxes.iter().any(|eb| point_in_bbox(cx, cy, *eb)) {
+                    return false;
+                }
+                // Inside original bbox — always include
+                if cx >= x1 && cx <= x2 {
+                    return true;
+                }
+                // On a matching line and within bridging distance of the line's edge
+                if let Some(ext) = extents.iter().find(|e| (e.y - cy).abs() < y_thresh) {
+                    let bridge = avg_char_w * 3.0;
+                    cx >= ext.min_x - bridge && cx <= ext.max_x + bridge
+                } else {
+                    false
+                }
+            })
+            .collect();
+        result = new_result;
+        if result.len() == prev_count {
+            break; // no new chars added
+        }
+    }
+    result
 }
 
 /// Average center Y of all elements in a line.
@@ -1115,12 +1238,40 @@ fn build_line_text(
 
                 // Handle italic transitions.
                 if c.codepoint == ' ' {
-                    if in_italic && !next_non_space_italic(ei + 1) {
-                        // Next real char is not italic — close before the space.
-                        text.push('*');
-                        in_italic = false;
+                    // Validate the space: some PDFs embed space chars at wrong
+                    // x-positions. After line sorting, they end up between
+                    // adjacent letters, producing mid-word splits like "recogn ize".
+                    // Only insert the space if the surrounding non-space characters
+                    // actually have a gap between them.
+                    let space_valid = if let Some(pr) = prev_right {
+                        // Find next non-space char's left edge
+                        let next_left = elements[ei + 1..].iter().find_map(|e| match e {
+                            LineElement::Char(nc)
+                                if !nc.codepoint.is_control()
+                                    && nc.codepoint != ' '
+                                    && (nc.bbox[2] - nc.bbox[0]) > 0.0 =>
+                            {
+                                Some(nc.bbox[0])
+                            }
+                            _ => None,
+                        });
+                        if let Some(nl) = next_left {
+                            let gap = nl - pr;
+                            let threshold = avg_width * 0.3;
+                            threshold > 0.0 && gap >= threshold
+                        } else {
+                            true // no next char — keep the space
+                        }
+                    } else {
+                        true // no previous char — keep the space
+                    };
+                    if space_valid {
+                        if in_italic && !next_non_space_italic(ei + 1) {
+                            text.push('*');
+                            in_italic = false;
+                        }
+                        text.push(' ');
                     }
-                    text.push(' ');
                 } else if let Some(cmd) = accented_bases.get(&(*c as *const ImageChar)) {
                     // Accented base char — emit as inline math $\hat{x}$
                     if in_italic {
@@ -1509,7 +1660,7 @@ pub fn expand_formula_bbox(chars: &[PdfChar], bbox: [f32; 4], page_height_pt: f3
 }
 
 fn expand_for_brackets(chars: &[ImageChar], bbox: [f32; 4]) -> [f32; 4] {
-    let matched = match_chars_to_region(chars, bbox, &[]);
+    let matched = match_chars_to_region_strict(chars, bbox, &[]);
 
     // Filter to visible chars
     let visible: Vec<&ImageChar> = matched
@@ -1594,7 +1745,7 @@ fn expand_for_brackets(chars: &[ImageChar], bbox: [f32; 4]) -> [f32; 4] {
     if pipes % 2 != 0 {
         expanded = scan_for_bracket(chars, expanded, '|', 1, true, &is_same_line);
         // Re-check: if we found one on the left, we're balanced. If not, try right.
-        let new_matched = match_chars_to_region(chars, expanded, &[]);
+        let new_matched = match_chars_to_region_strict(chars, expanded, &[]);
         let new_pipes = new_matched.iter().filter(|c| c.codepoint == '|').count();
         if new_pipes % 2 != 0 {
             expanded = scan_for_bracket(chars, expanded, '|', 1, false, &is_same_line);
@@ -1604,7 +1755,7 @@ fn expand_for_brackets(chars: &[ImageChar], bbox: [f32; 4]) -> [f32; 4] {
         // Try both U+2016 and U+2225 (∥)
         expanded = scan_for_bracket(chars, expanded, '\u{2016}', 1, true, &is_same_line);
         expanded = scan_for_bracket(chars, expanded, '\u{2225}', 1, true, &is_same_line);
-        let new_matched = match_chars_to_region(chars, expanded, &[]);
+        let new_matched = match_chars_to_region_strict(chars, expanded, &[]);
         let new_dp = new_matched
             .iter()
             .filter(|c| c.codepoint == '\u{2016}' || c.codepoint == '\u{2225}')
@@ -1815,7 +1966,7 @@ pub fn try_extract_inline_formula(
     // Match chars to the formula bbox, then expand if brackets are unbalanced
     let mut bbox = expand_for_brackets(&image_chars, formula_bbox);
 
-    let matched = match_chars_to_region(&image_chars, bbox, &[]);
+    let matched = match_chars_to_region_strict(&image_chars, bbox, &[]);
 
     // Helper: return early with no latex but the current adjusted bbox
     macro_rules! reject {
@@ -2154,12 +2305,24 @@ mod tests {
         let chars = vec![
             make_char_image_space('A', 98.0, 100.0, 10.0, 12.0, PAGE_H),  // center x=103, inside
             make_char_image_space('B', 96.0, 100.0, 10.0, 12.0, PAGE_H),  // center x=101, inside
-            make_char_image_space('C', 88.0, 100.0, 10.0, 12.0, PAGE_H),  // center x=93, outside
+            make_char_image_space('C', 88.0, 100.0, 10.0, 12.0, PAGE_H),  // center x=93, outside but near edge
         ];
         let bbox = [100.0, 50.0, 600.0, 200.0];
         let image_chars: Vec<ImageChar> = chars.iter().map(|c| to_image_char(c, PAGE_H)).collect();
         let matched = match_chars_to_region(&image_chars, bbox, &[]);
-        assert_eq!(matched.len(), 2);
+        // C is close to the line edge (within 2x char width), so it gets recovered
+        // by the horizontal expansion logic
+        assert_eq!(matched.len(), 3);
+
+        // A char far outside the bbox should NOT be recovered
+        let chars_far = vec![
+            make_char_image_space('A', 100.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('Z', 500.0, 100.0, 10.0, 12.0, PAGE_H), // far outside
+        ];
+        let bbox_small = [95.0, 50.0, 120.0, 200.0];
+        let ic2: Vec<ImageChar> = chars_far.iter().map(|c| to_image_char(c, PAGE_H)).collect();
+        let matched2 = match_chars_to_region(&ic2, bbox_small, &[]);
+        assert_eq!(matched2.len(), 1); // only A
     }
 
     #[test]

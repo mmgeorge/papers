@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use papers_extract::{DebugMode, ExtractOptions, FormulaModel, FormulaParseMode};
+use papers_extract::{DebugMode, ExtractOptions, FormulaModel, FormulaParseMode, parse_page_spec};
 
 #[derive(Parser)]
 #[command(
@@ -19,8 +19,24 @@ struct Cli {
     output: Option<PathBuf>,
 
     /// Extract only this page (1-indexed)
-    #[arg(long, short = 'p')]
+    #[arg(long, short = 'p', conflicts_with_all = ["pages", "chapter", "section"])]
     page: Option<u32>,
+
+    /// Extract specific pages (e.g. "1-50", "33,36,42", "1-10,15")
+    #[arg(long, conflicts_with_all = ["page", "chapter", "section"])]
+    pages: Option<String>,
+
+    /// Extract pages for a TOC chapter (e.g. "3" or "Introduction")
+    #[arg(long, conflicts_with_all = ["page", "pages", "section"])]
+    chapter: Option<String>,
+
+    /// Extract pages for a TOC section (e.g. "1.3.2")
+    #[arg(long, conflicts_with_all = ["page", "pages", "chapter"])]
+    section: Option<String>,
+
+    /// Re-run reflow from existing extraction JSON (skip model inference)
+    #[arg(long)]
+    reflow_only: bool,
 
     /// Skip image extraction
     #[arg(long)]
@@ -75,9 +91,20 @@ fn main() {
             .unwrap_or_else(|| PathBuf::from("."))
     });
 
+    let parsed_pages = cli.pages.as_deref().map(|s| {
+        parse_page_spec(s).unwrap_or_else(|e| {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        })
+    });
+
     let options = ExtractOptions {
         extract_images: !cli.skip_images,
         page: cli.page,
+        pages: parsed_pages,
+        reflow_only: cli.reflow_only,
+        chapter: cli.chapter.clone(),
+        section: cli.section.clone(),
         formula: match cli.formula {
             FormulaModelArg::PpFormulanet => FormulaModel::PpFormulanet,
             FormulaModelArg::GlmOcr => FormulaModel::GlmOcr,
@@ -94,6 +121,22 @@ fn main() {
         },
         ..ExtractOptions::default()
     };
+
+    if cli.reflow_only {
+        eprintln!(
+            "Reflow-only: {} → {}",
+            cli.pdf.display(),
+            output_dir.display()
+        );
+        match papers_extract::reflow_only(&cli.pdf, &output_dir, &options) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        }
+        return;
+    }
 
     eprintln!(
         "Extracting {} → {}",
