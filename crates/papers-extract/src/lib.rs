@@ -228,11 +228,14 @@ pub fn reflow_only(
         );
     }
 
+    // Detect watermarks via font-change analysis
+    let watermarks = output::detect_watermarks(&page_chars);
+
     // Run reflow
     let reflow_doc = if let Some(ref toc) = toc_result {
-        output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages)
+        output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages, &watermarks)
     } else {
-        output::reflow(&result)
+        output::reflow(&result, &watermarks)
     };
 
     // Write outputs

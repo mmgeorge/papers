@@ -4,7 +4,7 @@ use image::DynamicImage;
 use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
-use crate::pdf;
+use crate::pdf::{self, PdfChar};
 use crate::toc::{TocEntry, TocEntryKind};
 use crate::types::{ExtractionResult, Page, Region, RegionKind, ReflowDocument, ReflowNode};
 use crate::DebugMode;
@@ -18,7 +18,7 @@ pub fn write_json(result: &ExtractionResult, path: &Path) -> Result<(), ExtractE
 
 /// Write the extraction result as Markdown (via reflow intermediate).
 pub fn write_markdown(result: &ExtractionResult, path: &Path) -> Result<(), ExtractError> {
-    let doc = reflow(result);
+    let doc = reflow(result, &std::collections::HashSet::new());
     let md = render_markdown_from_reflow(&doc);
     std::fs::write(path, md)?;
     Ok(())
@@ -258,10 +258,131 @@ struct Section {
     formula_path: Option<String>,
 }
 
+/// Detect watermark text by scanning for font-family changes in PDF chars.
+///
+/// For each page, finds text at the end of the page (bottom 20%) where the
+/// font family differs from the page's dominant body font. If the same
+/// "font-tail" text appears on 3+ pages, it's a watermark.
+///
+/// Returns the set of watermark strings to strip (lowercased).
+pub fn detect_watermarks(page_chars: &[(Vec<PdfChar>, f32)]) -> std::collections::HashSet<String> {
+    let mut tail_pages: std::collections::HashMap<String, std::collections::HashSet<usize>> =
+        std::collections::HashMap::new();
+
+    for (page_idx, (chars, page_height)) in page_chars.iter().enumerate() {
+        if chars.is_empty() || *page_height <= 0.0 {
+            continue;
+        }
+
+        // Find the dominant font family on this page (by char count)
+        let mut font_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for c in chars {
+            if c.codepoint.is_control() || c.codepoint == ' ' {
+                continue;
+            }
+            let family = normalize_font_family(&c.font_name);
+            if !family.is_empty() {
+                *font_counts.entry(family).or_default() += 1;
+            }
+        }
+        let dominant = font_counts
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(f, _)| f.clone());
+        let Some(dominant) = dominant else { continue };
+
+        // Look at chars in the bottom 20% of the page
+        let bottom_threshold = *page_height * 0.80;
+        // PDF coords: bottom of page = y near 0, top = y near page_height.
+        // Chars with bbox[3] (top) < bottom_threshold are in the bottom 20%.
+        let bottom_chars: Vec<&PdfChar> = chars
+            .iter()
+            .filter(|c| {
+                !c.codepoint.is_control()
+                    && c.codepoint != ' '
+                    && c.bbox[3] < bottom_threshold // top of char below 80% of page
+            })
+            .collect();
+
+        if bottom_chars.is_empty() {
+            continue;
+        }
+
+        // Group bottom-page chars by non-dominant font family
+        let mut per_family: std::collections::HashMap<String, Vec<&PdfChar>> =
+            std::collections::HashMap::new();
+        for c in &bottom_chars {
+            let family = normalize_font_family(&c.font_name);
+            if family != dominant && !family.is_empty() {
+                per_family.entry(family).or_default().push(c);
+            }
+        }
+
+        // For each non-dominant font family, assemble the text and check
+        for (_family, mut fchars) in per_family {
+            // Sort by Y then X
+            fchars.sort_by(|a, b| {
+                a.bbox[1]
+                    .partial_cmp(&b.bbox[1])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(
+                        a.bbox[0]
+                            .partial_cmp(&b.bbox[0])
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+            });
+
+            let mut text = String::new();
+            let mut prev_right: Option<f32> = None;
+            for c in &fchars {
+                if let Some(pr) = prev_right {
+                    let gap = c.bbox[0] - pr;
+                    if gap > c.space_threshold.max(1.5) {
+                        text.push(' ');
+                    }
+                }
+                text.push(c.codepoint);
+                prev_right = Some(c.bbox[2]);
+            }
+
+            let trimmed = text.trim();
+            if trimmed.len() >= 10 && trimmed.split_whitespace().count() >= 3 {
+                tail_pages
+                    .entry(trimmed.to_lowercase())
+                    .or_default()
+                    .insert(page_idx);
+            }
+        }
+    }
+
+    // Keep texts that appear on 3+ pages
+    tail_pages
+        .into_iter()
+        .filter(|(_, pages)| pages.len() >= 3)
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// Normalize a font family name: strip subset prefix and style suffixes.
+fn normalize_font_family(name: &str) -> String {
+    if name.is_empty() {
+        return String::new();
+    }
+    // Strip subset prefix (e.g. "ABCDEF+FontName" → "FontName")
+    let name = name.split('+').last().unwrap_or(name);
+    // Strip style suffix (e.g. "BerkeleyOldITC-Book" → "BerkeleyOldITC")
+    let name = name
+        .split(|c: char| c == '-' || c == ',')
+        .next()
+        .unwrap_or(name);
+    name.to_string()
+}
+
 /// Build sections from extraction result: render regions to markdown,
 /// merge references, dehyphenate across region boundaries, and rejoin
 /// paragraphs split across column/page breaks.
-fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section> {
+fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &std::collections::HashSet<String>) -> Vec<Section> {
     let mut sections: Vec<Section> = Vec::new();
 
     for page in &result.pages {
@@ -358,21 +479,34 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
     //    truncated or slightly different. Also strips such fragments when they
     //    got merged into a longer paragraph.
     {
-        // Pass 1: Exact repeated text (whole-section match).
+        // Pass 1: Exact repeated text — checks both whole sections AND
+        // individual paragraphs within sections (separated by \n\n).
+        // This catches watermarks that were separated into their own paragraph
+        // by font-break detection but still live inside a larger region.
         let mut text_page_counts: std::collections::HashMap<String, std::collections::HashSet<u32>> =
             std::collections::HashMap::new();
         for sec in &sections {
             if !sec.is_text {
                 continue;
             }
+            // Check the whole section
             let norm = sec.markdown.trim().to_lowercase();
-            if norm.len() < 3 || norm.len() > 150 {
-                continue;
+            if norm.len() >= 3 && norm.len() <= 150 {
+                text_page_counts
+                    .entry(norm)
+                    .or_default()
+                    .insert(sec.page_idx);
             }
-            text_page_counts
-                .entry(norm)
-                .or_default()
-                .insert(sec.page_idx);
+            // Also check individual paragraphs within the section
+            for para in sec.markdown.split("\n\n") {
+                let pnorm = para.trim().to_lowercase();
+                if pnorm.len() >= 10 && pnorm.len() <= 150 {
+                    text_page_counts
+                        .entry(pnorm)
+                        .or_default()
+                        .insert(sec.page_idx);
+                }
+            }
         }
         let running_texts: std::collections::HashSet<String> = text_page_counts
             .into_iter()
@@ -381,6 +515,7 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
             .collect();
 
         if !running_texts.is_empty() {
+            // Remove whole sections that match
             sections.retain(|sec| {
                 if !sec.is_text {
                     return true;
@@ -388,6 +523,24 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
                 let norm = sec.markdown.trim().to_lowercase();
                 !running_texts.contains(&norm)
             });
+            // Strip matching paragraphs from within sections
+            for sec in &mut sections {
+                if !sec.is_text {
+                    continue;
+                }
+                let paras: Vec<&str> = sec.markdown.split("\n\n").collect();
+                if paras.len() <= 1 {
+                    continue;
+                }
+                let filtered: Vec<&str> = paras
+                    .into_iter()
+                    .filter(|p| {
+                        let pnorm = p.trim().to_lowercase();
+                        !running_texts.contains(&pnorm)
+                    })
+                    .collect();
+                sec.markdown = filtered.join("\n\n");
+            }
         }
 
         // Pass 2: Positional footer/header detection.
@@ -507,6 +660,82 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
             .count();
         if toc_lines as f32 / lines.len() as f32 > 0.4 {
             sec.markdown.clear();
+        }
+    }
+
+    // --- Watermark stripping (font-change detected) ---
+    // Remove watermark text detected by font-family analysis of PDF chars.
+    // Strips from both standalone sections and embedded within paragraphs.
+    if !watermarks.is_empty() {
+        // Build match prefixes: use the first 15+ chars of each watermark
+        // for matching, since the assembled text may have slightly different
+        // endings than what detect_watermarks extracted from raw chars.
+        let wm_prefixes: Vec<String> = watermarks
+            .iter()
+            .map(|w| {
+                // Use the first ~30 chars or up to the first digit-run at the end
+                let words: Vec<&str> = w.split_whitespace().collect();
+                // Keep meaningful words (skip trailing tracking numbers/codes)
+                let meaningful: Vec<&str> = words
+                    .iter()
+                    .take_while(|w| !w.chars().any(|c| c.is_ascii_digit()))
+                    .copied()
+                    .collect();
+                if meaningful.len() >= 3 {
+                    meaningful.join(" ")
+                } else {
+                    w.clone()
+                }
+            })
+            .filter(|p| p.len() >= 10)
+            .collect();
+
+        // Single pass: remove standalone watermark sections and strip
+        // watermark text from all remaining sections.
+        sections.retain(|sec| {
+            let norm = sec.markdown.trim().to_lowercase();
+            !wm_prefixes.iter().any(|p| norm.starts_with(p.as_str()))
+        });
+        for sec in &mut sections {
+            // Filter table lines (one pass over lines, checking all prefixes)
+            if sec.markdown.contains('|') {
+                let lines: Vec<&str> = sec.markdown.lines().collect();
+                let filtered: Vec<&str> = lines
+                    .into_iter()
+                    .filter(|line| {
+                        let ln = line.to_lowercase();
+                        !wm_prefixes.iter().any(|p| ln.contains(p.as_str()))
+                    })
+                    .collect();
+                sec.markdown = filtered.join("\n");
+            }
+            // Strip watermark text from body: process line-by-line,
+            // dropping lines that start with any watermark prefix and
+            // truncating lines that contain one mid-line.
+            let lower = sec.markdown.to_lowercase();
+            if wm_prefixes.iter().any(|p| lower.contains(p.as_str())) {
+                let mut result = String::with_capacity(sec.markdown.len());
+                for line in sec.markdown.lines() {
+                    let ll = line.to_lowercase();
+                    if let Some(pos) = wm_prefixes.iter().find_map(|p| ll.find(p.as_str())) {
+                        // Keep text before the watermark
+                        let before = line[..pos].trim_end();
+                        if !before.is_empty() {
+                            if !result.is_empty() {
+                                result.push('\n');
+                            }
+                            result.push_str(before);
+                        }
+                        // Skip everything from the watermark to end of line
+                    } else {
+                        if !result.is_empty() {
+                            result.push('\n');
+                        }
+                        result.push_str(line);
+                    }
+                }
+                sec.markdown = result;
+            }
         }
     }
 
@@ -668,8 +897,8 @@ fn section_to_content_node(sec: &Section) -> ReflowNode {
 ///
 /// This performs all reflow logic (dehyphenation, paragraph merging, references
 /// merging) and organizes the result into a heading-based tree.
-pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
-    let sections = build_sections(result, &[]);
+pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<String>) -> ReflowDocument {
+    let sections = build_sections(result, &[], watermarks);
 
     // --- Convert sections to ReflowNodes and build heading tree ---
 
@@ -988,8 +1217,9 @@ pub fn reflow_with_outline(
     toc_entries: &[TocEntry],
     toc_pages: &[u32],
     total_pages: u32,
+    watermarks: &std::collections::HashSet<String>,
 ) -> ReflowDocument {
-    let sections = build_sections(result, toc_pages);
+    let sections = build_sections(result, toc_pages, watermarks);
 
     // Step 1: Compute page offset
     let offset = compute_page_offset(toc_entries, toc_pages, result);
@@ -2545,7 +2775,7 @@ mod tests {
 
     /// Convenience wrapper: reflow + render, replacing the old `render_markdown`.
     fn render_markdown(result: &ExtractionResult) -> String {
-        let doc = reflow(result);
+        let doc = reflow(result, &std::collections::HashSet::new());
         render_markdown_from_reflow(&doc)
     }
 

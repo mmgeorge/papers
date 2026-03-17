@@ -292,10 +292,11 @@ impl Pipeline {
 
         output::write_json(&result, &json_path)?;
 
+        let watermarks = output::detect_watermarks(&page_chars);
         let reflow_doc = if let Some(ref toc) = toc_result {
-            output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages)
+            output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages, &watermarks)
         } else {
-            output::reflow(&result)
+            output::reflow(&result, &watermarks)
         };
         let reflow_path = output_dir.join(format!("{stem}.reflow.json"));
         output::write_reflow_json(&reflow_doc, &reflow_path)?;

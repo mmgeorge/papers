@@ -25,7 +25,7 @@ fn reflow_roundtrip_avbd() {
     let json_str = fs::read_to_string(json_path).expect("read avbd.json");
     let result: ExtractionResult = serde_json::from_str(&json_str).expect("parse avbd.json");
 
-    let doc = output::reflow(&result);
+    let doc = output::reflow(&result, &std::collections::HashSet::new());
 
     // Write reflow JSON for inspection
     let reflow_json = serde_json::to_string_pretty(&doc).expect("serialize reflow");
