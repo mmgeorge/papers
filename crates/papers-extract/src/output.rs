@@ -350,8 +350,15 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
     }
 
     // --- Fix E: Filter running headers/footers/watermarks ---
-    // Detect text that repeats on 3+ pages (running headers/footers).
+    //
+    // Two-pass approach:
+    // 1. Exact-match: short text regions whose full content repeats on 3+ pages.
+    // 2. Positional: short text regions in the top/bottom 15% of the page that
+    //    repeat on 5+ pages — these are headers/footers/watermarks even when
+    //    truncated or slightly different. Also strips such fragments when they
+    //    got merged into a longer paragraph.
     {
+        // Pass 1: Exact repeated text (whole-section match).
         let mut text_page_counts: std::collections::HashMap<String, std::collections::HashSet<u32>> =
             std::collections::HashMap::new();
         for sec in &sections {
@@ -359,7 +366,7 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
                 continue;
             }
             let norm = sec.markdown.trim().to_lowercase();
-            if norm.len() < 5 || norm.len() > 150 {
+            if norm.len() < 3 || norm.len() > 150 {
                 continue;
             }
             text_page_counts
@@ -382,18 +389,100 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
                 !running_texts.contains(&norm)
             });
         }
+
+        // Pass 2: Positional footer/header detection.
+        // Collect short text from top/bottom 15% of pages, find repeated content.
+        let mut margin_text_pages: std::collections::HashMap<String, std::collections::HashSet<u32>> =
+            std::collections::HashMap::new();
+        for sec in &sections {
+            if !sec.is_text {
+                continue;
+            }
+            let norm = sec.markdown.trim().to_lowercase();
+            if norm.len() < 3 || norm.len() > 80 {
+                continue;
+            }
+            // Check if this region is in the top or bottom 15% of the page.
+            // We use y_top relative to page height. y_top is in points from
+            // page top (after coordinate inversion).
+            let page_height = result
+                .pages
+                .iter()
+                .find(|p| p.page.saturating_sub(1) == sec.page_idx)
+                .map(|p| p.height_pt)
+                .unwrap_or(800.0);
+            let in_top = sec.y_top < page_height * 0.12;
+            let in_bottom = sec.y_bottom > page_height * 0.85;
+            if in_top || in_bottom {
+                margin_text_pages
+                    .entry(norm)
+                    .or_default()
+                    .insert(sec.page_idx);
+            }
+        }
+        // Collect all stamps, then cluster: if multiple stamps are prefixes
+        // of each other (e.g. "from t", "from th", "from the lib"), they're
+        // truncated versions of the same watermark. Use the shortest ≥5-char
+        // prefix as the stripping pattern.
+        let mut all_stamps: Vec<String> = margin_text_pages
+            .into_iter()
+            .filter(|(_, pages)| pages.len() >= 3)
+            .map(|(text, _)| text)
+            .collect();
+        all_stamps.sort_by_key(|s| s.len());
+
+        let mut margin_stamps: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for stamp in &all_stamps {
+            // Check if this stamp is a prefix of (or equal to) a longer stamp
+            let is_prefix_of_longer = all_stamps.iter().any(|other| {
+                other.len() > stamp.len() && other.starts_with(stamp.as_str())
+            });
+            // Keep standalone stamps and the shortest prefix in each cluster.
+            // Require ≥10 chars to avoid false positives from common short phrases.
+            if !is_prefix_of_longer || stamp.len() >= 10 {
+                // Don't add if a shorter prefix of this stamp is already present
+                let has_shorter = margin_stamps.iter().any(|existing| {
+                    stamp.starts_with(existing.as_str())
+                });
+                if !has_shorter {
+                    margin_stamps.insert(stamp.clone());
+                }
+            }
+        }
+
+        if !margin_stamps.is_empty() {
+            // Remove standalone stamp sections.
+            sections.retain(|sec| {
+                if !sec.is_text {
+                    return true;
+                }
+                let norm = sec.markdown.trim().to_lowercase();
+                !margin_stamps.contains(&norm)
+            });
+            // Strip embedded stamps from longer paragraphs and tables.
+            for sec in &mut sections {
+                for stamp in &margin_stamps {
+                    let lower = sec.markdown.to_lowercase();
+                    if let Some(pos) = lower.find(stamp.as_str()) {
+                        // Remove the stamp and any trailing truncated text.
+                        // For tables, remove the entire line containing the stamp.
+                        if sec.markdown.contains('|') {
+                            // Table: remove lines containing the stamp
+                            let lines: Vec<&str> = sec.markdown.lines().collect();
+                            let cleaned: Vec<&str> = lines
+                                .into_iter()
+                                .filter(|line| !line.to_lowercase().contains(stamp.as_str()))
+                                .collect();
+                            sec.markdown = cleaned.join("\n");
+                        } else {
+                            sec.markdown = sec.markdown[..pos].trim_end().to_string();
+                        }
+                    }
+                }
+            }
+        }
     }
-    // Filter known watermark patterns.
-    sections.retain(|sec| {
-        if !sec.is_text {
-            return true;
-        }
-        let t = sec.markdown.trim();
-        if t.starts_with("From the Library of") || t.starts_with("From the Lib") {
-            return false;
-        }
-        true
-    });
 
     // --- Fix O: Filter TOC-like body content (mini-TOCs at chapter starts) ---
     for sec in &mut sections {
@@ -1092,7 +1181,23 @@ pub fn reflow_with_outline(
     );
 
     postprocess_flat_nodes(&mut flat_nodes);
-    build_heading_tree(flat_nodes)
+    let mut doc = build_heading_tree(flat_nodes);
+
+    // If no title was found from a Title region, try to infer one from the
+    // first Title region on any page (even if it was demoted to text), or
+    // fall back to the first detected heading text from early pages.
+    if doc.title.is_none() || doc.title.as_deref() == Some("#") {
+        // Try: find a Title region on pages 0-10
+        let title_candidate = sections.iter()
+            .filter(|s| s.kind == RegionKind::Title && s.page_idx <= 10)
+            .map(|s| s.markdown.trim().strip_prefix("# ").unwrap_or(s.markdown.trim()).to_string())
+            .find(|t| t.len() >= 3);
+        if let Some(t) = title_candidate {
+            doc.title = Some(t);
+        }
+    }
+
+    doc
 }
 
 /// Inject synthetic heading nodes for TOC entries that weren't matched to any
@@ -1178,16 +1283,26 @@ fn split_table_caption(md: &str) -> (String, Option<String>) {
 /// the heading tree.
 fn postprocess_flat_nodes(flat_nodes: &mut Vec<ReflowNode>) {
     dedup_heading_echo(flat_nodes);
+    dedup_heading_echo_multiline(flat_nodes);
     reorder_parent_before_child(flat_nodes);
     reorder_headings_by_numbering(flat_nodes);
     dedup_consecutive_text(flat_nodes);
     // Collapse doubled characters (e.g. "EEXXPPEERRIIMMEENNTT" → "EXPERIMENT")
     for node in flat_nodes.iter_mut() {
-        if let ReflowNode::Text { content } = node {
-            let collapsed = collapse_doubled_chars(content);
-            if collapsed.len() < content.len() {
-                *content = collapsed;
+        match node {
+            ReflowNode::Text { content } => {
+                let collapsed = collapse_doubled_chars(content);
+                if collapsed.len() < content.len() {
+                    *content = collapsed;
+                }
             }
+            ReflowNode::Heading { title, .. } => {
+                let collapsed = collapse_doubled_chars(title);
+                if collapsed.len() < title.len() {
+                    *title = collapsed;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1224,6 +1339,73 @@ fn dedup_heading_echo(flat_nodes: &mut Vec<ReflowNode>) {
                 }
             }
         }
+        i += 1;
+    }
+}
+
+/// Fix A2: Remove multi-line heading echo.
+///
+/// Handles the pattern where a heading like "## I Theory" is followed by
+/// 2+ short text nodes that reconstruct the heading: "Part I" / "Theory".
+fn dedup_heading_echo_multiline(flat_nodes: &mut Vec<ReflowNode>) {
+    let mut i = 0;
+    while i < flat_nodes.len() {
+        let title_norm = if let ReflowNode::Heading { title, .. } = &flat_nodes[i] {
+            normalize_title(title)
+        } else {
+            i += 1;
+            continue;
+        };
+
+        if title_norm.len() < 3 {
+            i += 1;
+            continue;
+        }
+
+        let title_words: Vec<&str> = title_norm.split_whitespace().collect();
+
+        // Collect consecutive short text nodes after the heading.
+        // Check incrementally: after each node, test if we have a match.
+        let mut j = i + 1;
+        let mut collected_words: Vec<String> = Vec::new();
+        let mut nodes_to_remove: Vec<usize> = Vec::new();
+        let mut removed = false;
+        while j < flat_nodes.len() && nodes_to_remove.len() < 5 {
+            if let ReflowNode::Text { content } = &flat_nodes[j] {
+                let trimmed = content.trim();
+                let word_count = trimmed.split_whitespace().count();
+                if trimmed.len() <= 40 && word_count <= 4 && !trimmed.is_empty() {
+                    for w in trimmed.split_whitespace() {
+                        collected_words.push(w.to_lowercase());
+                    }
+                    nodes_to_remove.push(j);
+                    j += 1;
+
+                    // Check match after each addition
+                    if collected_words.len() >= 2 && nodes_to_remove.len() >= 2 {
+                        let match_count = collected_words
+                            .iter()
+                            .filter(|w| title_words.iter().any(|tw| *tw == w.as_str()))
+                            .count();
+                        if match_count >= collected_words.len().saturating_sub(1)
+                            && match_count >= title_words.len().saturating_sub(1)
+                        {
+                            for &idx in nodes_to_remove.iter().rev() {
+                                flat_nodes.remove(idx);
+                            }
+                            removed = true;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            break;
+        }
+        if removed {
+            continue;
+        }
+
         i += 1;
     }
 }

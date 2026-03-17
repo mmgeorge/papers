@@ -1370,12 +1370,13 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
             if class == Classification::Unknown {
                 // Try font signature
                 if let Some(&learned_depth) = learned.get(&line.font_sig) {
-                    depth = learned_depth;
+                    // Cap learned depth to avoid cascading SubEntry depths
+                    depth = learned_depth.min(4);
                     class = depth_to_classification(depth);
                 } else if !indent_levels.is_empty() {
                     // Try indentation
                     let indent = quantize_indent(line.x_left, &indent_levels);
-                    depth = indent + 1; // indent 0 → depth 1 (chapter)
+                    depth = (indent + 1).min(4); // indent 0 → depth 1 (chapter)
                     class = depth_to_classification(depth);
                 } else {
                     // Default to chapter
@@ -1497,7 +1498,7 @@ fn classify_by_pattern(title: &str, last_depth: u32) -> (Classification, u32) {
             | "further reading"
             | "summary"
     ) {
-        let sub_depth = last_depth + 1;
+        let sub_depth = (last_depth + 1).min(4);
         return (Classification::SubEntry, sub_depth);
     }
 
