@@ -1183,17 +1183,11 @@ pub fn reflow_with_outline(
     postprocess_flat_nodes(&mut flat_nodes);
     let mut doc = build_heading_tree(flat_nodes);
 
-    // If no title was found from a Title region, try to infer one from the
-    // first Title region on any page (even if it was demoted to text), or
-    // fall back to the first detected heading text from early pages.
-    if doc.title.is_none() || doc.title.as_deref() == Some("#") {
-        // Try: find a Title region on pages 0-10
-        let title_candidate = sections.iter()
-            .filter(|s| s.kind == RegionKind::Title && s.page_idx <= 10)
-            .map(|s| s.markdown.trim().strip_prefix("# ").unwrap_or(s.markdown.trim()).to_string())
-            .find(|t| t.len() >= 3);
-        if let Some(t) = title_candidate {
-            doc.title = Some(t);
+    // Clear garbage titles (e.g. just "#", short fragments, or truncated text)
+    if let Some(ref title) = doc.title {
+        let t = title.trim();
+        if t.is_empty() || t == "#" || t.len() < 5 {
+            doc.title = None;
         }
     }
 
