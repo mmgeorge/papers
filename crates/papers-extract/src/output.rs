@@ -5,7 +5,7 @@ use pdfium_render::prelude::*;
 
 use crate::error::ExtractError;
 use crate::pdf;
-use crate::toc::TocEntry;
+use crate::toc::{TocEntry, TocEntryKind};
 use crate::types::{ExtractionResult, Page, Region, RegionKind, ReflowDocument, ReflowNode};
 use crate::DebugMode;
 
@@ -214,7 +214,17 @@ fn appendix_letter(text: &str) -> Option<char> {
 /// that should be treated as content rather than a structural heading.
 fn is_labeled_block(text: &str) -> bool {
     let text = text.trim();
-    text.starts_with("Example ") || text.starts_with("Tip ") || text.starts_with("Algorithm ")
+    text.starts_with("Example ")
+        || text.starts_with("Tip ")
+        || text.starts_with("Algorithm ")
+        || text.starts_with("Figure ")
+        || text.starts_with("Fig. ")
+        || text.starts_with("Fig ")
+        || text.starts_with("Table ")
+        || text.starts_with("TABLE ")
+        || text.starts_with("Listing ")
+        || text.starts_with("FIGURE ")
+        || text.starts_with("ACM Reference Format")
 }
 
 /// Check if a heading text is a back-matter section (references, index, etc.)
@@ -330,6 +340,78 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
                 is_short_line,
                 formula_path,
             });
+        }
+    }
+
+    // --- Fix E: Filter running headers/footers/watermarks ---
+    // Detect text that repeats on 3+ pages (running headers/footers).
+    {
+        let mut text_page_counts: std::collections::HashMap<String, std::collections::HashSet<u32>> =
+            std::collections::HashMap::new();
+        for sec in &sections {
+            if !sec.is_text {
+                continue;
+            }
+            let norm = sec.markdown.trim().to_lowercase();
+            if norm.len() < 5 || norm.len() > 150 {
+                continue;
+            }
+            text_page_counts
+                .entry(norm)
+                .or_default()
+                .insert(sec.page_idx);
+        }
+        let running_texts: std::collections::HashSet<String> = text_page_counts
+            .into_iter()
+            .filter(|(_, pages)| pages.len() >= 3)
+            .map(|(text, _)| text)
+            .collect();
+
+        if !running_texts.is_empty() {
+            sections.retain(|sec| {
+                if !sec.is_text {
+                    return true;
+                }
+                let norm = sec.markdown.trim().to_lowercase();
+                !running_texts.contains(&norm)
+            });
+        }
+    }
+    // Filter known watermark patterns.
+    sections.retain(|sec| {
+        if !sec.is_text {
+            return true;
+        }
+        let t = sec.markdown.trim();
+        if t.starts_with("From the Library of") || t.starts_with("From the Lib") {
+            return false;
+        }
+        true
+    });
+
+    // --- Fix O: Filter TOC-like body content (mini-TOCs at chapter starts) ---
+    for sec in &mut sections {
+        if !sec.is_text {
+            continue;
+        }
+        let text = sec.markdown.trim();
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.len() < 4 {
+            continue;
+        }
+        // Count lines with leader dots + page number pattern
+        let toc_lines = lines
+            .iter()
+            .filter(|line| {
+                let t = line.trim();
+                (t.contains("...") || t.contains(". . ."))
+                    && t.split_whitespace()
+                        .last()
+                        .map_or(false, |w| w.chars().all(|c| c.is_ascii_digit()) && w.len() <= 4)
+            })
+            .count();
+        if toc_lines as f32 / lines.len() as f32 > 0.4 {
+            sec.markdown.clear();
         }
     }
 
@@ -576,7 +658,8 @@ pub fn reflow(result: &ExtractionResult) -> ReflowDocument {
         flat_nodes.push(node);
     }
 
-    // Build the heading tree from the flat list using a depth stack.
+    // Post-process and build the heading tree.
+    postprocess_flat_nodes(&mut flat_nodes);
     build_heading_tree(flat_nodes)
 }
 
@@ -665,8 +748,8 @@ pub(crate) fn compute_page_offset(
     toc_pages: &[u32],
     result: &ExtractionResult,
 ) -> i32 {
-    // Try to match body TOC entries to ParagraphTitle regions to compute offset.
-    // Try the first several body entries — the first one may not be detected.
+    // Fix G: Use majority voting across multiple TOC-to-region matches,
+    // skipping TOC pages themselves to avoid false matches.
     let body_entries: Vec<&TocEntry> = toc_entries
         .iter()
         .filter(|e| e.page_value > 0)
@@ -677,9 +760,18 @@ pub(crate) fn compute_page_offset(
         return toc_pages.last().map(|&p| p as i32 + 1).unwrap_or(0);
     }
 
+    let mut offset_votes: std::collections::HashMap<i32, usize> =
+        std::collections::HashMap::new();
+
     for entry in &body_entries {
         for page in &result.pages {
             let page_idx = page.page.saturating_sub(1);
+            // Skip TOC pages — matching a heading on a TOC page gives a
+            // wrong offset since the heading there is a TOC entry, not the
+            // actual section.
+            if toc_pages.contains(&page_idx) {
+                continue;
+            }
             for region in &page.regions {
                 if region.kind != RegionKind::ParagraphTitle {
                     continue;
@@ -687,10 +779,17 @@ pub(crate) fn compute_page_offset(
                 let Some(ref text) = region.text else { continue };
 
                 if titles_match(&entry.title, text) {
-                    return page_idx as i32 - (entry.page_value - 1) as i32;
+                    let offset = page_idx as i32 - (entry.page_value - 1) as i32;
+                    *offset_votes.entry(offset).or_default() += 1;
+                    break; // one match per page per entry is enough
                 }
             }
         }
+    }
+
+    // Return the most-voted offset
+    if let Some((&best_offset, _)) = offset_votes.iter().max_by_key(|(_, count)| *count) {
+        return best_offset;
     }
 
     // Fallback: body starts right after last TOC page
@@ -871,10 +970,21 @@ pub fn reflow_with_outline(
         let node = match sec.kind {
             RegionKind::Title => {
                 let title = text.strip_prefix("# ").unwrap_or(text).to_string();
-                ReflowNode::Heading {
-                    depth: 0,
-                    title,
-                    children: Vec::new(),
+                // Fix C: Only accept Title regions from early pages (before
+                // TOC or first 5 pages). Interior Title regions are likely
+                // chapter headings already handled by TOC matching.
+                let max_title_page = toc_pages
+                    .first()
+                    .map(|&p| p.saturating_sub(1))
+                    .unwrap_or(4);
+                if sec.page_idx <= max_title_page {
+                    ReflowNode::Heading {
+                        depth: 0,
+                        title,
+                        children: Vec::new(),
+                    }
+                } else {
+                    ReflowNode::Text { content: title }
                 }
             }
             RegionKind::ParagraphTitle => {
@@ -883,7 +993,14 @@ pub fn reflow_with_outline(
                 if let Some(toc_idx) = section_to_toc[sec_idx] {
                     // Matched to TOC entry — use its depth and title
                     let mut depth = toc_entries[toc_idx].depth;
-                    if has_parts {
+                    // Fix I: Shift depths for Parts, but exempt FrontMatter
+                    // and BackMatter — they're document-level, not Part children.
+                    if has_parts
+                        && !matches!(
+                            toc_entries[toc_idx].kind,
+                            TocEntryKind::FrontMatter | TocEntryKind::BackMatter
+                        )
+                    {
                         depth += 1;
                     }
                     // Depth 0 entries (Parts) become depth 1 when shifted
@@ -903,9 +1020,23 @@ pub fn reflow_with_outline(
                     // Empty heading — skip entirely
                     continue;
                 } else {
-                    // Not matched to TOC — demote to text
-                    ReflowNode::Text {
-                        content: title.clone(),
+                    // Fix H: Check if this looks like a numbered heading
+                    // below the TOC's granularity. If so, keep it as a
+                    // heading rather than demoting to text.
+                    let inferred = infer_heading_depth(&title);
+                    let max_toc_depth =
+                        toc_entries.iter().map(|e| e.depth).max().unwrap_or(1);
+                    let adjusted = if has_parts { inferred + 1 } else { inferred };
+                    if inferred > 0 && adjusted > max_toc_depth {
+                        ReflowNode::Heading {
+                            depth: adjusted.max(1),
+                            title,
+                            children: Vec::new(),
+                        }
+                    } else {
+                        ReflowNode::Text {
+                            content: title.clone(),
+                        }
                     }
                 }
             }
@@ -927,6 +1058,7 @@ pub fn reflow_with_outline(
         &mut next_inject_check,
     );
 
+    postprocess_flat_nodes(&mut flat_nodes);
     build_heading_tree(flat_nodes)
 }
 
@@ -953,7 +1085,12 @@ fn inject_missing_headings(
 
         if !toc_matched[*next_check] {
             let mut depth = entry.depth;
-            if has_parts {
+            if has_parts
+                && !matches!(
+                    entry.kind,
+                    TocEntryKind::FrontMatter | TocEntryKind::BackMatter
+                )
+            {
                 depth += 1;
             }
             let depth = depth.max(1);
@@ -1000,6 +1137,310 @@ fn split_table_caption(md: &str) -> (String, Option<String>) {
         }
     }
     (md.to_string(), None)
+}
+
+// ── Post-processing passes on flat nodes ────────────────────────────
+
+/// Apply all post-processing passes to the flat node list before building
+/// the heading tree.
+fn postprocess_flat_nodes(flat_nodes: &mut Vec<ReflowNode>) {
+    dedup_heading_echo(flat_nodes);
+    reorder_parent_before_child(flat_nodes);
+    dedup_consecutive_text(flat_nodes);
+    // Collapse doubled characters (e.g. "EEXXPPEERRIIMMEENNTT" → "EXPERIMENT")
+    for node in flat_nodes.iter_mut() {
+        if let ReflowNode::Text { content } = node {
+            let collapsed = collapse_doubled_chars(content);
+            if collapsed.len() < content.len() {
+                *content = collapsed;
+            }
+        }
+    }
+}
+
+/// Fix A: Remove heading title echoed as the first child text node.
+///
+/// The layout model sometimes extracts heading text as both a ParagraphTitle
+/// region AND as the opening line of the following Text region. This removes
+/// the duplicate prefix from the text node (or removes it entirely).
+fn dedup_heading_echo(flat_nodes: &mut Vec<ReflowNode>) {
+    let mut i = 0;
+    while i + 1 < flat_nodes.len() {
+        let title_norm = if let ReflowNode::Heading { title, .. } = &flat_nodes[i] {
+            let n = normalize_title(title);
+            if n.len() >= 5 { Some(n) } else { None }
+        } else {
+            None
+        };
+
+        if let Some(title_norm) = title_norm {
+            if let ReflowNode::Text { content } = &flat_nodes[i + 1] {
+                let content_norm = normalize_title(content);
+                if content_norm == title_norm || content_norm.starts_with(&title_norm) {
+                    // Try to strip the duplicate prefix from the content
+                    let remainder = strip_title_echo(content, &title_norm);
+                    if remainder.trim().is_empty() {
+                        flat_nodes.remove(i + 1);
+                        continue;
+                    } else {
+                        if let ReflowNode::Text { content } = &mut flat_nodes[i + 1] {
+                            *content = remainder;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Strip a heading-echo prefix from content text.
+/// Compares word-by-word against the normalized title.
+fn strip_title_echo(content: &str, title_norm: &str) -> String {
+    let content_trimmed = content.trim();
+    let content_lower = content_trimmed.to_lowercase();
+    let title_words: Vec<&str> = title_norm.split_whitespace().collect();
+
+    // Find how many words from the start of content match the title
+    let content_words: Vec<&str> = content_trimmed.split_whitespace().collect();
+    let content_lower_words: Vec<&str> = content_lower.split_whitespace().collect();
+
+    let mut matched = 0;
+    for (i, tw) in title_words.iter().enumerate() {
+        if i < content_lower_words.len() && content_lower_words[i] == *tw {
+            matched += 1;
+        } else {
+            break;
+        }
+    }
+
+    if matched >= title_words.len().min(content_words.len())
+        && matched >= 2
+        && matched <= content_words.len()
+    {
+        // Strip the matched prefix
+        content_words[matched..].join(" ")
+    } else {
+        content_trimmed.to_string()
+    }
+}
+
+/// Fix B: Ensure parent headings appear before their children.
+///
+/// When a child heading (higher depth) appears before its logical parent
+/// (lower depth) in the flat list, move the parent before the child.
+fn reorder_parent_before_child(flat_nodes: &mut Vec<ReflowNode>) {
+    let mut i = 0;
+    while i < flat_nodes.len() {
+        let child_depth = if let ReflowNode::Heading { depth, .. } = &flat_nodes[i] {
+            *depth
+        } else {
+            i += 1;
+            continue;
+        };
+
+        if child_depth <= 1 {
+            i += 1;
+            continue;
+        }
+
+        // Look ahead for a parent heading (lower depth)
+        let look_limit = (i + 6).min(flat_nodes.len());
+        let mut parent_idx = None;
+        for k in (i + 1)..look_limit {
+            if let ReflowNode::Heading { depth, .. } = &flat_nodes[k] {
+                if *depth < child_depth {
+                    parent_idx = Some(k);
+                }
+                break; // stop at first heading encountered
+            }
+        }
+
+        if let Some(pidx) = parent_idx {
+            let parent = flat_nodes.remove(pidx);
+            flat_nodes.insert(i, parent);
+            // Don't advance i — re-check from the same position
+        }
+        i += 1;
+    }
+}
+
+/// Fix D: Remove consecutive duplicate text blocks.
+///
+/// Detects adjacent Text nodes (possibly separated by a single Formula)
+/// with identical or highly overlapping content and removes the duplicate.
+fn dedup_consecutive_text(flat_nodes: &mut Vec<ReflowNode>) {
+    let mut i = 0;
+    while i + 1 < flat_nodes.len() {
+        // Get text content from node i, allowing skip of one formula
+        let (a_content, next_idx) = match &flat_nodes[i] {
+            ReflowNode::Text { content } => (content.clone(), i + 1),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        // Check the next node (or node after a formula)
+        let b_idx = if next_idx < flat_nodes.len() {
+            if matches!(&flat_nodes[next_idx], ReflowNode::Text { .. }) {
+                Some(next_idx)
+            } else if next_idx + 1 < flat_nodes.len()
+                && matches!(&flat_nodes[next_idx], ReflowNode::Formula { .. })
+                && matches!(&flat_nodes[next_idx + 1], ReflowNode::Text { .. })
+            {
+                Some(next_idx + 1)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let Some(b_idx) = b_idx else {
+            i += 1;
+            continue;
+        };
+
+        let b_content = if let ReflowNode::Text { content } = &flat_nodes[b_idx] {
+            content.clone()
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let a_norm: String = a_content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let b_norm: String = b_content.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        if a_norm.len() < 15 && b_norm.len() < 15 {
+            i += 1;
+            continue;
+        }
+
+        let should_dedup = if a_norm == b_norm {
+            true
+        } else if a_norm.len() >= 20 && b_norm.starts_with(&a_norm) {
+            true
+        } else if b_norm.len() >= 20 && a_norm.starts_with(&b_norm) {
+            true
+        } else {
+            text_overlap_ratio(&a_norm, &b_norm) > 0.8
+                && a_norm.len().min(b_norm.len()) >= 20
+        };
+
+        if should_dedup {
+            // Keep the longer one
+            if a_norm.len() >= b_norm.len() {
+                flat_nodes.remove(b_idx);
+            } else {
+                flat_nodes.remove(i);
+            }
+            continue; // re-check from same position
+        }
+
+        i += 1;
+    }
+}
+
+/// Compute word-overlap ratio between two normalized text strings.
+fn text_overlap_ratio(a: &str, b: &str) -> f32 {
+    let a_words: std::collections::HashSet<&str> = a.split_whitespace().collect();
+    let b_words: std::collections::HashSet<&str> = b.split_whitespace().collect();
+    let intersection = a_words.intersection(&b_words).count();
+    let min_len = a_words.len().min(b_words.len());
+    if min_len == 0 {
+        return 0.0;
+    }
+    intersection as f32 / min_len as f32
+}
+
+/// Fix M: Collapse text where every character is doubled.
+///
+/// Some PDFs render bold/shadow text by printing each character twice at the
+/// same position. The extractor picks up both, producing "EEXXPPEERRIIMMEENNTT".
+/// Applied per-paragraph so mixed normal/doubled content is handled.
+fn collapse_doubled_chars(text: &str) -> String {
+    // Process each paragraph independently
+    let paragraphs: Vec<&str> = text.split("\n\n").collect();
+    let mut any_changed = false;
+    let mut result_parts: Vec<String> = Vec::with_capacity(paragraphs.len());
+
+    for para in &paragraphs {
+        let collapsed = collapse_doubled_paragraph(para);
+        if collapsed.len() < para.len() {
+            any_changed = true;
+        }
+        result_parts.push(collapsed);
+    }
+
+    if any_changed {
+        result_parts.join("\n\n")
+    } else {
+        text.to_string()
+    }
+}
+
+fn collapse_doubled_paragraph(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 10 {
+        return text.to_string();
+    }
+
+    // Check non-space characters for the doubling pattern.
+    // Pattern: each letter appears twice, but spaces may not be doubled.
+    // E.g., "EE XX PP" → each non-space char is followed by itself.
+    let non_space: Vec<(usize, char)> = chars
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_whitespace())
+        .map(|(i, &c)| (i, c))
+        .collect();
+
+    if non_space.len() < 8 {
+        return text.to_string();
+    }
+
+    // Check if non-space chars come in consecutive pairs
+    let sample = non_space.len().min(40);
+    let mut doubled = 0;
+    let mut checked = 0;
+    let mut i = 0;
+    while i + 1 < sample {
+        if non_space[i].1 == non_space[i + 1].1
+            && non_space[i + 1].0 == non_space[i].0 + 1
+        {
+            doubled += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+        checked += 1;
+    }
+
+    if checked > 0 && (doubled as f32 / checked as f32) > 0.7 {
+        // Collapse: skip every second non-space char
+        let mut skip_indices: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
+        let mut j = 0;
+        while j + 1 < non_space.len() {
+            if non_space[j].1 == non_space[j + 1].1
+                && non_space[j + 1].0 == non_space[j].0 + 1
+            {
+                skip_indices.insert(non_space[j + 1].0);
+                j += 2;
+            } else {
+                j += 1;
+            }
+        }
+        chars
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| !skip_indices.contains(idx))
+            .map(|(_, &c)| c)
+            .collect()
+    } else {
+        text.to_string()
+    }
 }
 
 /// Build a heading tree from a flat list of reflow nodes.
@@ -1104,6 +1545,7 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 let depth = (*depth as usize).min(5); // cap at h6
                 let hashes = "#".repeat(depth + 1);
                 let title = collapse_spaced_letters(title);
+                let title = split_concatenated_allcaps(&title);
                 let title = fix_missing_spaces_in_title(&title);
                 parts.push(format!("{hashes} {title}"));
                 render_children(children, parts);
@@ -1209,6 +1651,81 @@ fn collapse_spaced_letters(title: &str) -> String {
 ///
 /// Detects `lowercaseUppercase` boundaries (e.g. "OrbitSatellites" → "Orbit Satellites")
 /// and `letterOf`/`letterThe` patterns (e.g. "ofa" → "of a").
+/// Split all-caps concatenated words like "CLASSICALLAMBDACALCULUS".
+///
+/// Uses a dictionary of common academic/technical words. Only applies to
+/// all-uppercase single tokens ≥12 chars. Falls back to original if
+/// the dictionary can't fully decompose the string.
+fn split_concatenated_allcaps(title: &str) -> String {
+    // Process each word in the title independently
+    let words: Vec<&str> = title.split_whitespace().collect();
+    let mut any_split = false;
+    let mut result_words: Vec<String> = Vec::new();
+
+    for word in &words {
+        if word.len() >= 12 && word.chars().all(|c| c.is_ascii_uppercase()) {
+            if let Some(split) = try_split_allcaps(word) {
+                result_words.push(split);
+                any_split = true;
+                continue;
+            }
+        }
+        result_words.push(word.to_string());
+    }
+
+    if any_split {
+        result_words.join(" ")
+    } else {
+        title.to_string()
+    }
+}
+
+fn try_split_allcaps(s: &str) -> Option<String> {
+    // Common words in academic headings, sorted longest-first for greedy match
+    static DICT: &[&str] = &[
+        "INTRODUCTION", "DEFINITIONS", "CONSTRUCTION", "COMBINATORY",
+        "INTERSECTION", "APPLICATIONS", "OPTIMIZATION",
+        "FUNDAMENTAL", "INDEPENDENT", "ARBITRARILY", "PROGRAMMING",
+        "STRATEGIES", "APPENDICES", "REFERENCES", "ALGORITHMS", "SEARCHING",
+        "DIMENSIONS", "STRUCTURES",
+        "CLASSICAL", "VARIABLES", "REDUCTION", "GEOMETRIC", "NUMERICAL",
+        "SEARCHING", "GENERALIZED",
+        "LABELLED", "SENSIBLE", "CALCULUS", "APPENDIX", "THEORIES",
+        "PROBLEMS", "ORIENTED", "PARALLEL", "RESULTS", "SUMMARY",
+        "OBJECTS", "MODELS", "LAMBDA", "GROUPS", "OTHER", "TYPED",
+        "INDEX", "DATA", "TYPE", "FREE", "PURE",
+    ];
+
+    let mut result = Vec::new();
+    let mut remaining = s;
+
+    while !remaining.is_empty() {
+        let mut found = false;
+        for word in DICT {
+            if remaining.starts_with(word) {
+                result.push(*word);
+                remaining = &remaining[word.len()..];
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            // Single char left over after successful splits? Skip.
+            if remaining.len() <= 2 && !result.is_empty() {
+                result.push(remaining);
+                return Some(result.join(" "));
+            }
+            return None;
+        }
+    }
+
+    if result.len() >= 2 {
+        Some(result.join(" "))
+    } else {
+        None
+    }
+}
+
 fn fix_missing_spaces_in_title(title: &str) -> String {
     let chars: Vec<char> = title.chars().collect();
     if chars.len() < 3 {

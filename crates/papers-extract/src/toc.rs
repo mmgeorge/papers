@@ -1438,13 +1438,24 @@ fn classify_by_pattern(title: &str, last_depth: u32) -> (Classification, u32) {
         return (class, num_depth);
     }
 
-    // Rule 5: Appendix section "A.1 Foo"
+    // Rule 5: Appendix section "A.1 Foo", "A.1.2 Bar", etc.
     if t.len() > 2 {
         let first = t.as_bytes()[0];
         if first.is_ascii_uppercase() && t.as_bytes().get(1) == Some(&b'.') {
             if let Some(ch) = t.as_bytes().get(2) {
                 if ch.is_ascii_digit() {
-                    return (Classification::Section, 2);
+                    // Count dots to determine depth: A.1 → 2, A.1.2 → 3
+                    let num_end = t.find(|c: char| c == ' ' || c == '\t').unwrap_or(t.len());
+                    let prefix = &t[..num_end];
+                    let dot_count = prefix.chars().filter(|&c| c == '.').count();
+                    let depth = (dot_count as u32) + 1;
+                    let class = match depth {
+                        1 => Classification::Chapter,
+                        2 => Classification::Section,
+                        3 => Classification::Subsection,
+                        _ => Classification::SubSubsection,
+                    };
+                    return (class, depth);
                 }
             }
         }
