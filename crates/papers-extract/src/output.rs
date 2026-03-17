@@ -243,6 +243,10 @@ struct Section {
     kind: RegionKind,
     /// 0-indexed PDF page this region came from.
     page_idx: u32,
+    /// Vertical position of this region (top of bbox, in points from page top).
+    y_top: f32,
+    /// Vertical position of this region (bottom of bbox, in points from page top).
+    y_bottom: f32,
     is_text: bool,
     is_references: bool,
     /// Display formulas are part of the paragraph flow — text before/after
@@ -334,6 +338,8 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
                 markdown: section,
                 kind: region.kind,
                 page_idx,
+                y_top: region.bbox[1],
+                y_bottom: region.bbox[3],
                 is_text,
                 is_references,
                 is_formula,
@@ -498,6 +504,21 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32]) -> Vec<Section>
             if !ends_mid {
                 i += 1;
                 continue;
+            }
+
+            // Fix K: Don't merge across large vertical gaps on the same page.
+            // A big gap suggests the current region is a footnote at page
+            // bottom, not a paragraph continuation. Use absolute threshold
+            // (half the page) to avoid blocking column-break merges.
+            if sections[k].page_idx == sections[i].page_idx {
+                let gap = sections[i].y_top - sections[k].y_bottom;
+                // Only block if gap > 200pt (about 1/3 of a typical page)
+                // and the gap is > 5× the previous region's height.
+                let region_height = (sections[k].y_bottom - sections[k].y_top).max(1.0);
+                if gap > 200.0 && gap > region_height * 5.0 {
+                    i += 1;
+                    continue;
+                }
             }
 
             let text = sections[k].markdown.trim_end().to_string();
@@ -817,6 +838,13 @@ fn titles_match(toc_title: &str, region_text: &str) -> bool {
     let toc_norm = normalize_title(toc_title);
     let region_norm = normalize_title(region_text);
 
+    // Reject obviously-too-long regions — real headings are short.
+    // A ParagraphTitle region with 200+ chars is almost certainly body text
+    // that the layout model misclassified.
+    if region_norm.len() > 200 {
+        return false;
+    }
+
     // Exact match
     if toc_norm == region_norm {
         return true;
@@ -829,22 +857,27 @@ fn titles_match(toc_title: &str, region_text: &str) -> bool {
         return true;
     }
 
-    // Prefix match: TOC title is prefix of region text
+    // Prefix match: TOC title is prefix of region text.
+    // But only if the region text isn't drastically longer (≤ 2× TOC length),
+    // to avoid matching body text that starts with the heading text.
     if !toc_norm.is_empty() && region_norm.starts_with(&toc_norm) {
-        return true;
+        if region_norm.len() <= toc_norm.len() * 2 + 20 {
+            return true;
+        }
     }
     // Region text is prefix of TOC title (truncated region text)
     if !region_norm.is_empty() && region_norm.len() >= 8 && toc_norm.starts_with(&region_norm) {
         return true;
     }
 
-    // Fuzzy: >80% of TOC title words appear in region text
+    // Fuzzy: >80% of TOC title words appear in region text.
+    // Require at least 3 words in the TOC title to avoid spurious matches.
     if !toc_stripped.is_empty() {
         let toc_words: Vec<&str> = toc_stripped.split_whitespace().collect();
-        if toc_words.len() >= 2 {
+        if toc_words.len() >= 3 {
             let matched = toc_words
                 .iter()
-                .filter(|w| region_stripped.contains(**w))
+                .filter(|w| w.len() >= 3 && region_stripped.contains(**w))
                 .count();
             if matched as f32 / toc_words.len() as f32 > 0.8 {
                 return true;
@@ -1146,6 +1179,7 @@ fn split_table_caption(md: &str) -> (String, Option<String>) {
 fn postprocess_flat_nodes(flat_nodes: &mut Vec<ReflowNode>) {
     dedup_heading_echo(flat_nodes);
     reorder_parent_before_child(flat_nodes);
+    reorder_headings_by_numbering(flat_nodes);
     dedup_consecutive_text(flat_nodes);
     // Collapse doubled characters (e.g. "EEXXPPEERRIIMMEENNTT" → "EXPERIMENT")
     for node in flat_nodes.iter_mut() {
@@ -1222,6 +1256,109 @@ fn strip_title_echo(content: &str, title_norm: &str) -> String {
         content_words[matched..].join(" ")
     } else {
         content_trimmed.to_string()
+    }
+}
+
+/// Fix B+: Reorder headings so that numbered sections appear in numeric order.
+///
+/// When a heading like "1.4.2" appears after "1.7" due to layout detection
+/// ordering, move it to the correct position (after the last "1.4.x" heading).
+/// Also ensures parent headings appear before their first child.
+fn reorder_headings_by_numbering(flat_nodes: &mut Vec<ReflowNode>) {
+    // Extract (index, numbering_key) for all heading nodes
+    let mut heading_indices: Vec<(usize, Vec<u32>)> = Vec::new();
+    for (i, node) in flat_nodes.iter().enumerate() {
+        if let ReflowNode::Heading { title, .. } = node {
+            if let Some(key) = parse_section_number(title) {
+                heading_indices.push((i, key));
+            }
+        }
+    }
+
+    if heading_indices.len() < 2 {
+        return;
+    }
+
+    // Find out-of-order headings and relocate them.
+    // A heading with key [1,4,2] should come after [1,4,1] but before [1,5].
+    // If it currently sits after [1,5], move it to right after [1,4,1].
+    for _pass in 0..10 {
+        let mut moved = false;
+
+        // Re-scan heading positions (they shift after each move)
+        heading_indices.clear();
+        for (i, node) in flat_nodes.iter().enumerate() {
+            if let ReflowNode::Heading { title, .. } = node {
+                if let Some(key) = parse_section_number(title) {
+                    heading_indices.push((i, key));
+                }
+            }
+        }
+
+        for hi in 1..heading_indices.len() {
+            let (cur_idx, ref cur_key) = heading_indices[hi];
+            let (prev_idx, ref prev_key) = heading_indices[hi - 1];
+
+            // If the previous heading (by flat position) has a LARGER key
+            // than us, we're out of order. Find where we should actually be.
+            if prev_key > cur_key {
+                // Find the last heading with key < cur_key
+                let mut insert_after_hi = None;
+                for hj in (0..hi).rev() {
+                    if heading_indices[hj].1 <= *cur_key {
+                        insert_after_hi = Some(hj);
+                        break;
+                    }
+                }
+
+                if let Some(ihi) = insert_after_hi {
+                    let target_idx = heading_indices[ihi].0;
+                    if target_idx < cur_idx {
+                        // Move the heading (and its trailing content) right
+                        // after target_idx. Find how many content nodes follow
+                        // the heading before the next heading.
+                        let next_heading = heading_indices.get(hi + 1).map(|(idx, _)| *idx).unwrap_or(flat_nodes.len());
+                        let block_end = next_heading.min(cur_idx + 1); // just the heading for now
+
+                        let node = flat_nodes.remove(cur_idx);
+                        flat_nodes.insert(target_idx + 1, node);
+                        moved = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if !moved {
+            break;
+        }
+    }
+}
+
+/// Parse a section number prefix like "1.4.2 Foo" into a sortable key [1, 4, 2].
+fn parse_section_number(title: &str) -> Option<Vec<u32>> {
+    let title = title.trim();
+    let num_end = title.find(|c: char| c == ' ' || c == '\t').unwrap_or(title.len());
+    let prefix = &title[..num_end];
+
+    // Must start with a digit and contain only digits and dots
+    if prefix.is_empty() || !prefix.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    if !prefix.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+
+    let parts: Vec<u32> = prefix
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
     }
 }
 

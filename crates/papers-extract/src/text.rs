@@ -172,11 +172,45 @@ pub fn extract_region_text(
     }
 
     let lines = group_elements_into_lines(&elements);
-    match mode {
+    let text = match mode {
         AssemblyMode::Reflow => assemble_text(&lines, false),
         AssemblyMode::References => assemble_text(&lines, true),
         AssemblyMode::PreserveLayout => assemble_preserving_layout(&lines, region_bbox[0]),
+    };
+    fix_common_mojibake(&text)
+}
+
+/// Fix common mojibake patterns from PDF font encoding issues.
+///
+/// Some PDFs (especially TeX-generated ones) map quotation marks to wrong
+/// Unicode codepoints. This cleans up the most frequent patterns.
+fn fix_common_mojibake(text: &str) -> String {
+    if !text.contains('\u{0141}') && !text.contains("\u{00E2}\u{0141}") {
+        return text.to_string();
     }
+
+    let mut result = text.to_string();
+    // U+00E2 U+0141 U+2122 = â Ł ™ → should be U+2019 (right single quote / apostrophe)
+    result = result.replace("\u{00E2}\u{0141}\u{2122}", "\u{2019}");
+    // U+00E2 U+0141 U+201C = â Ł " → should be U+201C (left double quote)
+    result = result.replace("\u{00E2}\u{0141}\u{201C}", "\u{201C}");
+    // U+00E2 U+0141 U+201D = â Ł " → should be U+201D (right double quote)
+    result = result.replace("\u{00E2}\u{0141}\u{201D}", "\u{201D}");
+    // Standalone Ł used as apostrophe (between word chars like "EulerŁs")
+    let chars: Vec<char> = result.chars().collect();
+    let mut cleaned = String::with_capacity(result.len());
+    for (i, &ch) in chars.iter().enumerate() {
+        if ch == '\u{0141}' {
+            let prev_alpha = i > 0 && chars[i - 1].is_alphanumeric();
+            let next_alpha = i + 1 < chars.len() && chars[i + 1].is_alphanumeric();
+            if prev_alpha && next_alpha {
+                cleaned.push('\u{2019}'); // right single quote
+                continue;
+            }
+        }
+        cleaned.push(ch);
+    }
+    cleaned
 }
 
 /// Filter characters whose center falls within the region bounding box,
@@ -1221,8 +1255,12 @@ fn build_line_text(
                 if c.codepoint != ' ' {
                     if let Some(pr) = prev_right {
                         let gap = c.bbox[0] - pr;
+                        // Use font's space threshold, but enforce a minimum
+                        // floor of avg_width * 0.25 to avoid TeX kerning gaps
+                        // being misread as word boundaries.
+                        let min_floor = avg_width * 0.25;
                         let threshold = if c.space_threshold > 0.0 {
-                            c.space_threshold
+                            c.space_threshold.max(min_floor)
                         } else {
                             avg_width * 0.3
                         };
