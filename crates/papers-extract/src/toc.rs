@@ -292,8 +292,26 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
         return None;
     }
 
-    // Phase 2: Extract lines from TOC pages
-    let raw_lines = extract_toc_lines(page_chars, &toc_pages);
+    // Phase 2: Extract lines from main TOC pages only (exclude pre-TOC
+    // pages like "Contents at a Glance" that are appended at the end of
+    // toc_pages for skipping purposes but shouldn't be used for entry
+    // extraction).
+    // Main TOC pages are sorted ascending; pre-TOC pages are appended and
+    // would break the ascending order.
+    let main_toc_pages: Vec<u32> = {
+        let mut main = Vec::new();
+        let mut prev = 0u32;
+        for &p in &toc_pages {
+            if p >= prev || main.is_empty() {
+                main.push(p);
+                prev = p;
+            } else {
+                break; // pre-TOC pages start here (out of order)
+            }
+        }
+        main
+    };
+    let raw_lines = extract_toc_lines(page_chars, &main_toc_pages);
     if raw_lines.is_empty() {
         return None;
     }
@@ -337,12 +355,39 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
 
 // ── Phase 1: Find TOC pages ──
 
+/// Check if a page looks like a TOC page based on its content.
+/// A TOC page has many lines ending with page numbers and/or leader dots.
+fn is_toc_like_page(page_data: &(Vec<PdfChar>, f32), page_idx: u32) -> bool {
+    let (chars, page_height) = page_data;
+    if chars.is_empty() || *page_height <= 0.0 {
+        return false;
+    }
+
+    let lines = build_lines_from_chars(chars, *page_height, page_idx);
+    let non_empty: Vec<&TocRawLine> = lines.iter().filter(|l| !l.text().trim().is_empty()).collect();
+    if non_empty.len() < 4 {
+        return false;
+    }
+
+    let with_trailing_number = non_empty.iter().filter(|l| line_ends_with_number(l)).count();
+    let with_dots = non_empty.iter().filter(|l| headings::has_leader_dots(&l.text())).count();
+
+    let pct_numbers = with_trailing_number as f32 / non_empty.len() as f32;
+    let pct_dots = with_dots as f32 / non_empty.len() as f32;
+
+    // A page is TOC-like if ≥30% of lines end with page numbers OR ≥20% have leader dots
+    pct_numbers >= 0.3 || pct_dots >= 0.2
+}
+
 fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
     let total = page_chars.len();
     let scan_limit = total.min(40).min(total / 3 + 5);
 
-    // Find the "Contents" start page
+    // Find the "Contents" start page.
+    // Two-pass: first look for exact heading match ("contents", "table of contents"),
+    // then fall back to any heading containing "contents".
     let mut start_page: Option<u32> = None;
+    let mut fallback_page: Option<u32> = None;
     for page_idx in 0..scan_limit {
         let (chars, page_height) = &page_chars[page_idx];
         if chars.is_empty() {
@@ -350,8 +395,6 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
         }
         let lines = build_lines_from_chars(chars, *page_height, page_idx as u32);
         // Check the 3 physically topmost lines (by Y-position, not list index)
-        // for "Contents" header. This is important for two-column layouts where
-        // the column reordering may move the header away from index 0.
         let mut top_indices: Vec<(usize, f32)> = lines
             .iter()
             .enumerate()
@@ -361,29 +404,68 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
         for &(idx, _) in top_indices.iter().take(3) {
             let text = lines[idx].text();
             let trimmed = text.trim().to_ascii_lowercase();
-            if trimmed == "contents"
-                || trimmed == "table of contents"
-                || trimmed == "detailed contents"
-            {
-                // Make sure it's not "List of..." pages
-                if !trimmed.starts_with("list of") {
-                    start_page = Some(page_idx as u32);
-                    break;
-                }
+            if trimmed.starts_with("list of") {
+                continue;
+            }
+            if trimmed == "contents" || trimmed == "table of contents" {
+                start_page = Some(page_idx as u32);
+                break;
+            }
+            if fallback_page.is_none() && trimmed.contains("contents") {
+                fallback_page = Some(page_idx as u32);
             }
         }
         if start_page.is_some() {
             break;
         }
     }
+    if start_page.is_none() {
+        start_page = fallback_page;
+    }
 
+    // If no "contents" heading found, fall back to content-based detection:
+    // scan from the front for consecutive pages with TOC characteristics
+    // (many lines ending with page numbers, leader dots).
     let start = match start_page {
         Some(s) => s,
-        None => return vec![],
+        None => {
+            // Scan the first ~30 pages for runs of TOC-like pages
+            let mut first_toc_page: Option<u32> = None;
+            for page_idx in 0..scan_limit {
+                if is_toc_like_page(&page_chars[page_idx], page_idx as u32) {
+                    if first_toc_page.is_none() {
+                        first_toc_page = Some(page_idx as u32);
+                    }
+                } else if first_toc_page.is_some() {
+                    // Found end of TOC run
+                    break;
+                }
+            }
+            match first_toc_page {
+                Some(s) => s,
+                None => return vec![],
+            }
+        }
     };
 
-    // Extend forward: include pages with TOC-like characteristics
+    // Extend forward: include pages with TOC-like characteristics.
     let mut toc_pages = vec![start];
+    // Scan backward to find preceding TOC-like pages (e.g. "Contents at a
+    // Glance" before "Table of Contents"). These are added to toc_pages
+    // for SKIPPING during reflow (so their content isn't in the body text),
+    // but they're placed AFTER the start page in the list so they don't
+    // interfere with entry extraction (which only uses lines from toc_pages
+    // in order). We'll append them at the end after forward extension.
+    let mut pre_toc_pages: Vec<u32> = Vec::new();
+    if start > 0 {
+        for page_idx in (0..start).rev() {
+            if is_toc_like_page(&page_chars[page_idx as usize], page_idx) {
+                pre_toc_pages.push(page_idx);
+            } else {
+                break;
+            }
+        }
+    }
     for page_idx in (start + 1)..scan_limit as u32 {
         let (chars, page_height) = &page_chars[page_idx as usize];
         if chars.is_empty() {
@@ -440,6 +522,11 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
             break;
         }
     }
+
+    // Append pre-TOC pages (for skipping only, not entry extraction).
+    // These go at the end of the list so extract_toc_lines processes the
+    // main TOC pages first. The pages are still skipped during reflow.
+    toc_pages.extend(pre_toc_pages);
 
     toc_pages
 }

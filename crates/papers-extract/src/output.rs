@@ -292,16 +292,15 @@ pub fn detect_watermarks(page_chars: &[(Vec<PdfChar>, f32)]) -> std::collections
             .map(|(f, _)| f.clone());
         let Some(dominant) = dominant else { continue };
 
-        // Look at chars in the bottom 20% of the page
-        let bottom_threshold = *page_height * 0.80;
-        // PDF coords: bottom of page = y near 0, top = y near page_height.
-        // Chars with bbox[3] (top) < bottom_threshold are in the bottom 20%.
+        // Look at chars in the bottom 20% of the page.
+        // CropBox-relative PDF coords: y=0 is bottom, y=page_height is top.
+        let bottom_threshold = *page_height * 0.20;
         let bottom_chars: Vec<&PdfChar> = chars
             .iter()
             .filter(|c| {
                 !c.codepoint.is_control()
                     && c.codepoint != ' '
-                    && c.bbox[3] < bottom_threshold // top of char below 80% of page
+                    && c.bbox[3] < bottom_threshold // top of char in bottom 20%
             })
             .collect();
 
@@ -2671,15 +2670,24 @@ pub fn write_debug(
 
         let page_h = page_info.height_pt;
 
+        // Get CropBox offset to convert CropBox-relative coords back to MediaBox
+        // for drawing on the PDF page.
+        let crop_rect = page.boundaries().crop().ok().map(|b| b.bounds);
+        let (crop_x, crop_y_bottom) = if let Some(rect) = crop_rect {
+            (rect.left().value, rect.bottom().value)
+        } else {
+            (0.0, 0.0)
+        };
+
         for region in &page_info.regions {
             let color = region_color(region.kind);
             let [x1, y1, x2, y2] = region.bbox;
 
-            // bbox is in top-left-origin points; convert to PDF bottom-left-origin
-            let pdf_left = x1;
-            let pdf_right = x2;
-            let pdf_bottom = page_h - y2;
-            let pdf_top = page_h - y1;
+            // bbox is CropBox-relative, Y-down; convert to MediaBox, Y-up (PDF coords)
+            let pdf_left = x1 + crop_x;
+            let pdf_right = x2 + crop_x;
+            let pdf_bottom = (page_h - y2) + crop_y_bottom;
+            let pdf_top = (page_h - y1) + crop_y_bottom;
 
             // Draw bounding box rectangle (stroke only, no fill)
             page.objects_mut()
@@ -2701,7 +2709,8 @@ pub fn write_debug(
 
             let font_size = 7.0;
             // Place label just above the box top edge
-            let label_y = if pdf_top + font_size + 1.0 < page_h {
+            let media_h = page_h + crop_y_bottom * 2.0; // approximate
+            let label_y = if pdf_top + font_size + 1.0 < media_h {
                 pdf_top + 1.0
             } else {
                 pdf_top - font_size - 1.0

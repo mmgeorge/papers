@@ -1244,6 +1244,36 @@ fn build_line_text(
     for (ei, elem) in elements.iter().enumerate() {
         match elem {
             LineElement::Char(c) => {
+                // Expand TeX ligatures (control chars 0x0B-0x0F) and
+                // Unicode ligatures (U+FB00-FB06) to component letters.
+                // Only expand control chars when they come from a real font
+                // (font_size > 0) — pdfium's line-break markers (\r, \n)
+                // have font_size=0 and should be skipped, not expanded.
+                // Expand ligatures: TeX control chars (0x0B-0x0F) from real
+                // fonts, and Unicode ligatures (U+FB00-FB06).
+                // Skip pdfium line-break markers (\r, \n) which have font_size ≈ 0.
+                if let Some(ligature) = crate::pdf::expand_ligature(c.codepoint) {
+                    // Only expand if the char has a real glyph (nonzero width).
+                    // Pdfium's line-break markers (\r, \n) have zero-width bboxes.
+                    let has_glyph = (c.bbox[2] - c.bbox[0]) > 0.1;
+                    if has_glyph || !c.codepoint.is_control() {
+                        if let Some(pr) = prev_right {
+                            let gap = c.bbox[0] - pr;
+                            let min_floor = avg_width * 0.25;
+                            let threshold = if c.space_threshold > 0.0 {
+                                c.space_threshold.max(min_floor)
+                            } else {
+                                avg_width * 0.3
+                            };
+                            if threshold > 0.0 && gap >= threshold && !text.ends_with(' ') {
+                                text.push(' ');
+                            }
+                        }
+                        text.push_str(ligature);
+                        prev_right = Some(c.bbox[2]);
+                        continue;
+                    }
+                }
                 if c.codepoint.is_control() { continue; }
 
                 // Skip accent chars (merged into their base char)

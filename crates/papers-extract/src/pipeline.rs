@@ -364,8 +364,13 @@ impl Pipeline {
         // Render page to image
         let page_image = pdf::render_page(page, self.options.dpi)?;
 
-        // Extract characters from text layer
-        let chars = pdf::extract_page_chars(page, page_idx)?;
+        // Extract characters from text layer and adjust for CropBox offset.
+        // Pdfium returns char bboxes in MediaBox coordinates, but the rendered
+        // image (and layout model) uses the CropBox area. Apply the offset so
+        // char positions align with layout-detected region bboxes.
+        let mut chars = pdf::extract_page_chars(page, page_idx)?;
+        let crop = pdf::crop_offset(page);
+        pdf::apply_crop_offset(&mut chars, crop);
 
         // Run direct layout detection (correct bboxes + reading order)
         let detected = self
