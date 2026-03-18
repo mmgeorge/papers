@@ -851,8 +851,27 @@ impl Pipeline {
                             )
                         }
                     };
-                    region.text = crate::html_table::html_table_to_markdown(&html);
-                    region.html = Some(html);
+                    let md = crate::html_table::html_table_to_markdown(&html);
+
+                    // Quality check: if the table markdown has mostly empty
+                    // cells (> 60% empty), demote to Image — the table
+                    // detection is likely a false positive.
+                    let is_low_quality = if let Some(ref md_text) = md {
+                        let total_cells = md_text.matches('|').count();
+                        let empty_cells = md_text.matches("|  |").count()
+                            + md_text.matches("| |").count();
+                        total_cells > 4 && empty_cells as f32 / (total_cells as f32 / 2.0) > 0.6
+                    } else {
+                        true
+                    };
+
+                    if is_low_quality {
+                        // Demote: keep as image, drop table text
+                        region.kind = RegionKind::Image;
+                    } else {
+                        region.text = md;
+                        region.html = Some(html);
+                    }
                 }
             }
 
@@ -1251,6 +1270,18 @@ fn bbox_contains(outer: [f32; 4], inner: [f32; 4]) -> bool {
 /// - `PageHeader` / `PageFooter`
 /// - Any non-header region whose bbox is fully contained within a PageHeader bbox
 ///   (e.g. a duplicate Title detection that overlaps the header)
+/// Compute the fraction of `a`'s area that overlaps with `b`.
+fn bbox_overlap_ratio(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let x_overlap = (a[2].min(b[2]) - a[0].max(b[0])).max(0.0);
+    let y_overlap = (a[3].min(b[3]) - a[1].max(b[1])).max(0.0);
+    let overlap_area = x_overlap * y_overlap;
+    let a_area = (a[2] - a[0]) * (a[3] - a[1]);
+    if a_area <= 0.0 {
+        return 0.0;
+    }
+    overlap_area / a_area
+}
+
 fn strip_structural_regions(regions: &mut Vec<Region>) {
     // Collect PageHeader bboxes before filtering.
     let header_bboxes: Vec<[f32; 4]> = regions
@@ -1271,33 +1302,70 @@ fn strip_structural_regions(regions: &mut Vec<Region>) {
         .map(|r| r.bbox)
         .collect();
 
-    regions.retain(|r| {
-        // Always drop these kinds.
-        if matches!(
-            r.kind,
-            RegionKind::FormulaNumber | RegionKind::PageHeader | RegionKind::PageFooter
-        ) {
-            return false;
+    // Deduplicate overlapping regions. The layout model sometimes detects
+    // the same content area as multiple region types (e.g. Table + Text,
+    // Algorithm + Text). Keep the more specific/higher-priority kind.
+    // Priority: Table > Algorithm > Text (Table has structured extraction,
+    // Algorithm preserves layout, Text is the fallback).
+    fn region_priority(kind: RegionKind) -> u8 {
+        match kind {
+            RegionKind::Table => 3,
+            RegionKind::Algorithm => 2,
+            RegionKind::Image | RegionKind::FigureGroup => 2,
+            RegionKind::DisplayFormula | RegionKind::InlineFormula => 2,
+            RegionKind::Footnote => 1,
+            _ => 0, // Text, ParagraphTitle, etc.
         }
+    }
 
-        // Drop any region fully contained within a PageHeader bbox.
-        if header_bboxes
-            .iter()
-            .any(|hdr| bbox_contains(*hdr, r.bbox))
-        {
-            return false;
+    // Mark indices of regions to drop due to overlap with a higher-priority region.
+    let mut drop_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for i in 0..regions.len() {
+        if drop_indices.contains(&i) {
+            continue;
         }
-
-        // Drop Text regions whose bbox is contained within or mostly overlaps
-        // a Figure/Image bbox — these are figure-internal labels the layout
-        // model extracted as separate Text regions.
-        if r.kind == RegionKind::Text {
-            if figure_bboxes.iter().any(|fig| bbox_contains(*fig, r.bbox)) {
-                return false;
+        for j in (i + 1)..regions.len() {
+            if drop_indices.contains(&j) {
+                continue;
+            }
+            let ri = &regions[i];
+            let rj = &regions[j];
+            // Skip zero bboxes (synthetic/test data)
+            if ri.bbox == [0.0; 4] || rj.bbox == [0.0; 4] {
+                continue;
+            }
+            let overlap = bbox_overlap_ratio(ri.bbox, rj.bbox);
+            let overlap_rev = bbox_overlap_ratio(rj.bbox, ri.bbox);
+            // If either region covers >50% of the other, they're duplicates
+            if overlap > 0.5 || overlap_rev > 0.5 {
+                let pi = region_priority(ri.kind);
+                let pj = region_priority(rj.kind);
+                if pi >= pj {
+                    drop_indices.insert(j);
+                } else {
+                    drop_indices.insert(i);
+                    break; // i is dropped, no need to compare further
+                }
             }
         }
+    }
 
-        true
+    let mut idx = 0;
+    regions.retain(|r| {
+        let keep = !drop_indices.contains(&idx);
+        // Also apply the original structural filters
+        let dominated = matches!(
+            r.kind,
+            RegionKind::FormulaNumber | RegionKind::PageHeader | RegionKind::PageFooter
+        ) || header_bboxes
+            .iter()
+            .any(|hdr| bbox_contains(*hdr, r.bbox))
+            || (r.kind == RegionKind::Text
+                && figure_bboxes
+                    .iter()
+                    .any(|fig| bbox_contains(*fig, r.bbox)));
+        idx += 1;
+        keep && !dominated
     });
 }
 

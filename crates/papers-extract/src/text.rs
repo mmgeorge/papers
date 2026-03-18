@@ -699,6 +699,94 @@ fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
     }
     let result = collapsed;
 
+    fix_split_words(&result)
+}
+
+/// Fix words split by false space detection in justified text.
+///
+/// Justified PDFs often stretch inter-character gaps to fill line width.
+/// This can cause gaps between the last 1-2 characters of a word to exceed
+/// the space threshold, producing splits like "bi t", "th e", "popula r".
+///
+/// Strategy: scan for `<fragment> <suffix>` where suffix is 1-2 lowercase
+/// chars and the fragment ends with a lowercase letter. If the suffix
+/// followed by a word-boundary suggests the split is artificial, rejoin.
+fn fix_split_words(text: &str) -> String {
+    // We'll work with bytes/chars, scanning for the pattern:
+    //   [a-z] SPACE [a-z]{1,2} (followed by space, punctuation, or end)
+    // and rejoin when the fragment + suffix form a plausible word.
+    let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        // Look for: lowercase_letter SPACE lowercase{1,2} word_boundary
+        if i + 2 < chars.len()
+            && chars[i].is_ascii_lowercase()
+            && chars[i + 1] == ' '
+            && chars[i + 2].is_ascii_lowercase()
+        {
+            // Determine suffix length (1 or 2 chars)
+            let suffix_len = if i + 3 < chars.len() && chars[i + 3].is_ascii_lowercase() {
+                if i + 4 >= chars.len()
+                    || !chars[i + 4].is_ascii_lowercase()
+                {
+                    2 // 2-char suffix followed by non-letter
+                } else {
+                    0 // 3+ chars after space — this is a real word, not a split
+                }
+            } else {
+                1 // 1-char suffix
+            };
+
+            if suffix_len > 0 {
+                // Check what follows the suffix
+                let after_suffix = i + 2 + suffix_len;
+                let at_boundary = after_suffix >= chars.len()
+                    || chars[after_suffix] == ' '
+                    || chars[after_suffix] == '\n'
+                    || chars[after_suffix] == ','
+                    || chars[after_suffix] == '.'
+                    || chars[after_suffix] == ';'
+                    || chars[after_suffix] == ':'
+                    || chars[after_suffix] == '!'
+                    || chars[after_suffix] == '?'
+                    || chars[after_suffix] == ')'
+                    || chars[after_suffix] == '\''
+                    || chars[after_suffix] == '"'
+                    || chars[after_suffix] == '*';
+
+                if at_boundary {
+                    // Check that we're inside a word (previous chars are also letters)
+                    // by looking back to make sure the fragment has 2+ letters
+                    let has_fragment = i >= 1 && chars[i - 1].is_ascii_lowercase();
+
+                    // Don't rejoin if the suffix is a standalone word:
+                    // common 1-letter words: a, I (uppercase)
+                    // common 2-letter words: to, in, on, at, of, is, it, or, an, as, if, so, no, do, up, we, he, my, by
+                    let suffix: String = chars[i + 2..i + 2 + suffix_len].iter().collect();
+                    let is_common_word = match suffix.as_str() {
+                        "a" | "i" => true,
+                        "to" | "in" | "on" | "at" | "of" | "is" | "it" | "or" | "an"
+                        | "as" | "if" | "so" | "no" | "do" | "up" | "we" | "he" | "my"
+                        | "by" | "be" => true,
+                        _ => false,
+                    };
+
+                    if has_fragment && !is_common_word {
+                        // Rejoin: skip the space
+                        result.push(chars[i]);
+                        // skip chars[i+1] (the space)
+                        i += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+
     result
 }
 
@@ -934,12 +1022,40 @@ fn split_line_number_prefix(line: &[&LineElement]) -> (Option<String>, usize) {
     let mut idx = 0;
     let mut num_str = String::new();
 
-    // Phase 1: collect leading digits
+    // Phase 1: collect leading digits (allowing spaces between digits from
+    // justified-text gap inflation, e.g. "1  0" should be read as "10")
     while idx < line.len() {
         match &line[idx] {
             LineElement::Char(c) if c.codepoint.is_ascii_digit() => {
                 num_str.push(c.codepoint);
                 idx += 1;
+            }
+            // Skip spaces between digits (look ahead for another digit)
+            LineElement::Char(c)
+                if (c.codepoint == ' ' || c.codepoint.is_control()) && !num_str.is_empty() =>
+            {
+                // Look ahead to see if there's another digit coming
+                let mut peek = idx + 1;
+                while peek < line.len() {
+                    match &line[peek] {
+                        LineElement::Char(c)
+                            if c.codepoint == ' ' || c.codepoint.is_control() =>
+                        {
+                            peek += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if peek < line.len() {
+                    if let LineElement::Char(c) = &line[peek] {
+                        if c.codepoint.is_ascii_digit() {
+                            // Skip this space — another digit follows
+                            idx += 1;
+                            continue;
+                        }
+                    }
+                }
+                break;
             }
             _ => break,
         }
@@ -5429,5 +5545,47 @@ mod tests {
             result.contains("it\u{2019}s"),
             "standalone Ł should become apostrophe, got: {result}"
         );
+    }
+
+    // ── Split word fix tests ──
+
+    #[test]
+    fn test_fix_split_words_single_char() {
+        assert_eq!(fix_split_words("bi t stream"), "bit stream");
+        assert_eq!(fix_split_words("th e receiver"), "the receiver");
+        assert_eq!(fix_split_words("popula r protocol"), "popular protocol");
+    }
+
+    #[test]
+    fn test_fix_split_words_two_chars() {
+        assert_eq!(fix_split_words("lin k layer"), "link layer");
+        assert_eq!(fix_split_words("neve r within"), "never within");
+        assert_eq!(fix_split_words("fiv e consecutive"), "five consecutive");
+    }
+
+    #[test]
+    fn test_fix_split_words_preserves_real_words() {
+        // "a" and "is" are real words, don't rejoin
+        assert_eq!(fix_split_words("use a shortcut"), "use a shortcut");
+        assert_eq!(fix_split_words("flag is transmitted"), "flag is transmitted");
+        assert_eq!(fix_split_words("it is fine"), "it is fine");
+    }
+
+    #[test]
+    fn test_fix_split_words_at_end() {
+        assert_eq!(fix_split_words("physica l"), "physical");
+    }
+
+    #[test]
+    fn test_fix_split_words_before_punctuation() {
+        assert_eq!(fix_split_words("bi t, then"), "bit, then");
+        assert_eq!(fix_split_words("popula r."), "popular.");
+    }
+
+    #[test]
+    fn test_fix_split_words_no_false_positive() {
+        // Don't rejoin when suffix is 3+ chars (real word)
+        assert_eq!(fix_split_words("a bit more"), "a bit more");
+        assert_eq!(fix_split_words("the bit stream"), "the bit stream");
     }
 }
