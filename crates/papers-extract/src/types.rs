@@ -11,7 +11,19 @@ use serde::{Deserialize, Serialize};
 pub struct ReflowDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Table of contents entries parsed from the PDF.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub toc: Vec<TocEntryRendered>,
     pub children: Vec<ReflowNode>,
+}
+
+/// A rendered TOC entry for inclusion in the reflow document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TocEntryRendered {
+    pub depth: u32,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page: Option<String>,
 }
 
 /// A node in the reflow document tree.
@@ -26,7 +38,20 @@ pub enum ReflowNode {
     },
     /// A reflowed paragraph of text.
     /// Unresolved inline formulas appear as `[[FORMULA <id>]]` placeholders.
-    Text { content: String },
+    Text {
+        content: String,
+        /// Footnotes referenced by this paragraph, rendered after it.
+        /// Not set during construction — populated by a post-processing pass.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        footnotes: Vec<String>,
+    },
+    /// A single footnote node, placed after the paragraph that references it.
+    Footnote {
+        /// Footnote marker (e.g. "1", "2", "*", "†")
+        marker: String,
+        /// Footnote body text
+        content: String,
+    },
     /// A display formula. `content` holds `$$…$$` when parsed; `None` when unparsed.
     /// `path` points to a cropped image when the formula could not be parsed.
     Formula {
@@ -49,6 +74,15 @@ pub enum ReflowNode {
     },
     /// Preserved-layout text (e.g. algorithm pseudocode).
     Algorithm { content: String },
+    /// Formatted text block — preserves layout as-is (mini-TOCs, structured
+    /// listings, decorated sidebars). Not code, but shouldn't be reflowed.
+    FormattedText { content: String },
+    /// A code block detected from text content.
+    CodeBlock {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        language: Option<String>,
+    },
     /// A composite figure group with optional caption.
     FigureGroup {
         path: String,
@@ -59,6 +93,16 @@ pub enum ReflowNode {
     References { content: String },
     /// Footnote text block.
     FootnoteBlock { content: String },
+    /// A list (bulleted or numbered).
+    List {
+        /// "bulleted" or "numbered"
+        list_type: String,
+        /// List items (just the text, without the bullet/number prefix)
+        items: Vec<String>,
+    },
+    /// Pre-TOC front matter (dedications, acknowledgments, copyright, etc.)
+    /// Preserved in JSON for completeness but skipped in markdown rendering.
+    FrontMatter { children: Vec<ReflowNode> },
 }
 
 // ── Extraction types ────────────────────────────────────────────────
@@ -178,6 +222,10 @@ pub enum RegionKind {
     SidebarText,
     /// Synthetic group of spatially close visual regions sharing one caption.
     FigureGroup,
+    /// Formatted/structured text detected by the pipeline (mini-TOC, structured
+    /// listing). Not from the layout model — promoted from Text during extraction
+    /// when the content has structured visual patterns.
+    FormattedText,
 }
 
 impl RegionKind {

@@ -138,7 +138,13 @@ pub fn extract_region_text(
     let mut exclude_bboxes: Vec<[f32; 4]> = inline_formulas.iter().map(|f| f.bbox).collect();
     exclude_bboxes.extend(unresolved_formulas.iter().map(|f| f.bbox));
 
-    let matched = match_chars_to_region(&image_chars, region_bbox, &exclude_bboxes);
+    // Use strict matching (no horizontal expansion) for preserved-layout modes
+    // to avoid pulling in chars from outside the region that would flatten indentation.
+    let matched = if mode == AssemblyMode::PreserveLayout {
+        match_chars_to_region_strict(&image_chars, region_bbox, &exclude_bboxes)
+    } else {
+        match_chars_to_region(&image_chars, region_bbox, &exclude_bboxes)
+    };
 
     // Build LineElements from matched chars
     let mut elements: Vec<LineElement> = matched.iter().map(|c| LineElement::Char(c)).collect();
@@ -604,17 +610,24 @@ fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
             } else if has_hyphen_marker {
                 // This line ends with a hyphen marker (pdfium's STX).
                 // Distinguish compound-word hyphens ("Barrier-augmented")
-                // from line-break splits ("encoun-tering"):
-                // If the last word starts with uppercase, it's likely a
-                // compound word — keep the hyphen. Otherwise, join directly.
+                // from line-break splits ("Invo-cation", "encoun-tering"):
+                //
+                // Compound words: both parts are complete words, the first
+                // is typically ≥4 chars and starts with uppercase.
+                // Line-break splits: the first part is a word FRAGMENT.
+                //
+                // Heuristic: keep the hyphen if:
+                // 1. The last word starts with uppercase (proper/compound), AND
+                // 2. The last word is ≥ 5 chars (not a short prefix like "In-")
+                // Otherwise dehyphenate.
                 let last_word_start = result.rfind(|c: char| c == ' ' || c == '\n')
                     .map(|p| p + 1)
                     .unwrap_or(0);
                 let last_word = &result[last_word_start..];
-                if last_word.starts_with(|c: char| c.is_ascii_uppercase()) {
+                let is_compound = last_word.starts_with(|c: char| c.is_ascii_uppercase())
+                    && last_word.len() >= 5;
+                if is_compound {
                     result.push('-');
-                    // No pending_dehyphen — we kept the hyphen and the
-                    // next line will be joined with a normal reflow space.
                 } else {
                     pending_dehyphen = true;
                 }
@@ -644,20 +657,47 @@ fn assemble_text(lines: &[Vec<&LineElement>], hanging_indent: bool) -> String {
             }
         } else if has_hyphen_marker {
             // Last line of this region ends with a split word.
-            // Same compound-word check as above: if the last word is
-            // capitalized, keep the hyphen instead of propagating the
-            // STX sentinel for cross-region dehyphenation.
-            let last_word_start = result.rfind(|c: char| c == ' ' || c == '\n')
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            let last_word = &result[last_word_start..];
-            if last_word.starts_with(|c: char| c.is_ascii_uppercase()) {
-                result.push('-');
-            } else {
-                result.push(PDFIUM_HYPHEN_MARKER);
-            }
+            // For cross-region dehyphenation, we always propagate the
+            // STX marker — the next region's text assembly will handle
+            // the compound-word check based on the continuation's case.
+            result.push(PDFIUM_HYPHEN_MARKER);
         }
     }
+
+    // Collapse spurious italic markers at line join boundaries.
+    // When italic text wraps across lines, each line gets its own *...*
+    // markers. Joining produces patterns like:
+    //   *dif* *ferent* → should be *different* (italic continues across space)
+    //   *dif**ferent* → should be *different* (italic continues, no space)
+    // Only collapse when the markers are between word characters (not at
+    // word boundaries where they'd be valid bold/italic markdown).
+    let mut collapsed = String::with_capacity(result.len());
+    let chars: Vec<char> = result.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '*' && i + 2 < chars.len() && chars[i + 1] == ' ' && chars[i + 2] == '*' {
+            // Check: letter before * and letter after second *
+            let before_alpha = i > 0 && chars[i - 1].is_alphanumeric();
+            let after_alpha = i + 3 < chars.len() && chars[i + 3].is_alphanumeric();
+            if before_alpha && after_alpha {
+                collapsed.push(' '); // replace "* *" with just space
+                i += 3;
+                continue;
+            }
+        }
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            let before_alpha = i > 0 && chars[i - 1].is_alphanumeric();
+            let after_alpha = i + 2 < chars.len() && chars[i + 2].is_alphanumeric();
+            if before_alpha && after_alpha {
+                // Remove both stars — italic continues
+                i += 2;
+                continue;
+            }
+        }
+        collapsed.push(chars[i]);
+        i += 1;
+    }
+    let result = collapsed;
 
     result
 }
@@ -752,7 +792,13 @@ fn assemble_preserving_layout(lines: &[Vec<&LineElement>], region_left_x: f32) -
     } else {
         lines
             .iter()
-            .map(|line| line.first().map(|e| e.bbox()[0]).unwrap_or(region_left_x))
+            .map(|line| {
+                // Use the first NON-SPACE visible char's X position
+                line.iter()
+                    .find(|e| matches!(e, LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' '))
+                    .map(|e| e.bbox()[0])
+                    .unwrap_or(region_left_x)
+            })
             .collect()
     };
 
@@ -5257,5 +5303,131 @@ mod tests {
         let bbox = [95.0, 95.0, 138.0, 115.0];
         let result = try_extract_inline_formula(&chars, bbox, PAGE_H);
         assert_eq!(result.latex, Some("bc".to_string()));
+    }
+
+    // ── Dehyphenation tests ──
+
+    #[test]
+    fn test_dehyphen_short_uppercase_fragment() {
+        // "Invo-" (4 chars, uppercase) followed by "cation" → should dehyphenate
+        // because "Invo" is too short (< 5) to be a compound word part.
+        let mut chars = Vec::new();
+        // Line 1: "Platform Invo" + STX
+        for (i, c) in "Platform ".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        for (i, c) in "Invo".chars().enumerate() {
+            chars.push(make_char_image_space(c, 194.5 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space('\u{0002}', 236.5, 100.0, 3.0, 12.0, PAGE_H));
+        // Line 2: "cation" at y=130
+        for (i, c) in "cation technology".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("Invocation"),
+            "short uppercase fragment should be dehyphenated, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_dehyphen_long_compound_word_preserved() {
+        // "Barrier-" (7 chars, uppercase) + "augmented" → compound word, keep hyphen
+        let mut chars = Vec::new();
+        for (i, c) in "the Barrier".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space('\u{0002}', 215.5, 100.0, 3.0, 12.0, PAGE_H));
+        for (i, c) in "augmented method".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("Barrier-augmented"),
+            "long compound word hyphen should be preserved, got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_dehyphen_lowercase_fragment() {
+        // "encoun-" (lowercase) + "tering" → always dehyphenate
+        let mut chars = Vec::new();
+        for (i, c) in "encoun".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        chars.push(make_char_image_space('\u{0002}', 163.0, 100.0, 3.0, 12.0, PAGE_H));
+        for (i, c) in "tering the".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 130.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("encountering"),
+            "lowercase fragment should be dehyphenated, got: {text}"
+        );
+    }
+
+    // ── Ligature expansion tests ──
+
+    #[test]
+    fn test_ligature_fi_expanded() {
+        // TeX OT1 ligature: 0x0C = fi
+        let mut chars = Vec::new();
+        for (i, c) in "signi".chars().enumerate() {
+            chars.push(make_char_image_space(c, 100.0 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        // fi ligature glyph (0x0C) with nonzero width
+        let mut lig = make_char_image_space('\u{000C}', 152.5, 100.0, 10.0, 12.0, PAGE_H);
+        lig.font_size = 10.0;
+        chars.push(lig);
+        for (i, c) in "cantly".chars().enumerate() {
+            chars.push(make_char_image_space(c, 162.5 + i as f32 * 10.5, 100.0, 10.0, 12.0, PAGE_H));
+        }
+        let bbox = [50.0, 50.0, 600.0, 300.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
+        assert!(
+            text.contains("significantly"),
+            "fi ligature should expand to 'fi', got: {text}"
+        );
+    }
+
+    #[test]
+    fn test_ligature_control_char_not_expanded_for_zero_width() {
+        // A genuine control char (\r) with zero width should NOT be expanded
+        let chars = vec![
+            make_char_image_space('A', 100.0, 100.0, 10.0, 12.0, PAGE_H),
+            make_char_image_space('\r', 110.0, 100.0, 0.0, 12.0, PAGE_H),
+            make_char_image_space('B', 110.5, 100.0, 10.0, 12.0, PAGE_H),
+        ];
+        let bbox = [50.0, 50.0, 600.0, 200.0];
+        let text = extract_region_text(&chars, bbox, PAGE_H, &[], &[], AssemblyMode::Reflow);
+        assert_eq!(text, "AB", "zero-width control char should be filtered, not expanded");
+    }
+
+    // ── Mojibake cleanup tests ──
+
+    #[test]
+    fn test_mojibake_apostrophe() {
+        // âŁ™ (U+00E2 U+0141 U+2122) → ' (U+2019)
+        let input = "Euler\u{00E2}\u{0141}\u{2122}s method";
+        let result = fix_common_mojibake(input);
+        assert!(
+            result.contains("Euler\u{2019}s"),
+            "mojibake should be fixed, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_mojibake_standalone_l_stroke() {
+        // Ł between word chars → right single quote
+        let input = "it\u{0141}s a test";
+        let result = fix_common_mojibake(input);
+        assert!(
+            result.contains("it\u{2019}s"),
+            "standalone Ł should become apostrophe, got: {result}"
+        );
     }
 }

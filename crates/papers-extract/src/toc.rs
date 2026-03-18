@@ -639,23 +639,47 @@ fn build_lines_from_chars(
         .collect();
 
     // Convert to TocChar in image-space.
-    // Skip control chars and literal spaces — we reconstruct spacing from gaps.
-    let toc_chars: Vec<TocChar> = chars
-        .iter()
-        .filter(|c| !c.codepoint.is_control() && c.codepoint != ' ')
-        .map(|c| {
-            let y1 = page_height - c.bbox[3]; // top in image-space
-            let y2 = page_height - c.bbox[1]; // bottom in image-space
-            TocChar {
-                codepoint: c.codepoint,
-                bbox: [c.bbox[0], y1, c.bbox[2], y2],
-                space_threshold: c.space_threshold,
-                font_name: c.font_name.clone(),
-                font_size: c.font_size,
-                is_italic: c.is_italic,
+    // Skip literal spaces (we reconstruct spacing from gaps) and control chars.
+    // Expand TeX ligatures (0x0B-0x0F) to their component characters.
+    let mut toc_chars: Vec<TocChar> = Vec::new();
+    for c in chars {
+        if c.codepoint == ' ' {
+            continue;
+        }
+        let y1 = page_height - c.bbox[3];
+        let y2 = page_height - c.bbox[1];
+        // Expand ligatures: fi, fl, ff, ffi, ffl
+        if let Some(ligature) = crate::pdf::expand_ligature(c.codepoint) {
+            let has_glyph = (c.bbox[2] - c.bbox[0]) > 0.1;
+            if has_glyph || !c.codepoint.is_control() {
+                let glyph_w = c.bbox[2] - c.bbox[0];
+                let char_w = glyph_w / ligature.len() as f32;
+                for (li, lc) in ligature.chars().enumerate() {
+                    let x_off = char_w * li as f32;
+                    toc_chars.push(TocChar {
+                        codepoint: lc,
+                        bbox: [c.bbox[0] + x_off, y1, c.bbox[0] + x_off + char_w, y2],
+                        space_threshold: c.space_threshold,
+                        font_name: c.font_name.clone(),
+                        font_size: c.font_size,
+                        is_italic: c.is_italic,
+                    });
+                }
+                continue;
             }
-        })
-        .collect();
+        }
+        if c.codepoint.is_control() {
+            continue;
+        }
+        toc_chars.push(TocChar {
+            codepoint: c.codepoint,
+            bbox: [c.bbox[0], y1, c.bbox[2], y2],
+            space_threshold: c.space_threshold,
+            font_name: c.font_name.clone(),
+            font_size: c.font_size,
+            is_italic: c.is_italic,
+        });
+    }
 
     if toc_chars.is_empty() {
         return vec![];
@@ -1261,6 +1285,26 @@ fn parse_lowercase_roman(s: &str) -> Option<u32> {
 
 // ── Phase 4: Multi-line title merging ──
 
+/// Join two title fragments, handling line-break hyphenation.
+/// "About Clas-" + "sical Mechanics" → "About Classical Mechanics"
+/// "Some Title" + "Continued" → "Some Title Continued"
+fn join_title_parts(left: &str, right: &str) -> String {
+    if left.ends_with('-') {
+        // Check if this is a real hyphenated compound word (both sides capitalized)
+        // or a line-break split (second part is lowercase).
+        let right_starts_lower = right.starts_with(|c: char| c.is_lowercase());
+        if right_starts_lower {
+            // Line-break hyphenation: remove hyphen and join directly
+            format!("{}{}", &left[..left.len() - 1], right)
+        } else {
+            // Compound word like "Self-Adjoint": keep the hyphen
+            format!("{} {}", left, right)
+        }
+    } else {
+        format!("{} {}", left, right)
+    }
+}
+
 fn merge_multiline_titles(lines: Vec<TocSplitLine>) -> Vec<TocSplitLine> {
     if lines.is_empty() {
         return vec![];
@@ -1298,11 +1342,15 @@ fn merge_multiline_titles(lines: Vec<TocSplitLine>) -> Vec<TocSplitLine> {
                         // Merge remaining buffer entries + current line
                         let mut merged = buffer.remove(0);
                         for remaining in buffer.drain(..) {
-                            merged.title =
-                                format!("{} {}", merged.title.trim(), remaining.title.trim());
+                            merged.title = join_title_parts(
+                                merged.title.trim(),
+                                remaining.title.trim(),
+                            );
                         }
-                        merged.title =
-                            format!("{} {}", merged.title.trim(), line.title.trim());
+                        merged.title = join_title_parts(
+                            merged.title.trim(),
+                            line.title.trim(),
+                        );
                         merged.page_label = line.page_label;
                         merged.page_value = line.page_value;
                         merged.has_leader_dots = line.has_leader_dots;

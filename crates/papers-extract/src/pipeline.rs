@@ -684,10 +684,10 @@ impl Pipeline {
             .collect();
 
         for (idx, det) in detected.iter().enumerate() {
-            let kind = det.kind;
+            let mut kind = det.kind;
 
             // Convert pixel bboxes to PDF-point top-left-origin
-            let bbox = [
+            let mut bbox = [
                 det.bbox_px[0] / scale,
                 det.bbox_px[1] / scale,
                 det.bbox_px[2] / scale,
@@ -775,11 +775,44 @@ impl Pipeline {
                         }
                     })
                     .collect();
-                let mode = if kind == RegionKind::Algorithm {
-                    text::AssemblyMode::PreserveLayout
+                // Decide assembly mode based on content analysis.
+                // For Text regions, check if the content looks like code
+                // or formatted text (mini-TOC, structured listings) — if so,
+                // preserve the layout instead of reflowing.
+                let (mode, promote_kind) = if kind == RegionKind::Algorithm {
+                    (text::AssemblyMode::PreserveLayout, None)
+                } else if kind == RegionKind::Text {
+                    let region_chars: Vec<&PdfChar> = chars.iter()
+                        .filter(|c| {
+                            let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
+                            let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+                            let cy_img = page_height_pt - cy;
+                            cx >= bbox[0] && cx <= bbox[2] && cy_img >= bbox[1] && cy_img <= bbox[3]
+                        })
+                        .collect();
+                    let sample_text: String = region_chars.iter()
+                        .filter(|c| !c.codepoint.is_control())
+                        .map(|c| c.codepoint)
+                        .take(500)
+                        .collect();
+                    if is_likely_formula(&region_chars) {
+                        // Promote to DisplayFormula — chars are mostly math
+                        (text::AssemblyMode::Reflow, Some(RegionKind::DisplayFormula))
+                    } else if output::code_score(&sample_text) >= 3 {
+                        (text::AssemblyMode::PreserveLayout, Some(RegionKind::Algorithm))
+                    } else if is_formatted_text(&region_chars, page_height_pt, bbox) {
+                        (text::AssemblyMode::PreserveLayout, Some(RegionKind::FormattedText))
+                    } else {
+                        (text::AssemblyMode::Reflow, None)
+                    }
                 } else {
-                    text::AssemblyMode::Reflow
+                    (text::AssemblyMode::Reflow, None)
                 };
+                // Apply kind promotion if detected
+                if let Some(new_kind) = promote_kind {
+                    kind = new_kind;
+                    region.kind = new_kind;
+                }
                 region.text = Some(text::extract_region_text(
                     chars,
                     bbox,
@@ -1226,6 +1259,18 @@ fn strip_structural_regions(regions: &mut Vec<Region>) {
         .map(|r| r.bbox)
         .collect();
 
+    // Collect Image/Figure bboxes to suppress text inside figures.
+    let figure_bboxes: Vec<[f32; 4]> = regions
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind,
+                RegionKind::Image | RegionKind::FigureGroup
+            )
+        })
+        .map(|r| r.bbox)
+        .collect();
+
     regions.retain(|r| {
         // Always drop these kinds.
         if matches!(
@@ -1241,6 +1286,15 @@ fn strip_structural_regions(regions: &mut Vec<Region>) {
             .any(|hdr| bbox_contains(*hdr, r.bbox))
         {
             return false;
+        }
+
+        // Drop Text regions whose bbox is contained within or mostly overlaps
+        // a Figure/Image bbox — these are figure-internal labels the layout
+        // model extracted as separate Text regions.
+        if r.kind == RegionKind::Text {
+            if figure_bboxes.iter().any(|fig| bbox_contains(*fig, r.bbox)) {
+                return false;
+            }
         }
 
         true
@@ -1291,10 +1345,11 @@ fn resolve_toc_page_range(
     // Compute page offset using fallback (toc_pages end)
     let offset = toc.toc_pages.last().map(|&p| p as i32 + 1).unwrap_or(0);
 
-    let start = output::toc_page_to_pdf_page(start_page_value, offset, total_pages)
+    let fm_offset = 0; // front-matter offset not needed for chapter extraction
+    let start = output::toc_page_to_pdf_page(start_page_value, offset, fm_offset, total_pages)
         .unwrap_or(0);
     let end = end_page_value
-        .and_then(|pv| output::toc_page_to_pdf_page(pv, offset, total_pages))
+        .and_then(|pv| output::toc_page_to_pdf_page(pv, offset, fm_offset, total_pages))
         .unwrap_or(total_pages);
 
     eprintln!(
@@ -1534,4 +1589,279 @@ mod tests {
         // Number should be consumed (discarded) since there's no valid formula
         assert!(regions[1].consumed);
     }
+}
+
+/// Detect if a Text region likely contains a display formula.
+///
+/// Formulas misclassified as Text have these characteristics:
+/// - Short content (< 100 visible chars)
+/// - High ratio of math-like chars (operators, single letters, parens)
+/// - Many italic chars (variables rendered in italic)
+/// - Few multi-letter words (prose has long words, math has single-char variables)
+fn is_likely_formula(chars: &[&PdfChar]) -> bool {
+    let visible: Vec<&&PdfChar> = chars.iter()
+        .filter(|c| !c.codepoint.is_control() && c.codepoint != ' ')
+        .collect();
+
+    if visible.len() < 3 || visible.len() > 80 {
+        return false;
+    }
+
+    let mut math_chars = 0;
+    let mut italic_chars = 0;
+    let mut letter_chars = 0;
+
+    for c in &visible {
+        let ch = c.codepoint;
+        if matches!(ch, '=' | '+' | '-' | '×' | '÷' | '∫' | '∑' | '∏'
+            | '≤' | '≥' | '≠' | '∈' | '∉' | '⊂' | '⊃' | '∪' | '∩'
+            | '(' | ')' | '[' | ']' | '{' | '}' | '/' | '|' | ','
+            | '→' | '←' | '↔' | '∞' | '∂' | '∇')
+        {
+            math_chars += 1;
+        }
+        if ch.is_alphabetic() {
+            letter_chars += 1;
+        }
+        if c.is_italic {
+            italic_chars += 1;
+        }
+    }
+
+    let total = visible.len() as f32;
+    let math_ratio = math_chars as f32 / total;
+    let italic_ratio = italic_chars as f32 / total;
+
+    // High math symbol ratio (> 15%) → likely formula
+    if math_ratio > 0.15 && total < 60.0 {
+        return true;
+    }
+
+    // High italic ratio (> 50%) + math symbols → likely formula with variables
+    if italic_ratio > 0.5 && math_chars >= 2 && total < 60.0 {
+        return true;
+    }
+
+    // Very short with any math operators → likely inline formula promoted to display
+    if total < 15.0 && math_chars >= 1 {
+        return true;
+    }
+
+    false
+}
+
+/// Trim an Algorithm region's bbox to exclude trailing body text.
+///
+/// The layout model sometimes extends the Algorithm bbox too far down,
+/// capturing prose text below the code. We detect this by checking for
+/// a font-family change: code uses monospace fonts (LucidaSans, Courier,
+/// Consolas, etc.) while prose uses serif/sans-serif body fonts.
+/// When we find the font change, we trim the bbox to stop above it.
+fn trim_algorithm_bbox(chars: &[PdfChar], bbox: [f32; 4], page_height_pt: f32) -> [f32; 4] {
+    // Collect chars inside the bbox
+    let region_chars: Vec<&PdfChar> = chars.iter()
+        .filter(|c| {
+            if c.codepoint.is_control() || c.codepoint == ' ' {
+                return false;
+            }
+            let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
+            let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+            let cy_img = page_height_pt - cy;
+            cx >= bbox[0] && cx <= bbox[2] && cy_img >= bbox[1] && cy_img <= bbox[3]
+        })
+        .collect();
+
+    if region_chars.len() < 10 {
+        return bbox;
+    }
+
+    // Find the dominant font (should be the code font)
+    let mut font_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for c in &region_chars {
+        let family = crate::output::normalize_font_family(&c.font_name);
+        if !family.is_empty() {
+            *font_counts.entry(family).or_default() += 1;
+        }
+    }
+    // For Algorithm regions, prefer monospace fonts as the "dominant" code font.
+    // If a monospace font is present with significant usage, use it even if
+    // a body font has more chars (due to bbox overlap with body text).
+    let is_mono = |name: &str| -> bool {
+        let n = name.to_ascii_lowercase();
+        n.contains("lucida") || n.contains("courier") || n.contains("consola")
+            || n.contains("mono") || n.contains("typewriter") || n.contains("menlo")
+            || n.contains("source code") || n.contains("fira code")
+    };
+    let mono_font = font_counts.iter()
+        .filter(|(name, count)| is_mono(name) && **count >= 10)
+        .max_by_key(|(_, count)| *count)
+        .map(|(f, _)| f.clone());
+    let dominant = if let Some(mono) = mono_font {
+        mono
+    } else {
+        match font_counts.iter().max_by_key(|(_, count)| *count) {
+            Some((f, _)) => f.clone(),
+            None => return bbox,
+        }
+    };
+
+    // Scan from the bottom of the region upward. Find the first line
+    // (by Y position) where the dominant font switches to a different font.
+    // Sort chars by Y (image space: higher Y = lower on page)
+    let mut by_y: Vec<(f32, &str)> = region_chars.iter()
+        .map(|c| {
+            let cy_img = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
+            (cy_img, c.font_name.as_str())
+        })
+        .collect();
+    by_y.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Group into lines by Y proximity
+    let avg_h = {
+        let heights: Vec<f32> = region_chars.iter()
+            .map(|c| (c.bbox[3] - c.bbox[1]).abs())
+            .filter(|h| *h > 0.5)
+            .collect();
+        if heights.is_empty() { return bbox; }
+        heights.iter().sum::<f32>() / heights.len() as f32
+    };
+    let y_thresh = avg_h * 0.5;
+
+    // Group chars into lines by Y proximity (image coords, top-to-bottom)
+    let mut lines: Vec<(f32, std::collections::HashMap<String, usize>)> = Vec::new();
+    let mut current_y = f32::NAN;
+    for &(cy, font_name) in &by_y {
+        let family = crate::output::normalize_font_family(font_name);
+        if family.is_empty() { continue; }
+
+        if current_y.is_nan() || (current_y - cy).abs() > y_thresh {
+            lines.push((cy, std::collections::HashMap::new()));
+            current_y = cy;
+        }
+        *lines.last_mut().unwrap().1.entry(family).or_default() += 1;
+    }
+
+    if lines.len() < 2 {
+        return bbox;
+    }
+
+    // Find the line-level dominant font for each line
+    let line_dominants: Vec<(f32, String)> = lines.iter()
+        .map(|(y, fonts)| {
+            let dom = fonts.iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(f, _)| f.clone())
+                .unwrap_or_default();
+            (*y, dom)
+        })
+        .collect();
+
+    // Trim from top: skip leading lines with non-code font
+    let mut new_y1 = bbox[1];
+    for (y, font) in &line_dominants {
+        if *font != dominant {
+            new_y1 = *y + avg_h * 0.5; // move top below this line
+        } else {
+            break;
+        }
+    }
+
+    // Trim from bottom: skip trailing lines with non-code font
+    let mut new_y2 = bbox[3];
+    for (y, font) in line_dominants.iter().rev() {
+        if *font != dominant {
+            new_y2 = *y - avg_h * 0.5; // move bottom above this line
+        } else {
+            break;
+        }
+    }
+
+    // Only trim if we still have meaningful content
+    if new_y2 > new_y1 + avg_h * 2.0 {
+        [bbox[0], new_y1, bbox[2], new_y2]
+    } else {
+        bbox
+    }
+}
+
+/// Detect if a Text region contains formatted/structured text that should
+/// preserve its layout (mini-TOCs, structured listings, decorated blocks).
+///
+/// Tells:
+/// - Multiple lines where many end with digits (page numbers)
+/// - Leader dots (". . ." or "...") on multiple lines
+/// - Lines significantly shorter than the region width
+/// - Consistent repeating visual pattern
+fn is_formatted_text(chars: &[&PdfChar], page_height_pt: f32, bbox: [f32; 4]) -> bool {
+    if chars.len() < 20 {
+        return false;
+    }
+
+    // Group chars into lines by Y proximity
+    let avg_h = {
+        let heights: Vec<f32> = chars.iter()
+            .map(|c| (c.bbox[3] - c.bbox[1]).abs())
+            .filter(|h| *h > 0.5)
+            .collect();
+        if heights.is_empty() { return false; }
+        heights.iter().sum::<f32>() / heights.len() as f32
+    };
+    let y_thresh = avg_h * 0.5;
+
+    // Count distinct lines
+    let mut line_ys: Vec<f32> = Vec::new();
+    for c in chars {
+        // Use image-space Y for grouping
+        let cy = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
+        if !line_ys.iter().any(|&ly| (ly - cy).abs() < y_thresh) {
+            line_ys.push(cy);
+        }
+    }
+
+    if line_ys.len() < 4 {
+        return false;
+    }
+
+    // For each line, check the last visible char and count dots
+    let mut lines_ending_digit = 0;
+    let mut lines_with_dots = 0;
+
+    for &ly in &line_ys {
+        // Collect chars on this line
+        let line_chars: Vec<&&PdfChar> = chars.iter()
+            .filter(|c| {
+                let cy = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
+                (cy - ly).abs() < y_thresh
+            })
+            .collect();
+
+        if line_chars.is_empty() {
+            continue;
+        }
+
+        // Check last visible char
+        let last = line_chars.iter()
+            .filter(|c| !c.codepoint.is_control() && c.codepoint != ' ')
+            .max_by(|a, b| a.bbox[2].partial_cmp(&b.bbox[2]).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some(last_char) = last {
+            if last_char.codepoint.is_ascii_digit() {
+                lines_ending_digit += 1;
+            }
+        }
+
+        // Count dots on this line
+        let dot_count = line_chars.iter()
+            .filter(|c| c.codepoint == '.')
+            .count();
+        if dot_count >= 5 {
+            lines_with_dots += 1;
+        }
+    }
+
+    let total_lines = line_ys.len();
+    let pct_digit = lines_ending_digit as f32 / total_lines as f32;
+    let pct_dots = lines_with_dots as f32 / total_lines as f32;
+
+    // Formatted text: many lines end with digits AND have leader dots
+    (pct_digit >= 0.4 && pct_dots >= 0.3) || pct_dots >= 0.5
 }
