@@ -1490,28 +1490,85 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
         })
         .collect();
 
-    // Also learn x-indentation levels
+    // Also learn x-indentation levels — use ALL entries (not just classified)
+    // so the indent clusters accurately reflect the full visual hierarchy.
     let x_lefts: Vec<f32> = entries
         .iter()
-        .filter(|(_, c, _)| *c != Classification::Unknown)
         .map(|(l, _, _)| l.x_left)
         .collect();
-    let indent_levels = compute_indent_levels(&x_lefts);
+    // Normalize x_left per page: subtract each page's minimum x_left so that
+    // indent positions are comparable across pages with different margins.
+    let mut page_min_x: HashMap<u32, f32> = HashMap::new();
+    for (line, _, _) in &entries {
+        let min = page_min_x.entry(line.page_idx).or_insert(f32::MAX);
+        if line.x_left < *min {
+            *min = line.x_left;
+        }
+    }
+    let x_lefts_normalized: Vec<f32> = entries
+        .iter()
+        .map(|(l, _, _)| {
+            let page_min = page_min_x.get(&l.page_idx).copied().unwrap_or(0.0);
+            l.x_left - page_min
+        })
+        .collect();
+    let indent_levels = compute_indent_levels(&x_lefts_normalized);
 
-    // Third pass: resolve ambiguous entries
+    // (debug removed)
+
+    // Build a mapping from indent level → most common depth among classified
+    // entries at that indent. This lets us anchor indent levels to known depths.
+    let mut indent_depth_votes: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (line, class, depth) in &entries {
+        if *class != Classification::Unknown {
+            let page_min = page_min_x.get(&line.page_idx).copied().unwrap_or(0.0);
+            let indent = quantize_indent(line.x_left - page_min, &indent_levels);
+            indent_depth_votes.entry(indent).or_default().push(*depth);
+        }
+    }
+    let indent_to_depth: HashMap<u32, u32> = indent_depth_votes
+        .into_iter()
+        .map(|(indent, depths)| {
+            let mut counts: HashMap<u32, usize> = HashMap::new();
+            for d in &depths {
+                *counts.entry(*d).or_default() += 1;
+            }
+            let best = counts.into_iter().max_by_key(|(_, c)| *c).unwrap().0;
+            (indent, best)
+        })
+        .collect();
+
+    // Third pass: resolve ambiguous entries.
+    // Priority: x-position indentation first (more reliable across visual
+    // hierarchies), font signature as fallback.
     let mut result: Vec<ClassifiedEntry> = entries
         .into_iter()
         .map(|(line, mut class, mut depth)| {
             if class == Classification::Unknown {
-                // Try font signature
-                if let Some(&learned_depth) = learned.get(&line.font_sig) {
-                    // Cap learned depth to avoid cascading SubEntry depths
-                    depth = learned_depth.min(4);
+                if !indent_levels.is_empty() {
+                    let page_min = page_min_x.get(&line.page_idx).copied().unwrap_or(0.0);
+                    let indent = quantize_indent(line.x_left - page_min, &indent_levels);
+                    // Use anchored indent→depth if available, else raw indent+1
+                    if let Some(&anchored) = indent_to_depth.get(&indent) {
+                        depth = anchored;
+                    } else {
+                        // Interpolate: find the nearest anchored indent level
+                        // and offset from it.
+                        let nearest = indent_to_depth
+                            .iter()
+                            .min_by_key(|(k, _)| (**k as i32 - indent as i32).unsigned_abs());
+                        if let Some((near_indent, near_depth)) = nearest {
+                            let (near_indent, near_depth) = (*near_indent, *near_depth);
+                            let offset = indent as i32 - near_indent as i32;
+                            depth = (near_depth as i32 + offset).max(1).min(4) as u32;
+                        } else {
+                            depth = (indent + 1).min(4);
+                        }
+                    }
                     class = depth_to_classification(depth);
-                } else if !indent_levels.is_empty() {
-                    // Try indentation
-                    let indent = quantize_indent(line.x_left, &indent_levels);
-                    depth = (indent + 1).min(4); // indent 0 → depth 1 (chapter)
+                } else if let Some(&learned_depth) = learned.get(&line.font_sig) {
+                    // Font signature fallback when no indent levels available
+                    depth = learned_depth.min(4);
                     class = depth_to_classification(depth);
                 } else {
                     // Default to chapter
@@ -1561,10 +1618,9 @@ fn classify_by_pattern(title: &str, last_depth: u32) -> (Classification, u32) {
         return (Classification::Part, 0);
     }
 
-    // Rule 3-4: Dotted decimal numbering
+    // Rule 3-4: Dotted decimal numbering (multi-level only: 1.1, 1.2.3, etc.)
     let (num_depth, is_multi) = headings::infer_depth_from_numbering(t);
     if num_depth > 0 && is_multi {
-        // Multi-level: 1.1 → depth 2, 1.2.3 → depth 3, etc.
         let class = match num_depth {
             1 => Classification::Chapter,
             2 => Classification::Section,
@@ -1597,13 +1653,15 @@ fn classify_by_pattern(title: &str, last_depth: u32) -> (Classification, u32) {
         }
     }
 
-    // Rule 6: Bare number + word (chapter)
+    // Rule 6: Bare number + word (chapter), including "N. Title" format
     if let Some(first) = t.chars().next() {
         if first.is_ascii_digit() {
             // Check it's not something weird — find the space after the number
             if let Some(space_pos) = t.find(' ') {
                 let num_part = &t[..space_pos];
-                if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
+                // Accept pure digits ("1 Title") or digits+dot ("1. Title")
+                let stripped = num_part.trim_end_matches('.');
+                if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()) {
                     return (Classification::Chapter, 1);
                 }
             }
