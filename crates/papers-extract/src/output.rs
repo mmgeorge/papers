@@ -32,6 +32,9 @@ pub fn write_reflow_json(doc: &ReflowDocument, path: &Path) -> Result<(), Extrac
 }
 
 /// Save a single region's image if it has an `image_path`.
+///
+/// When the region has a caption, the crop bbox excludes the caption area
+/// so the saved image contains only the visual content (not the caption text).
 fn save_region_image(
     region: &Region,
     page_img: &DynamicImage,
@@ -48,9 +51,18 @@ fn save_region_image(
             std::fs::create_dir_all(parent)?;
         }
 
+        // Exclude the caption from the crop bbox. The region bbox may have been
+        // expanded by expand_visual_bounds to include the caption; we want just
+        // the visual content in the saved image.
+        let crop_bbox = if let Some(ref cap) = region.caption {
+            exclude_caption_from_bbox(region.bbox, cap.bbox)
+        } else {
+            region.bbox
+        };
+
         let cropped = crate::figure::crop_region(
             page_img,
-            region.bbox,
+            crop_bbox,
             page.width_pt,
             page.height_pt,
             page.dpi,
@@ -59,6 +71,39 @@ fn save_region_image(
         cropped.save(&full_path)?;
     }
     Ok(())
+}
+
+/// Shrink `bbox` to exclude the area occupied by `caption_bbox`.
+///
+/// Determines whether the caption is below, above, left, or right of the
+/// visual center and trims the corresponding edge.
+fn exclude_caption_from_bbox(mut bbox: [f32; 4], cap: [f32; 4]) -> [f32; 4] {
+    let vis_cy = (bbox[1] + bbox[3]) / 2.0;
+    let cap_cy = (cap[1] + cap[3]) / 2.0;
+    let vis_cx = (bbox[0] + bbox[2]) / 2.0;
+    let cap_cx = (cap[0] + cap[2]) / 2.0;
+
+    let dy = (cap_cy - vis_cy).abs();
+    let dx = (cap_cx - vis_cx).abs();
+
+    if dy >= dx {
+        // Caption is primarily above or below
+        if cap_cy > vis_cy {
+            // Caption below → shrink bottom to top of caption
+            bbox[3] = bbox[3].min(cap[1]);
+        } else {
+            // Caption above → shrink top to bottom of caption
+            bbox[1] = bbox[1].max(cap[3]);
+        }
+    } else {
+        // Caption is primarily left or right
+        if cap_cx > vis_cx {
+            bbox[2] = bbox[2].min(cap[0]);
+        } else {
+            bbox[0] = bbox[0].max(cap[2]);
+        }
+    }
+    bbox
 }
 
 /// Save cropped region images to the output directory.
