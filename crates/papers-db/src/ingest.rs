@@ -1741,6 +1741,10 @@ fn process_reflow_node(node: &ReflowNode, state: &mut ChunkingState) {
         ReflowNode::FrontMatter { .. } => {
             // Skip — copyright, dedications, etc.
         }
+
+        ReflowNode::Toc { .. } => {
+            // Skip — TOC listing is structural, not content
+        }
     }
 }
 

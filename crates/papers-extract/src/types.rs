@@ -103,6 +103,9 @@ pub enum ReflowNode {
     /// Pre-TOC front matter (dedications, acknowledgments, copyright, etc.)
     /// Preserved in JSON for completeness but skipped in markdown rendering.
     FrontMatter { children: Vec<ReflowNode> },
+    /// Embedded table of contents listing, rendered in its natural position
+    /// within the document tree (e.g. under a "Contents" heading).
+    Toc { entries: Vec<TocEntryRendered> },
 }
 
 // ── Extraction types ────────────────────────────────────────────────

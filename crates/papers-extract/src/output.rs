@@ -1557,9 +1557,11 @@ fn titles_match(toc_title: &str, region_text: &str) -> bool {
 /// Build an outline-driven reflow document using TOC entries as the
 /// authoritative heading structure.
 ///
-/// TOC entries determine heading depths. ParagraphTitle regions matched to
-/// TOC entries use the TOC depth; unmatched ParagraphTitles are demoted to
-/// text. Missing TOC headings are injected as synthetic heading nodes.
+/// This is a purely TOC-driven, page-range based approach:
+/// 1. Each TOC entry defines a heading with a known start page.
+/// 2. Content sections are assigned to headings by page position.
+/// 3. Everything before the first TOC entry's page is FrontMatter.
+/// 4. ParagraphTitle regions matching a TOC heading are suppressed (no dupes).
 pub fn reflow_with_outline(
     result: &ExtractionResult,
     toc_entries: &[TocEntry],
@@ -1575,247 +1577,71 @@ pub fn reflow_with_outline(
     // Step 2: Check if Parts exist — if so, shift all depths +1
     let has_parts = toc_entries.iter().any(|e| e.depth == 0);
 
-    // Step 3: Pre-match TOC entries to ParagraphTitle sections.
-    // For each TOC entry, find the best matching section index.
-    // matched_sections[section_idx] = Some(toc_entry_idx)
-    let mut section_to_toc: Vec<Option<usize>> = vec![None; sections.len()];
-    let mut toc_matched: Vec<bool> = vec![false; toc_entries.len()];
-
-    for (toc_idx, entry) in toc_entries.iter().enumerate() {
-        let expected_pdf_page =
-            toc_page_to_pdf_page(entry.page_value, offset, fm_offset, total_pages);
-
-        let mut best_section: Option<usize> = None;
-        let mut best_score: u32 = 0;
-
-        for (sec_idx, sec) in sections.iter().enumerate() {
-            if sec.kind != RegionKind::ParagraphTitle {
-                continue;
-            }
-            if section_to_toc[sec_idx].is_some() {
-                continue; // already claimed
-            }
-
-            let title = sec
-                .markdown
-                .trim()
-                .strip_prefix("## ")
-                .unwrap_or(sec.markdown.trim());
-
-            if !titles_match(&entry.title, title) {
-                continue;
-            }
-
-            // Page proximity scoring
-            let page_ok = match expected_pdf_page {
-                Some(expected) => {
-                    let diff = (sec.page_idx as i32 - expected as i32).unsigned_abs();
-                    diff <= 3
-                }
-                None => true, // can't verify page, accept any match
-            };
-
-            if !page_ok {
-                continue;
-            }
-
-            // Score: exact normalized match > prefix > fuzzy
-            let toc_norm = normalize_title(&entry.title);
-            let sec_norm = normalize_title(title);
-            let score = if toc_norm == sec_norm {
-                3
-            } else if sec_norm.starts_with(&toc_norm) || toc_norm.starts_with(&sec_norm) {
-                2
-            } else {
-                1
-            };
-
-            if score > best_score {
-                best_score = score;
-                best_section = Some(sec_idx);
-            }
+    // Step 3: Build heading schedule from TOC entries.
+    // Each entry becomes (pdf_page, depth, title, is_toc_page).
+    // Entries pointing to TOC pages are kept (they become the "Contents"
+    // heading) but flagged so we can embed the TOC listing under them.
+    let toc_page_set: std::collections::HashSet<u32> = toc_pages.iter().copied().collect();
+    let mut headings: Vec<(u32, u32, String, bool)> = Vec::new();
+    for entry in toc_entries {
+        let pdf_page = toc_page_to_pdf_page(entry.page_value, offset, fm_offset, total_pages);
+        let Some(page) = pdf_page else { continue };
+        // Detect "Contents" entries: either by title or by pointing to a TOC page.
+        let title_lower = entry.title.trim().to_lowercase();
+        let is_toc_entry = toc_page_set.contains(&page)
+            || title_lower == "contents"
+            || title_lower == "table of contents";
+        let mut depth = entry.depth;
+        if has_parts
+            && !matches!(
+                entry.kind,
+                TocEntryKind::FrontMatter | TocEntryKind::BackMatter
+            )
+        {
+            depth += 1;
         }
-
-        if let Some(sec_idx) = best_section {
-            section_to_toc[sec_idx] = Some(toc_idx);
-            toc_matched[toc_idx] = true;
-        }
+        headings.push((page, depth.max(1), entry.title.clone(), is_toc_entry));
     }
 
-    // Step 4: Determine the first content page.
-    // Content before the TOC pages is front matter (title page, copyright,
-    // dedications). The first TOC page marks the boundary — everything from
-    // there onward (including preface, introduction between TOC and chapter 1)
-    // is included in the main content.
-    let first_content_page = toc_pages
-        .first()
-        .copied()
-        .unwrap_or(0);
+    // Step 4: Determine front matter boundary.
+    // Everything before the first heading's page is FrontMatter.
+    let first_heading_page = headings.first().map(|(p, _, _, _)| *p).unwrap_or(0);
 
-    // Collect pre-TOC front matter
-    let mut front_matter_children: Vec<ReflowNode> = Vec::new();
+    // Pre-compute normalized TOC heading titles for duplicate suppression.
+    let heading_titles_norm: Vec<String> =
+        headings.iter().map(|(_, _, t, _)| normalize_title(t)).collect();
+    let max_toc_depth = toc_entries.iter().map(|e| e.depth).max().unwrap_or(1);
+
+    // Collect front matter sections (before first heading page)
+    let mut fm_children: Vec<ReflowNode> = Vec::new();
     for sec in &sections {
-        if sec.page_idx >= first_content_page {
+        if sec.page_idx >= first_heading_page {
             break;
         }
         let text = sec.markdown.trim();
         if text.is_empty() {
             continue;
         }
-        front_matter_children.push(section_to_content_node(sec));
+        fm_children.push(section_to_content_node(sec));
     }
 
-    // Step 5: Build flat nodes with outline-aware heading assignment.
+    // Step 5: Build flat nodes.
     let mut flat_nodes: Vec<ReflowNode> = Vec::new();
 
-    // Insert FrontMatter node at the start if there's pre-TOC content.
-    // Run postprocessing on front matter children (list/code/dedup detection).
-    if !front_matter_children.is_empty() {
-        postprocess_flat_nodes(&mut front_matter_children);
+    if !fm_children.is_empty() {
+        postprocess_flat_nodes(&mut fm_children);
         flat_nodes.push(ReflowNode::FrontMatter {
-            children: front_matter_children,
+            children: fm_children,
         });
     }
 
-    let mut next_inject_check: usize = 0;
-
-    for (sec_idx, sec) in sections.iter().enumerate() {
-        // Skip sections before the first TOC entry (already in FrontMatter)
-        if sec.page_idx < first_content_page {
-            continue;
-        }
-        let text = sec.markdown.trim();
-        if text.is_empty() && sec.formula_path.is_none() {
-            continue;
-        }
-
-        // Before processing this section, inject any missing TOC headings
-        // that should appear before this section's page position.
-        inject_missing_headings(
-            &mut flat_nodes,
-            toc_entries,
-            &toc_matched,
-            offset,
-            fm_offset,
-            total_pages,
-            has_parts,
-            sec.page_idx,
-            &mut next_inject_check,
-        );
-
-        let node = match sec.kind {
-            RegionKind::Title => {
-                let title = text.strip_prefix("# ").unwrap_or(text).to_string();
-                // Fix C: Only accept Title regions from early pages (before
-                // TOC or first 5 pages). Interior Title regions are likely
-                // chapter headings already handled by TOC matching.
-                let max_title_page = toc_pages
-                    .first()
-                    .map(|&p| p.saturating_sub(1))
-                    .unwrap_or(4);
-                if sec.page_idx <= max_title_page {
-                    ReflowNode::Heading {
-                        depth: 0,
-                        title,
-                        children: Vec::new(),
-                    }
-                } else {
-                    ReflowNode::Text { content: title, footnotes: Vec::new() }
-                }
-            }
-            RegionKind::ParagraphTitle => {
-                let title = text.strip_prefix("## ").unwrap_or(text).to_string();
-
-                if let Some(toc_idx) = section_to_toc[sec_idx] {
-                    // Matched to TOC entry — use its depth and title
-                    let mut depth = toc_entries[toc_idx].depth;
-                    // Fix I: Shift depths for Parts, but exempt FrontMatter
-                    // and BackMatter — they're document-level, not Part children.
-                    if has_parts
-                        && !matches!(
-                            toc_entries[toc_idx].kind,
-                            TocEntryKind::FrontMatter | TocEntryKind::BackMatter
-                        )
-                    {
-                        depth += 1;
-                    }
-                    // Depth 0 entries (Parts) become depth 1 when shifted
-                    let depth = depth.max(1);
-                    let toc_title = toc_entries[toc_idx].title.clone();
-                    ReflowNode::Heading {
-                        depth,
-                        title: toc_title,
-                        children: Vec::new(),
-                    }
-                } else if is_labeled_block(&title) {
-                    // Labeled blocks are content, not headings — bold the label
-                    ReflowNode::Text {
-                        content: format!("**{title}**"),
-                        footnotes: Vec::new(),
-                    }
-                } else if title.is_empty() {
-                    // Empty heading — skip entirely
-                    continue;
-                } else {
-                    // Fix H: Check if this looks like a numbered heading
-                    // below the TOC's granularity. If so, keep it as a
-                    // heading rather than demoting to text.
-                    let inferred = infer_heading_depth(&title);
-                    let max_toc_depth =
-                        toc_entries.iter().map(|e| e.depth).max().unwrap_or(1);
-                    let adjusted = if has_parts { inferred + 1 } else { inferred };
-                    if inferred > 0 && adjusted > max_toc_depth {
-                        ReflowNode::Heading {
-                            depth: adjusted.max(1),
-                            title,
-                            children: Vec::new(),
-                        }
-                    } else {
-                        ReflowNode::Text {
-                            content: title.clone(),
-                            footnotes: Vec::new(),
-                        }
-                    }
-                }
-            }
-            _ => section_to_content_node(sec),
-        };
-
-        flat_nodes.push(node);
-    }
-
-    // Inject any remaining unmatched TOC headings that go after all sections.
-    inject_missing_headings(
-        &mut flat_nodes,
-        toc_entries,
-        &toc_matched,
-        offset,
-        fm_offset,
-        total_pages,
-        has_parts,
-        u32::MAX,
-        &mut next_inject_check,
-    );
-
-    postprocess_flat_nodes(&mut flat_nodes);
-    let mut doc = build_heading_tree(flat_nodes);
-
-    // Clear garbage titles (e.g. just "#", short fragments, or truncated text)
-    if let Some(ref title) = doc.title {
-        let t = title.trim();
-        if t.is_empty() || t == "#" || t.len() < 5 {
-            doc.title = None;
-        }
-    }
-
-    // Populate TOC from the parsed entries
-    doc.toc = toc_entries
+    // Pre-build the rendered TOC entries for embedding in the Toc node.
+    let toc_rendered: Vec<crate::types::TocEntryRendered> = toc_entries
         .iter()
         .map(|e| {
             let page = if e.page_value > 0 {
                 Some(e.page_value.to_string())
             } else if e.page_value < 0 {
-                // Convert negative page_value back to roman numeral display
                 let abs_val = (-e.page_value) as u32;
                 Some(to_lower_roman(abs_val))
             } else {
@@ -1828,6 +1654,142 @@ pub fn reflow_with_outline(
             }
         })
         .collect();
+
+    // Walk sections, emitting heading nodes from the schedule as we reach
+    // their start pages, and assigning content to the current heading.
+    let mut heading_idx: usize = 0;
+    // When inside a TOC heading (e.g. "Contents"), suppress all content
+    // sections — the Toc node already provides the clean listing.
+    let mut in_toc_heading = false;
+
+    for sec in &sections {
+        if sec.page_idx < first_heading_page {
+            continue;
+        }
+        let text = sec.markdown.trim();
+        if text.is_empty() && sec.formula_path.is_none() {
+            continue;
+        }
+
+        // Emit all headings whose start page <= this section's page.
+        while heading_idx < headings.len() && headings[heading_idx].0 <= sec.page_idx {
+            let (_, depth, ref title, is_toc_entry) = headings[heading_idx];
+            flat_nodes.push(ReflowNode::Heading {
+                depth,
+                title: title.clone(),
+                children: Vec::new(),
+            });
+            // For TOC headings (e.g. "Contents"), embed the rendered
+            // TOC listing and suppress raw content until next heading.
+            if is_toc_entry {
+                flat_nodes.push(ReflowNode::Toc {
+                    entries: toc_rendered.clone(),
+                });
+                in_toc_heading = true;
+            } else {
+                in_toc_heading = false;
+            }
+            heading_idx += 1;
+        }
+
+        // Skip content sections while inside a TOC heading — the raw
+        // text from TOC pages (leader dots, page numbers) is noise.
+        if in_toc_heading {
+            continue;
+        }
+
+        // Convert section to a node.
+        let node = match sec.kind {
+            RegionKind::Title => {
+                let title = text.strip_prefix("# ").unwrap_or(text).to_string();
+                // Only accept Title regions from early pages (before first
+                // heading or first 5 pages). Interior Title regions are
+                // likely chapter headings already handled by TOC.
+                if sec.page_idx < first_heading_page.min(5) {
+                    ReflowNode::Heading {
+                        depth: 0,
+                        title,
+                        children: Vec::new(),
+                    }
+                } else {
+                    continue; // skip interior titles
+                }
+            }
+            RegionKind::ParagraphTitle => {
+                let title = text.strip_prefix("## ").unwrap_or(text).to_string();
+
+                if title.is_empty() {
+                    continue;
+                }
+
+                // Suppress if this matches a TOC heading (avoid duplicates)
+                let title_norm = normalize_title(&title);
+                if heading_titles_norm.contains(&title_norm) {
+                    continue;
+                }
+
+                if is_labeled_block(&title) {
+                    // Labeled blocks are content, not headings — bold the label
+                    ReflowNode::Text {
+                        content: format!("**{title}**"),
+                        footnotes: Vec::new(),
+                    }
+                } else {
+                    // Check if this is a numbered heading below the TOC's
+                    // granularity. If so, keep it as a heading.
+                    let inferred = infer_heading_depth(&title);
+                    let adjusted = if has_parts { inferred + 1 } else { inferred };
+                    if inferred > 0 && adjusted > max_toc_depth {
+                        ReflowNode::Heading {
+                            depth: adjusted.max(1),
+                            title,
+                            children: Vec::new(),
+                        }
+                    } else {
+                        ReflowNode::Text {
+                            content: title,
+                            footnotes: Vec::new(),
+                        }
+                    }
+                }
+            }
+            _ => section_to_content_node(sec),
+        };
+
+        flat_nodes.push(node);
+    }
+
+    // Emit any remaining headings not yet emitted (e.g. empty trailing chapters)
+    while heading_idx < headings.len() {
+        let (_, depth, ref title, is_toc_page) = headings[heading_idx];
+        flat_nodes.push(ReflowNode::Heading {
+            depth,
+            title: title.clone(),
+            children: Vec::new(),
+        });
+        if is_toc_page {
+            flat_nodes.push(ReflowNode::Toc {
+                entries: toc_rendered.clone(),
+            });
+        }
+        heading_idx += 1;
+    }
+
+    postprocess_flat_nodes(&mut flat_nodes);
+    let mut doc = build_heading_tree(flat_nodes);
+
+    // Clear garbage titles (e.g. just "#", short fragments, or truncated text)
+    if let Some(ref title) = doc.title {
+        let t = title.trim();
+        if t.is_empty() || t == "#" || t.len() < 5 {
+            doc.title = None;
+        }
+    }
+
+    // Populate doc.toc — always store it for structured data consumers.
+    // The markdown renderer will only emit it at the top if no embedded
+    // Toc node exists in the tree.
+    doc.toc = toc_rendered;
 
     doc
 }
@@ -1847,50 +1809,6 @@ fn to_lower_roman(mut n: u32) -> String {
         }
     }
     result
-}
-
-/// Inject synthetic heading nodes for TOC entries that weren't matched to any
-/// ParagraphTitle region and whose expected PDF page is <= `up_to_page`.
-fn inject_missing_headings(
-    flat_nodes: &mut Vec<ReflowNode>,
-    toc_entries: &[TocEntry],
-    toc_matched: &[bool],
-    offset: i32,
-    fm_offset: i32,
-    total_pages: u32,
-    has_parts: bool,
-    up_to_page: u32,
-    next_check: &mut usize,
-) {
-    while *next_check < toc_entries.len() {
-        let entry = &toc_entries[*next_check];
-        let expected = toc_page_to_pdf_page(entry.page_value, offset, fm_offset, total_pages)
-            .unwrap_or(u32::MAX);
-
-        if expected > up_to_page {
-            break;
-        }
-
-        if !toc_matched[*next_check] {
-            let mut depth = entry.depth;
-            if has_parts
-                && !matches!(
-                    entry.kind,
-                    TocEntryKind::FrontMatter | TocEntryKind::BackMatter
-                )
-            {
-                depth += 1;
-            }
-            let depth = depth.max(1);
-            flat_nodes.push(ReflowNode::Heading {
-                depth,
-                title: entry.title.clone(),
-                children: Vec::new(),
-            });
-        }
-
-        *next_check += 1;
-    }
 }
 
 /// Parse figure markdown like `"![](path)\n\ncaption"` into (path, caption).
@@ -2513,6 +2431,68 @@ fn build_heading_tree(flat: Vec<ReflowNode>) -> ReflowDocument {
     doc
 }
 
+/// Render a TOC entry list as a markdown bullet list.
+/// If `with_heading` is true, prepends a `## Contents` heading.
+fn render_toc_listing(entries: &[crate::types::TocEntryRendered], with_heading: bool) -> String {
+    // Normalize depths to be contiguous (e.g., 0,1,4 → 0,1,2)
+    let mut unique_depths: Vec<u32> = entries.iter().map(|e| e.depth).collect();
+    unique_depths.sort();
+    unique_depths.dedup();
+    let depth_map: std::collections::HashMap<u32, usize> = unique_depths
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| (d, i))
+        .collect();
+
+    let mut toc_lines = Vec::new();
+    if with_heading {
+        toc_lines.push("## Contents\n".to_string());
+    }
+    for entry in entries {
+        let normalized_depth = depth_map.get(&entry.depth).copied().unwrap_or(0);
+        let indent = "  ".repeat(normalized_depth);
+        let page_str = entry.page.as_deref().unwrap_or("");
+        // Clean up title: strip leader dots and anything after them
+        let title = if let Some(dot_pos) = entry.title.find(". . .") {
+            entry.title[..dot_pos].trim()
+        } else if let Some(dot_pos) = entry.title.find("...") {
+            entry.title[..dot_pos].trim()
+        } else {
+            entry.title.trim()
+        };
+        if title.is_empty() {
+            continue;
+        }
+        if page_str.is_empty() {
+            toc_lines.push(format!("{indent}- {title}"));
+        } else {
+            toc_lines.push(format!("{indent}- {title} (p. {page_str})"));
+        }
+    }
+    toc_lines.join("\n")
+}
+
+/// Check if any node in the tree is a Toc node (recursively).
+fn has_toc_node(nodes: &[ReflowNode]) -> bool {
+    for node in nodes {
+        match node {
+            ReflowNode::Toc { .. } => return true,
+            ReflowNode::Heading { children, .. } => {
+                if has_toc_node(children) {
+                    return true;
+                }
+            }
+            ReflowNode::FrontMatter { children } => {
+                if has_toc_node(children) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Render a reflow document as Markdown.
 pub fn render_markdown_from_reflow(doc: &ReflowDocument) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -2525,42 +2505,11 @@ pub fn render_markdown_from_reflow(doc: &ReflowDocument) -> String {
         }
     }
 
-    // Table of contents (from parsed TOC entries, not re-extracted text)
-    if !doc.toc.is_empty() {
-        // Normalize depths to be contiguous (e.g., 0,1,4 → 0,1,2)
-        let mut unique_depths: Vec<u32> = doc.toc.iter().map(|e| e.depth).collect();
-        unique_depths.sort();
-        unique_depths.dedup();
-        let depth_map: std::collections::HashMap<u32, usize> = unique_depths
-            .iter()
-            .enumerate()
-            .map(|(i, &d)| (d, i))
-            .collect();
-
-        let mut toc_lines = Vec::new();
-        toc_lines.push("## Contents\n".to_string());
-        for entry in &doc.toc {
-            let normalized_depth = depth_map.get(&entry.depth).copied().unwrap_or(0);
-            let indent = "  ".repeat(normalized_depth);
-            let page_str = entry.page.as_deref().unwrap_or("");
-            // Clean up title: strip leader dots and anything after them
-            let title = if let Some(dot_pos) = entry.title.find(". . .") {
-                entry.title[..dot_pos].trim()
-            } else if let Some(dot_pos) = entry.title.find("...") {
-                entry.title[..dot_pos].trim()
-            } else {
-                entry.title.trim()
-            };
-            if title.is_empty() {
-                continue;
-            }
-            if page_str.is_empty() {
-                toc_lines.push(format!("{indent}- {title}"));
-            } else {
-                toc_lines.push(format!("{indent}- {title} (p. {page_str})"));
-            }
-        }
-        parts.push(toc_lines.join("\n"));
+    // Render TOC at the top only if there's no embedded Toc node in the tree
+    // (i.e. for papers/articles without a "Contents" heading in the TOC).
+    let has_embedded_toc = has_toc_node(&doc.children);
+    if !doc.toc.is_empty() && !has_embedded_toc {
+        parts.push(render_toc_listing(&doc.toc, true));
     }
 
     // Render children
@@ -3366,6 +3315,13 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
             }
             ReflowNode::FootnoteBlock { content } => {
                 parts.push(content.clone());
+            }
+            ReflowNode::Toc { entries } => {
+                // Render embedded TOC listing (no heading — parent
+                // Heading node already provides "Contents" or similar).
+                if !entries.is_empty() {
+                    parts.push(render_toc_listing(entries, false));
+                }
             }
         }
     }
