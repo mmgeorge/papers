@@ -102,6 +102,73 @@ Structs with `Deserialize` + `JsonSchema`:
 - DB params: `DbChunkSearchParams`, `DbChunkGetParams`, `DbFigureSearchParams`, `DbFigureGetParams`,
   `DbWorkListParams`, `DbWorkOutlineParams`, `DbSectionGetParams`, `DbChapterGetParams`, `DbTagListParams`
 
+## CLI / MCP feature overlap
+
+The MCP server exposes **all read/search operations** from the CLI. Write and
+mutation operations remain CLI-only. This is by design — the MCP is for LLM
+consumption; indexing, syncing, and bulk ops go through the CLI.
+
+### Selection commands
+
+| CLI subcommand              | MCP tool            | Status    |
+|-----------------------------|---------------------|-----------|
+| `selection list`            | `selection_list`    | Both      |
+| `selection set`             | `selection_get`     | Both (MCP activates on get) |
+| `selection create`          | `selection_create`  | Both      |
+| `selection delete`          | `selection_delete`  | Both      |
+| `selection add`             | `selection_add`     | Both      |
+| `selection remove`          | `selection_remove`  | Both      |
+| `selection status`          | —                   | CLI only  |
+| `selection find`            | —                   | CLI only (OA PDF download) |
+| `selection sync`            | —                   | CLI only (Zotero sync) |
+| `selection merge`           | —                   | CLI only  |
+| `selection rename`          | —                   | CLI only  |
+| `selection db add`          | —                   | CLI only (batch ingest) |
+| `selection db remove`       | —                   | CLI only (batch remove) |
+| `selection collection add`  | —                   | CLI only (import Zotero collection) |
+
+### Database commands
+
+| CLI subcommand       | MCP tool            | Status    |
+|----------------------|---------------------|-----------|
+| `db chunk search`    | `db_chunk_search`   | Both      |
+| `db chunk get`       | `db_chunk_get`      | Both      |
+| `db chunk list`      | `db_chunk_list`     | Both      |
+| `db exhibit search`  | `db_exhibit_search` | Both      |
+| `db exhibit get`     | `db_exhibit_get`    | Both      |
+| `db work list`       | `db_work_list`      | Both      |
+| `db work get`        | `db_work_get`       | Both      |
+| `db work search`     | `db_work_search`    | Both      |
+| `db work outline`    | `db_work_outline`   | Both      |
+| `db work add`        | —                   | CLI only (index paper; `--embed-only` re-embeds without re-extracting) |
+| `db work remove`     | —                   | CLI only (remove from index) |
+| `db work extract`    | —                   | CLI only (print cached extraction) |
+| `db section search`  | `db_section_search` | Both      |
+| `db section list`    | `db_section_list`   | Both      |
+| `db section get`     | `db_section_get`    | Both      |
+| `db chapter search`  | `db_chapter_search` | Both (pending merge into `db_section_*` with depth param) |
+| `db chapter list`    | `db_chapter_list`   | Both (pending merge) |
+| `db chapter get`     | `db_chapter_get`    | Both (pending merge) |
+| `db tag list`        | `db_tag_list`       | Both      |
+
+### CLI-only gaps (not exposed via MCP)
+
+**Selection**: status, find, sync, merge, rename, db add/remove, collection add
+**Database**: work add/remove, work extract
+
+When adding new MCP tools that close these gaps, update this table.
+
+### Extraction pipeline
+
+The DB ingestion pipeline uses `papers-extract` (local ONNX-based extraction)
+instead of the DataLab cloud API. When `reflow.json` is present in the cache,
+the reflow-based chunking pipeline is used; otherwise falls back to the legacy
+DataLab Marker JSON pipeline.
+
+Cache locations:
+- **New (preferred)**: `<cache_dir>/papers/extracts/{zotero_id}/` (env: `PAPERS_EXTRACT_CACHE_DIR`)
+- **Legacy**: `<cache_dir>/papers/datalab/{zotero_id}/` (env: `PAPERS_DATALAB_CACHE_DIR`)
+
 ## How to update
 
 When the `papers` crate adds or changes endpoints:

@@ -3,10 +3,10 @@ mod format;
 
 use clap::Parser;
 use cli::{
-    AdvancedMode, AuthorCommand, AuthorFilterArgs, Cli, ConfigCommand, ConfigSetCommand,
+    AuthorCommand, AuthorFilterArgs, Cli, ConfigCommand, ConfigSetCommand,
     DomainCommand, DomainFilterArgs, EntityCommand, FieldCommand, FieldFilterArgs, FunderCommand,
     FunderFilterArgs, InstitutionCommand, InstitutionFilterArgs, McpCommand, PublisherCommand,
-    PublisherFilterArgs, DbChapterCommand, DbChunkCommand, DbCommand, DbEmbedCommand,
+    PublisherFilterArgs, DbChunkCommand, DbCommand,
     DbExhibitCommand, DbSectionCommand, DbTagCommand, DbWorkCommand, SelectionCommand,
     SelectionCollectionCommand, SelectionDbCommand,
     SourceCommand,
@@ -290,8 +290,13 @@ async fn find_pdf_attachment(zotero: &ZoteroClient, item_key: &str) -> Result<It
 async fn run_extraction_for_key(
     zotero: &ZoteroClient,
     key: &str,
-    mode: AdvancedMode,
 ) -> Result<(), String> {
+    // Already cached?
+    if papers_core::extract_cache::extract_cached(key) {
+        return Ok(());
+    }
+
+    // Find the PDF attachment in Zotero
     let att = find_pdf_attachment(zotero, key).await?;
     let filename = att
         .data
@@ -303,21 +308,140 @@ async fn run_extraction_for_key(
         .join("storage")
         .join(&att.key)
         .join(&filename);
-    let pdf_bytes = std::fs::read(&local_path)
-        .map_err(|e| format!("failed to read {}: {e}", local_path.display()))?;
-    let dl = papers_datalab::DatalabClient::from_env().map_err(|e| e.to_string())?;
-    let processing_mode = match mode {
-        AdvancedMode::Fast => papers_core::text::ProcessingMode::Fast,
-        AdvancedMode::Balanced => papers_core::text::ProcessingMode::Balanced,
-        AdvancedMode::Accurate => papers_core::text::ProcessingMode::Accurate,
-    };
-    let mut source = papers_core::text::PdfSource::ZoteroLocal {
-        path: local_path.to_string_lossy().into_owned(),
-    };
-    papers_core::text::do_extract(pdf_bytes, key, Some(zotero), Some((&dl, processing_mode)), &mut source)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+
+    if !local_path.exists() {
+        return Err(format!("PDF not found: {}", local_path.display()));
+    }
+
+    // Run extraction in a blocking task (Pipeline is synchronous / CPU-bound)
+    let pdf_path = local_path.clone();
+    let item_key = key.to_string();
+    let zotero_clone = zotero.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let options = papers_extract::ExtractOptions::default();
+        let pipeline = papers_extract::Pipeline::new(&options)
+            .map_err(|e| format!("failed to load extraction pipeline: {e}"))?;
+
+        // Extract to a temp directory, then move files to the cache
+        let tmp = tempfile::tempdir()
+            .map_err(|e| format!("failed to create temp dir: {e}"))?;
+
+        let result = pipeline.extract(&pdf_path, tmp.path())
+            .map_err(|e| format!("extraction failed: {e}"))?;
+
+        // Find the output files (named {stem}.json, {stem}.reflow.json, {stem}.md)
+        let stem = pdf_path.file_stem().unwrap_or_default().to_string_lossy();
+        let extraction_json = tmp.path().join(format!("{stem}.json"));
+        let reflow_json = tmp.path().join(format!("{stem}.reflow.json"));
+        let markdown = tmp.path().join(format!("{stem}.md"));
+
+        let extraction_str = std::fs::read_to_string(&extraction_json)
+            .map_err(|e| format!("failed to read extraction.json: {e}"))?;
+        let reflow_str = std::fs::read_to_string(&reflow_json)
+            .map_err(|e| format!("failed to read reflow.json: {e}"))?;
+        let md_str = std::fs::read_to_string(&markdown)
+            .map_err(|e| format!("failed to read output.md: {e}"))?;
+
+        // Build meta.json
+        let meta = papers_core::text::ExtractionMeta {
+            item_key: item_key.clone(),
+            zotero_user_id: std::env::var("ZOTERO_USER_ID").ok(),
+            title: None, // Will be enriched below
+            authors: None,
+            item_type: None,
+            date: None,
+            doi: None,
+            url: None,
+            publication_title: None,
+            extracted_at: Some(chrono_free_iso_now()),
+            processing_mode: None,
+            pdf_source: None,
+        };
+        let meta_json = serde_json::to_string_pretty(&meta)
+            .map_err(|e| format!("failed to serialize meta: {e}"))?;
+
+        // Write to extract cache
+        let cache_dir = papers_core::extract_cache::write_extract_cache(
+            &item_key, &meta_json, &extraction_str, &reflow_str, &md_str,
+        ).map_err(|e| format!("failed to write extract cache: {e}"))?;
+
+        // Copy images directory if it exists
+        let images_src = tmp.path().join("images");
+        if images_src.is_dir() {
+            let images_dst = cache_dir.join("images");
+            std::fs::create_dir_all(&images_dst)
+                .map_err(|e| format!("failed to create images dir: {e}"))?;
+            if let Ok(entries) = std::fs::read_dir(&images_src) {
+                for entry in entries.flatten() {
+                    let dest = images_dst.join(entry.file_name());
+                    let _ = std::fs::copy(entry.path(), dest);
+                }
+            }
+        }
+
+        Ok(())
+    }).await.map_err(|e| format!("extraction task panicked: {e}"))?;
+
+    result?;
+
+    // Best-effort: enrich meta.json with Zotero metadata
+    if let Some(cache_dir) = papers_core::extract_cache::extract_cache_dir(key) {
+        let meta_path = cache_dir.join("meta.json");
+        if let Ok(bytes) = std::fs::read(&meta_path) {
+            if let Ok(mut meta) = serde_json::from_slice::<papers_core::text::ExtractionMeta>(&bytes) {
+                // Fetch item metadata from Zotero
+                if let Ok(item) = zotero_clone.get_item(key).await {
+                    meta.title = item.data.title.clone();
+                    meta.authors = Some(
+                        item.data.creators.iter()
+                            .filter_map(|c| {
+                                match (c.first_name.as_deref(), c.last_name.as_deref()) {
+                                    (Some(f), Some(l)) => Some(format!("{f} {l}")),
+                                    (None, Some(l)) => Some(l.to_string()),
+                                    _ => c.name.clone(),
+                                }
+                            })
+                            .collect()
+                    );
+                    meta.item_type = Some(item.data.item_type.clone());
+                    meta.date = item.data.date.clone();
+                    meta.doi = item.data.doi.clone();
+                    meta.url = item.data.url.clone();
+                    meta.publication_title = item.data.publication_title.clone();
+                    if let Ok(updated) = serde_json::to_string_pretty(&meta) {
+                        let _ = std::fs::write(&meta_path, updated);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// ISO 8601 UTC timestamp without chrono dependency.
+fn chrono_free_iso_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let rem = secs % 86400;
+    let hh = rem / 3600;
+    let mm = (rem % 3600) / 60;
+    let ss = rem % 60;
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
 fn looks_like_doi(s: &str) -> bool {
@@ -2078,7 +2202,7 @@ async fn handle_db_command(cmd: DbCommand) {
                 }
             }
 
-            DbWorkCommand::Add { work: item_key, all, tag, force, json, mode, force_extract } => {
+            DbWorkCommand::Add { work: item_key, all, tag, force, json, force_extract, embed_only } => {
                 let rag = open_db_store().await;
                 if all {
                     let keys = papers_db::list_cached_item_keys();
@@ -2098,7 +2222,7 @@ async fn handle_db_command(cmd: DbCommand) {
                         let zotero = zotero_client().await.unwrap_or_else(|e| exit_err(&e.to_string()));
                         for key in &keys {
                             if !json { print!("  [re-extract] {key}... "); }
-                            match run_extraction_for_key(&zotero, key, mode.clone()).await {
+                            match run_extraction_for_key(&zotero, key).await {
                                 Ok(()) => { if !json { println!("done"); } }
                                 Err(e) => { eprintln!("  [extract-fail] {key}: {e}"); failed += 1; }
                             }
@@ -2166,7 +2290,7 @@ async fn handle_db_command(cmd: DbCommand) {
                             || papers_core::text::datalab_cached_markdown(&key).is_none();
                         if needs_extract {
                             if !json { print!("  [extract] {key}... "); }
-                            if let Err(e) = run_extraction_for_key(&zotero, &key, mode).await {
+                            if let Err(e) = run_extraction_for_key(&zotero, &key).await {
                                 exit_err(&format!("Extraction failed for {key}: {e}"));
                             }
                             if !json { println!("done"); }
@@ -2227,7 +2351,7 @@ async fn handle_db_command(cmd: DbCommand) {
                 }
             }
 
-            DbWorkCommand::Outline { paper_id, json } => {
+            DbWorkCommand::Outline { paper_id, section: _section, contents: _contents, json } => {
                 let rag = open_db_store().await;
                 let paper_id = match papers_db::resolve_paper_id(&rag, &paper_id).await {
                     Ok(r) => r,
@@ -2251,14 +2375,20 @@ async fn handle_db_command(cmd: DbCommand) {
                 let key = smart_resolve_item_key(&zotero, &work).await
                     .unwrap_or_else(|e| exit_err(&e));
                 if json {
-                    match papers_core::text::datalab_cached_json(&key) {
+                    // Prefer reflow JSON, fall back to legacy DataLab JSON
+                    let result = papers_core::extract_cache::read_cached_reflow_json(&key)
+                        .or_else(|| papers_core::text::datalab_cached_json(&key));
+                    match result {
                         Some(json_str) => print!("{json_str}"),
                         None => exit_err(&format!(
                             "No cached extraction for {key}. Run: papers db work add {key}"
                         )),
                     }
                 } else {
-                    match papers_core::text::datalab_cached_markdown(&key) {
+                    // Prefer extract cache markdown, fall back to legacy DataLab markdown
+                    let result = papers_core::extract_cache::read_cached_markdown(&key)
+                        .or_else(|| papers_core::text::datalab_cached_markdown(&key));
+                    match result {
                         Some(md) => print!("{md}"),
                         None => exit_err(&format!(
                             "No cached extraction for {key}. Run: papers db work add {key}"
@@ -2292,7 +2422,8 @@ async fn handle_db_command(cmd: DbCommand) {
                 },
             };
                 let params = papers_db::SearchSectionsParams {
-                    query, paper_ids, chapter_idx, filter_year_min: year_min, filter_year_max: year_max,
+                    query, paper_ids, chapter_idx, depth: None,
+                    filter_year_min: year_min, filter_year_max: year_max,
                     filter_venue: venue, filter_tags: tag, limit,
                 };
                 match papers_db::query::search_sections(&rag, params).await {
@@ -2313,7 +2444,7 @@ async fn handle_db_command(cmd: DbCommand) {
                     }
                     None => None,
                 };
-                match papers_db::query::list_sections(&rag, papers_db::ListSectionsParams { paper_id }).await {
+                match papers_db::query::list_sections(&rag, papers_db::ListSectionsParams { paper_id, depth: None }).await {
                     Ok(results) => { if json { print_json(&results); } else { format_db_section_list(&results); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
@@ -2327,70 +2458,6 @@ async fn handle_db_command(cmd: DbCommand) {
                 };
                 match papers_db::query::get_section(&rag, &paper_id, chapter_idx, section_idx).await {
                     Ok(result) => { if json { print_json(&result); } else { format_db_section(&result); } }
-                    Err(e) => exit_err(&e.to_string()),
-                }
-            }
-        },
-
-        DbCommand::Chapter { cmd } => match cmd {
-            DbChapterCommand::Search {
-                query, selection, work, year_min, year_max, venue, tag, limit, json,
-            } => {
-                let rag = open_db_store().await;
-            let paper_ids = match selection.as_deref() {
-                Some(sel) => match papers_core::selection::load_selection(sel) {
-                    Ok(s) => Some(s.entries.iter().flat_map(|e| {
-                        e.doi.iter().chain(e.openalex_id.iter()).chain(e.zotero_key.iter()).cloned()
-                    }).collect()),
-                    Err(e) => exit_err(&e.to_string()),
-                },
-                None => match work {
-                    Some(id) => {
-                        let resolved = match papers_db::resolve_paper_id(&rag, &id).await {
-                            Ok(r) => r,
-                            Err(e) => exit_err(&e.to_string()),
-                        };
-                        Some(vec![resolved])
-                    }
-                    None => None,
-                },
-            };
-                let params = papers_db::SearchChaptersParams {
-                    query, paper_ids, filter_year_min: year_min, filter_year_max: year_max,
-                    filter_venue: venue, filter_tags: tag, limit,
-                };
-                match papers_db::query::search_chapters(&rag, params).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_db_chapter_search(&results); } }
-                    Err(e) => exit_err(&e.to_string()),
-                }
-            }
-
-            DbChapterCommand::List { work, json } => {
-                let rag = open_db_store().await;
-                let paper_id = match work {
-                    Some(ref id) => {
-                        let resolved = match papers_db::resolve_paper_id(&rag, id).await {
-                            Ok(r) => r,
-                            Err(e) => exit_err(&e.to_string()),
-                        };
-                        Some(resolved)
-                    }
-                    None => None,
-                };
-                match papers_db::query::list_chapters(&rag, papers_db::ListChaptersParams { paper_id }).await {
-                    Ok(results) => { if json { print_json(&results); } else { format_db_chapter_list(&results); } }
-                    Err(e) => exit_err(&e.to_string()),
-                }
-            }
-
-            DbChapterCommand::Get { paper_id, chapter_idx, json } => {
-                let rag = open_db_store().await;
-                let paper_id = match papers_db::resolve_paper_id(&rag, &paper_id).await {
-                    Ok(r) => r,
-                    Err(e) => exit_err(&e.to_string()),
-                };
-                match papers_db::query::get_chapter(&rag, &paper_id, chapter_idx).await {
-                    Ok(result) => { if json { print_json(&result); } else { format_db_chapter(&result); } }
                     Err(e) => exit_err(&e.to_string()),
                 }
             }
@@ -2416,9 +2483,6 @@ async fn handle_db_command(cmd: DbCommand) {
             }
         },
 
-        DbCommand::Embed { cmd } => {
-            handle_db_embed_command(cmd).await;
-        }
     }
 }
 
@@ -2474,25 +2538,6 @@ fn format_db_section_list(sections: &[papers_db::SectionListItem]) {
     }
 }
 
-fn format_db_chapter_search(results: &[papers_db::ChapterSearchResult]) {
-    if results.is_empty() { println!("No matching chapters found."); return; }
-    for r in results {
-        println!("[{:.3}] Ch.{} {} \u{2014} {}", r.score, r.chapter_idx, r.chapter_title, r.paper_title);
-        println!("       {} sections, {} chunks  |  {}", r.section_count, r.chunk_count, r.paper_id);
-        println!("       {}", r.top_chunk.chars().take(100).collect::<String>());
-        println!();
-    }
-}
-
-fn format_db_chapter_list(chapters: &[papers_db::ChapterListItem]) {
-    if chapters.is_empty() { println!("No chapters found."); return; }
-    for c in chapters {
-        println!("  Ch.{} {}  [{} sections, {} chunks]",
-            c.chapter_idx, c.chapter_title, c.section_count, c.chunk_count);
-    }
-}
-
-
 fn handle_config_command(cmd: ConfigCommand) {
     match cmd {
         ConfigCommand::Set {
@@ -2522,123 +2567,6 @@ async fn handle_mcp_command(cmd: McpCommand) {
         McpCommand::Start { stdio: _ } => {
             if let Err(e) = papers_mcp::start_stdio().await {
                 exit_err(&format!("MCP server error: {e}"));
-            }
-        }
-    }
-}
-
-async fn handle_db_embed_command(cmd: DbEmbedCommand) {
-    let cache = papers_db::default_embed_cache();
-    let default_model = || {
-        papers_core::config::PapersConfig::load()
-            .map(|c| c.embedding_model)
-            .unwrap_or_else(|_| "embedding-gemma-300m".to_string())
-    };
-
-    match cmd {
-        DbEmbedCommand::List { work, json } => {
-            if let Some(key) = work {
-                match cache.list_models(&key) {
-                    Ok(models) => {
-                        if json {
-                            print_json(&serde_json::json!({ "item_key": key, "models": models }));
-                        } else if models.is_empty() {
-                            println!("No cached embeddings for {key}.");
-                        } else {
-                            for model in &models {
-                                let chunk_count = cache
-                                    .load_manifest(model, &key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|m| m.chunks.len());
-                                if let Some(n) = chunk_count {
-                                    println!("{key}  {model}  ({n} chunks)");
-                                } else {
-                                    println!("{key}  {model}");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => exit_err(&e.to_string()),
-                }
-            } else {
-                match cache.list_all() {
-                    Ok(pairs) => {
-                        if json {
-                            let out: Vec<_> = pairs
-                                .iter()
-                                .map(|(k, m)| serde_json::json!({ "item_key": k, "model": m }))
-                                .collect();
-                            print_json(&out);
-                        } else if pairs.is_empty() {
-                            println!("No cached embeddings.");
-                        } else {
-                            for (key, model) in &pairs {
-                                let chunk_count = cache
-                                    .load_manifest(model, key)
-                                    .ok()
-                                    .flatten()
-                                    .map(|m| m.chunks.len());
-                                if let Some(n) = chunk_count {
-                                    println!("{key}  {model}  ({n} chunks)");
-                                } else {
-                                    println!("{key}  {model}");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => exit_err(&e.to_string()),
-                }
-            }
-        }
-
-        DbEmbedCommand::Add { work, model, force } => {
-            let model_name = model.unwrap_or_else(default_model);
-            if let Err(e) = papers_core::config::PapersConfig::validate_model(&model_name) {
-                exit_err(&e.to_string());
-            }
-
-            let keys = if let Some(key) = work {
-                vec![key]
-            } else {
-                papers_db::list_cached_item_keys()
-            };
-
-            if keys.is_empty() {
-                println!("No cached papers found.");
-                return;
-            }
-
-            let rag = open_db_store().await;
-            for key in &keys {
-                let params = match papers_db::ingest_params_from_cache(key) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("  [skip] {key}: {e}");
-                        continue;
-                    }
-                };
-                match papers_db::cache_paper_embeddings(&rag, &params, &model_name, force).await {
-                    Ok(n) => println!("Cached {n} chunks for {key} [{model_name}]"),
-                    Err(e) => eprintln!("  [fail] {key}: {e}"),
-                }
-            }
-        }
-
-        DbEmbedCommand::Delete { work, model } => {
-            let model_name = model.unwrap_or_else(default_model);
-
-            let keys = if let Some(key) = work {
-                vec![key]
-            } else {
-                papers_db::list_cached_item_keys()
-            };
-
-            for key in &keys {
-                match cache.delete(&model_name, key) {
-                    Ok(()) => println!("Deleted embeddings for {key} [{model_name}]"),
-                    Err(e) => exit_err(&e.to_string()),
-                }
             }
         }
     }
@@ -2727,22 +2655,6 @@ fn format_db_section(r: &papers_db::SectionResult) {
     for chunk in &r.chunks {
         println!("{}", chunk.text);
         println!("---");
-    }
-}
-
-fn format_db_chapter(r: &papers_db::ChapterResult) {
-    println!(
-        "[{}] Ch.{} {} ({} chunks)",
-        r.paper_id, r.chapter_idx, r.chapter_title, r.total_chunks
-    );
-    println!();
-    for sec in &r.sections {
-        println!("  § {} {}", sec.section_idx, sec.section_title);
-        for chunk in &sec.chunks {
-            let preview: String = chunk.text.chars().take(120).collect();
-            println!("    {}", preview);
-        }
-        println!();
     }
 }
 

@@ -12,7 +12,6 @@ readme = "../../README.md"
 base64.workspace = true
 papers-openalex.workspace = true
 papers-zotero.workspace = true
-papers-datalab.workspace = true
 dirs.workspace = true
 reqwest.workspace = true
 pdf-extract.workspace = true

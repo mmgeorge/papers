@@ -16,4 +16,6 @@ pub enum DbError {
     Json(#[from] serde_json::Error),
     #[error("Embed cache error: {0}")]
     Cache(String),
+    #[error("Ingest error: {0}")]
+    Ingest(String),
 }

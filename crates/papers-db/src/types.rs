@@ -131,6 +131,9 @@ pub struct OutlineSection {
     pub section_idx: u16,
     pub section_title: String,
     pub chunk_count: usize,
+    /// First sentence of the first paragraph (when `--contents` is used).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,10 +239,16 @@ pub struct ListChunksParams {
 }
 
 /// Input parameters for section-level semantic search.
+///
+/// Use `depth` to control granularity:
+/// - `Some(1)` — chapter-level results (one per chapter)
+/// - `Some(2)` — section-level results (one per section)
+/// - `None`    — all depths (default, both chapters and sections)
 pub struct SearchSectionsParams {
     pub query: String,
     pub paper_ids: Option<Vec<String>>,
     pub chapter_idx: Option<u16>,
+    pub depth: Option<u16>,
     pub filter_year_min: Option<u16>,
     pub filter_year_max: Option<u16>,
     pub filter_venue: Option<String>,
@@ -248,8 +257,11 @@ pub struct SearchSectionsParams {
 }
 
 /// Input parameters for listing sections in a paper.
+///
+/// Use `depth` to filter: `Some(1)` for chapters only, `Some(2)` for sections only.
 pub struct ListSectionsParams {
     pub paper_id: Option<String>,
+    pub depth: Option<u16>,
 }
 
 /// Input parameters for chapter-level semantic search.

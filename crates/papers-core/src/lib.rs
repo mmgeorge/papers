@@ -1,5 +1,6 @@
 pub mod api;
 pub mod config;
+pub mod extract_cache;
 pub mod filter;
 pub mod selection;
 pub mod summary;

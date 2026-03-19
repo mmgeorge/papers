@@ -1,6 +1,4 @@
-pub use papers_datalab::ProcessingMode;
 use base64::Engine as _;
-use papers_datalab::{DatalabClient, MarkerRequest, OutputFormat};
 use papers_openalex::{GetParams, OpenAlexClient, Work};
 use papers_zotero::{ItemListParams, ZoteroClient};
 use serde::{Deserialize, Serialize};
@@ -14,7 +12,7 @@ pub enum PdfSource {
     ZoteroRemote { item_key: String },
     DirectUrl { url: String },
     OpenAlexContent,
-    DataLab,
+    LocalExtract,
 }
 
 /// Result of extracting text from a work's PDF.
@@ -44,9 +42,6 @@ pub enum WorkTextError {
 
     #[error("PDF extraction error: {0}")]
     PdfExtract(String),
-
-    #[error(transparent)]
-    DataLab(#[from] papers_datalab::DatalabError),
 
     #[error("No PDF found for work {work_id}{}", title.as_ref().map(|t| format!(" ({})", t)).unwrap_or_default())]
     NoPdfFound {
@@ -127,11 +122,11 @@ pub async fn upload_extraction_to_zotero(
     zc: &ZoteroClient,
     item_key: &str,
 ) -> Result<(), WorkTextError> {
-    let dir = datalab_cache_dir(item_key)
-        .ok_or_else(|| WorkTextError::PdfExtract("cannot determine cache directory".into()))?;
-    if !dir.join(format!("{item_key}.md")).exists() {
-        return Err(WorkTextError::PdfExtract(format!("no local cache for {item_key}")));
-    }
+    // Prefer extract cache, fall back to legacy datalab cache
+    let dir = crate::extract_cache::extract_cache_dir(item_key)
+        .filter(|d| d.join("output.md").exists())
+        .or_else(|| datalab_cache_dir(item_key).filter(|d| d.join(format!("{item_key}.md")).exists()))
+        .ok_or_else(|| WorkTextError::PdfExtract(format!("no local cache for {item_key}")))?;
     upload_papers_zip(zc, item_key, &dir, item_key).await
 }
 
@@ -153,8 +148,13 @@ pub async fn download_extraction_from_zotero(
     unzip_to_cache_dir(&zip_bytes, &dir).map_err(|e| WorkTextError::PdfExtract(e.to_string()))
 }
 
-/// Return the cached markdown for `cache_id` if it exists, otherwise `None`.
+/// Return cached markdown for `cache_id` (checks extract cache first, then legacy datalab cache).
 pub fn datalab_cached_markdown(cache_id: &str) -> Option<String> {
+    // Prefer new extract cache
+    if let Some(md) = crate::extract_cache::read_cached_markdown(cache_id) {
+        return Some(md);
+    }
+    // Fall back to legacy datalab cache
     let dir = datalab_cache_dir(cache_id)?;
     std::fs::read_to_string(dir.join(format!("{cache_id}.md"))).ok()
 }
@@ -190,8 +190,13 @@ pub fn datalab_cached_item_keys() -> Vec<String> {
     keys
 }
 
-/// Return the cached JSON for `cache_id` if it exists, otherwise `None`.
+/// Return cached JSON for `cache_id` (checks extract cache first, then legacy datalab cache).
 pub fn datalab_cached_json(cache_id: &str) -> Option<String> {
+    // Prefer new extract cache (reflow JSON)
+    if let Some(json) = crate::extract_cache::read_cached_reflow_json(cache_id) {
+        return Some(json);
+    }
+    // Fall back to legacy datalab cache
     let dir = datalab_cache_dir(cache_id)?;
     std::fs::read_to_string(dir.join(format!("{cache_id}.json"))).ok()
 }
@@ -793,157 +798,57 @@ async fn upload_papers_zip(
     Ok(())
 }
 
-/// Extract text from PDF bytes, routing through DataLab if `datalab` is `Some`.
+/// Extract text from PDF bytes.
 ///
-/// `zotero_id` is the Zotero parent item key (or OpenAlex short ID for non-Zotero sources)
-/// used as the on-disk cache ID. When `zotero` is `Some`, the DataLab result is also
-/// backed up to/restored from a `papers_extract_{key}.zip` attachment on the parent Zotero item.
+/// Checks the extract cache and legacy DataLab cache first. Falls back to
+/// local pdfium text extraction if no cache is available.
+///
+/// `zotero_id` is used as the on-disk cache ID. When `zotero` is `Some`,
+/// results are backed up to/restored from a `papers_extract_{key}.zip`
+/// attachment on the parent Zotero item.
 pub async fn do_extract(
     pdf_bytes: Vec<u8>,
     zotero_id: &str,
     zotero: Option<&ZoteroClient>,
-    datalab: Option<(&DatalabClient, ProcessingMode)>,
     source: &mut PdfSource,
 ) -> Result<String, WorkTextError> {
-    if let Some((dl, mode)) = datalab {
-        // Validate key if Zotero sync is requested
-        if let Some(zc) = zotero {
-            if !is_valid_zotero_key(zotero_id) {
-                return Err(WorkTextError::InvalidZoteroKey(zotero_id.to_string()));
-            }
-            let _ = zc; // used below
-        }
-
-        let cache_dir = datalab_cache_dir(zotero_id);
-
-        // --- local cache check ---
-        if let Some(ref dir) = cache_dir {
-            let md_path = dir.join(format!("{zotero_id}.md"));
-            if let Ok(text) = std::fs::read_to_string(&md_path) {
-                *source = PdfSource::DataLab;
-                // Best-effort: upload to Zotero if no papers_extract_*.zip exists yet
-                if let Some(zc) = zotero {
-                    let zc = zc.clone();
-                    let dir = dir.clone();
-                    let id = zotero_id.to_string();
-                    tokio::spawn(async move {
-                        match find_papers_zip_key(&zc, &id).await {
-                            Ok(None) => {
-                                if let Err(e) = upload_papers_zip(&zc, &id, &dir, &id).await {
-                                    if !is_zotero_write_denied(&e) {
-                                        eprintln!("[papers] Zotero backup upload failed: {e}");
-                                    }
-                                }
-                            }
-                            Ok(Some(_)) => {} // already present
-                            Err(e) => {
-                                if !is_zotero_write_denied(&e) {
-                                    eprintln!("[papers] Zotero children check failed: {e}");
-                                }
-                            }
-                        }
-                    });
-                }
-                return Ok(text);
-            }
-        }
-
-        // --- Zotero cache check (papers_extract_*.zip) ---
-        if let Some(zc) = zotero {
-            if let Ok(Some(att_key)) = find_papers_zip_key(zc, zotero_id).await {
-                match zc.download_item_file(&att_key).await {
-                    Ok(zip_bytes) if !zip_bytes.is_empty() => {
-                        if let Some(ref dir) = cache_dir {
-                            if unzip_to_cache_dir(&zip_bytes, dir).is_ok() {
-                                let md_path = dir.join(format!("{zotero_id}.md"));
-                                if let Ok(text) = std::fs::read_to_string(&md_path) {
-                                    *source = PdfSource::DataLab;
-                                    return Ok(text);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        return Err(WorkTextError::Zotero(e));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // --- DataLab API call ---
-        // Capture mode string and original source before they are moved/overwritten.
-        let mode_str_opt = serde_json::to_value(&mode)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from));
-        let original_source = source.clone();
-        let dl_result = dl
-            .convert_document(MarkerRequest {
-                file: Some(pdf_bytes),
-                filename: Some(format!("{zotero_id}.pdf")),
-                output_format: vec![OutputFormat::Markdown, OutputFormat::Json],
-                mode,
-                ..Default::default()
-            })
-            .await?;
-
-        *source = PdfSource::DataLab;
-        let markdown = dl_result.markdown.clone().unwrap_or_default();
-
-        // --- write local cache (best-effort) ---
-        if let Some(ref dir) = cache_dir {
-            let _ = std::fs::create_dir_all(dir);
-
-            let md_path = dir.join(format!("{zotero_id}.md"));
-            let _ = std::fs::write(&md_path, &markdown);
-
-            if let Some(ref json_val) = dl_result.json {
-                let json_path = dir.join(format!("{zotero_id}.json"));
-                let _ = std::fs::write(&json_path, json_val.to_string());
-            }
-
-            if let Some(ref images) = dl_result.images {
-                if !images.is_empty() {
-                    let img_dir = dir.join("images");
-                    let _ = std::fs::create_dir_all(&img_dir);
-                    for (name, data) in images {
-                        let b64 = if let Some(pos) = data.find(";base64,") {
-                            &data[pos + 8..]
-                        } else {
-                            data.as_str()
-                        };
-                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) {
-                            let img_path = img_dir.join(name);
-                            let _ = std::fs::write(&img_path, bytes);
-                        }
-                    }
-                }
-            }
-
-            // Write meta.json (best-effort, before upload so it's included in the ZIP)
-            write_extraction_meta(
-                dir,
-                zotero_id,
-                zotero,
-                mode_str_opt.as_deref(),
-                Some(&original_source),
-            )
-            .await;
-
-            // Best-effort: upload papers_extract_*.zip to Zotero (silently skip on 403)
-            if let Some(zc) = zotero {
-                if let Err(e) = upload_papers_zip(zc, zotero_id, dir, zotero_id).await {
-                    if !is_zotero_write_denied(&e) {
-                        eprintln!("[papers] Zotero backup upload failed: {e}");
-                    }
-                }
-            }
-        }
-
-        Ok(markdown)
-    } else {
-        extract_text(&pdf_bytes)
+    // --- check new extract cache ---
+    if let Some(md) = crate::extract_cache::read_cached_markdown(zotero_id) {
+        *source = PdfSource::LocalExtract;
+        return Ok(md);
     }
+
+    // --- check legacy DataLab cache ---
+    if let Some(md) = datalab_cached_markdown(zotero_id) {
+        *source = PdfSource::LocalExtract;
+        return Ok(md);
+    }
+
+    // --- Zotero cache check (papers_extract_*.zip) ---
+    if let Some(zc) = zotero {
+        if let Ok(Some(att_key)) = find_papers_zip_key(zc, zotero_id).await {
+            match zc.download_item_file(&att_key).await {
+                Ok(zip_bytes) if !zip_bytes.is_empty() => {
+                    if let Some(dir) = datalab_cache_dir(zotero_id) {
+                        if unzip_to_cache_dir(&zip_bytes, &dir).is_ok() {
+                            let md_path = dir.join(format!("{zotero_id}.md"));
+                            if let Ok(text) = std::fs::read_to_string(&md_path) {
+                                *source = PdfSource::LocalExtract;
+                                return Ok(text);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Err(WorkTextError::Zotero(e));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // --- fall back to local pdfium extraction ---
+    extract_text(&pdf_bytes)
 }
 
 /// Download and extract the full text of a scholarly work.
@@ -954,13 +859,11 @@ pub async fn do_extract(
 /// 3. Direct PDF URLs from OpenAlex locations (whitelisted domains)
 /// 4. OpenAlex Content API (requires `OPENALEX_API_KEY`)
 ///
-/// When `datalab` is `Some`, the final extraction step uses the DataLab Marker
-/// API instead of local pdfium extraction, producing higher-quality markdown.
-/// The `ProcessingMode` controls quality vs. speed: `Fast` < `Balanced` < `Accurate`.
+/// If a cached extraction exists (from `papers-extract` or legacy DataLab cache),
+/// it is returned directly. Otherwise falls back to local pdfium text extraction.
 pub async fn work_text(
     openalex: &OpenAlexClient,
     zotero: Option<&ZoteroClient>,
-    datalab: Option<(&DatalabClient, ProcessingMode)>,
     work_id: &str,
 ) -> Result<WorkTextResult, WorkTextError> {
     // 1. Fetch work metadata from OpenAlex
@@ -976,7 +879,7 @@ pub async fn work_text(
     // 2. Try Zotero (local then remote)
     if let (Some(zotero), Some(doi)) = (zotero, doi) {
         if let Some((bytes, mut source, zotero_key)) = try_zotero(zotero, doi, title.as_deref()).await? {
-            let text = do_extract(bytes, &zotero_key, Some(zotero), datalab, &mut source).await?;
+            let text = do_extract(bytes, &zotero_key, Some(zotero), &mut source).await?;
             return Ok(WorkTextResult {
                 text,
                 source,
@@ -990,7 +893,7 @@ pub async fn work_text(
     // 3. Try direct PDF URLs from OpenAlex locations
     let pdf_urls = collect_pdf_urls(&work);
     if let Some((bytes, mut source)) = try_direct_urls(&http, &pdf_urls).await? {
-        let text = do_extract(bytes, short_id, None, datalab, &mut source).await?;
+        let text = do_extract(bytes, short_id, None, &mut source).await?;
         return Ok(WorkTextResult {
             text,
             source,
@@ -1002,7 +905,7 @@ pub async fn work_text(
 
     // 4. Try OpenAlex Content API
     if let Some((bytes, mut source)) = try_openalex_content(&http, &work).await? {
-        let text = do_extract(bytes, short_id, None, datalab, &mut source).await?;
+        let text = do_extract(bytes, short_id, None, &mut source).await?;
         return Ok(WorkTextResult {
             text,
             source,

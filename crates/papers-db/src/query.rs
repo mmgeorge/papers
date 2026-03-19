@@ -1087,6 +1087,7 @@ pub async fn get_paper_outline(
                         section_idx: sec_idx,
                         section_title: sec_title,
                         chunk_count: count,
+                        summary: None,
                     }
                 })
                 .collect();

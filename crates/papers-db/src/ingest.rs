@@ -29,32 +29,32 @@ pub struct IngestParams {
     pub force: bool,
 }
 
-struct ChunkRecord {
-    chunk_id: String,
-    chapter_title: String,
-    chapter_idx: u16,
-    section_title: String,
-    section_idx: u16,
-    chunk_idx: u16,
-    block_type: String,
-    text: String,
-    page_start: Option<u16>,
-    page_end: Option<u16>,
-    exhibit_ids: Vec<String>,
+pub(crate) struct ChunkRecord {
+    pub(crate) chunk_id: String,
+    pub(crate) chapter_title: String,
+    pub(crate) chapter_idx: u16,
+    pub(crate) section_title: String,
+    pub(crate) section_idx: u16,
+    pub(crate) chunk_idx: u16,
+    pub(crate) block_type: String,
+    pub(crate) text: String,
+    pub(crate) page_start: Option<u16>,
+    pub(crate) page_end: Option<u16>,
+    pub(crate) exhibit_ids: Vec<String>,
 }
 
-struct ExhibitRecord {
-    exhibit_id: String,
-    exhibit_type: String,
-    caption: String,
-    description: Option<String>,
-    image_path: Option<String>,
-    content: Option<String>,
-    page: Option<u16>,
-    chapter_idx: u16,
-    section_idx: u16,
-    first_ref_chunk_id: Option<String>,
-    ref_count: u16,
+pub(crate) struct ExhibitRecord {
+    pub(crate) exhibit_id: String,
+    pub(crate) exhibit_type: String,
+    pub(crate) caption: String,
+    pub(crate) description: Option<String>,
+    pub(crate) image_path: Option<String>,
+    pub(crate) content: Option<String>,
+    pub(crate) page: Option<u16>,
+    pub(crate) chapter_idx: u16,
+    pub(crate) section_idx: u16,
+    pub(crate) first_ref_chunk_id: Option<String>,
+    pub(crate) ref_count: u16,
 }
 
 // ── Token estimation ──────────────────────────────────────────────────────────
@@ -498,28 +498,59 @@ fn normalize_exhibit_kind(raw: &str) -> String {
 
 // ── Cache/path helpers ────────────────────────────────────────────────────────
 
-/// Return the DataLab cache root directory.
-fn cache_root() -> Option<PathBuf> {
+/// Return the extract cache root directory (new pipeline).
+fn extract_cache_root() -> Option<PathBuf> {
+    papers_core::extract_cache::extract_cache_root()
+}
+
+/// Return the DataLab cache root directory (legacy pipeline).
+fn datalab_cache_root() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("PAPERS_DATALAB_CACHE_DIR") {
         return Some(PathBuf::from(p));
     }
     dirs::cache_dir().map(|d| d.join("papers").join("datalab"))
 }
 
-/// Build IngestParams from a cached item_key using meta.json.
-pub fn ingest_params_from_cache(item_key: &str) -> Result<IngestParams, DbError> {
-    let root = cache_root().ok_or_else(|| {
-        DbError::NotFound("cannot determine cache directory".into())
-    })?;
-    let cache_dir = root.join(item_key);
-    if !cache_dir.is_dir() {
-        return Err(DbError::NotFound(format!(
-            "cache directory not found: {}",
-            cache_dir.display()
-        )));
+/// Locate the cache directory for an item_key, preferring extract cache over datalab.
+fn resolve_cache_dir(item_key: &str) -> Option<PathBuf> {
+    // Prefer new extract cache
+    if let Some(root) = extract_cache_root() {
+        let dir = root.join(item_key);
+        if dir.join("reflow.json").exists() {
+            return Some(dir);
+        }
     }
+    // Fall back to legacy datalab cache
+    if let Some(root) = datalab_cache_root() {
+        let dir = root.join(item_key);
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+    None
+}
 
-    let meta = papers_core::text::read_extraction_meta(item_key);
+/// Build IngestParams from a cached item_key using meta.json.
+///
+/// Prefers the new extract cache (`<cache>/papers/extracts/{key}/`) over the
+/// legacy DataLab cache (`<cache>/papers/datalab/{key}/`).
+pub fn ingest_params_from_cache(item_key: &str) -> Result<IngestParams, DbError> {
+    let cache_dir = resolve_cache_dir(item_key).ok_or_else(|| {
+        DbError::NotFound(format!("no cache directory found for {item_key}"))
+    })?;
+
+    // Try reading meta.json from the resolved cache dir first, then fall back
+    // to the legacy datalab helper which looks in the datalab cache.
+    let meta = {
+        let meta_path = cache_dir.join("meta.json");
+        if meta_path.exists() {
+            std::fs::read(&meta_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<papers_core::text::ExtractionMeta>(&bytes).ok())
+        } else {
+            papers_core::text::read_extraction_meta(item_key)
+        }
+    };
     let (title, authors, year, venue, doi) = match meta {
         Some(m) => {
             let y = m.date.as_deref().and_then(parse_year);
@@ -1200,7 +1231,20 @@ pub async fn cache_paper_embeddings(
         }
     }
 
-    let (chunk_records, _exhibit_records) = parse_paper_blocks(params)?;
+    let (chunk_records, _exhibit_records) = {
+        let reflow_path = params.cache_dir.join("reflow.json");
+        if reflow_path.exists() {
+            let json_bytes = std::fs::read(&reflow_path).map_err(|e| {
+                DbError::Ingest(format!("failed to read {}: {e}", reflow_path.display()))
+            })?;
+            let doc: ReflowDocument = serde_json::from_slice(&json_bytes).map_err(|e| {
+                DbError::Ingest(format!("failed to parse reflow.json: {e}"))
+            })?;
+            parse_reflow_document(params, &doc)?
+        } else {
+            parse_paper_blocks(params)?
+        }
+    };
     let n = chunk_records.len();
 
     let embeddings = if chunk_records.is_empty() {
@@ -1273,10 +1317,482 @@ fn embedding_text(params: &IngestParams, c: &ChunkRecord) -> String {
     s
 }
 
-/// Ingest a paper from the DataLab Marker JSON cache into LanceDB.
+// ── Reflow-based chunking ─────────────────────────────────────────────────────
+
+use papers_extract::types::{ReflowDocument, ReflowNode};
+
+/// Mutable state for the recursive reflow tree walk.
+struct ChunkingState<'a> {
+    params: &'a IngestParams,
+    chapter_idx: u16,
+    section_idx: u16,
+    chunk_idx: u16,
+    chapter_title: String,
+    section_title: String,
+    buffer: ChunkBuffer,
+    chunk_records: Vec<ChunkRecord>,
+    exhibit_records: Vec<ExhibitRecord>,
+    exhibit_seq: u16,
+    in_references: bool,
+}
+
+impl<'a> ChunkingState<'a> {
+    fn new(params: &'a IngestParams) -> Self {
+        Self {
+            params,
+            chapter_idx: 0,
+            section_idx: 0,
+            chunk_idx: 0,
+            chapter_title: String::new(),
+            section_title: String::new(),
+            buffer: ChunkBuffer::new(),
+            chunk_records: Vec::new(),
+            exhibit_records: Vec::new(),
+            exhibit_seq: 0,
+            in_references: false,
+        }
+    }
+
+    /// Emit a chunk from a flushed buffer.
+    fn emit_chunk(&mut self, flushed: FlushedChunk) {
+        let chunk_id = format!(
+            "{}/ch{}/s{}/p{}",
+            self.params.paper_id, self.chapter_idx, self.section_idx, self.chunk_idx,
+        );
+        self.chunk_records.push(ChunkRecord {
+            chunk_id,
+            chapter_title: self.chapter_title.clone(),
+            chapter_idx: self.chapter_idx,
+            section_title: self.section_title.clone(),
+            section_idx: self.section_idx,
+            chunk_idx: self.chunk_idx,
+            block_type: "text".to_string(),
+            text: flushed.text,
+            page_start: flushed.page_start,
+            page_end: flushed.page_end,
+            exhibit_ids: vec![],
+        });
+        self.chunk_idx += 1;
+    }
+
+    /// Flush at a section/chapter boundary with smart-merge for undersized chunks.
+    fn flush_section_boundary(&mut self) {
+        if let Some(flushed) = self.buffer.flush() {
+            self.smart_merge_or_emit(flushed);
+        }
+    }
+
+    /// Flush mid-section due to token overflow, carrying overlap into the new buffer.
+    fn flush_mid_section(&mut self) {
+        if let Some(flushed) = self.buffer.flush() {
+            let overlap = ChunkBuffer::overlap_tail(&flushed.text);
+            self.emit_chunk(flushed);
+            if !overlap.is_empty() {
+                self.buffer.push(overlap, None);
+            }
+        }
+    }
+
+    /// Smart merge: if chunk < MIN_CHUNK_TOKENS and previous chunk is same section,
+    /// merge if combined <= MAX_CHUNK_TOKENS. Otherwise emit standalone.
+    fn smart_merge_or_emit(&mut self, flushed: FlushedChunk) {
+        let f_tokens = estimate_tokens(&flushed.text);
+        if f_tokens < MIN_CHUNK_TOKENS && !self.chunk_records.is_empty() {
+            let prev = self.chunk_records.last().unwrap();
+            if prev.chapter_idx == self.chapter_idx && prev.section_idx == self.section_idx {
+                let prev_tokens = estimate_tokens(&prev.text);
+                if prev_tokens + f_tokens <= MAX_CHUNK_TOKENS {
+                    let prev = self.chunk_records.last_mut().unwrap();
+                    prev.text.push_str("\n\n");
+                    prev.text.push_str(&flushed.text);
+                    if let Some(p) = flushed.page_end {
+                        prev.page_end = Some(p);
+                    }
+                    return;
+                }
+            }
+        }
+        self.emit_chunk(flushed);
+    }
+
+    /// Post-process: link exhibit references in chunk text to ExhibitRecords.
+    fn link_exhibits(&mut self) {
+        if self.exhibit_records.is_empty() {
+            return;
+        }
+
+        let caption_re = regex::Regex::new(
+            r"(?i)(Figure|Fig|Table|Tab|Algorithm|Alg|Procedure|Pseudocode|Listing|Code)\s*\.?\s+(\d+)"
+        ).unwrap();
+
+        let mut exhibit_number_to_id: HashMap<(String, u32), String> = HashMap::new();
+        for er in &self.exhibit_records {
+            // Try caption first
+            if let Some(caps) = caption_re.captures(&er.caption) {
+                let kind = normalize_exhibit_kind(&caps[1]);
+                if let Ok(n) = caps[2].parse::<u32>() {
+                    exhibit_number_to_id.insert((kind, n), er.exhibit_id.clone());
+                    continue;
+                }
+            }
+            // For algorithms: try extracting number from content first line
+            if er.exhibit_type == "algorithm" {
+                if let Some(content) = &er.content {
+                    let first_line = content.lines().next().unwrap_or("");
+                    if let Some(caps) = caption_re.captures(first_line) {
+                        let kind = normalize_exhibit_kind(&caps[1]);
+                        if let Ok(n) = caps[2].parse::<u32>() {
+                            exhibit_number_to_id.insert((kind, n), er.exhibit_id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let ref_re = regex::Regex::new(r"(?i)(?:Figures?|Figs?)\s*\.?\s+(\d+)").unwrap();
+        let tbl_ref_re = regex::Regex::new(r"(?i)(?:Tables?|Tabs?)\s*\.?\s+(\d+)").unwrap();
+        let algo_ref_re = regex::Regex::new(
+            r"(?i)(?:Algorithms?|Algs?|Procedures?|Pseudocodes?|Listings?|Codes?)\s*\.?\s+(\d+)"
+        ).unwrap();
+
+        let mut exhibit_ref_map: HashMap<String, (Option<String>, u16)> = HashMap::new();
+
+        for chunk in &mut self.chunk_records {
+            let mut ids: Vec<String> = Vec::new();
+            for caps in ref_re.captures_iter(&chunk.text) {
+                if let Ok(n) = caps[1].parse::<u32>() {
+                    if let Some(eid) = exhibit_number_to_id.get(&("figure".to_string(), n)) {
+                        if !ids.contains(eid) {
+                            ids.push(eid.clone());
+                        }
+                    }
+                }
+            }
+            for caps in tbl_ref_re.captures_iter(&chunk.text) {
+                if let Ok(n) = caps[1].parse::<u32>() {
+                    if let Some(eid) = exhibit_number_to_id.get(&("table".to_string(), n)) {
+                        if !ids.contains(eid) {
+                            ids.push(eid.clone());
+                        }
+                    }
+                }
+            }
+            for caps in algo_ref_re.captures_iter(&chunk.text) {
+                if let Ok(n) = caps[1].parse::<u32>() {
+                    if let Some(eid) = exhibit_number_to_id.get(&("algorithm".to_string(), n)) {
+                        if !ids.contains(eid) {
+                            ids.push(eid.clone());
+                        }
+                    }
+                }
+            }
+
+            for eid in &ids {
+                let entry = exhibit_ref_map.entry(eid.clone()).or_insert((None, 0));
+                if entry.0.is_none() {
+                    entry.0 = Some(chunk.chunk_id.clone());
+                }
+                entry.1 += 1;
+            }
+            chunk.exhibit_ids = ids;
+        }
+
+        for er in &mut self.exhibit_records {
+            if let Some((first_ref, count)) = exhibit_ref_map.get(&er.exhibit_id) {
+                er.first_ref_chunk_id = first_ref.clone();
+                er.ref_count = *count;
+            }
+        }
+    }
+}
+
+/// Process a single ReflowNode, recursing into Heading children.
+fn process_reflow_node(node: &ReflowNode, state: &mut ChunkingState) {
+    if state.in_references {
+        return;
+    }
+
+    match node {
+        ReflowNode::Heading { depth, title, children } => {
+            let lower = title.to_lowercase();
+            if REFERENCES_TITLES.iter().any(|t| lower.contains(t)) {
+                state.flush_section_boundary();
+                state.in_references = true;
+                return;
+            }
+
+            match *depth {
+                0 => {
+                    // Paper title level — skip (title comes from params)
+                }
+                1 => {
+                    // Chapter boundary
+                    state.flush_section_boundary();
+                    state.chapter_idx += 1;
+                    state.section_idx = 0;
+                    state.chunk_idx = 0;
+                    state.chapter_title = title.clone();
+                    state.section_title = String::new();
+                }
+                2 => {
+                    // Section boundary
+                    state.flush_section_boundary();
+                    state.section_idx += 1;
+                    state.chunk_idx = 0;
+                    state.section_title = title.clone();
+                }
+                _ => {
+                    // Subsection (depth 3+): inject as bold paragraph separator
+                    if !state.buffer.is_empty()
+                        && state.buffer.token_count > TARGET_CHUNK_TOKENS / 2
+                    {
+                        state.flush_mid_section();
+                    }
+                    state.buffer.push(format!("**{title}**"), None);
+                }
+            }
+
+            for child in children {
+                process_reflow_node(child, state);
+            }
+        }
+
+        ReflowNode::Text { content, footnotes } => {
+            let text = content.trim();
+            if text.is_empty() {
+                return;
+            }
+            if !state.buffer.is_empty() && state.buffer.would_overflow(text) {
+                state.flush_mid_section();
+            }
+            state.buffer.push(text.to_string(), None);
+
+            // Append associated footnotes inline
+            for footnote in footnotes {
+                let fn_text = footnote.trim();
+                if !fn_text.is_empty() {
+                    state.buffer.push(fn_text.to_string(), None);
+                }
+            }
+        }
+
+        ReflowNode::Formula { content, path } => {
+            let formula_text = if let Some(latex) = content {
+                latex.clone()
+            } else if path.is_some() {
+                "[display formula]".to_string()
+            } else {
+                return;
+            };
+
+            if !state.buffer.is_empty()
+                && state.buffer.token_count + estimate_tokens(&formula_text) > MAX_CHUNK_TOKENS
+            {
+                state.flush_mid_section();
+            }
+            state.buffer.push(formula_text, None);
+        }
+
+        ReflowNode::Figure { path, caption } => {
+            state.exhibit_seq += 1;
+            let exhibit_id = format!("{}/fig{}", state.params.paper_id, state.exhibit_seq);
+            let image_path = if path.is_empty() {
+                None
+            } else {
+                Some(state.params.cache_dir.join(path).to_string_lossy().into_owned())
+            };
+            state.exhibit_records.push(ExhibitRecord {
+                exhibit_id,
+                exhibit_type: "figure".to_string(),
+                caption: caption.as_deref().unwrap_or("").to_string(),
+                description: None,
+                image_path,
+                content: None,
+                page: None,
+                chapter_idx: state.chapter_idx,
+                section_idx: state.section_idx,
+                first_ref_chunk_id: None,
+                ref_count: 0,
+            });
+        }
+
+        ReflowNode::FigureGroup { path, caption } => {
+            state.exhibit_seq += 1;
+            let exhibit_id = format!("{}/fig{}", state.params.paper_id, state.exhibit_seq);
+            let image_path = if path.is_empty() {
+                None
+            } else {
+                Some(state.params.cache_dir.join(path).to_string_lossy().into_owned())
+            };
+            state.exhibit_records.push(ExhibitRecord {
+                exhibit_id,
+                exhibit_type: "figure".to_string(),
+                caption: caption.as_deref().unwrap_or("").to_string(),
+                description: None,
+                image_path,
+                content: None,
+                page: None,
+                chapter_idx: state.chapter_idx,
+                section_idx: state.section_idx,
+                first_ref_chunk_id: None,
+                ref_count: 0,
+            });
+        }
+
+        ReflowNode::Table { content, caption } => {
+            state.exhibit_seq += 1;
+            let exhibit_id = format!("{}/fig{}", state.params.paper_id, state.exhibit_seq);
+            state.exhibit_records.push(ExhibitRecord {
+                exhibit_id,
+                exhibit_type: "table".to_string(),
+                caption: caption.as_deref().unwrap_or("").to_string(),
+                description: None,
+                image_path: None,
+                content: Some(content.clone()),
+                page: None,
+                chapter_idx: state.chapter_idx,
+                section_idx: state.section_idx,
+                first_ref_chunk_id: None,
+                ref_count: 0,
+            });
+        }
+
+        ReflowNode::Algorithm { content } => {
+            if content.trim().is_empty() {
+                return;
+            }
+            state.exhibit_seq += 1;
+            let exhibit_id = format!("{}/fig{}", state.params.paper_id, state.exhibit_seq);
+            state.exhibit_records.push(ExhibitRecord {
+                exhibit_id,
+                exhibit_type: "algorithm".to_string(),
+                caption: String::new(),
+                description: None,
+                image_path: None,
+                content: Some(content.clone()),
+                page: None,
+                chapter_idx: state.chapter_idx,
+                section_idx: state.section_idx,
+                first_ref_chunk_id: None,
+                ref_count: 0,
+            });
+        }
+
+        ReflowNode::List { list_type, items } => {
+            let list_text: String = items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    if list_type == "numbered" {
+                        format!("{}. {}", i + 1, item)
+                    } else {
+                        format!("- {}", item)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if list_text.is_empty() {
+                return;
+            }
+            if !state.buffer.is_empty() && state.buffer.would_overflow(&list_text) {
+                state.flush_mid_section();
+            }
+            state.buffer.push(list_text, None);
+        }
+
+        ReflowNode::CodeBlock { content, language } => {
+            if content.trim().is_empty() {
+                return;
+            }
+            let lang = language.as_deref().unwrap_or("");
+            let code_text = format!("```{lang}\n{}\n```", content.trim());
+            if !state.buffer.is_empty() && state.buffer.would_overflow(&code_text) {
+                state.flush_mid_section();
+            }
+            state.buffer.push(code_text, None);
+        }
+
+        ReflowNode::FormattedText { content } => {
+            let text = content.trim();
+            if text.is_empty() {
+                return;
+            }
+            if !state.buffer.is_empty() && state.buffer.would_overflow(text) {
+                state.flush_mid_section();
+            }
+            state.buffer.push(text.to_string(), None);
+        }
+
+        ReflowNode::Footnote { marker, content } => {
+            let fn_text = format!("[{marker}] {content}");
+            state.buffer.push(fn_text, None);
+        }
+
+        ReflowNode::References { .. } => {
+            state.flush_section_boundary();
+            state.in_references = true;
+        }
+
+        ReflowNode::FootnoteBlock { .. } => {
+            // Skip — footnotes already distributed to Text nodes
+        }
+
+        ReflowNode::FrontMatter { .. } => {
+            // Skip — copyright, dedications, etc.
+        }
+    }
+}
+
+/// Parse a ReflowDocument into chunks and exhibits for database ingestion.
+pub(crate) fn parse_reflow_document(
+    params: &IngestParams,
+    doc: &ReflowDocument,
+) -> Result<(Vec<ChunkRecord>, Vec<ExhibitRecord>), DbError> {
+    let mut state = ChunkingState::new(params);
+
+    for node in &doc.children {
+        process_reflow_node(node, &mut state);
+    }
+
+    // Flush remaining buffer
+    if let Some(flushed) = state.buffer.flush() {
+        state.smart_merge_or_emit(flushed);
+    }
+
+    // Post-process: link exhibit references
+    state.link_exhibits();
+
+    eprintln!(
+        "  [{}] chunked {} chunks, {} exhibits",
+        params.item_key,
+        state.chunk_records.len(),
+        state.exhibit_records.len(),
+    );
+
+    Ok((state.chunk_records, state.exhibit_records))
+}
+
+/// Ingest a paper into LanceDB.
+///
+/// Tries the reflow pipeline first (`reflow.json` in cache_dir). Falls back to
+/// the legacy DataLab Marker pipeline (`{item_key}.json`) if no reflow is found.
 pub async fn ingest_paper(store: &DbStore, params: IngestParams) -> Result<IngestStats, DbError> {
     let t_total = std::time::Instant::now();
-    let (chunk_records, exhibit_records) = parse_paper_blocks(&params)?;
+    let (chunk_records, exhibit_records) = {
+        let reflow_path = params.cache_dir.join("reflow.json");
+        if reflow_path.exists() {
+            let json_bytes = std::fs::read(&reflow_path).map_err(|e| {
+                DbError::Ingest(format!("failed to read {}: {e}", reflow_path.display()))
+            })?;
+            let doc: ReflowDocument = serde_json::from_slice(&json_bytes).map_err(|e| {
+                DbError::Ingest(format!("failed to parse reflow.json: {e}"))
+            })?;
+            parse_reflow_document(&params, &doc)?
+        } else {
+            parse_paper_blocks(&params)?
+        }
+    };
 
     let chunks_added = chunk_records.len();
     let exhibits_added = exhibit_records.len();
@@ -1687,30 +2203,38 @@ pub async fn is_ingested(store: &DbStore, paper_id: &str) -> bool {
     }
 }
 
-/// List all item keys in the DataLab cache that have a JSON extraction file.
+/// List all item keys that have a cached extraction (extract cache or DataLab cache).
 pub fn list_cached_item_keys() -> Vec<String> {
-    let base = match cache_root() {
-        Some(b) => b,
-        None => return vec![],
-    };
-    if !base.is_dir() {
-        return vec![];
-    }
     let mut keys = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let key = match entry.file_name().to_str() {
-                Some(k) => k.to_string(),
-                None => continue,
-            };
-            if entry.path().join(format!("{key}.json")).exists() {
-                keys.push(key);
+    let mut seen = std::collections::HashSet::new();
+
+    // New extract cache
+    for key in papers_core::extract_cache::list_cached_extract_keys() {
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+
+    // Legacy DataLab cache
+    if let Some(base) = datalab_cache_root() {
+        if base.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&base) {
+                for entry in entries.flatten() {
+                    if !entry.path().is_dir() {
+                        continue;
+                    }
+                    let key = match entry.file_name().to_str() {
+                        Some(k) => k.to_string(),
+                        None => continue,
+                    };
+                    if entry.path().join(format!("{key}.json")).exists() && seen.insert(key.clone()) {
+                        keys.push(key);
+                    }
+                }
             }
         }
     }
+
     keys
 }
 
@@ -1901,8 +2425,11 @@ mod tests {
         fs::write(key4_dir.join("other.json"), "{}").unwrap();
 
         let old = std::env::var("PAPERS_DATALAB_CACHE_DIR").ok();
+        let old_extract = std::env::var("PAPERS_EXTRACT_CACHE_DIR").ok();
         unsafe {
             std::env::set_var("PAPERS_DATALAB_CACHE_DIR", dir.path().to_str().unwrap());
+            // Point extract cache at an empty temp dir so it doesn't pick up stale data
+            std::env::set_var("PAPERS_EXTRACT_CACHE_DIR", dir.path().join("_empty_extract").to_str().unwrap());
         }
 
         let mut keys = list_cached_item_keys();
@@ -1914,6 +2441,11 @@ mod tests {
             } else {
                 std::env::remove_var("PAPERS_DATALAB_CACHE_DIR");
             }
+            if let Some(old_val) = old_extract {
+                std::env::set_var("PAPERS_EXTRACT_CACHE_DIR", old_val);
+            } else {
+                std::env::remove_var("PAPERS_EXTRACT_CACHE_DIR");
+            }
         }
 
         assert_eq!(keys, vec!["ABCD1234"]);
@@ -1923,9 +2455,14 @@ mod tests {
     #[test]
     fn list_cached_keys_nonexistent_cache_dir_returns_empty() {
         let old = std::env::var("PAPERS_DATALAB_CACHE_DIR").ok();
+        let old_extract = std::env::var("PAPERS_EXTRACT_CACHE_DIR").ok();
         unsafe {
             std::env::set_var(
                 "PAPERS_DATALAB_CACHE_DIR",
+                "/nonexistent/path/that/does/not/exist",
+            );
+            std::env::set_var(
+                "PAPERS_EXTRACT_CACHE_DIR",
                 "/nonexistent/path/that/does/not/exist",
             );
         }
@@ -1935,6 +2472,11 @@ mod tests {
                 std::env::set_var("PAPERS_DATALAB_CACHE_DIR", old_val);
             } else {
                 std::env::remove_var("PAPERS_DATALAB_CACHE_DIR");
+            }
+            if let Some(old_val) = old_extract {
+                std::env::set_var("PAPERS_EXTRACT_CACHE_DIR", old_val);
+            } else {
+                std::env::remove_var("PAPERS_EXTRACT_CACHE_DIR");
             }
         }
         assert!(keys.is_empty());
@@ -2025,5 +2567,1017 @@ mod tests {
         assert_eq!(normalize_exhibit_kind("Pseudocode"), "algorithm");
         assert_eq!(normalize_exhibit_kind("Listing"), "algorithm");
         assert_eq!(normalize_exhibit_kind("Code"), "algorithm");
+    }
+
+    // ── Reflow chunking tests ────────────────────────────────────────────────
+
+    use papers_extract::types::{ReflowDocument, ReflowNode, TocEntryRendered};
+
+    fn test_params() -> IngestParams {
+        IngestParams {
+            item_key: "TESTKEY".into(),
+            paper_id: "TESTKEY".into(),
+            title: "Test Paper".into(),
+            authors: vec!["Author A".into()],
+            year: Some(2024),
+            venue: Some("Test Journal".into()),
+            tags: vec![],
+            cache_dir: std::path::PathBuf::from("."),
+            force: false,
+        }
+    }
+
+    #[test]
+    fn reflow_basic_chapter_section() {
+        let doc = ReflowDocument {
+            title: Some("Test".into()),
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Introduction".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Intro paragraph one.".into(), footnotes: vec![] },
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "1.1 Background".into(),
+                            children: vec![
+                                ReflowNode::Text { content: "Background text.".into(), footnotes: vec![] },
+                            ],
+                        },
+                    ],
+                },
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "2 Methods".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Methods paragraph.".into(), footnotes: vec![] },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _exhibits) = parse_reflow_document(&params, &doc).unwrap();
+
+        // Should have 3 chunks: intro, background, methods
+        assert_eq!(chunks.len(), 3);
+
+        assert_eq!(chunks[0].chapter_idx, 1);
+        assert_eq!(chunks[0].section_idx, 0);
+        assert_eq!(chunks[0].chapter_title, "1 Introduction");
+        assert!(chunks[0].text.contains("Intro paragraph one"));
+
+        assert_eq!(chunks[1].chapter_idx, 1);
+        assert_eq!(chunks[1].section_idx, 1);
+        assert_eq!(chunks[1].section_title, "1.1 Background");
+
+        assert_eq!(chunks[2].chapter_idx, 2);
+        assert_eq!(chunks[2].section_idx, 0);
+        assert_eq!(chunks[2].chapter_title, "2 Methods");
+    }
+
+    #[test]
+    fn reflow_formula_absorption() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Math".into(),
+                    children: vec![
+                        ReflowNode::Text {
+                            content: "The energy is given by".into(),
+                            footnotes: vec![],
+                        },
+                        ReflowNode::Formula {
+                            content: Some("$$E = mc^2$$".into()),
+                            path: None,
+                        },
+                        ReflowNode::Text {
+                            content: "where m is mass.".into(),
+                            footnotes: vec![],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // All three should be in one chunk (formula absorbed)
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("energy is given by"));
+        assert!(chunks[0].text.contains("$$E = mc^2$$"));
+        assert!(chunks[0].text.contains("where m is mass"));
+    }
+
+    #[test]
+    fn reflow_formula_image_fallback() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Math".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "See the formula below.".into(), footnotes: vec![] },
+                        ReflowNode::Formula { content: None, path: Some("images/eq1.png".into()) },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("[display formula]"));
+    }
+
+    #[test]
+    fn reflow_exhibit_creation() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Results".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Some results.".into(), footnotes: vec![] },
+                        ReflowNode::Figure {
+                            path: "images/fig1.png".into(),
+                            caption: Some("Figure 1: Overview of the system.".into()),
+                        },
+                        ReflowNode::Table {
+                            content: "| A | B |\n|---|---|\n| 1 | 2 |".into(),
+                            caption: Some("Table 1: Results summary.".into()),
+                        },
+                        ReflowNode::Algorithm {
+                            content: "Algorithm 1: Main Loop\n1. Init\n2. Iterate".into(),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (_, exhibits) = parse_reflow_document(&params, &doc).unwrap();
+
+        assert_eq!(exhibits.len(), 3);
+        assert_eq!(exhibits[0].exhibit_type, "figure");
+        assert_eq!(exhibits[0].caption, "Figure 1: Overview of the system.");
+        assert_eq!(exhibits[1].exhibit_type, "table");
+        assert!(exhibits[1].content.as_ref().unwrap().contains("| A | B |"));
+        assert_eq!(exhibits[2].exhibit_type, "algorithm");
+        assert!(exhibits[2].content.as_ref().unwrap().contains("Main Loop"));
+    }
+
+    #[test]
+    fn reflow_exhibit_linking() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Results".into(),
+                    children: vec![
+                        ReflowNode::Figure {
+                            path: "fig1.png".into(),
+                            caption: Some("Figure 1: The system.".into()),
+                        },
+                        ReflowNode::Table {
+                            content: "| X |".into(),
+                            caption: Some("Table 1: Data.".into()),
+                        },
+                        ReflowNode::Text {
+                            content: "As shown in Figure 1, the system works. See Table 1 for data.".into(),
+                            footnotes: vec![],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, exhibits) = parse_reflow_document(&params, &doc).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].exhibit_ids.len(), 2);
+
+        // Exhibits should have first_ref set
+        let fig = exhibits.iter().find(|e| e.exhibit_type == "figure").unwrap();
+        assert!(fig.first_ref_chunk_id.is_some());
+        assert_eq!(fig.ref_count, 1);
+    }
+
+    #[test]
+    fn reflow_footnotes_inline() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Intro".into(),
+                    children: vec![
+                        ReflowNode::Text {
+                            content: "Main text with a citation.".into(),
+                            footnotes: vec!["See Smith (2020) for details.".into()],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("Main text"));
+        assert!(chunks[0].text.contains("See Smith (2020)"));
+    }
+
+    #[test]
+    fn reflow_list_in_chunk() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Steps".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "The steps are:".into(), footnotes: vec![] },
+                        ReflowNode::List {
+                            list_type: "numbered".into(),
+                            items: vec!["First step".into(), "Second step".into()],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("1. First step"));
+        assert!(chunks[0].text.contains("2. Second step"));
+    }
+
+    #[test]
+    fn reflow_subsection_inline() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Chapter".into(),
+                    children: vec![
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "1.1 Section".into(),
+                            children: vec![
+                                ReflowNode::Text { content: "Section text.".into(), footnotes: vec![] },
+                                ReflowNode::Heading {
+                                    depth: 3,
+                                    title: "1.1.1 Subsection".into(),
+                                    children: vec![
+                                        ReflowNode::Text { content: "Subsection text.".into(), footnotes: vec![] },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // Subsection should NOT create a new section boundary
+        // All content in section 1.1 (including subsection) should stay in section_idx=1
+        for c in &chunks {
+            assert_eq!(c.chapter_idx, 1);
+            assert_eq!(c.section_idx, 1);
+        }
+
+        // The subsection heading should appear as bold text
+        let all_text: String = chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n\n");
+        assert!(all_text.contains("**1.1.1 Subsection**"));
+    }
+
+    #[test]
+    fn reflow_references_stop() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Intro".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Main content.".into(), footnotes: vec![] },
+                    ],
+                },
+                ReflowNode::References { content: "[1] Smith 2020.".into() },
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "Appendix".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "This should be skipped.".into(), footnotes: vec![] },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].text.contains("skipped"));
+    }
+
+    #[test]
+    fn reflow_no_headings() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Text { content: "Standalone paragraph.".into(), footnotes: vec![] },
+                ReflowNode::Text { content: "Another paragraph.".into(), footnotes: vec![] },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks[0].chapter_idx, 0);
+        assert_eq!(chunks[0].section_idx, 0);
+    }
+
+    #[test]
+    fn reflow_empty_heading() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Empty Chapter".into(),
+                    children: vec![],
+                },
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "2 Real Chapter".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Real content.".into(), footnotes: vec![] },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // Should not crash, and the real content should be in chapter 2
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].chapter_idx, 2);
+    }
+
+    #[test]
+    fn reflow_code_block() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Code".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Example code:".into(), footnotes: vec![] },
+                        ReflowNode::CodeBlock {
+                            content: "fn main() {}".into(),
+                            language: Some("rust".into()),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("```rust"));
+        assert!(chunks[0].text.contains("fn main()"));
+    }
+
+    #[test]
+    fn reflow_chunk_ids_correct_format() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Ch".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "P1.".into(), footnotes: vec![] },
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "1.1 Sec".into(),
+                            children: vec![
+                                ReflowNode::Text { content: "P2.".into(), footnotes: vec![] },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        assert_eq!(chunks[0].chunk_id, "TESTKEY/ch1/s0/p0");
+        assert_eq!(chunks[1].chunk_id, "TESTKEY/ch1/s1/p0");
+    }
+
+    #[test]
+    fn reflow_frontmatter_skipped() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::FrontMatter {
+                    children: vec![
+                        ReflowNode::Text { content: "Copyright 2024".into(), footnotes: vec![] },
+                    ],
+                },
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Intro".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Real content.".into(), footnotes: vec![] },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert!(!chunks[0].text.contains("Copyright"));
+    }
+
+    #[test]
+    fn reflow_standalone_footnote() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Intro".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Main text.".into(), footnotes: vec![] },
+                        ReflowNode::Footnote {
+                            marker: "1".into(),
+                            content: "A standalone footnote.".into(),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("[1] A standalone footnote."));
+    }
+
+    // ── Token overflow & overlap tests ───────────────────────────────────────
+
+    /// Generate a text block with approximately `n` tokens (words * 1.3).
+    fn words(n: usize) -> String {
+        (0..n).map(|i| format!("word{i}")).collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn reflow_mid_section_flush_with_overlap() {
+        // TARGET = 400 tokens. Two big paragraphs that each exceed TARGET
+        // force a mid-section flush with overlap carry.
+        let para1 = words(320); // ~416 tokens
+        let para2 = words(320); // ~416 tokens
+
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Chapter".into(),
+                    children: vec![
+                        ReflowNode::Text { content: para1.clone(), footnotes: vec![] },
+                        ReflowNode::Text { content: para2.clone(), footnotes: vec![] },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // First para fills buffer past TARGET. Second para triggers would_overflow →
+        // flush_mid_section → emit first chunk → carry overlap → push second para.
+        // At end-of-doc, second chunk is emitted. But smart_merge may merge if combined < MAX.
+        // Since each is ~416 tokens and MAX=600, they can't merge (416+416=832 > 600).
+        assert!(chunks.len() >= 2, "expected at least 2 chunks, got {}", chunks.len());
+        assert_eq!(chunks[0].chapter_idx, 1);
+        assert_eq!(chunks[1].chapter_idx, 1);
+    }
+
+    #[test]
+    fn reflow_small_chunk_merge_same_section() {
+        // Two short paragraphs in the same section — should be merged
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Chapter".into(),
+                    children: vec![
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "1.1 Section A".into(),
+                            children: vec![
+                                ReflowNode::Text { content: words(310), footnotes: vec![] },
+                                ReflowNode::Text { content: "A short tail.".into(), footnotes: vec![] },
+                            ],
+                        },
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "1.2 Section B".into(),
+                            children: vec![
+                                ReflowNode::Text { content: "Tiny section.".into(), footnotes: vec![] },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // Section A has a big para + short tail → flush big, then merge tail into big
+        // Section B is tiny → should merge with... well it's a different section, so standalone
+        // Check that the tiny section B is present
+        let last = chunks.last().unwrap();
+        assert_eq!(last.section_idx, 2);
+        assert!(last.text.contains("Tiny section"));
+    }
+
+    #[test]
+    fn reflow_small_chunk_merge_within_section() {
+        // A section boundary with a small trailing chunk that gets merged back
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Chapter".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "First paragraph of chapter.".into(), footnotes: vec![] },
+                        ReflowNode::Text { content: "Second short paragraph.".into(), footnotes: vec![] },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // Both are small, should be merged into one chunk
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("First paragraph"));
+        assert!(chunks[0].text.contains("Second short"));
+    }
+
+    #[test]
+    fn reflow_formula_overflow_flushes_before() {
+        // Buffer near MAX (600 tokens), formula pushes it over → flush before formula
+        // The formula overflow check uses MAX_CHUNK_TOKENS, not TARGET
+        let big_para = words(460); // ~598 tokens, just under MAX=600
+        let formula = "$$\\sum_{i=1}^{n} x_i^2 + y_i^2 = R^2 \\quad \\forall i \\in \\{1,\\ldots,n\\}$$";
+        // Formula is ~15 words ≈ 20 tokens. 598+20=618 > MAX=600 → should flush
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Math".into(),
+                    children: vec![
+                        ReflowNode::Text { content: big_para, footnotes: vec![] },
+                        ReflowNode::Formula {
+                            content: Some(formula.into()),
+                            path: None,
+                        },
+                        ReflowNode::Text { content: "where R is the radius.".into(), footnotes: vec![] },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // big_para fills buffer to ~598 tokens. Then formula check:
+        // 598 + ~20 = 618 > MAX=600 → flush_mid_section → emit big_para → formula in new buffer.
+        assert!(chunks.len() >= 2, "expected ≥2 chunks, got {}", chunks.len());
+
+        // Formula should be in the second (or later) chunk, not the first
+        let first_text = &chunks[0].text;
+        assert!(!first_text.contains("\\sum"), "formula should not be in the first chunk");
+
+        // Formula should be in some later chunk
+        let later = chunks[1..].iter().any(|c| c.text.contains("\\sum"));
+        assert!(later, "formula should appear in a later chunk");
+    }
+
+    #[test]
+    fn reflow_multiple_chapters_section_reset() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 First".into(),
+                    children: vec![
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "1.1 Sec A".into(),
+                            children: vec![
+                                ReflowNode::Text { content: "Content A.".into(), footnotes: vec![] },
+                            ],
+                        },
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "1.2 Sec B".into(),
+                            children: vec![
+                                ReflowNode::Text { content: "Content B.".into(), footnotes: vec![] },
+                            ],
+                        },
+                    ],
+                },
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "2 Second".into(),
+                    children: vec![
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "2.1 Sec C".into(),
+                            children: vec![
+                                ReflowNode::Text { content: "Content C.".into(), footnotes: vec![] },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // Chapter 2's first section should have section_idx=1 (reset from chapter 1)
+        let ch2_chunks: Vec<_> = chunks.iter().filter(|c| c.chapter_idx == 2).collect();
+        assert!(!ch2_chunks.is_empty());
+        assert_eq!(ch2_chunks[0].section_idx, 1);
+        assert_eq!(ch2_chunks[0].chunk_idx, 0);
+    }
+
+    #[test]
+    fn reflow_figure_group_creates_exhibit() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Figures".into(),
+                    children: vec![
+                        ReflowNode::FigureGroup {
+                            path: "images/group1.png".into(),
+                            caption: Some("Figure 2: Composite overview.".into()),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (_, exhibits) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(exhibits.len(), 1);
+        assert_eq!(exhibits[0].exhibit_type, "figure");
+        assert!(exhibits[0].caption.contains("Figure 2"));
+    }
+
+    #[test]
+    fn reflow_algorithm_linking_from_content() {
+        // Algorithm without a caption — number extracted from content first line
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Methods".into(),
+                    children: vec![
+                        ReflowNode::Algorithm {
+                            content: "Algorithm 1: Training Loop\n1. Forward pass\n2. Backward pass\n3. Update weights".into(),
+                        },
+                        ReflowNode::Text {
+                            content: "As shown in Algorithm 1, the training procedure is straightforward.".into(),
+                            footnotes: vec![],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, exhibits) = parse_reflow_document(&params, &doc).unwrap();
+
+        assert_eq!(exhibits.len(), 1);
+        assert_eq!(exhibits[0].exhibit_type, "algorithm");
+
+        // The text chunk should reference the algorithm
+        assert_eq!(chunks[0].exhibit_ids.len(), 1);
+        assert_eq!(exhibits[0].first_ref_chunk_id, Some(chunks[0].chunk_id.clone()));
+    }
+
+    #[test]
+    fn reflow_bulleted_list() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Points".into(),
+                    children: vec![
+                        ReflowNode::List {
+                            list_type: "bulleted".into(),
+                            items: vec!["Alpha".into(), "Beta".into(), "Gamma".into()],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("- Alpha"));
+        assert!(chunks[0].text.contains("- Beta"));
+        assert!(chunks[0].text.contains("- Gamma"));
+    }
+
+    #[test]
+    fn reflow_formatted_text_included() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Misc".into(),
+                    children: vec![
+                        ReflowNode::FormattedText { content: "Key: Value\nFoo: Bar".into() },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("Key: Value"));
+    }
+
+    #[test]
+    fn reflow_footnote_block_skipped() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Intro".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Main text.".into(), footnotes: vec![] },
+                    ],
+                },
+                ReflowNode::FootnoteBlock { content: "1. Footnote one\n2. Footnote two".into() },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        // FootnoteBlock should be skipped entirely
+        for c in &chunks {
+            assert!(!c.text.contains("Footnote one"));
+        }
+    }
+
+    #[test]
+    fn reflow_heading_references_anywhere() {
+        // References heading as a child of another heading (not just top-level)
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Intro".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Before references.".into(), footnotes: vec![] },
+                    ],
+                },
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "References".into(),
+                    children: vec![
+                        ReflowNode::Text { content: "Should not appear.".into(), footnotes: vec![] },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].text.contains("Before references"));
+        for c in &chunks {
+            assert!(!c.text.contains("Should not appear"));
+        }
+    }
+
+    #[test]
+    fn reflow_multiple_exhibits_cross_referenced() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Results".into(),
+                    children: vec![
+                        ReflowNode::Figure {
+                            path: "fig1.png".into(),
+                            caption: Some("Figure 1: First.".into()),
+                        },
+                        ReflowNode::Figure {
+                            path: "fig2.png".into(),
+                            caption: Some("Figure 2: Second.".into()),
+                        },
+                        ReflowNode::Table {
+                            content: "| X |".into(),
+                            caption: Some("Table 1: Data.".into()),
+                        },
+                        ReflowNode::Text {
+                            content: "See Figure 1 and Figure 2 for visuals. Table 1 has the numbers.".into(),
+                            footnotes: vec![],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, exhibits) = parse_reflow_document(&params, &doc).unwrap();
+
+        assert_eq!(exhibits.len(), 3);
+        assert_eq!(chunks[0].exhibit_ids.len(), 3, "should reference all 3 exhibits");
+
+        // All exhibits should have ref_count=1
+        for ex in &exhibits {
+            assert_eq!(ex.ref_count, 1, "exhibit {} should have ref_count=1", ex.exhibit_id);
+        }
+    }
+
+    #[test]
+    fn reflow_deep_nesting_depth_4_and_5() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: vec![],
+            children: vec![
+                ReflowNode::Heading {
+                    depth: 1,
+                    title: "1 Chapter".into(),
+                    children: vec![
+                        ReflowNode::Heading {
+                            depth: 2,
+                            title: "1.1 Section".into(),
+                            children: vec![
+                                ReflowNode::Heading {
+                                    depth: 3,
+                                    title: "1.1.1 Subsection".into(),
+                                    children: vec![
+                                        ReflowNode::Heading {
+                                            depth: 4,
+                                            title: "1.1.1.1 Sub-subsection".into(),
+                                            children: vec![
+                                                ReflowNode::Heading {
+                                                    depth: 5,
+                                                    title: "Deep heading".into(),
+                                                    children: vec![
+                                                        ReflowNode::Text {
+                                                            content: "Deeply nested content.".into(),
+                                                            footnotes: vec![],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // All content should be in chapter 1, section 1 (depths 3+ are inlined)
+        for c in &chunks {
+            assert_eq!(c.chapter_idx, 1);
+            assert_eq!(c.section_idx, 1);
+        }
+
+        let all_text: String = chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n\n");
+        assert!(all_text.contains("**1.1.1 Subsection**"));
+        assert!(all_text.contains("**1.1.1.1 Sub-subsection**"));
+        assert!(all_text.contains("**Deep heading**"));
+        assert!(all_text.contains("Deeply nested content."));
+    }
+
+    #[test]
+    fn reflow_large_document_many_sections() {
+        // Stress test: 10 chapters, 3 sections each, 2 paragraphs per section
+        let mut children = Vec::new();
+        for ch in 1..=10 {
+            let mut chapter_children = Vec::new();
+            for sec in 1..=3 {
+                let mut sec_children = Vec::new();
+                sec_children.push(ReflowNode::Text {
+                    content: format!("Paragraph 1 of chapter {ch} section {sec}."),
+                    footnotes: vec![],
+                });
+                sec_children.push(ReflowNode::Text {
+                    content: format!("Paragraph 2 of chapter {ch} section {sec}."),
+                    footnotes: vec![],
+                });
+                chapter_children.push(ReflowNode::Heading {
+                    depth: 2,
+                    title: format!("{ch}.{sec} Section"),
+                    children: sec_children,
+                });
+            }
+            children.push(ReflowNode::Heading {
+                depth: 1,
+                title: format!("{ch} Chapter {ch}"),
+                children: chapter_children,
+            });
+        }
+
+        let doc = ReflowDocument { title: None, toc: vec![], children };
+
+        let params = test_params();
+        let (chunks, _) = parse_reflow_document(&params, &doc).unwrap();
+
+        // 10 chapters × 3 sections × 1 merged chunk (2 short paras merge) = 30 chunks
+        assert_eq!(chunks.len(), 30, "expected 30 chunks for 10×3 sections");
+
+        // Verify chapter/section indices
+        assert_eq!(chunks.last().unwrap().chapter_idx, 10);
+        assert_eq!(chunks.last().unwrap().section_idx, 3);
+
+        // Verify chunk IDs are unique
+        let ids: std::collections::HashSet<_> = chunks.iter().map(|c| &c.chunk_id).collect();
+        assert_eq!(ids.len(), chunks.len(), "all chunk IDs should be unique");
     }
 }

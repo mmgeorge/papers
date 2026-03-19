@@ -13,6 +13,7 @@ doctest = false
 
 [dependencies]
 papers-core.workspace = true
+papers-extract.workspace = true
 lancedb = "0.26"
 fastembed = "5"
 arrow-array = { version = "57", default-features = false }

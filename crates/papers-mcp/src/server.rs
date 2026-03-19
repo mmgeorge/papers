@@ -1,5 +1,4 @@
 use papers_core::{filter::FilterError, zotero as zotero_resolve, DiskCache, OpenAlexClient};
-use papers_datalab::DatalabClient;
 use papers_zotero::ZoteroClient;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +38,6 @@ use crate::params::{
 pub struct PapersMcp {
     client: OpenAlexClient,
     zotero: Arc<tokio::sync::Mutex<Option<ZoteroClient>>>,
-    datalab: Option<DatalabClient>,
     db: Option<Arc<papers_db::DbStore>>,
     tool_router: ToolRouter<Self>,
 }
@@ -50,12 +48,10 @@ impl PapersMcp {
         if let Ok(cache) = DiskCache::default_location(Duration::from_secs(600)) {
             client = client.with_cache(cache);
         }
-        let datalab = DatalabClient::from_env().ok();
         let db = Self::open_db_store().await;
         Self {
             client,
             zotero: Arc::new(tokio::sync::Mutex::new(None)),
-            datalab,
             db,
             tool_router: Self::tool_router(),
         }
@@ -66,7 +62,6 @@ impl PapersMcp {
         Self {
             client,
             zotero: Arc::new(tokio::sync::Mutex::new(None)),
-            datalab: DatalabClient::from_env().ok(),
             db,
             tool_router: Self::tool_router(),
         }
@@ -77,7 +72,6 @@ impl PapersMcp {
         Self {
             client: OpenAlexClient::new(),
             zotero: Arc::new(tokio::sync::Mutex::new(Some(zotero))),
-            datalab: None,
             db: None,
             tool_router: Self::tool_router(),
         }
@@ -902,16 +896,7 @@ impl PapersMcp {
         Parameters(params): Parameters<WorkTextToolParams>,
     ) -> Result<String, String> {
         let zotero = self.get_optional_zotero().await?;
-        let datalab = self.datalab.as_ref().and_then(|dl| {
-            let mode = match params.advanced.as_deref() {
-                Some("fast")     => papers_core::text::ProcessingMode::Fast,
-                Some("accurate") => papers_core::text::ProcessingMode::Accurate,
-                Some(_)          => papers_core::text::ProcessingMode::Balanced,
-                None             => return None,
-            };
-            Some((dl, mode))
-        });
-        match papers_core::text::work_text(&self.client, zotero.as_ref(), datalab, &params.id).await {
+        match papers_core::text::work_text(&self.client, zotero.as_ref(), &params.id).await {
             Ok(result) => json_result::<_, String>(Ok(result)),
             Err(papers_core::text::WorkTextError::NoPdfFound { work_id, title, doi }) => {
                 // Try the fallback chain: sampling → elicitation → error
@@ -1235,6 +1220,7 @@ impl PapersMcp {
             query: p.query,
             paper_ids,
             chapter_idx: p.chapter_idx,
+            depth: None,
             filter_year_min: p.filter_year_min,
             filter_year_max: p.filter_year_max,
             filter_venue: p.filter_venue,
@@ -1256,7 +1242,7 @@ impl PapersMcp {
             }
             None => None,
         };
-        let params = papers_db::ListSectionsParams { paper_id };
+        let params = papers_db::ListSectionsParams { paper_id, depth: None };
         json_result(papers_db::query::list_sections(rag, params).await)
     }
 

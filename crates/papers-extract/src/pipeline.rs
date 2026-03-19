@@ -578,13 +578,18 @@ impl Pipeline {
 
         // Associate captions with their parent regions
         figure::associate_captions(&mut regions);
-
         // Group spatially close visual regions into FigureGroups
         figure::group_figure_regions(&mut regions);
 
         // Expand visual bboxes to include their captions, and consume
         // sub-labels / text regions enclosed within the expanded bounds.
         figure::expand_visual_bounds(&mut regions);
+
+        // Attach formula numbers to their nearest display formula
+        associate_formula_numbers(&mut regions);
+
+        // Remove structural/redundant regions from output
+        strip_structural_regions(&mut regions);
 
         // Assign composite image path to FigureGroups, clear member image paths
         if self.options.extract_images {
@@ -600,15 +605,6 @@ impl Pipeline {
                 }
             }
         }
-
-        // Attach formula numbers to their nearest display formula
-        associate_formula_numbers(&mut regions);
-
-        // Remove structural/redundant regions from output:
-        // - FormulaNumber (already captured as tag on DisplayFormula)
-        // - PageHeader / PageFooter (structural noise)
-        // - Any region fully contained within a PageHeader bbox (e.g. duplicate Title)
-        strip_structural_regions(&mut regions);
 
         let result_page = Page {
             page: page_idx + 1,
@@ -1319,13 +1315,14 @@ fn strip_structural_regions(regions: &mut Vec<Region>) {
     }
 
     // Mark indices of regions to drop due to overlap with a higher-priority region.
+    // Skip consumed regions — they're already handled (e.g. FigureGroup members).
     let mut drop_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for i in 0..regions.len() {
-        if drop_indices.contains(&i) {
+        if drop_indices.contains(&i) || regions[i].consumed {
             continue;
         }
         for j in (i + 1)..regions.len() {
-            if drop_indices.contains(&j) {
+            if drop_indices.contains(&j) || regions[j].consumed {
                 continue;
             }
             let ri = &regions[i];

@@ -2,19 +2,6 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-/// Quality level for DataLab Marker API extraction.
-///
-/// Maps directly to DataLab's processing modes:
-/// - `fast`     — quickest turnaround, lower layout accuracy
-/// - `balanced` — default DataLab mode, good quality/speed trade-off
-/// - `accurate` — highest quality markdown with full layout reconstruction (slowest)
-#[derive(ValueEnum, Clone, Debug)]
-pub enum AdvancedMode {
-    Fast,
-    Balanced,
-    Accurate,
-}
-
 /// Formula recognition model for the extract command.
 #[derive(ValueEnum, Clone, Debug)]
 pub enum FormulaModelArg {
@@ -180,20 +167,10 @@ pub enum DbCommand {
         #[command(subcommand)]
         cmd: DbSectionCommand,
     },
-    /// Chapters: read full chapter content in order
-    Chapter {
-        #[command(subcommand)]
-        cmd: DbChapterCommand,
-    },
     /// Tags across indexed papers
     Tag {
         #[command(subcommand)]
         cmd: DbTagCommand,
-    },
-    /// Manage the on-disk embedding cache
-    Embed {
-        #[command(subcommand)]
-        cmd: DbEmbedCommand,
     },
 }
 
@@ -363,13 +340,12 @@ pub enum DbWorkCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Index a paper (or all papers) from local DataLab cache into the RAG database.
-    /// If the DataLab cache is missing for a paper, extraction runs automatically
-    /// via DataLab Marker API (requires DATALAB_API_KEY and a local Zotero PDF).
+    /// Index a paper (or all papers) into the RAG database.
+    /// Extracts from PDF via papers-extract if not already cached.
     Add {
         /// Paper: item key (e.g. LF4MJWZK), DOI, or title search; omit with --all
         work: Option<String>,
-        /// Index all papers in the DataLab cache
+        /// Index all papers in the extraction cache
         #[arg(long)]
         all: bool,
         /// Add tags to this paper (repeatable)
@@ -381,12 +357,12 @@ pub enum DbWorkCommand {
         /// Output raw JSON
         #[arg(long)]
         json: bool,
-        /// Quality level for DataLab extraction when cache is missing (ignored if already cached)
-        #[arg(long, short = 'm', default_value = "balanced")]
-        mode: AdvancedMode,
-        /// Re-run DataLab extraction even if a local cache already exists
+        /// Re-run extraction even if a local cache already exists
         #[arg(long)]
         force_extract: bool,
+        /// Re-embed only (skip extraction, re-chunk and re-embed from cached reflow)
+        #[arg(long)]
+        embed_only: bool,
     },
     /// Remove a paper from the RAG index (deletes all chunks and exhibits)
     Remove {
@@ -400,11 +376,17 @@ pub enum DbWorkCommand {
     Outline {
         /// Paper: DOI, item key, or title search
         paper_id: String,
+        /// Show outline for a specific section only (e.g. "ch2/s3")
+        #[arg(long)]
+        section: Option<String>,
+        /// Include the first sentence of each paragraph in the outline
+        #[arg(long)]
+        contents: bool,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
     },
-    /// Print cached DataLab extraction (markdown by default; use --json for structured JSON)
+    /// Print cached extraction (markdown by default; use --json for reflow JSON)
     Extract {
         /// Paper: item key (e.g. LF4MJWZK), DOI, or title search
         work: String,
@@ -467,59 +449,6 @@ pub enum DbSectionCommand {
         /// Section index (1-based within chapter)
         #[arg(long)]
         section_idx: u16,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-pub enum DbChapterCommand {
-    /// Semantic search returning one result per matching chapter
-    Search {
-        /// Natural language search query
-        query: String,
-        /// Scope to papers in a named selection
-        #[arg(long)]
-        selection: Option<String>,
-        /// Scope to a specific paper (DOI, item key, or title search)
-        #[arg(long)]
-        work: Option<String>,
-        /// Minimum publication year
-        #[arg(long)]
-        year_min: Option<u16>,
-        /// Maximum publication year
-        #[arg(long)]
-        year_max: Option<u16>,
-        /// Filter by venue name
-        #[arg(long)]
-        venue: Option<String>,
-        /// Filter by tag (repeatable)
-        #[arg(long)]
-        tag: Option<Vec<String>>,
-        /// Maximum number of results
-        #[arg(long, short = 'n', default_value = "5")]
-        limit: u16,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// List all chapters as a flat outline (all papers, or scoped with --work)
-    List {
-        /// Scope to a specific paper (DOI, item key, or title search)
-        #[arg(long)]
-        work: Option<String>,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Fetch all chunks in a chapter in reading order
-    Get {
-        /// Paper: DOI, item key, or title search
-        paper_id: String,
-        /// Chapter index (1-based)
-        #[arg(long)]
-        chapter_idx: u16,
         /// Output raw JSON
         #[arg(long)]
         json: bool,
@@ -1960,37 +1889,6 @@ pub enum ZoteroPermissionCommand {
 }
 
 #[derive(Subcommand)]
-pub enum DbEmbedCommand {
-    /// List cached embeddings for a paper (or all papers when work is omitted)
-    List {
-        /// Paper identifier (Zotero key)
-        work: Option<String>,
-        /// Output raw JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Compute and cache embeddings for a paper (or all papers)
-    Add {
-        /// Paper identifier (Zotero key)
-        work: Option<String>,
-        /// Embedding model (defaults to configured model)
-        #[arg(long)]
-        model: Option<String>,
-        /// Re-embed even if the cache already exists
-        #[arg(long)]
-        force: bool,
-    },
-    /// Remove cached embeddings for a paper (or all papers)
-    Delete {
-        /// Paper identifier (Zotero key)
-        work: Option<String>,
-        /// Embedding model (defaults to configured model)
-        #[arg(long)]
-        model: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
 pub enum ConfigCommand {
     /// Set a configuration value
     Set {
@@ -2027,127 +1925,6 @@ mod tests {
                         cmd: ConfigSetCommand::Model { name },
                     },
             } => assert_eq!(name, "embedding-gemma-300m"),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_db_embed_list_no_args() {
-        let cli = parse(&["papers", "db", "embed", "list"]);
-        match cli.entity {
-            EntityCommand::Db {
-                cmd:
-                    DbCommand::Embed {
-                        cmd: DbEmbedCommand::List { work, json: _ },
-                    },
-            } => assert!(work.is_none()),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_db_embed_list_with_work() {
-        let cli = parse(&["papers", "db", "embed", "list", "ABC123"]);
-        match cli.entity {
-            EntityCommand::Db {
-                cmd:
-                    DbCommand::Embed {
-                        cmd: DbEmbedCommand::List { work, json: _ },
-                    },
-            } => assert_eq!(work.as_deref(), Some("ABC123")),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_db_embed_add_no_model() {
-        let cli = parse(&["papers", "db", "embed", "add", "KEY1"]);
-        match cli.entity {
-            EntityCommand::Db {
-                cmd:
-                    DbCommand::Embed {
-                        cmd: DbEmbedCommand::Add { work, model, force },
-                    },
-            } => {
-                assert_eq!(work.as_deref(), Some("KEY1"));
-                assert!(model.is_none());
-                assert!(!force);
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_db_embed_add_explicit_model() {
-        let cli = parse(&[
-            "papers",
-            "db",
-            "embed",
-            "add",
-            "KEY1",
-            "--model",
-            "embedding-gemma-300m",
-        ]);
-        match cli.entity {
-            EntityCommand::Db {
-                cmd:
-                    DbCommand::Embed {
-                        cmd: DbEmbedCommand::Add { model, .. },
-                    },
-            } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_db_embed_add_force_flag() {
-        let cli = parse(&["papers", "db", "embed", "add", "KEY1", "--force"]);
-        match cli.entity {
-            EntityCommand::Db {
-                cmd:
-                    DbCommand::Embed {
-                        cmd: DbEmbedCommand::Add { force, .. },
-                    },
-            } => assert!(force),
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_db_embed_delete() {
-        let cli = parse(&["papers", "db", "embed", "delete", "KEY1"]);
-        match cli.entity {
-            EntityCommand::Db {
-                cmd:
-                    DbCommand::Embed {
-                        cmd: DbEmbedCommand::Delete { work, model },
-                    },
-            } => {
-                assert_eq!(work.as_deref(), Some("KEY1"));
-                assert!(model.is_none());
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_db_embed_delete_with_model() {
-        let cli = parse(&[
-            "papers",
-            "db",
-            "embed",
-            "delete",
-            "KEY1",
-            "--model",
-            "embedding-gemma-300m",
-        ]);
-        match cli.entity {
-            EntityCommand::Db {
-                cmd:
-                    DbCommand::Embed {
-                        cmd: DbEmbedCommand::Delete { model, .. },
-                    },
-            } => assert_eq!(model.as_deref(), Some("embedding-gemma-300m")),
             _ => panic!("wrong variant"),
         }
     }
@@ -2214,20 +1991,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_db_work_add_with_mode() {
-        let cli = parse(&["papers", "db", "work", "add", "YFACFA8C", "-m", "accurate"]);
-        match cli.entity {
-            EntityCommand::Db {
-                cmd: DbCommand::Work { cmd: DbWorkCommand::Add { work, mode, .. } },
-            } => {
-                assert_eq!(work.as_deref(), Some("YFACFA8C"));
-                assert!(matches!(mode, AdvancedMode::Accurate));
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn test_parse_db_work_add_force_extract() {
         let cli = parse(&["papers", "db", "work", "add", "YFACFA8C", "--force-extract"]);
         match cli.entity {
@@ -2242,13 +2005,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_db_work_add_mode_default_balanced() {
-        let cli = parse(&["papers", "db", "work", "add", "YFACFA8C"]);
+    fn test_parse_db_work_add_embed_only() {
+        let cli = parse(&["papers", "db", "work", "add", "YFACFA8C", "--embed-only"]);
         match cli.entity {
             EntityCommand::Db {
-                cmd: DbCommand::Work { cmd: DbWorkCommand::Add { mode, .. } },
+                cmd: DbCommand::Work { cmd: DbWorkCommand::Add { work, embed_only, .. } },
             } => {
-                assert!(matches!(mode, AdvancedMode::Balanced));
+                assert_eq!(work.as_deref(), Some("YFACFA8C"));
+                assert!(embed_only);
             }
             _ => panic!("wrong variant"),
         }

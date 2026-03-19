@@ -139,17 +139,36 @@ Two helpers in `main.rs`:
 
 ## Running the CLI for testing
 
-Always run `target/debug/papers.exe` directly — never pass API keys on the command line or via
-`powershell.exe` env var lookups. All required keys (`ZOTERO_API_KEY`, `ZOTERO_USER_ID`,
-`DATALAB_API_KEY`, etc.) are already present in the shell environment.
+Use `cargo run --release` which automatically sets env vars from `.cargo/config.toml`
+(including `ORT_DYLIB_PATH` for ONNX runtime and `PDFIUM_PATH` for PDF extraction).
+All required keys (`ZOTERO_API_KEY`, `ZOTERO_USER_ID`) must be in the shell environment.
 
-```
-# correct
-target/debug/papers.exe rag work add U9PRIZJ7
+```bash
+# Preferred — cargo sets .cargo/config.toml env vars automatically
+cargo run --release -- db work add U9PRIZJ7
+cargo run --release -- db chunk search "some query"
 
-# wrong — don't do this
-ZOTERO_API_KEY=$(powershell.exe -Command "...") target/debug/papers.exe ...
+# Direct binary — must set ORT_DYLIB_PATH manually (not read from .cargo/config.toml)
+ORT_DYLIB_PATH=D:/code/papers/.cache/onnxruntime.dll target/release/papers.exe db chunk search "query"
+
+# wrong — don't do this (no ORT runtime, embedding will fail)
+target/release/papers.exe db chunk search "query"
 ```
+
+### Required env vars (`.cargo/config.toml`)
+
+| Variable | Value | Purpose |
+|---|---|---|
+| `ORT_DYLIB_PATH` | `.cache/onnxruntime.dll` (relative) | ONNX Runtime for embeddings |
+| `PDFIUM_PATH` | `.cache` (relative) | pdfium library for PDF extraction |
+| `PROTOC` | path to `protoc.exe` | Protocol Buffers compiler (build dep) |
+
+### Required env vars (shell)
+
+| Variable | Purpose |
+|---|---|
+| `ZOTERO_USER_ID` | Zotero library access |
+| `ZOTERO_API_KEY` | Zotero API authentication |
 
 ## Integration test cache directory
 

@@ -709,8 +709,11 @@ fn test_list_cached_keys_multiple_papers() {
     fs::create_dir_all(dir.path().join("NOJSON")).unwrap();
 
     let old = std::env::var("PAPERS_DATALAB_CACHE_DIR").ok();
+    let old_extract = std::env::var("PAPERS_EXTRACT_CACHE_DIR").ok();
     unsafe {
         std::env::set_var("PAPERS_DATALAB_CACHE_DIR", dir.path().to_str().unwrap());
+        // Point extract cache at empty path so it doesn't pick up stale data
+        std::env::set_var("PAPERS_EXTRACT_CACHE_DIR", dir.path().join("_empty").to_str().unwrap());
     }
 
     let mut keys = list_cached_item_keys();
@@ -721,6 +724,11 @@ fn test_list_cached_keys_multiple_papers() {
             std::env::set_var("PAPERS_DATALAB_CACHE_DIR", v);
         } else {
             std::env::remove_var("PAPERS_DATALAB_CACHE_DIR");
+        }
+        if let Some(v) = old_extract {
+            std::env::set_var("PAPERS_EXTRACT_CACHE_DIR", v);
+        } else {
+            std::env::remove_var("PAPERS_EXTRACT_CACHE_DIR");
         }
     }
 

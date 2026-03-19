@@ -12,7 +12,6 @@ readme = "../../README.md"
 papers-core.workspace = true
 papers-db.workspace = true
 papers-zotero.workspace = true
-papers-datalab.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
