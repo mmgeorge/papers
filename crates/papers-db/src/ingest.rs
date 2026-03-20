@@ -1506,6 +1506,14 @@ impl<'a> ChunkingState<'a> {
     }
 }
 
+/// Combine section number and text into a display title.
+fn format_heading_title(section: Option<&str>, text: &str) -> String {
+    match section {
+        Some(s) if !s.is_empty() => format!("{s} {text}"),
+        _ => text.to_string(),
+    }
+}
+
 /// Process a single ReflowNode, recursing into Heading children.
 fn process_reflow_node(node: &ReflowNode, state: &mut ChunkingState) {
     if state.in_references {
@@ -1513,8 +1521,9 @@ fn process_reflow_node(node: &ReflowNode, state: &mut ChunkingState) {
     }
 
     match node {
-        ReflowNode::Heading { depth, title, children } => {
-            let lower = title.to_lowercase();
+        ReflowNode::Heading { depth, text, section, children } => {
+            let combined = format_heading_title(section.as_deref(), text);
+            let lower = combined.to_lowercase();
             if REFERENCES_TITLES.iter().any(|t| lower.contains(t)) {
                 state.flush_section_boundary();
                 state.in_references = true;
@@ -1531,7 +1540,7 @@ fn process_reflow_node(node: &ReflowNode, state: &mut ChunkingState) {
                     state.chapter_idx += 1;
                     state.section_idx = 0;
                     state.chunk_idx = 0;
-                    state.chapter_title = title.clone();
+                    state.chapter_title = combined.clone();
                     state.section_title = String::new();
                 }
                 2 => {
@@ -1539,7 +1548,7 @@ fn process_reflow_node(node: &ReflowNode, state: &mut ChunkingState) {
                     state.flush_section_boundary();
                     state.section_idx += 1;
                     state.chunk_idx = 0;
-                    state.section_title = title.clone();
+                    state.section_title = combined.clone();
                 }
                 _ => {
                     // Subsection (depth 3+): inject as bold paragraph separator
@@ -1548,7 +1557,7 @@ fn process_reflow_node(node: &ReflowNode, state: &mut ChunkingState) {
                     {
                         state.flush_mid_section();
                     }
-                    state.buffer.push(format!("**{title}**"), None);
+                    state.buffer.push(format!("**{combined}**"), None);
                 }
             }
 

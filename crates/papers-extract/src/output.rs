@@ -1228,9 +1228,11 @@ pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<
                 // Document title — strip the "# " prefix added by region_to_markdown
                 let title = text.strip_prefix("# ").unwrap_or(text).to_string();
                 last_numbered_depth = 0;
+                let (section, text_part) = parse_section_and_text(&title);
                 ReflowNode::Heading {
                     depth: 0,
-                    title,
+                    text: text_part,
+                    section,
                     children: Vec::new(),
                 }
             }
@@ -1267,7 +1269,8 @@ pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<
                                 if seen_appendix_letters.insert(letter) {
                                     flat_nodes.push(ReflowNode::Heading {
                                         depth: 1,
-                                        title: format!("Appendix {letter}"),
+                                        text: format!("Appendix {letter}"),
+                                        section: None,
                                         children: Vec::new(),
                                     });
                                 }
@@ -1275,9 +1278,11 @@ pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<
                         }
                         last_numbered_depth = depth;
                     }
+                    let (section, text_part) = parse_section_and_text(&title);
                     ReflowNode::Heading {
                         depth,
-                        title,
+                        text: text_part,
+                        section,
                         children: Vec::new(),
                     }
                 }
@@ -1325,6 +1330,16 @@ fn collapse_section_number_spaces(s: &str) -> String {
         }
     }
     result
+}
+
+/// Combine section number and text into a display title.
+/// "1.4" + "Conclusions" -> "1.4 Conclusions"
+/// None + "Conclusions" -> "Conclusions"
+fn format_heading_title(section: Option<&str>, text: &str) -> String {
+    match section {
+        Some(s) if !s.is_empty() => format!("{s} {text}"),
+        _ => text.to_string(),
+    }
 }
 
 /// Normalize a title for fuzzy comparison: lowercase, collapse whitespace,
@@ -1647,19 +1662,35 @@ pub fn reflow_with_outline(
             } else {
                 None
             };
+            let (section, text_part) = parse_section_and_text(&e.title);
             crate::types::TocEntryRendered {
                 depth: e.depth,
-                title: e.title.clone(),
+                text: text_part,
+                section,
                 page,
             }
         })
         .collect();
 
-    // Walk sections, emitting heading nodes from the schedule as we reach
-    // their start pages, and assigning content to the current heading.
+    // Walk sections, emitting content nodes.  TOC headings are NOT emitted
+    // here — they are placed in a second pass that locates the real heading
+    // text on the page and replaces it.  This avoids inserting headings at
+    // the wrong position (page start) when the heading actually appears
+    // partway through the page.
+    //
+    // We tag each content node with the page it came from so the second
+    // pass can restrict its search to the correct page.
+
+    // (page_idx, node) pairs — page_idx is u32::MAX for non-page nodes.
+    let mut tagged_nodes: Vec<(u32, ReflowNode)> = Vec::new();
+
+    // Track which pages are TOC pages so we can suppress their content.
+    let toc_page_set_local: std::collections::HashSet<u32> =
+        toc_pages.iter().copied().collect();
+
+    // Track heading schedule index — we still need it to detect when we
+    // cross into TOC-heading territory (to suppress raw TOC content).
     let mut heading_idx: usize = 0;
-    // When inside a TOC heading (e.g. "Contents"), suppress all content
-    // sections — the Toc node already provides the clean listing.
     let mut in_toc_heading = false;
 
     for sec in &sections {
@@ -1671,20 +1702,10 @@ pub fn reflow_with_outline(
             continue;
         }
 
-        // Emit all headings whose start page <= this section's page.
+        // Advance heading_idx to track TOC-heading suppression.
         while heading_idx < headings.len() && headings[heading_idx].0 <= sec.page_idx {
-            let (_, depth, ref title, is_toc_entry) = headings[heading_idx];
-            flat_nodes.push(ReflowNode::Heading {
-                depth,
-                title: title.clone(),
-                children: Vec::new(),
-            });
-            // For TOC headings (e.g. "Contents"), embed the rendered
-            // TOC listing and suppress raw content until next heading.
-            if is_toc_entry {
-                flat_nodes.push(ReflowNode::Toc {
-                    entries: toc_rendered.clone(),
-                });
+            let (_, _, _, is_toc_entry) = &headings[heading_idx];
+            if *is_toc_entry {
                 in_toc_heading = true;
             } else {
                 in_toc_heading = false;
@@ -1692,8 +1713,6 @@ pub fn reflow_with_outline(
             heading_idx += 1;
         }
 
-        // Skip content sections while inside a TOC heading — the raw
-        // text from TOC pages (leader dots, page numbers) is noise.
         if in_toc_heading {
             continue;
         }
@@ -1702,50 +1721,47 @@ pub fn reflow_with_outline(
         let node = match sec.kind {
             RegionKind::Title => {
                 let title = text.strip_prefix("# ").unwrap_or(text).to_string();
-                // Only accept Title regions from early pages (before first
-                // heading or first 5 pages). Interior Title regions are
-                // likely chapter headings already handled by TOC.
                 if sec.page_idx < first_heading_page.min(5) {
+                    let (section, text_part) = parse_section_and_text(&title);
                     ReflowNode::Heading {
                         depth: 0,
-                        title,
+                        text: text_part,
+                        section,
                         children: Vec::new(),
                     }
                 } else {
-                    continue; // skip interior titles
+                    continue;
                 }
             }
             RegionKind::ParagraphTitle => {
                 let title = text.strip_prefix("## ").unwrap_or(text).to_string();
-
                 if title.is_empty() {
                     continue;
                 }
 
-                // Suppress if this matches a TOC heading (avoid duplicates)
-                let title_norm = normalize_title(&title);
-                if heading_titles_norm.contains(&title_norm) {
-                    continue;
-                }
+                // Don't suppress ParagraphTitles that match TOC headings —
+                // let them flow through as Text so place_toc_headings can
+                // find and replace them at the correct position.
 
                 if is_labeled_block(&title) {
-                    // Labeled blocks are content, not headings — bold the label
                     ReflowNode::Text {
                         content: format!("**{title}**"),
                         footnotes: Vec::new(),
                     }
                 } else {
-                    // Check if this is a numbered heading below the TOC's
-                    // granularity. If so, keep it as a heading.
                     let inferred = infer_heading_depth(&title);
                     let adjusted = if has_parts { inferred + 1 } else { inferred };
                     if inferred > 0 && adjusted > max_toc_depth {
+                        let (section, text_part) = parse_section_and_text(&title);
                         ReflowNode::Heading {
                             depth: adjusted.max(1),
-                            title,
+                            text: text_part,
+                            section,
                             children: Vec::new(),
                         }
                     } else {
+                        // Emit as text — the TOC replace pass will promote
+                        // it to a heading if it matches a TOC entry.
                         ReflowNode::Text {
                             content: title,
                             footnotes: Vec::new(),
@@ -1756,24 +1772,14 @@ pub fn reflow_with_outline(
             _ => section_to_content_node(sec),
         };
 
-        flat_nodes.push(node);
+        tagged_nodes.push((sec.page_idx, node));
     }
 
-    // Emit any remaining headings not yet emitted (e.g. empty trailing chapters)
-    while heading_idx < headings.len() {
-        let (_, depth, ref title, is_toc_page) = headings[heading_idx];
-        flat_nodes.push(ReflowNode::Heading {
-            depth,
-            title: title.clone(),
-            children: Vec::new(),
-        });
-        if is_toc_page {
-            flat_nodes.push(ReflowNode::Toc {
-                entries: toc_rendered.clone(),
-            });
-        }
-        heading_idx += 1;
-    }
+    // Place TOC headings by locating the real heading text on each page.
+    place_toc_headings(&mut tagged_nodes, &headings, &heading_titles_norm, &toc_rendered);
+
+    // Strip page tags — from here on we work with plain flat_nodes.
+    flat_nodes = tagged_nodes.into_iter().map(|(_, node)| node).collect();
 
     postprocess_flat_nodes(&mut flat_nodes);
     let mut doc = build_heading_tree(flat_nodes);
@@ -1791,7 +1797,304 @@ pub fn reflow_with_outline(
     // Toc node exists in the tree.
     doc.toc = toc_rendered;
 
+    // Auto-number unnumbered headings (up to 2 levels below main level).
+    auto_number_document(&mut doc);
+
     doc
+}
+
+// ── Auto-numbering for unnumbered TOC entries ────────────────────────
+
+/// Check if a heading title starts with a section number prefix.
+/// Matches: "1 ...", "1. ...", "1.2 ...", "A.1 ...", "A. ...", etc.
+fn has_section_number(title: &str) -> bool {
+    let t = title.trim();
+    let first = match t.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !first.is_ascii_digit() && !first.is_ascii_uppercase() {
+        return false;
+    }
+    let space = match t.find(' ') {
+        Some(p) => p,
+        None => return false,
+    };
+    let prefix = &t[..space];
+    let stripped = prefix.trim_end_matches('.');
+    if stripped.is_empty() {
+        return false;
+    }
+    // Pure digits or digits+dots: "1", "1.2", "1.2.3"
+    if stripped.chars().all(|c| c.is_ascii_digit() || c == '.') && stripped.chars().any(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    // Appendix-style: "A", "A.1", "B.2.3" — single letter + dot + digits
+    if first.is_ascii_uppercase() && !first.is_ascii_digit() {
+        if stripped.len() == 1 {
+            return true; // bare letter like "A"
+        }
+        if stripped.len() > 2 && stripped.as_bytes()[1] == b'.' {
+            return stripped[2..].chars().all(|c| c.is_ascii_digit() || c == '.');
+        }
+    }
+    false
+}
+
+/// Extract the section number prefix from a title.
+/// "1.2 Foo" → "1.2", "3. Bar" → "3", "A.1 Baz" → "A.1"
+fn extract_section_number(title: &str) -> Option<String> {
+    if !has_section_number(title) {
+        return None;
+    }
+    let t = title.trim();
+    let space = t.find(' ')?;
+    let prefix = t[..space].trim_end_matches('.');
+    Some(prefix.to_string())
+}
+
+/// Split a heading title into (section_number, text).
+///
+/// "1.4 Conclusions" → (Some("1.4"), "Conclusions")
+/// "Conclusions"      → (None, "Conclusions")
+/// "A.1 Appendix"     → (Some("A.1"), "Appendix")
+/// "Chapter 3 Foo"    → (Some("3"), "Foo")  // strips "Chapter" label
+fn parse_section_and_text(title: &str) -> (Option<String>, String) {
+    let t = title.trim();
+    // Handle "Chapter N ..." prefix
+    if let Some(r) = t
+        .strip_prefix("Chapter ")
+        .or_else(|| t.strip_prefix("CHAPTER "))
+        .or_else(|| t.strip_prefix("chapter "))
+    {
+        if let Some(sp) = r.find(' ') {
+            let num = r[..sp].trim_end_matches('.');
+            if num.chars().all(|c| c.is_ascii_digit()) && !num.is_empty() {
+                return (Some(num.to_string()), r[sp + 1..].trim().to_string());
+            }
+        }
+    }
+
+    if let Some(section) = extract_section_number(t) {
+        let text = t[section.len()..].trim_start_matches('.').trim().to_string();
+        (Some(section), text)
+    } else {
+        (None, t.to_string())
+    }
+}
+
+/// Auto-number unnumbered headings in the document.
+///
+/// For each depth level (1, 2, 3), if fewer than 30% of entries already
+/// have section numbers, all entries at that depth get auto-numbered.
+/// Numbers are hierarchical: chapter 1's sections become 1.1, 1.2, etc.
+///
+/// This also updates embedded `Toc` nodes in the heading tree.
+fn auto_number_document(doc: &mut ReflowDocument) {
+    if doc.toc.is_empty() {
+        return;
+    }
+
+    // Determine which depth levels need auto-numbering.
+    let mut numbered_at_depth = [0u32; 5];
+    let mut total_at_depth = [0u32; 5];
+    for entry in &doc.toc {
+        let d = entry.depth as usize;
+        if d < 5 {
+            total_at_depth[d] += 1;
+            if entry.section.is_some() {
+                numbered_at_depth[d] += 1;
+            }
+        }
+    }
+
+    let mut auto_depths = [false; 5];
+    for d in 1..=3 {
+        if total_at_depth[d] > 0 {
+            let ratio = numbered_at_depth[d] as f32 / total_at_depth[d] as f32;
+            auto_depths[d] = ratio < 0.3;
+        }
+    }
+
+    if !auto_depths.iter().any(|&b| b) {
+        return; // nothing to number
+    }
+
+    // Number the TOC entries.
+    let mut counters = [0u32; 5];
+    let mut parent_num = [String::new(), String::new(), String::new(), String::new(), String::new()];
+
+    for entry in &mut doc.toc {
+        let d = entry.depth as usize;
+        if d == 0 || d > 3 {
+            continue;
+        }
+
+        // Reset deeper counters.
+        for i in (d + 1)..5 {
+            counters[i] = 0;
+            parent_num[i].clear();
+        }
+
+        if let Some(ref num) = entry.section {
+            // Already numbered — track it.
+            parent_num[d] = num.clone();
+            // Sync counter to the last component.
+            if let Some(last) = num.rsplit('.').next() {
+                if let Ok(n) = last.parse::<u32>() {
+                    counters[d] = n;
+                }
+            }
+        } else if auto_depths[d] {
+            counters[d] += 1;
+            let number = if d == 1 || parent_num[d - 1].is_empty() {
+                format!("{}", counters[d])
+            } else {
+                format!("{}.{}", parent_num[d - 1], counters[d])
+            };
+            parent_num[d] = number.clone();
+            entry.section = Some(number);
+        }
+    }
+
+    // Number the heading nodes in the tree with the same logic.
+    let mut counters = [0u32; 5];
+    let mut parent_num = [String::new(), String::new(), String::new(), String::new(), String::new()];
+    auto_number_tree(&mut doc.children, &auto_depths, &mut counters, &mut parent_num);
+}
+
+/// Recursively auto-number heading nodes in the tree.
+fn auto_number_tree(
+    children: &mut [ReflowNode],
+    auto_depths: &[bool; 5],
+    counters: &mut [u32; 5],
+    parent_num: &mut [String; 5],
+) {
+    for node in children.iter_mut() {
+        match node {
+            ReflowNode::Heading { depth, text, section, children } => {
+                let d = *depth as usize;
+                if d >= 1 && d <= 3 {
+                    // Reset deeper counters.
+                    for i in (d + 1)..5 {
+                        counters[i] = 0;
+                        parent_num[i].clear();
+                    }
+
+                    if let Some(num) = section.as_ref() {
+                        parent_num[d] = num.clone();
+                        if let Some(last) = num.rsplit('.').next() {
+                            if let Ok(n) = last.parse::<u32>() {
+                                counters[d] = n;
+                            }
+                        }
+                    } else if d < auto_depths.len() && auto_depths[d] {
+                        counters[d] += 1;
+                        let number = if d == 1 || parent_num[d - 1].is_empty() {
+                            format!("{}", counters[d])
+                        } else {
+                            format!("{}.{}", parent_num[d - 1], counters[d])
+                        };
+                        parent_num[d] = number.clone();
+                        *section = Some(number);
+                    }
+                }
+
+                auto_number_tree(children, auto_depths, counters, parent_num);
+            }
+            ReflowNode::Toc { entries } => {
+                // Re-number the embedded TOC entries to match.
+                let mut c = [0u32; 5];
+                let mut p = [String::new(), String::new(), String::new(), String::new(), String::new()];
+                for entry in entries.iter_mut() {
+                    let d = entry.depth as usize;
+                    if d == 0 || d > 3 { continue; }
+                    for i in (d + 1)..5 { c[i] = 0; p[i].clear(); }
+                    if let Some(ref num) = entry.section {
+                        p[d] = num.clone();
+                        if let Some(last) = num.rsplit('.').next() {
+                            if let Ok(n) = last.parse::<u32>() { c[d] = n; }
+                        }
+                    } else if d < auto_depths.len() && auto_depths[d] {
+                        c[d] += 1;
+                        let number = if d == 1 || p[d - 1].is_empty() {
+                            format!("{}", c[d])
+                        } else {
+                            format!("{}.{}", p[d - 1], c[d])
+                        };
+                        p[d] = number.clone();
+                        entry.section = Some(number);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Auto-number unnumbered raw TOC entries (for `--section` CLI lookup).
+///
+/// Same logic as `auto_number_document` but operates on `TocEntry` directly.
+pub fn auto_number_toc_entries(entries: &mut [TocEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut numbered_at_depth = [0u32; 5];
+    let mut total_at_depth = [0u32; 5];
+    for entry in entries.iter() {
+        let d = entry.depth as usize;
+        if d < 5 {
+            total_at_depth[d] += 1;
+            if has_section_number(&entry.title) {
+                numbered_at_depth[d] += 1;
+            }
+        }
+    }
+
+    let mut auto_depths = [false; 5];
+    for d in 1..=3 {
+        if total_at_depth[d] > 0 {
+            let ratio = numbered_at_depth[d] as f32 / total_at_depth[d] as f32;
+            auto_depths[d] = ratio < 0.3;
+        }
+    }
+
+    if !auto_depths.iter().any(|&b| b) {
+        return;
+    }
+
+    let mut counters = [0u32; 5];
+    let mut parent_num = [String::new(), String::new(), String::new(), String::new(), String::new()];
+
+    for entry in entries.iter_mut() {
+        let d = entry.depth as usize;
+        if d == 0 || d > 3 {
+            continue;
+        }
+        for i in (d + 1)..5 {
+            counters[i] = 0;
+            parent_num[i].clear();
+        }
+
+        if let Some(num) = extract_section_number(&entry.title) {
+            parent_num[d] = num.clone();
+            if let Some(last) = num.rsplit('.').next() {
+                if let Ok(n) = last.parse::<u32>() {
+                    counters[d] = n;
+                }
+            }
+        } else if auto_depths[d] {
+            counters[d] += 1;
+            let number = if d == 1 || parent_num[d - 1].is_empty() {
+                format!("{}", counters[d])
+            } else {
+                format!("{}.{}", parent_num[d - 1], counters[d])
+            };
+            parent_num[d] = number.clone();
+            entry.title = format!("{number} {}", entry.title);
+        }
+    }
 }
 
 /// Convert an integer to lowercase roman numerals.
@@ -1845,6 +2148,125 @@ fn split_table_caption(md: &str) -> (String, Option<String>) {
     (md.to_string(), None)
 }
 
+// ── TOC heading placement ────────────────────────────────────────────
+
+/// Place TOC headings by locating the real heading text on each page.
+///
+/// For each TOC heading, searches for a text node on its target page whose
+/// content matches the heading title.  When found, the text node is **replaced**
+/// with the proper `Heading` node (carrying the TOC's numbering and depth).
+///
+/// If no matching text is found on the page, the heading is **injected** before
+/// the first content node from that page as a fallback.
+fn place_toc_headings(
+    tagged_nodes: &mut Vec<(u32, ReflowNode)>,
+    headings: &[(u32, u32, String, bool)],
+    heading_titles_norm: &[String],
+    toc_rendered: &[crate::types::TocEntryRendered],
+) {
+    let heading_stripped: Vec<String> = headings
+        .iter()
+        .map(|(_, _, title, _)| strip_numbering(title))
+        .collect();
+
+    let mut placed = vec![false; headings.len()];
+
+    // Pass 1: find and replace matching text nodes.
+    for (hi, (page, depth, title, is_toc_entry)) in headings.iter().enumerate() {
+        let title_norm = &heading_titles_norm[hi];
+        let title_stripped = &heading_stripped[hi];
+
+        let mut match_idx: Option<usize> = None;
+        for (ni, (pg, node)) in tagged_nodes.iter().enumerate() {
+            if *pg < *page {
+                continue;
+            }
+            if *pg > *page {
+                break;
+            }
+            let content = match node {
+                ReflowNode::Text { content, .. } => content.trim(),
+                _ => continue,
+            };
+            if content.is_empty() || content.len() > 120 {
+                continue;
+            }
+            let content_norm = normalize_title(content);
+            let content_stripped = strip_numbering(content);
+
+            let exact = content_norm == *title_norm;
+            let stripped = !title_stripped.is_empty()
+                && title_stripped.len() >= 3
+                && *title_stripped == content_stripped;
+            let section_match = {
+                let tn = title_norm.split_whitespace().next().unwrap_or("");
+                let cn = content_norm.split_whitespace().next().unwrap_or("");
+                !tn.is_empty()
+                    && tn == cn
+                    && (tn.contains('.') || tn.starts_with("chapter"))
+            };
+
+            if exact || stripped || section_match {
+                match_idx = Some(ni);
+                break;
+            }
+        }
+
+        if let Some(ni) = match_idx {
+            let (sec, txt) = parse_section_and_text(title);
+            tagged_nodes[ni] = (
+                *page,
+                ReflowNode::Heading {
+                    depth: *depth,
+                    text: txt,
+                    section: sec,
+                    children: Vec::new(),
+                },
+            );
+            if *is_toc_entry {
+                tagged_nodes.insert(
+                    ni + 1,
+                    (*page, ReflowNode::Toc { entries: toc_rendered.to_vec() }),
+                );
+            }
+            placed[hi] = true;
+        }
+    }
+
+    // Pass 2: inject unmatched headings at page boundary (fallback).
+    // Process in reverse so insertions don't shift indices of earlier headings.
+    for hi in (0..headings.len()).rev() {
+        if placed[hi] {
+            continue;
+        }
+        let (page, depth, ref title, is_toc_entry) = headings[hi];
+        let insert_pos = tagged_nodes
+            .iter()
+            .position(|(pg, _)| *pg >= page)
+            .unwrap_or(tagged_nodes.len());
+
+        let (sec, txt) = parse_section_and_text(title);
+        tagged_nodes.insert(
+            insert_pos,
+            (
+                page,
+                ReflowNode::Heading {
+                    depth,
+                    text: txt,
+                    section: sec,
+                    children: Vec::new(),
+                },
+            ),
+        );
+        if is_toc_entry {
+            tagged_nodes.insert(
+                insert_pos + 1,
+                (page, ReflowNode::Toc { entries: toc_rendered.to_vec() }),
+            );
+        }
+    }
+}
+
 // ── Post-processing passes on flat nodes ────────────────────────────
 
 /// Apply all post-processing passes to the flat node list before building
@@ -1868,10 +2290,10 @@ fn postprocess_flat_nodes(flat_nodes: &mut Vec<ReflowNode>) {
                     *content = collapsed;
                 }
             }
-            ReflowNode::Heading { title, .. } => {
-                let collapsed = collapse_doubled_chars(title);
-                if collapsed.len() < title.len() {
-                    *title = collapsed;
+            ReflowNode::Heading { text, .. } => {
+                let collapsed = collapse_doubled_chars(text);
+                if collapsed.len() < text.len() {
+                    *text = collapsed;
                 }
             }
             _ => {}
@@ -1903,8 +2325,9 @@ fn dedup_footnotes(flat_nodes: &mut Vec<ReflowNode>) {
 fn dedup_heading_echo(flat_nodes: &mut Vec<ReflowNode>) {
     let mut i = 0;
     while i + 1 < flat_nodes.len() {
-        let title_norm = if let ReflowNode::Heading { title, .. } = &flat_nodes[i] {
-            let n = normalize_title(title);
+        let title_norm = if let ReflowNode::Heading { text, section, .. } = &flat_nodes[i] {
+            let combined = format_heading_title(section.as_deref(), text);
+            let n = normalize_title(&combined);
             if n.len() >= 5 { Some(n) } else { None }
         } else {
             None
@@ -1947,8 +2370,8 @@ fn dedup_heading_echo(flat_nodes: &mut Vec<ReflowNode>) {
 fn dedup_heading_echo_multiline(flat_nodes: &mut Vec<ReflowNode>) {
     let mut i = 0;
     while i < flat_nodes.len() {
-        let title_norm = if let ReflowNode::Heading { title, .. } = &flat_nodes[i] {
-            normalize_title(title)
+        let title_norm = if let ReflowNode::Heading { text, section, .. } = &flat_nodes[i] {
+            normalize_title(&format_heading_title(section.as_deref(), text))
         } else {
             i += 1;
             continue;
@@ -2047,8 +2470,9 @@ fn reorder_headings_by_numbering(flat_nodes: &mut Vec<ReflowNode>) {
     // Extract (index, numbering_key) for all heading nodes
     let mut heading_indices: Vec<(usize, Vec<u32>)> = Vec::new();
     for (i, node) in flat_nodes.iter().enumerate() {
-        if let ReflowNode::Heading { title, .. } = node {
-            if let Some(key) = parse_section_number(title) {
+        if let ReflowNode::Heading { text, section, .. } = node {
+            let combined = format_heading_title(section.as_deref(), text);
+            if let Some(key) = parse_section_number(&combined) {
                 heading_indices.push((i, key));
             }
         }
@@ -2067,8 +2491,9 @@ fn reorder_headings_by_numbering(flat_nodes: &mut Vec<ReflowNode>) {
         // Re-scan heading positions (they shift after each move)
         heading_indices.clear();
         for (i, node) in flat_nodes.iter().enumerate() {
-            if let ReflowNode::Heading { title, .. } = node {
-                if let Some(key) = parse_section_number(title) {
+            if let ReflowNode::Heading { text, section, .. } = node {
+                let combined = format_heading_title(section.as_deref(), text);
+                if let Some(key) = parse_section_number(&combined) {
                     heading_indices.push((i, key));
                 }
             }
@@ -2398,13 +2823,13 @@ fn build_heading_tree(flat: Vec<ReflowNode>) -> ReflowDocument {
 
     for node in flat {
         match &node {
-            ReflowNode::Heading { depth, title, .. } => {
+            ReflowNode::Heading { depth, text, section, .. } => {
                 let depth = *depth;
 
                 // Document title (depth 0): set as doc title
                 if depth == 0 {
                     flush_to_depth(&mut stack, &mut doc.children, 1);
-                    doc.title = Some(title.clone());
+                    doc.title = Some(format_heading_title(section.as_deref(), text));
                     continue;
                 }
 
@@ -2452,13 +2877,14 @@ fn render_toc_listing(entries: &[crate::types::TocEntryRendered], with_heading: 
         let normalized_depth = depth_map.get(&entry.depth).copied().unwrap_or(0);
         let indent = "  ".repeat(normalized_depth);
         let page_str = entry.page.as_deref().unwrap_or("");
-        // Clean up title: strip leader dots and anything after them
-        let title = if let Some(dot_pos) = entry.title.find(". . .") {
-            entry.title[..dot_pos].trim()
-        } else if let Some(dot_pos) = entry.title.find("...") {
-            entry.title[..dot_pos].trim()
+        // Combine section + text into display title, then strip leader dots
+        let full_title = format_heading_title(entry.section.as_deref(), &entry.text);
+        let title = if let Some(dot_pos) = full_title.find(". . .") {
+            full_title[..dot_pos].trim()
+        } else if let Some(dot_pos) = full_title.find("...") {
+            full_title[..dot_pos].trim()
         } else {
-            entry.title.trim()
+            full_title.trim()
         };
         if title.is_empty() {
             continue;
@@ -3196,11 +3622,13 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
         match node {
             ReflowNode::Heading {
                 depth,
-                title,
+                text,
+                section,
                 children,
             } => {
                 // Skip Index section — page-number references are useless in markdown
-                let title_upper = title.trim().to_ascii_uppercase();
+                let combined = format_heading_title(section.as_deref(), text);
+                let title_upper = combined.trim().to_ascii_uppercase();
                 if title_upper.contains("INDEX") {
                     continue;
                 }
@@ -3211,7 +3639,7 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 }
                 let depth = (*depth as usize).min(5); // cap at h6
                 let hashes = "#".repeat(depth + 1);
-                let title = collapse_spaced_letters(title);
+                let title = collapse_spaced_letters(&combined);
                 let title = split_concatenated_allcaps(&title);
                 let title = fix_missing_spaces_in_title(&title);
                 parts.push(format!("{hashes} {title}"));
@@ -3263,8 +3691,8 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                             continue;
                         }
                     }
-                    if let ReflowNode::Heading { title, .. } = child {
-                        let t = title.trim().to_lowercase();
+                    if let ReflowNode::Heading { text, .. } = child {
+                        let t = text.trim().to_lowercase();
                         if t == "preface" {
                             in_preface = true;
                         } else {
@@ -5108,5 +5536,278 @@ mod tests {
             i += 1;
         }
         assert_eq!(collapsed, "differ");
+    }
+
+    /// Helper to build a heading node for tests.
+    fn h(depth: u32, title: &str) -> ReflowNode {
+        let (sec, txt) = parse_section_and_text(title);
+        ReflowNode::Heading {
+            depth,
+            text: txt,
+            section: sec,
+            children: Vec::new(),
+        }
+    }
+
+    /// Helper to build a text node for tests.
+    fn t(content: &str) -> ReflowNode {
+        ReflowNode::Text {
+            content: content.to_string(),
+            footnotes: Vec::new(),
+        }
+    }
+
+    /// Format a node as a short label for test assertions.
+    fn node_label(n: &ReflowNode) -> String {
+        match n {
+            ReflowNode::Heading { text, section, .. } => {
+                let full = format_heading_title(section.as_deref(), text);
+                format!("H:{full}")
+            }
+            ReflowNode::Text { content, .. } => {
+                let s = content.trim();
+                if s.len() > 40 {
+                    format!("T:{}...", &s[..37])
+                } else {
+                    format!("T:{s}")
+                }
+            }
+            ReflowNode::Figure { .. } => "Figure".to_string(),
+            ReflowNode::Toc { .. } => "Toc".to_string(),
+            _ => "Other".to_string(),
+        }
+    }
+
+    fn titles(nodes: &[ReflowNode]) -> Vec<String> {
+        nodes.iter().map(node_label).collect()
+    }
+
+    // ── parse_section_and_text tests ──────────────────────────────────
+
+    #[test]
+    fn test_parse_simple_numbered() {
+        assert_eq!(parse_section_and_text("1.4 Conclusions"), (Some("1.4".into()), "Conclusions".into()));
+        assert_eq!(parse_section_and_text("3. Methods"), (Some("3".into()), "Methods".into()));
+        assert_eq!(parse_section_and_text("12.3.1 Detailed Results"), (Some("12.3.1".into()), "Detailed Results".into()));
+    }
+
+    #[test]
+    fn test_parse_unnumbered() {
+        assert_eq!(parse_section_and_text("Conclusions"), (None, "Conclusions".into()));
+        assert_eq!(parse_section_and_text("The Fixed-Function Pipeline"), (None, "The Fixed-Function Pipeline".into()));
+    }
+
+    #[test]
+    fn test_parse_appendix_style() {
+        assert_eq!(parse_section_and_text("A.1 First Appendix"), (Some("A.1".into()), "First Appendix".into()));
+        assert_eq!(parse_section_and_text("A.1.2 Detailed Appendix"), (Some("A.1.2".into()), "Detailed Appendix".into()));
+        assert_eq!(parse_section_and_text("B.3 Another"), (Some("B.3".into()), "Another".into()));
+        assert_eq!(parse_section_and_text("A Overview"), (Some("A".into()), "Overview".into()));
+    }
+
+    #[test]
+    fn test_parse_chapter_prefix() {
+        assert_eq!(parse_section_and_text("Chapter 3 Fundamental Concepts"), (Some("3".into()), "Fundamental Concepts".into()));
+        assert_eq!(parse_section_and_text("CHAPTER 10 Advanced Topics"), (Some("10".into()), "Advanced Topics".into()));
+    }
+
+    #[test]
+    fn test_parse_roman_not_section() {
+        // Roman numerals like "IV" aren't valid section numbers (no dot pattern)
+        // but single uppercase letters like "A" are (appendix style)
+        let (sec, text) = parse_section_and_text("Foreword");
+        assert_eq!(sec, None);
+        assert_eq!(text, "Foreword");
+    }
+
+    #[test]
+    fn test_format_heading_title_roundtrip() {
+        // parse then format should reconstruct the original
+        for input in &["1.4 Conclusions", "A.1.2 Detailed", "Conclusions", "Chapter 3 Foo"] {
+            let (sec, text) = parse_section_and_text(input);
+            let formatted = format_heading_title(sec.as_deref(), &text);
+            // For "Chapter 3 Foo" → section="3", text="Foo" → formatted="3 Foo"
+            // This is expected — the "Chapter" label is stripped
+            if !input.starts_with("Chapter") {
+                assert_eq!(&formatted, *input, "roundtrip failed for {input:?}");
+            }
+        }
+    }
+
+    // ── place_toc_headings tests ────────────────────────────────────
+
+    /// Helper: run place_toc_headings and return (page, label) pairs.
+    fn place(
+        nodes: Vec<(u32, ReflowNode)>,
+        headings: &[(u32, u32, &str, bool)],
+    ) -> Vec<(u32, String)> {
+        let mut tagged = nodes;
+        let headings_owned: Vec<(u32, u32, String, bool)> = headings
+            .iter()
+            .map(|(p, d, t, toc)| (*p, *d, t.to_string(), *toc))
+            .collect();
+        let norms: Vec<String> = headings_owned
+            .iter()
+            .map(|(_, _, t, _)| normalize_title(t))
+            .collect();
+        place_toc_headings(&mut tagged, &headings_owned, &norms, &[]);
+        tagged
+            .iter()
+            .map(|(pg, node)| (*pg, node_label(node)))
+            .collect()
+    }
+
+    fn tp(page: u32, s: &str) -> (u32, ReflowNode) {
+        (page, ReflowNode::Text { content: s.to_string(), footnotes: vec![] })
+    }
+
+    #[test]
+    fn test_place_heading_replaces_echo_on_correct_page() {
+        // "Conclusions" text on page 49 should be replaced by "1.4 Conclusions" heading
+        let nodes = vec![
+            tp(49, "glEnableClientState( GL_VERTEX_ARRAY ); glEnableClientState( GL_COLOR_ARRAY ); ...long code..."),
+            tp(49, "which is certainly shorter and feels more elegant."),
+            tp(49, "Conclusions"),
+            tp(49, "The fixed-function graphics pipeline has shown itself to be very valuable..."),
+        ];
+        let result = place(nodes, &[(49, 2, "1.4 Conclusions", false)]);
+        assert_eq!(result[2], (49, "H:1.4 Conclusions".into()));
+        assert_eq!(result.len(), 4); // no extra nodes injected
+    }
+
+    #[test]
+    fn test_place_heading_exact_match() {
+        // Exact normalized match: "1.4 Conclusions" text matches "1.4 Conclusions" heading
+        let nodes = vec![
+            tp(10, "Some content before"),
+            tp(10, "1.4 Conclusions"),
+            tp(10, "Body text here"),
+        ];
+        let result = place(nodes, &[(10, 2, "1.4 Conclusions", false)]);
+        assert_eq!(result[1], (10, "H:1.4 Conclusions".into()));
+    }
+
+    #[test]
+    fn test_place_heading_stripped_match() {
+        // Stripped match: TOC has "1.4 Conclusions", page text is just "Conclusions"
+        let nodes = vec![
+            tp(20, "Conclusions"),
+            tp(20, "Body text"),
+        ];
+        let result = place(nodes, &[(20, 2, "1.4 Conclusions", false)]);
+        assert_eq!(result[0], (20, "H:1.4 Conclusions".into()));
+    }
+
+    #[test]
+    fn test_place_heading_section_number_match() {
+        // Section number match: content has "1.4 Summary" but TOC has "1.4 Conclusions"
+        // — both share "1.4" prefix
+        let nodes = vec![
+            tp(20, "1.4 Summary of Results"),
+        ];
+        let result = place(nodes, &[(20, 2, "1.4 Conclusions", false)]);
+        assert_eq!(result[0], (20, "H:1.4 Conclusions".into()));
+    }
+
+    #[test]
+    fn test_place_heading_no_match_injects_at_page_start() {
+        // No matching text on the page — heading injected before first content
+        let nodes = vec![
+            tp(5, "Earlier page content"),
+            tp(10, "First content on page 10"),
+            tp(10, "More content"),
+        ];
+        let result = place(nodes, &[(10, 2, "1.4 Conclusions", false)]);
+        assert_eq!(result[1], (10, "H:1.4 Conclusions".into()));
+        assert_eq!(result[2], (10, "T:First content on page 10".into()));
+    }
+
+    #[test]
+    fn test_place_heading_does_not_match_wrong_page() {
+        // "Conclusions" exists but on page 48, heading targets page 49
+        // Should NOT replace page 48 text; should inject at page 49 boundary
+        let nodes = vec![
+            tp(48, "Conclusions"),
+            tp(49, "First content on page 49"),
+        ];
+        let result = place(nodes, &[(49, 2, "1.4 Conclusions", false)]);
+        // Page 48 text unchanged
+        assert_eq!(result[0], (48, "T:Conclusions".into()));
+        // Heading injected before page 49 content
+        assert_eq!(result[1], (49, "H:1.4 Conclusions".into()));
+        assert_eq!(result[2], (49, "T:First content on page 49".into()));
+    }
+
+    #[test]
+    fn test_place_multiple_headings_same_page() {
+        // Two headings on same page — each replaces its own echo
+        let nodes = vec![
+            tp(10, "The Traditional View"),
+            tp(10, "Some intro text about the traditional view that is long enough to skip."),
+            tp(10, "The Vertex Operation"),
+            tp(10, "Content about vertices"),
+        ];
+        let result = place(nodes, &[
+            (10, 2, "1.1 The Traditional View", false),
+            (10, 3, "1.1.1 The Vertex Operation", false),
+        ]);
+        assert_eq!(result[0], (10, "H:1.1 The Traditional View".into()));
+        assert_eq!(result[2], (10, "H:1.1.1 The Vertex Operation".into()));
+        assert_eq!(result.len(), 4); // no extras
+    }
+
+    #[test]
+    fn test_place_heading_ignores_long_text() {
+        // Text > 120 chars should never be matched as a heading echo
+        let long_text = "Conclusions ".repeat(20); // well over 120 chars
+        let nodes = vec![
+            tp(10, &long_text),
+            tp(10, "Conclusions"),
+        ];
+        let result = place(nodes, &[(10, 2, "1.4 Conclusions", false)]);
+        // Should match the short one, not the long one
+        assert_eq!(result[1], (10, "H:1.4 Conclusions".into()));
+    }
+
+    #[test]
+    fn test_place_heading_preserves_content_before_echo() {
+        // Content before the echo on the same page should NOT be displaced
+        let nodes = vec![
+            tp(49, "Code from previous section that runs over to this page"),
+            tp(49, "More leftover content"),
+            tp(49, "Conclusions"),
+            tp(49, "The actual conclusions body text"),
+        ];
+        let result = place(nodes, &[(49, 2, "1.4 Conclusions", false)]);
+        // Content before echo stays in place
+        assert_eq!(result[0].1, "T:Code from previous section that runs ...");
+        assert_eq!(result[1].1, "T:More leftover content");
+        // Echo replaced
+        assert_eq!(result[2], (49, "H:1.4 Conclusions".into()));
+        // Content after echo stays
+        assert_eq!(result[3].1, "T:The actual conclusions body text");
+    }
+
+    #[test]
+    fn test_place_heading_fallback_empty_page() {
+        // Heading targets a page with no content — inject at end
+        let nodes = vec![
+            tp(5, "Content on page 5"),
+        ];
+        let result = place(nodes, &[(10, 2, "1.4 Conclusions", false)]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[1], (10, "H:1.4 Conclusions".into()));
+    }
+
+    #[test]
+    fn test_place_heading_chapter_match() {
+        // "Chapter 3 Concepts" in TOC matches "Chapter 3 Concepts" on page
+        // parse_section_and_text strips "Chapter" label → section="3", text="Concepts"
+        let nodes = vec![
+            tp(30, "Chapter 3 Concepts"),
+            tp(30, "Body text"),
+        ];
+        let result = place(nodes, &[(30, 1, "Chapter 3 Concepts", false)]);
+        assert_eq!(result[0], (30, "H:3 Concepts".into()));
     }
 }

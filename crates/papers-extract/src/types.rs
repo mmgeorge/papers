@@ -21,7 +21,11 @@ pub struct ReflowDocument {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TocEntryRendered {
     pub depth: u32,
-    pub title: String,
+    /// Heading text without section numbering (e.g. "Conclusions").
+    pub text: String,
+    /// Section number prefix, if any (e.g. "1.4").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub section: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<String>,
 }
@@ -33,7 +37,11 @@ pub enum ReflowNode {
     /// A structural heading that nests child content.
     Heading {
         depth: u32,
-        title: String,
+        /// Heading text without section numbering (e.g. "Conclusions").
+        text: String,
+        /// Section number prefix, if any (e.g. "1.4").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        section: Option<String>,
         children: Vec<ReflowNode>,
     },
     /// A reflowed paragraph of text.

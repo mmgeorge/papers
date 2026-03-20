@@ -218,13 +218,15 @@ impl Pipeline {
                 (chars, height)
             })
             .collect();
-        let toc_result = toc::parse_toc(&page_chars);
-        if let Some(ref toc) = toc_result {
+        let mut toc_result = toc::parse_toc(&page_chars);
+        if let Some(ref mut toc) = toc_result {
             eprintln!(
                 "  TOC: {} entries from {} pages",
                 toc.entries.len(),
                 toc.toc_pages.len(),
             );
+            // Auto-number unnumbered TOC entries so --section works.
+            crate::output::auto_number_toc_entries(&mut toc.entries);
         }
 
         let mut pages = Vec::new();
