@@ -3424,7 +3424,7 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
                     // algorithmic structure shouldn't be code blocks
                     let has_math = content.matches('$').count() >= 2
                         || content.contains("[[FORMULA")
-                        || content.matches('*').count() >= 4;
+                        || count_italic_spans(content) >= 2;
                     if has_math && !is_pseudocode && !looks_like_code(content) {
                         // Math-heavy prose misclassified as Algorithm
                         *node = ReflowNode::Text {
@@ -3513,6 +3513,31 @@ fn looks_like_pseudocode(text: &str) -> bool {
     keyword_lines >= 3
 }
 
+/// Count italic spans (*word*) in text — matches `*non-space..non-space*` pairs.
+/// Bare `*` used as multiplication (e.g. `a * b`) is NOT counted.
+fn count_italic_spans(text: &str) -> usize {
+    let mut count = 0;
+    let mut in_italic = false;
+    let bytes = text.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'*' {
+            if !in_italic {
+                // Opening: * followed by non-space
+                if i + 1 < bytes.len() && bytes[i + 1] != b' ' && bytes[i + 1] != b'*' {
+                    in_italic = true;
+                }
+            } else {
+                // Closing: preceded by non-space
+                if i > 0 && bytes[i - 1] != b' ' && bytes[i - 1] != b'*' {
+                    count += 1;
+                    in_italic = false;
+                }
+            }
+        }
+    }
+    count
+}
+
 fn looks_like_code(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.len() < 15 {
@@ -3528,8 +3553,9 @@ fn looks_like_code(text: &str) -> bool {
     if trimmed.contains("[[FORMULA") {
         return false;
     }
-    // Italic markers (*word*) → formatted prose, not code
-    if trimmed.matches('*').count() >= 4 {
+    // Italic markers (*word*) → formatted prose, not code.
+    // Count actual italic spans, not bare * (which appear as multiplication in code).
+    if count_italic_spans(trimmed) >= 2 {
         return false;
     }
 
@@ -3591,10 +3617,17 @@ pub fn code_score(text: &str) -> u32 {
     if text.contains("const ") && text.contains(" => ") { score += 2; }
     if text.contains("function ") && text.contains('{') { score += 2; }
 
-    // GLSL/HLSL shaders
+    // GLSL shaders
     if text.contains("uniform ") || text.contains("varying ") { score += 2; }
     if text.contains("gl_Position") || text.contains("gl_FragColor") { score += 2; }
     if text.contains("vec2 ") || text.contains("vec3 ") || text.contains("vec4 ") { score += 1; }
+    // HLSL shaders
+    if text.contains("float2 ") || text.contains("float3 ") || text.contains("float4 ") { score += 1; }
+    if text.contains("uint2 ") || text.contains("uint3 ") || text.contains("uint4 ") { score += 1; }
+    if text.contains("half2 ") || text.contains("half3 ") || text.contains("half4 ") { score += 1; }
+    if text.contains("SV_Position") || text.contains("SV_Target") || text.contains("SV_DispatchThreadID") { score += 2; }
+    if text.contains("cbuffer ") || text.contains("StructuredBuffer") || text.contains("RWTexture") { score += 2; }
+    if text.contains("[numthreads") || text.contains("[maxvertexcount") { score += 2; }
 
     // === Operators and syntax patterns ===
     let semicolons = text.matches(';').count();
@@ -3699,12 +3732,24 @@ fn guess_language(code: &str) -> Option<String> {
         s
     };
 
-    let max = c_score.max(rust_score).max(python_score).max(js_score).max(glsl_score);
+    // HLSL indicators
+    let hlsl_score = {
+        let mut s = 0u32;
+        if code.contains("float2 ") || code.contains("float3 ") || code.contains("float4 ") { s += 1; }
+        if code.contains("uint2 ") || code.contains("uint3 ") || code.contains("uint4 ") { s += 1; }
+        if code.contains("SV_Position") || code.contains("SV_Target") { s += 3; }
+        if code.contains("cbuffer ") || code.contains("StructuredBuffer") { s += 2; }
+        if code.contains("[numthreads") { s += 3; }
+        s
+    };
+
+    let max = c_score.max(rust_score).max(python_score).max(js_score).max(glsl_score).max(hlsl_score);
     if max < 2 {
         return None;
     }
 
-    if c_score == max { Some("c".to_string()) }
+    if hlsl_score == max && hlsl_score >= 2 { Some("hlsl".to_string()) }
+    else if c_score == max { Some("c".to_string()) }
     else if rust_score == max { Some("rust".to_string()) }
     else if python_score == max { Some("python".to_string()) }
     else if js_score == max { Some("javascript".to_string()) }
@@ -5959,6 +6004,51 @@ mod tests {
         ];
         let result = place(nodes, &[(30, 1, "Chapter 3 Concepts", false)]);
         assert_eq!(result[0], (30, "H:3 Concepts".into()));
+    }
+
+    // ── code detection tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_count_italic_spans() {
+        // Real italic: *word*
+        assert_eq!(count_italic_spans("This is *italic* text"), 1);
+        assert_eq!(count_italic_spans("*foo* and *bar*"), 2);
+        // Multiplication in code: a * b
+        assert_eq!(count_italic_spans("0.5f * 1023.0f"), 0);
+        assert_eq!(count_italic_spans("a * b * c * d"), 0);
+        // No italics
+        assert_eq!(count_italic_spans("no stars here"), 0);
+    }
+
+    #[test]
+    fn test_hlsl_code_not_demoted_to_text() {
+        let hlsl = " 1     uint4 EncodeTBN(in float3 normal, in float3 tangent, in uint bitangentHandedness)\n \
+ 2     {\n \
+ 3       // octahedron normal vector encoding\n \
+ 4       uint2 encodedNormal = uint2((EncodeNormal(normal) * 0.5f + 0.5f) * 1023.0f);\n \
+ 5\n \
+ 6       // find largest component of tangent\n \
+ 7       float3 tangentAbs = abs(tangent);\n \
+ 8       float maxComp = max(max(tangentAbs.x, tangentAbs.y), tangentAbs.z);\n \
+ 9       float3 refVector;\n \
+10       uint compIndex;\n \
+11       if(maxComp == tangentAbs.x)\n \
+12       {\n \
+13         refVector = float3(1.0f, 0.0f, 0.0f);\n \
+14         compIndex = 0;\n \
+15       }";
+        // Should score highly for code
+        assert!(code_score(hlsl) >= 2, "HLSL code_score too low: {}", code_score(hlsl));
+        // Multiplication * should NOT trigger italic detection
+        assert_eq!(count_italic_spans(hlsl), 0);
+        // Should be detected as code
+        let mut nodes = vec![ReflowNode::Algorithm { content: hlsl.to_string() }];
+        detect_code_blocks(&mut nodes);
+        assert!(
+            matches!(&nodes[0], ReflowNode::CodeBlock { .. }),
+            "HLSL Algorithm should become CodeBlock, got: {:?}",
+            std::mem::discriminant(&nodes[0])
+        );
     }
 
     // ── is_labeled_block tests ───────────────────────────────────────
