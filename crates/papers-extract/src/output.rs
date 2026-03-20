@@ -795,7 +795,12 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
                 !margin_stamps.contains(&norm)
             });
             // Strip embedded stamps from longer paragraphs and tables.
+            // Only modify text-like sections — don't truncate headings/titles
+            // (their "## " prefix would get chopped, leaving bare "##").
             for sec in &mut sections {
+                if !sec.is_text && sec.kind != RegionKind::References {
+                    continue;
+                }
                 for stamp in &margin_stamps {
                     let lower = sec.markdown.to_lowercase();
                     if let Some(pos) = lower.find(stamp.as_str()) {
@@ -1239,6 +1244,11 @@ pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<
             RegionKind::ParagraphTitle => {
                 // Section heading — strip the "## " prefix
                 let title = text.strip_prefix("## ").unwrap_or(text).to_string();
+                let title = collapse_spaced_letters(&title);
+                let title = title.replace("**", "");
+                if title.trim().is_empty() || title.trim() == "##" {
+                    continue;
+                }
                 if is_labeled_block(&title) {
                     // Labeled blocks (Example, Tip, Algorithm headings) are content
                     ReflowNode::Text {
@@ -1735,7 +1745,12 @@ pub fn reflow_with_outline(
             }
             RegionKind::ParagraphTitle => {
                 let title = text.strip_prefix("## ").unwrap_or(text).to_string();
-                if title.is_empty() {
+                let title = collapse_spaced_letters(&title);
+                // Strip bold markers — the region type already conveys
+                // "heading"; inline ** from text extraction would cause
+                // double-wrapping when we bold the label below.
+                let title = title.replace("**", "");
+                if title.trim().is_empty() || title.trim() == "##" {
                     continue;
                 }
 
@@ -3642,6 +3657,8 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 let title = collapse_spaced_letters(&combined);
                 let title = split_concatenated_allcaps(&title);
                 let title = fix_missing_spaces_in_title(&title);
+                // Strip bold markers — heading markdown already conveys emphasis
+                let title = title.replace("**", "");
                 parts.push(format!("{hashes} {title}"));
                 render_children(children, parts);
             }

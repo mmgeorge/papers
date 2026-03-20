@@ -32,6 +32,8 @@ pub struct PdfChar {
     pub font_size: f32,
     /// Whether the font is italic (excluding symbolic/math fonts).
     pub is_italic: bool,
+    /// Whether the font is bold (excluding symbolic/math fonts).
+    pub is_bold: bool,
 }
 
 /// Get the CropBox offset for a page.
@@ -159,6 +161,11 @@ fn push_char(
     // (like LinLibertineTI) also set the symbolic flag due to custom encodings.
     let is_italic = char_info.font_is_italic() && !is_math_font(&font_name);
 
+    // Bold detection: use font name patterns (same heuristic as TOC depth
+    // classification). Skip math/symbol fonts that may contain bold glyphs
+    // as part of their design (not text bold).
+    let is_bold = is_bold_font(&font_name) && !is_math_font(&font_name);
+
     chars.push(PdfChar {
         codepoint: c,
         bbox: [
@@ -171,6 +178,7 @@ fn push_char(
         font_name: font_name.clone(),
         font_size,
         is_italic,
+        is_bold,
     });
 }
 
@@ -227,6 +235,21 @@ pub fn is_math_font(name: &str) -> bool {
         || n.contains("DINGBAT")
         // Libertine/Stix math variants (not text italic)
         || n.contains("LIBERTINEMATH") || n.contains("MATHMI")
+}
+
+/// Check if a font name matches known bold font patterns.
+///
+/// Detects bold variants by common naming conventions: "Bold", "-Bd",
+/// "Demi", "Heavy", "Black", and TeX bold-extended (bx10, bx12).
+pub fn is_bold_font(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.contains("bold")
+        || lower.contains("-bd")
+        || lower.contains("demi")
+        || lower.contains("heavy")
+        || lower.contains("black")
+        || lower.ends_with("bx10")
+        || lower.ends_with("bx12")
 }
 
 fn is_high_surrogate(raw: u32) -> bool {

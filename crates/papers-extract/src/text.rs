@@ -41,6 +41,8 @@ struct ImageChar<'a> {
     font_size: f32,
     /// Whether the character is rendered in an italic font.
     is_italic: bool,
+    /// Whether the character is rendered in a bold font.
+    is_bold: bool,
     _source: &'a PdfChar,
 }
 
@@ -87,6 +89,7 @@ fn to_image_char<'a>(c: &'a PdfChar, page_height_pt: f32) -> ImageChar<'a> {
         space_threshold: c.space_threshold,
         font_size: c.font_size,
         is_italic: c.is_italic,
+        is_bold: c.is_bold,
         _source: c,
     }
 }
@@ -1388,6 +1391,7 @@ fn build_line_text(
     let AccentMerge { ref accented_bases, ref accent_ptrs } = *accent_merge;
 
     let mut in_italic = false;
+    let mut in_bold = false;
 
     // Helper: find the next non-space, non-control element's italic status.
     let next_non_space_italic = |from: usize| -> bool {
@@ -1395,6 +1399,20 @@ fn build_line_text(
             match e {
                 LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' ' => {
                     return c.is_italic;
+                }
+                LineElement::Formula { .. } | LineElement::FormulaPlaceholder { .. } => return false,
+                _ => continue,
+            }
+        }
+        false
+    };
+
+    // Helper: find the next non-space, non-control element's bold status.
+    let next_non_space_bold = |from: usize| -> bool {
+        for e in &elements[from..] {
+            match e {
+                LineElement::Char(c) if !c.codepoint.is_control() && c.codepoint != ' ' => {
+                    return c.is_bold;
                 }
                 LineElement::Formula { .. } | LineElement::FormulaPlaceholder { .. } => return false,
                 _ => continue,
@@ -1457,9 +1475,14 @@ fn build_line_text(
                             avg_width * 0.3
                         };
                         if threshold > 0.0 && gap >= threshold && !text.ends_with(' ') {
+                            // Close italic before bold (proper nesting)
                             if in_italic && !c.is_italic {
                                 text.push('*');
                                 in_italic = false;
+                            }
+                            if in_bold && !c.is_bold {
+                                text.push_str("**");
+                                in_bold = false;
                             }
                             text.push(' ');
                         }
@@ -1496,9 +1519,14 @@ fn build_line_text(
                         true // no previous char — keep the space
                     };
                     if space_valid {
+                        // Close italic before bold (proper nesting)
                         if in_italic && !next_non_space_italic(ei + 1) {
                             text.push('*');
                             in_italic = false;
+                        }
+                        if in_bold && !next_non_space_bold(ei + 1) {
+                            text.push_str("**");
+                            in_bold = false;
                         }
                         text.push(' ');
                     }
@@ -1508,9 +1536,27 @@ fn build_line_text(
                         text.push('*');
                         in_italic = false;
                     }
+                    if in_bold {
+                        text.push_str("**");
+                        in_bold = false;
+                    }
                     text.push_str(&format!("$\\{cmd}{{{}}}", c.codepoint));
                     text.push('$');
                 } else {
+                    // Bold transitions (outer wrapper)
+                    if c.is_bold && !in_bold {
+                        text.push_str("**");
+                        in_bold = true;
+                    } else if !c.is_bold && in_bold {
+                        // Close italic first for proper nesting
+                        if in_italic {
+                            text.push('*');
+                            in_italic = false;
+                        }
+                        text.push_str("**");
+                        in_bold = false;
+                    }
+                    // Italic transitions (inner wrapper)
                     if c.is_italic && !in_italic {
                         text.push('*');
                         in_italic = true;
@@ -1530,6 +1576,10 @@ fn build_line_text(
                 if in_italic {
                     text.push('*');
                     in_italic = false;
+                }
+                if in_bold {
+                    text.push_str("**");
+                    in_bold = false;
                 }
                 let trimmed = text.trim_end();
                 if trimmed.ends_with('$') && trimmed.len() > 1 {
@@ -1555,6 +1605,10 @@ fn build_line_text(
                     text.push('*');
                     in_italic = false;
                 }
+                if in_bold {
+                    text.push_str("**");
+                    in_bold = false;
+                }
                 if !text.is_empty() && !text.ends_with(' ') {
                     text.push(' ');
                 }
@@ -1566,6 +1620,9 @@ fn build_line_text(
     }
     if in_italic {
         text.push('*');
+    }
+    if in_bold {
+        text.push_str("**");
     }
     collapse_spaces(&text)
 }
@@ -2409,6 +2466,7 @@ mod tests {
             font_name: String::new(),
             font_size: 10.0,
             is_italic,
+            is_bold: false,
         }
     }
 
@@ -2578,6 +2636,7 @@ mod tests {
             font_name: String::new(),
             font_size: 10.0,
             is_italic: false,
+            is_bold: false,
         };
         let img = to_image_char(&top_char, page_h);
         // In image space, this should be near y=0 (top of page)
@@ -2592,6 +2651,7 @@ mod tests {
             font_name: String::new(),
             font_size: 10.0,
             is_italic: false,
+            is_bold: false,
         };
         let img = to_image_char(&bottom_char, page_h);
         // In image space, this should be near y=790 (bottom of page)
@@ -3250,6 +3310,7 @@ mod tests {
             font_name: String::new(),
             font_size,
             is_italic: false,
+            is_bold: false,
         }
     }
 
@@ -3629,6 +3690,7 @@ mod tests {
             font_name: String::new(),
             font_size,
             is_italic: false,
+            is_bold: false,
         }
     }
 

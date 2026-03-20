@@ -8,6 +8,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pdf::is_bold_font;
+
 use crate::headings;
 use crate::pdf::PdfChar;
 
@@ -222,17 +224,6 @@ impl FontSig {
             is_all_caps,
         }
     }
-}
-
-fn is_bold_font(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("bold")
-        || lower.contains("-bd")
-        || lower.contains("demi")
-        || lower.contains("heavy")
-        || lower.contains("black")
-        || lower.ends_with("bx10")
-        || lower.ends_with("bx12")
 }
 
 /// Classification assigned during pattern matching.
