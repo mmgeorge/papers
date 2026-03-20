@@ -1397,7 +1397,7 @@ pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<
     }
 
     // Post-process and build the heading tree.
-    postprocess_flat_nodes(&mut flat_nodes);
+    postprocess_flat_nodes(&mut flat_nodes, false);
     build_heading_tree(flat_nodes)
 }
 
@@ -1518,11 +1518,14 @@ pub(crate) fn compute_page_offsets(
         std::collections::HashMap::new();
 
     for entry in &body_entries {
+        // Collect all candidate (offset, page_idx) pairs for this entry.
+        // Then pick the single best match — the one closest to the expected
+        // page (i.e., smallest positive offset, since offset should be constant
+        // across all entries).  This prevents generic titles like "Bibliography"
+        // from casting votes at every occurrence in the book.
+        let mut candidates: Vec<(i32, u32)> = Vec::new();
         for page in &result.pages {
             let page_idx = page.page.saturating_sub(1);
-            // Skip TOC pages — matching a heading on a TOC page gives a
-            // wrong offset since the heading there is a TOC entry, not the
-            // actual section.
             if toc_pages.contains(&page_idx) {
                 continue;
             }
@@ -1534,10 +1537,16 @@ pub(crate) fn compute_page_offsets(
 
                 if titles_match(&entry.title, text) {
                     let offset = page_idx as i32 - (entry.page_value - 1) as i32;
-                    *offset_votes.entry(offset).or_default() += 1;
-                    break; // one match per page per entry is enough
+                    candidates.push((offset, page_idx));
+                    break; // one match per page is enough
                 }
             }
+        }
+        // Vote for only the first match with a non-negative offset.
+        // The first match (lowest page_idx) with offset >= 0 is most likely
+        // the correct one, since pages are in order and the offset is constant.
+        if let Some(&(off, _)) = candidates.iter().find(|(o, _)| *o >= 0) {
+            *offset_votes.entry(off).or_default() += 1;
         }
     }
 
@@ -1560,6 +1569,7 @@ pub(crate) fn compute_page_offsets(
     let mut fm_offset_votes: std::collections::HashMap<i32, usize> =
         std::collections::HashMap::new();
     for entry in &fm_entries {
+        let mut candidates: Vec<(i32, u32)> = Vec::new();
         for page in &result.pages {
             let page_idx = page.page.saturating_sub(1);
             if toc_pages.contains(&page_idx) {
@@ -1571,12 +1581,14 @@ pub(crate) fn compute_page_offsets(
                 }
                 let Some(ref text) = region.text else { continue };
                 if titles_match(&entry.title, text) {
-                    // fm_offset = page_idx - (-page_value - 1)
                     let fm_offset = page_idx as i32 - (-entry.page_value - 1);
-                    *fm_offset_votes.entry(fm_offset).or_default() += 1;
+                    candidates.push((fm_offset, page_idx));
                     break;
                 }
             }
+        }
+        if let Some(&(off, _)) = candidates.iter().find(|(o, _)| *o >= 0) {
+            *fm_offset_votes.entry(off).or_default() += 1;
         }
     }
 
@@ -1721,13 +1733,31 @@ pub fn reflow_with_outline(
         headings.push((page, depth.max(1), entry.title.clone(), is_toc_entry));
     }
 
-    // Step 4: Determine front matter boundary.
-    // Everything before the first heading's page is FrontMatter.
+    // Step 4: Sort headings by page and fix front-matter placement.
+    //
+    // Front-matter entries (like "Preface") use a separate fm_offset which
+    // may be wrong, causing them to map to pages inside the body range.
+    // Fix: clamp front-matter headings to before the first body heading.
+    let first_body_page = headings.iter()
+        .zip(toc_entries.iter())
+        .find(|(_, entry)| !matches!(entry.kind, TocEntryKind::FrontMatter))
+        .map(|((p, _, _, _), _)| *p);
+
+    if let Some(body_start) = first_body_page {
+        // Headings still correspond 1:1 to toc_entries at this point.
+        for (heading, entry) in headings.iter_mut().zip(toc_entries.iter()) {
+            if matches!(entry.kind, TocEntryKind::FrontMatter) && heading.0 >= body_start {
+                // Clamp to just before the first body heading.
+                heading.0 = body_start.saturating_sub(1);
+            }
+        }
+    }
+
+    // Sort by page (stable sort preserves TOC order for same-page headings).
+    headings.sort_by_key(|(page, _, _, _)| *page);
+
     let first_heading_page = headings.first().map(|(p, _, _, _)| *p).unwrap_or(0);
 
-    // Pre-compute normalized TOC heading titles for duplicate suppression.
-    let heading_titles_norm: Vec<String> =
-        headings.iter().map(|(_, _, t, _)| normalize_title(t)).collect();
     let max_toc_depth = toc_entries.iter().map(|e| e.depth).max().unwrap_or(1);
 
     // Collect front matter sections (before first heading page)
@@ -1747,7 +1777,7 @@ pub fn reflow_with_outline(
     let mut flat_nodes: Vec<ReflowNode> = Vec::new();
 
     if !fm_children.is_empty() {
-        postprocess_flat_nodes(&mut fm_children);
+        postprocess_flat_nodes(&mut fm_children, false);
         flat_nodes.push(ReflowNode::FrontMatter {
             children: fm_children,
         });
@@ -1775,28 +1805,43 @@ pub fn reflow_with_outline(
         })
         .collect();
 
-    // Walk sections, emitting content nodes.  TOC headings are NOT emitted
-    // here — they are placed in a second pass that locates the real heading
-    // text on the page and replaces it.  This avoids inserting headings at
-    // the wrong position (page start) when the heading actually appears
-    // partway through the page.
+    // ── Anchor-based heading placement ──────────────────────────────
     //
-    // We tag each content node with the page it came from so the second
-    // pass can restrict its search to the correct page.
+    // Pre-pass: for each TOC heading, find its matching ParagraphTitle
+    // on the target page.  The section index becomes a placement anchor.
+    // Main pass: emit headings at their anchor position (or page boundary
+    // as fallback).  Content before a heading on the same page stays
+    // under the previous heading.
 
-    // (page_idx, node) pairs — page_idx is u32::MAX for non-page nodes.
-    let mut tagged_nodes: Vec<(u32, ReflowNode)> = Vec::new();
+    let anchors = find_heading_anchors(&headings, &sections);
+    let consumed_sections: std::collections::HashSet<usize> =
+        anchors.iter().filter_map(|a| *a).collect();
 
-    // Track which pages are TOC pages so we can suppress their content.
-    let toc_page_set_local: std::collections::HashSet<u32> =
-        toc_pages.iter().copied().collect();
+    // Build emission maps:
+    // - anchored headings fire just before their anchor section
+    // - unanchored headings fire at the page boundary (first content on page)
+    let mut heading_before_section: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut heading_at_page_start: std::collections::HashMap<u32, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (h_idx, anchor) in anchors.iter().enumerate() {
+        if let Some(s_idx) = anchor {
+            heading_before_section.entry(*s_idx).or_default().push(h_idx);
+        } else {
+            heading_at_page_start
+                .entry(headings[h_idx].0)
+                .or_default()
+                .push(h_idx);
+        }
+    }
 
-    // Track heading schedule index — we still need it to detect when we
-    // cross into TOC-heading territory (to suppress raw TOC content).
-    let mut heading_idx: usize = 0;
+    let mut emitted_page_starts: std::collections::HashSet<u32> =
+        std::collections::HashSet::new();
+    let mut emitted_headings: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     let mut in_toc_heading = false;
 
-    for sec in &sections {
+    for (s_idx, sec) in sections.iter().enumerate() {
         if sec.page_idx < first_heading_page {
             continue;
         }
@@ -1805,18 +1850,36 @@ pub fn reflow_with_outline(
             continue;
         }
 
-        // Advance heading_idx to track TOC-heading suppression.
-        while heading_idx < headings.len() && headings[heading_idx].0 <= sec.page_idx {
-            let (_, _, _, is_toc_entry) = &headings[heading_idx];
-            if *is_toc_entry {
-                in_toc_heading = true;
-            } else {
-                in_toc_heading = false;
+        // On first content of a new page, emit unanchored headings
+        if emitted_page_starts.insert(sec.page_idx) {
+            if let Some(h_indices) = heading_at_page_start.get(&sec.page_idx) {
+                for &h_idx in h_indices {
+                    emit_heading(
+                        h_idx, &headings, &toc_rendered,
+                        &mut flat_nodes, &mut in_toc_heading,
+                    );
+                    emitted_headings.insert(h_idx);
+                }
             }
-            heading_idx += 1;
+        }
+
+        // Emit anchored headings that fire before this section
+        if let Some(h_indices) = heading_before_section.get(&s_idx) {
+            for &h_idx in h_indices {
+                emit_heading(
+                    h_idx, &headings, &toc_rendered,
+                    &mut flat_nodes, &mut in_toc_heading,
+                );
+                emitted_headings.insert(h_idx);
+            }
         }
 
         if in_toc_heading {
+            continue;
+        }
+
+        // Skip consumed ParagraphTitles (matched as heading anchors)
+        if consumed_sections.contains(&s_idx) {
             continue;
         }
 
@@ -1839,17 +1902,10 @@ pub fn reflow_with_outline(
             RegionKind::ParagraphTitle => {
                 let title = text.strip_prefix("## ").unwrap_or(text).to_string();
                 let title = collapse_spaced_letters(&title);
-                // Strip bold markers — the region type already conveys
-                // "heading"; inline ** from text extraction would cause
-                // double-wrapping when we bold the label below.
                 let title = title.replace("**", "");
                 if title.trim().is_empty() || title.trim() == "##" {
                     continue;
                 }
-
-                // Don't suppress ParagraphTitles that match TOC headings —
-                // let them flow through as Text so place_toc_headings can
-                // find and replace them at the correct position.
 
                 if is_labeled_block(&title) {
                     ReflowNode::Text {
@@ -1868,8 +1924,6 @@ pub fn reflow_with_outline(
                             children: Vec::new(),
                         }
                     } else {
-                        // Emit as text — the TOC replace pass will promote
-                        // it to a heading if it matches a TOC entry.
                         ReflowNode::Text {
                             content: title,
                             footnotes: Vec::new(),
@@ -1880,16 +1934,20 @@ pub fn reflow_with_outline(
             _ => section_to_content_node(sec),
         };
 
-        tagged_nodes.push((sec.page_idx, node));
+        flat_nodes.push(node);
     }
 
-    // Place TOC headings by locating the real heading text on each page.
-    place_toc_headings(&mut tagged_nodes, &headings, &heading_titles_norm, &toc_rendered);
+    // Emit any remaining headings not yet emitted (pages with no content)
+    for h_idx in 0..headings.len() {
+        if !emitted_headings.contains(&h_idx) {
+            emit_heading(
+                h_idx, &headings, &toc_rendered,
+                &mut flat_nodes, &mut in_toc_heading,
+            );
+        }
+    }
 
-    // Strip page tags — from here on we work with plain flat_nodes.
-    flat_nodes = tagged_nodes.into_iter().map(|(_, node)| node).collect();
-
-    postprocess_flat_nodes(&mut flat_nodes);
+    postprocess_flat_nodes(&mut flat_nodes, has_parts);
     let mut doc = build_heading_tree(flat_nodes);
 
     // Clear garbage titles (e.g. just "#", short fragments, or truncated text)
@@ -2256,122 +2314,83 @@ fn split_table_caption(md: &str) -> (String, Option<String>) {
     (md.to_string(), None)
 }
 
-// ── TOC heading placement ────────────────────────────────────────────
+// ── Anchor-based heading placement helpers ───────────────────────────
 
-/// Place TOC headings by locating the real heading text on each page.
-///
-/// For each TOC heading, searches for a text node on its target page whose
-/// content matches the heading title.  When found, the text node is **replaced**
-/// with the proper `Heading` node (carrying the TOC's numbering and depth).
-///
-/// If no matching text is found on the page, the heading is **injected** before
-/// the first content node from that page as a fallback.
-fn place_toc_headings(
-    tagged_nodes: &mut Vec<(u32, ReflowNode)>,
+/// For each TOC heading, find the ParagraphTitle section on its target page
+/// that matches the heading title.  Returns `Vec<Option<usize>>` parallel
+/// to `headings` — `Some(section_index)` when an anchor was found, `None`
+/// for page-boundary fallback.
+fn find_heading_anchors(
     headings: &[(u32, u32, String, bool)],
-    heading_titles_norm: &[String],
-    toc_rendered: &[crate::types::TocEntryRendered],
-) {
-    let heading_stripped: Vec<String> = headings
-        .iter()
-        .map(|(_, _, title, _)| strip_numbering(title))
-        .collect();
-
-    let mut placed = vec![false; headings.len()];
-
-    // Pass 1: find and replace matching text nodes.
-    for (hi, (page, depth, title, is_toc_entry)) in headings.iter().enumerate() {
-        let title_norm = &heading_titles_norm[hi];
-        let title_stripped = &heading_stripped[hi];
-
-        let mut match_idx: Option<usize> = None;
-        for (ni, (pg, node)) in tagged_nodes.iter().enumerate() {
-            if *pg < *page {
-                continue;
-            }
-            if *pg > *page {
-                break;
-            }
-            let content = match node {
-                ReflowNode::Text { content, .. } => content.trim(),
-                _ => continue,
-            };
-            if content.is_empty() || content.len() > 120 {
-                continue;
-            }
-            let content_norm = normalize_title(content);
-            let content_stripped = strip_numbering(content);
-
-            let exact = content_norm == *title_norm;
-            let stripped = !title_stripped.is_empty()
-                && title_stripped.len() >= 3
-                && *title_stripped == content_stripped;
-            let section_match = {
-                let tn = title_norm.split_whitespace().next().unwrap_or("");
-                let cn = content_norm.split_whitespace().next().unwrap_or("");
-                !tn.is_empty()
-                    && tn == cn
-                    && (tn.contains('.') || tn.starts_with("chapter"))
-            };
-
-            if exact || stripped || section_match {
-                match_idx = Some(ni);
-                break;
-            }
-        }
-
-        if let Some(ni) = match_idx {
-            let (sec, txt) = parse_section_and_text(title);
-            tagged_nodes[ni] = (
-                *page,
-                ReflowNode::Heading {
-                    depth: *depth,
-                    text: txt,
-                    section: sec,
-                    children: Vec::new(),
-                },
-            );
-            if *is_toc_entry {
-                tagged_nodes.insert(
-                    ni + 1,
-                    (*page, ReflowNode::Toc { entries: toc_rendered.to_vec() }),
-                );
-            }
-            placed[hi] = true;
-        }
+    sections: &[Section],
+) -> Vec<Option<usize>> {
+    // Build page → section index range lookup.
+    let mut page_ranges: std::collections::HashMap<u32, (usize, usize)> =
+        std::collections::HashMap::new();
+    for (i, sec) in sections.iter().enumerate() {
+        page_ranges
+            .entry(sec.page_idx)
+            .and_modify(|(_, end)| *end = i + 1)
+            .or_insert((i, i + 1));
     }
 
-    // Pass 2: inject unmatched headings at page boundary (fallback).
-    // Process in reverse so insertions don't shift indices of earlier headings.
-    for hi in (0..headings.len()).rev() {
-        if placed[hi] {
-            continue;
-        }
-        let (page, depth, ref title, is_toc_entry) = headings[hi];
-        let insert_pos = tagged_nodes
-            .iter()
-            .position(|(pg, _)| *pg >= page)
-            .unwrap_or(tagged_nodes.len());
+    let mut claimed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut anchors: Vec<Option<usize>> = Vec::with_capacity(headings.len());
 
-        let (sec, txt) = parse_section_and_text(title);
-        tagged_nodes.insert(
-            insert_pos,
-            (
-                page,
-                ReflowNode::Heading {
-                    depth,
-                    text: txt,
-                    section: sec,
-                    children: Vec::new(),
-                },
-            ),
-        );
-        if is_toc_entry {
-            tagged_nodes.insert(
-                insert_pos + 1,
-                (page, ReflowNode::Toc { entries: toc_rendered.to_vec() }),
-            );
+    for (page, _, title, _) in headings {
+        let mut found = None;
+
+        if let Some(&(start, end)) = page_ranges.get(page) {
+            for s_idx in start..end {
+                if claimed.contains(&s_idx) {
+                    continue;
+                }
+                if sections[s_idx].kind != RegionKind::ParagraphTitle {
+                    continue;
+                }
+                let sec_text = sections[s_idx].markdown.trim();
+                let sec_text = sec_text.strip_prefix("## ").unwrap_or(sec_text);
+                let sec_text = collapse_spaced_letters(sec_text);
+                let sec_text = sec_text.replace("**", "");
+                if sec_text.trim().is_empty() {
+                    continue;
+                }
+
+                if titles_match(title, &sec_text) {
+                    found = Some(s_idx);
+                    claimed.insert(s_idx);
+                    break; // first match on page wins (reading order)
+                }
+            }
         }
+        anchors.push(found);
+    }
+    anchors
+}
+
+/// Emit a TOC heading node (and optional Toc listing) into flat_nodes.
+fn emit_heading(
+    h_idx: usize,
+    headings: &[(u32, u32, String, bool)],
+    toc_rendered: &[crate::types::TocEntryRendered],
+    flat_nodes: &mut Vec<ReflowNode>,
+    in_toc_heading: &mut bool,
+) {
+    let (_, depth, ref title, is_toc_entry) = headings[h_idx];
+    let (section, text_part) = parse_section_and_text(title);
+    flat_nodes.push(ReflowNode::Heading {
+        depth,
+        text: text_part,
+        section,
+        children: Vec::new(),
+    });
+    if is_toc_entry {
+        flat_nodes.push(ReflowNode::Toc {
+            entries: toc_rendered.to_vec(),
+        });
+        *in_toc_heading = true;
+    } else {
+        *in_toc_heading = false;
     }
 }
 
@@ -2379,11 +2398,15 @@ fn place_toc_headings(
 
 /// Apply all post-processing passes to the flat node list before building
 /// the heading tree.
-fn postprocess_flat_nodes(flat_nodes: &mut Vec<ReflowNode>) {
+fn postprocess_flat_nodes(flat_nodes: &mut Vec<ReflowNode>, has_parts: bool) {
     dedup_heading_echo(flat_nodes);
     dedup_heading_echo_multiline(flat_nodes);
-    reorder_parent_before_child(flat_nodes);
-    reorder_headings_by_numbering(flat_nodes);
+    // Skip heading reordering when the book has Parts — section numbers
+    // restart per Part, so cross-section reordering scrambles the structure.
+    if !has_parts {
+        reorder_parent_before_child(flat_nodes);
+        reorder_headings_by_numbering(flat_nodes);
+    }
     dedup_consecutive_text(flat_nodes);
     dedup_footnotes(flat_nodes);
     detect_lists(flat_nodes);
@@ -5829,181 +5852,328 @@ mod tests {
         }
     }
 
-    // ── place_toc_headings tests ────────────────────────────────────
+    // ── find_heading_anchors tests ─────────────────────────────────
 
-    /// Helper: run place_toc_headings and return (page, label) pairs.
-    fn place(
-        nodes: Vec<(u32, ReflowNode)>,
-        headings: &[(u32, u32, &str, bool)],
-    ) -> Vec<(u32, String)> {
-        let mut tagged = nodes;
-        let headings_owned: Vec<(u32, u32, String, bool)> = headings
-            .iter()
-            .map(|(p, d, t, toc)| (*p, *d, t.to_string(), *toc))
-            .collect();
-        let norms: Vec<String> = headings_owned
-            .iter()
-            .map(|(_, _, t, _)| normalize_title(t))
-            .collect();
-        place_toc_headings(&mut tagged, &headings_owned, &norms, &[]);
-        tagged
-            .iter()
-            .map(|(pg, node)| (*pg, node_label(node)))
-            .collect()
-    }
-
-    fn tp(page: u32, s: &str) -> (u32, ReflowNode) {
-        (page, ReflowNode::Text { content: s.to_string(), footnotes: vec![] })
+    fn make_section(page_idx: u32, kind: RegionKind, text: &str) -> Section {
+        Section {
+            markdown: text.to_string(),
+            kind,
+            page_idx,
+            y_top: 0.0,
+            y_bottom: 10.0,
+            x_left: 0.0,
+            x_right: 100.0,
+            is_text: kind == RegionKind::Text,
+            is_references: false,
+            is_formula: false,
+            is_short_line: false,
+            formula_path: None,
+        }
     }
 
     #[test]
-    fn test_place_heading_replaces_echo_on_correct_page() {
-        // "Conclusions" text on page 49 should be replaced by "1.4 Conclusions" heading
-        let nodes = vec![
-            tp(49, "glEnableClientState( GL_VERTEX_ARRAY ); glEnableClientState( GL_COLOR_ARRAY ); ...long code..."),
-            tp(49, "which is certainly shorter and feels more elegant."),
-            tp(49, "Conclusions"),
-            tp(49, "The fixed-function graphics pipeline has shown itself to be very valuable..."),
+    fn test_anchor_finds_paragraph_title_on_page() {
+        let sections = vec![
+            make_section(5, RegionKind::Text, "leftover content"),
+            make_section(5, RegionKind::ParagraphTitle, "## 1.5 Conclusions"),
+            make_section(5, RegionKind::Text, "We propose..."),
         ];
-        let result = place(nodes, &[(49, 2, "1.4 Conclusions", false)]);
-        assert_eq!(result[2], (49, "H:1.4 Conclusions".into()));
-        assert_eq!(result.len(), 4); // no extra nodes injected
+        let headings = vec![(5, 3, "1.5 Conclusions".to_string(), false)];
+        let anchors = find_heading_anchors(&headings, &sections);
+        assert_eq!(anchors, vec![Some(1)]);
     }
 
     #[test]
-    fn test_place_heading_exact_match() {
-        // Exact normalized match: "1.4 Conclusions" text matches "1.4 Conclusions" heading
-        let nodes = vec![
-            tp(10, "Some content before"),
-            tp(10, "1.4 Conclusions"),
-            tp(10, "Body text here"),
+    fn test_anchor_not_found_returns_none() {
+        let sections = vec![
+            make_section(5, RegionKind::Text, "some content"),
+            make_section(5, RegionKind::Text, "more content"),
         ];
-        let result = place(nodes, &[(10, 2, "1.4 Conclusions", false)]);
-        assert_eq!(result[1], (10, "H:1.4 Conclusions".into()));
+        let headings = vec![(5, 3, "1.5 Conclusions".to_string(), false)];
+        let anchors = find_heading_anchors(&headings, &sections);
+        assert_eq!(anchors, vec![None]);
     }
 
     #[test]
-    fn test_place_heading_stripped_match() {
-        // Stripped match: TOC has "1.4 Conclusions", page text is just "Conclusions"
-        let nodes = vec![
-            tp(20, "Conclusions"),
-            tp(20, "Body text"),
+    fn test_anchor_claimed_not_reused() {
+        // Two headings target same page; only one "Bibliography" ParagraphTitle
+        let sections = vec![
+            make_section(5, RegionKind::ParagraphTitle, "## Bibliography"),
         ];
-        let result = place(nodes, &[(20, 2, "1.4 Conclusions", false)]);
-        assert_eq!(result[0], (20, "H:1.4 Conclusions".into()));
+        let headings = vec![
+            (5, 3, "Bibliography".to_string(), false),
+            (5, 3, "Bibliography".to_string(), false),
+        ];
+        let anchors = find_heading_anchors(&headings, &sections);
+        assert_eq!(anchors[0], Some(0)); // first claims it
+        assert_eq!(anchors[1], None);     // second gets fallback
     }
 
     #[test]
-    fn test_place_heading_section_number_match() {
-        // Section number match: content has "1.4 Summary" but TOC has "1.4 Conclusions"
-        // — both share "1.4" prefix
-        let nodes = vec![
-            tp(20, "1.4 Summary of Results"),
+    fn test_anchor_does_not_match_wrong_page() {
+        let sections = vec![
+            make_section(3, RegionKind::ParagraphTitle, "## 1.5 Conclusions"),
+            make_section(5, RegionKind::Text, "some content"),
         ];
-        let result = place(nodes, &[(20, 2, "1.4 Conclusions", false)]);
-        assert_eq!(result[0], (20, "H:1.4 Conclusions".into()));
+        let headings = vec![(5, 3, "1.5 Conclusions".to_string(), false)];
+        let anchors = find_heading_anchors(&headings, &sections);
+        // ParagraphTitle is on page 3, heading targets page 5 → no match
+        assert_eq!(anchors, vec![None]);
+    }
+
+    // ── reflow_with_outline integration tests ───────────────────────
+
+    /// Build a TocEntry with defaults for page_label.
+    fn toc(title: &str, page_value: i32, depth: u32, kind: TocEntryKind) -> TocEntry {
+        TocEntry {
+            title: title.to_string(),
+            page_label: page_value.to_string(),
+            page_value,
+            depth,
+            kind,
+        }
+    }
+
+    /// Build a minimal ExtractionResult with the given (page_0indexed, kind, text) tuples.
+    fn make_extraction(sections: &[(u32, RegionKind, &str)], total_pages: u32) -> ExtractionResult {
+        use crate::types::Metadata;
+        let mut pages = Vec::new();
+        for page_idx in 0..total_pages {
+            let regions: Vec<Region> = sections
+                .iter()
+                .filter(|(p, _, _)| *p == page_idx)
+                .enumerate()
+                .map(|(i, (_, kind, text_str))| Region {
+                    id: format!("r{page_idx}_{i}"),
+                    kind: *kind,
+                    bbox: [0.0, 0.0, 100.0, 20.0],
+                    confidence: 0.9,
+                    order: i as u32,
+                    text: Some(text_str.to_string()),
+                    html: None,
+                    latex: None,
+                    formula_source: None,
+                    ocr_confidence: None,
+                    image_path: None,
+                    caption: None,
+                    chart_type: None,
+                    tag: None,
+                    items: None,
+                    consumed: false,
+                })
+                .collect();
+            pages.push(Page {
+                page: page_idx + 1, // 1-indexed
+                width_pt: 612.0,
+                height_pt: 792.0,
+                dpi: 144,
+                regions,
+            });
+        }
+        ExtractionResult {
+            metadata: Metadata {
+                filename: "test.pdf".to_string(),
+                page_count: total_pages,
+                extraction_time_ms: 0,
+            },
+            pages,
+        }
+    }
+
+    /// Collect all Heading nodes from the reflow doc in tree order.
+    fn collect_headings(doc: &ReflowDocument) -> Vec<(u32, String)> {
+        let mut out = Vec::new();
+        fn walk(nodes: &[ReflowNode], out: &mut Vec<(u32, String)>) {
+            for n in nodes {
+                match n {
+                    ReflowNode::Heading { depth, text, section, children } => {
+                        let full = format_heading_title(section.as_deref(), text);
+                        out.push((*depth, full));
+                        walk(children, out);
+                    }
+                    ReflowNode::FrontMatter { children } => walk(children, out),
+                    _ => {}
+                }
+            }
+        }
+        walk(&doc.children, &mut out);
+        out
     }
 
     #[test]
-    fn test_place_heading_no_match_injects_at_page_start() {
-        // No matching text on the page — heading injected before first content
-        let nodes = vec![
-            tp(5, "Earlier page content"),
-            tp(10, "First content on page 10"),
-            tp(10, "More content"),
+    fn test_reflow_no_duplicate_headings() {
+        // Simulate: TOC has "1.1 Introduction" at page 3, and a ParagraphTitle
+        // "Introduction" also appears on page 3 after some body text.
+        // The ParagraphTitle should be suppressed — no duplicate heading.
+        let sections = vec![
+            (3, RegionKind::Text, "Body text before the heading on the same page."),
+            (3, RegionKind::ParagraphTitle, "1.1 Introduction"),
+            (3, RegionKind::Text, "The actual introduction content."),
+            (4, RegionKind::Text, "More content on next page."),
         ];
-        let result = place(nodes, &[(10, 2, "1.4 Conclusions", false)]);
-        assert_eq!(result[1], (10, "H:1.4 Conclusions".into()));
-        assert_eq!(result[2], (10, "T:First content on page 10".into()));
+        let result = make_extraction(&sections, 5);
+        let toc_entries = vec![toc("1.1 Introduction", 4, 2, TocEntryKind::Section)];
+        let doc = reflow_with_outline(&result, &toc_entries, &[], 5, &Default::default());
+        let headings = collect_headings(&doc);
+        let intro_count = headings.iter().filter(|(_, t)| t == "1.1 Introduction").count();
+        assert_eq!(intro_count, 1, "Expected 1 heading, got {intro_count}: {headings:?}");
     }
 
     #[test]
-    fn test_place_heading_does_not_match_wrong_page() {
-        // "Conclusions" exists but on page 48, heading targets page 49
-        // Should NOT replace page 48 text; should inject at page 49 boundary
-        let nodes = vec![
-            tp(48, "Conclusions"),
-            tp(49, "First content on page 49"),
+    fn test_reflow_content_before_heading_stays_under_previous() {
+        // Critical anchor test: content on the page BEFORE the ParagraphTitle
+        // should stay under the PREVIOUS heading, not the new one.
+        let sections = vec![
+            (4, RegionKind::Text, "Content under 2.2."),
+            (5, RegionKind::Text, "Leftover 2.2 content on next page."),
+            (5, RegionKind::ParagraphTitle, "2.3 Algorithm"),
+            (5, RegionKind::Text, "The algorithm works as follows..."),
         ];
-        let result = place(nodes, &[(49, 2, "1.4 Conclusions", false)]);
-        // Page 48 text unchanged
-        assert_eq!(result[0], (48, "T:Conclusions".into()));
-        // Heading injected before page 49 content
-        assert_eq!(result[1], (49, "H:1.4 Conclusions".into()));
-        assert_eq!(result[2], (49, "T:First content on page 49".into()));
+        let result = make_extraction(&sections, 10);
+        let toc_entries = vec![
+            toc("2.2 Background", 5, 2, TocEntryKind::Section),
+            toc("2.3 Algorithm", 6, 2, TocEntryKind::Section),
+        ];
+        let doc = reflow_with_outline(&result, &toc_entries, &[], 10, &Default::default());
+
+        // Check: "2.3 Algorithm" should appear exactly once
+        let headings = collect_headings(&doc);
+        let algo_count = headings.iter().filter(|(_, t)| t == "2.3 Algorithm").count();
+        assert_eq!(algo_count, 1, "Echo should be suppressed: {headings:?}");
+
+        // Check: "Leftover 2.2 content" should be under "2.2 Background", NOT "2.3 Algorithm"
+        fn find_text_under_heading<'a>(nodes: &'a [ReflowNode], target: &str) -> Vec<&'a str> {
+            let mut result = Vec::new();
+            for n in nodes {
+                if let ReflowNode::Heading { text, section, children, .. } = n {
+                    let full = format_heading_title(section.as_deref(), text);
+                    if full == target {
+                        for c in children {
+                            if let ReflowNode::Text { content, .. } = c {
+                                result.push(content.as_str());
+                            }
+                        }
+                    }
+                    result.extend(find_text_under_heading(children, target));
+                }
+            }
+            result
+        }
+
+        let bg_texts = find_text_under_heading(&doc.children, "2.2 Background");
+        assert!(
+            bg_texts.iter().any(|t| t.contains("Leftover 2.2")),
+            "Leftover content should be under 2.2, not 2.3. 2.2 has: {bg_texts:?}"
+        );
+
+        let algo_texts = find_text_under_heading(&doc.children, "2.3 Algorithm");
+        assert!(
+            !algo_texts.iter().any(|t| t.contains("Leftover 2.2")),
+            "Leftover content should NOT be under 2.3. 2.3 has: {algo_texts:?}"
+        );
     }
 
     #[test]
-    fn test_place_multiple_headings_same_page() {
-        // Two headings on same page — each replaces its own echo
-        let nodes = vec![
-            tp(10, "The Traditional View"),
-            tp(10, "Some intro text about the traditional view that is long enough to skip."),
-            tp(10, "The Vertex Operation"),
-            tp(10, "Content about vertices"),
+    fn test_reflow_multiple_headings_same_page_no_dupes() {
+        // Two TOC headings on the same page, both with ParagraphTitle echoes.
+        let sections = vec![
+            (10, RegionKind::ParagraphTitle, "1.1 The Traditional View"),
+            (10, RegionKind::Text, "Intro text about the traditional view."),
+            (10, RegionKind::ParagraphTitle, "1.1.1 The Vertex Operation"),
+            (10, RegionKind::Text, "Content about vertices."),
         ];
-        let result = place(nodes, &[
-            (10, 2, "1.1 The Traditional View", false),
-            (10, 3, "1.1.1 The Vertex Operation", false),
-        ]);
-        assert_eq!(result[0], (10, "H:1.1 The Traditional View".into()));
-        assert_eq!(result[2], (10, "H:1.1.1 The Vertex Operation".into()));
-        assert_eq!(result.len(), 4); // no extras
+        let result = make_extraction(&sections, 15);
+        let toc_entries = vec![
+            toc("1.1 The Traditional View", 11, 2, TocEntryKind::Section),
+            toc("1.1.1 The Vertex Operation", 11, 3, TocEntryKind::Subsection),
+        ];
+        let doc = reflow_with_outline(&result, &toc_entries, &[], 15, &Default::default());
+        let headings = collect_headings(&doc);
+        let view_count = headings.iter().filter(|(_, t)| t == "1.1 The Traditional View").count();
+        let vertex_count = headings.iter().filter(|(_, t)| t == "1.1.1 The Vertex Operation").count();
+        assert_eq!(view_count, 1, "Duplicate heading: {headings:?}");
+        assert_eq!(vertex_count, 1, "Duplicate heading: {headings:?}");
     }
 
     #[test]
-    fn test_place_heading_ignores_long_text() {
-        // Text > 120 chars should never be matched as a heading echo
-        let long_text = "Conclusions ".repeat(20); // well over 120 chars
-        let nodes = vec![
-            tp(10, &long_text),
-            tp(10, "Conclusions"),
+    fn test_reflow_heading_order_matches_toc() {
+        // Headings should appear in TOC order, not scrambled.
+        let sections = vec![
+            (3, RegionKind::ParagraphTitle, "1.1 Introduction"),
+            (3, RegionKind::Text, "Intro content."),
+            (5, RegionKind::ParagraphTitle, "1.2 Methods"),
+            (5, RegionKind::Text, "Methods content."),
+            (8, RegionKind::ParagraphTitle, "1.3 Results"),
+            (8, RegionKind::Text, "Results content."),
         ];
-        let result = place(nodes, &[(10, 2, "1.4 Conclusions", false)]);
-        // Should match the short one, not the long one
-        assert_eq!(result[1], (10, "H:1.4 Conclusions".into()));
+        let result = make_extraction(&sections, 10);
+        let toc_entries = vec![
+            toc("1.1 Introduction", 4, 2, TocEntryKind::Section),
+            toc("1.2 Methods", 6, 2, TocEntryKind::Section),
+            toc("1.3 Results", 9, 2, TocEntryKind::Section),
+        ];
+        let doc = reflow_with_outline(&result, &toc_entries, &[], 10, &Default::default());
+        let headings = collect_headings(&doc);
+        let titles: Vec<&str> = headings.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(titles, vec!["1.1 Introduction", "1.2 Methods", "1.3 Results"]);
     }
 
     #[test]
-    fn test_place_heading_preserves_content_before_echo() {
-        // Content before the echo on the same page should NOT be displaced
-        let nodes = vec![
-            tp(49, "Code from previous section that runs over to this page"),
-            tp(49, "More leftover content"),
-            tp(49, "Conclusions"),
-            tp(49, "The actual conclusions body text"),
+    fn test_reflow_parts_with_restarting_numbers() {
+        // Simulates a book like zen0: Part I has Ch 1, Part II has Ch 1 again.
+        // Both "1 Foo" and "1 Bar" should appear, not be suppressed as echoes
+        // of each other (they have different stripped titles).
+        let sections = vec![
+            (1, RegionKind::ParagraphTitle, "Foo Chapter"),
+            (1, RegionKind::Text, "Content of Foo."),
+            (5, RegionKind::ParagraphTitle, "Bar Chapter"),
+            (5, RegionKind::Text, "Content of Bar."),
         ];
-        let result = place(nodes, &[(49, 2, "1.4 Conclusions", false)]);
-        // Content before echo stays in place
-        assert_eq!(result[0].1, "T:Code from previous section that runs ...");
-        assert_eq!(result[1].1, "T:More leftover content");
-        // Echo replaced
-        assert_eq!(result[2], (49, "H:1.4 Conclusions".into()));
-        // Content after echo stays
-        assert_eq!(result[3].1, "T:The actual conclusions body text");
+        let result = make_extraction(&sections, 10);
+        let toc_entries = vec![
+            toc("I First Part", 1, 0, TocEntryKind::Part),
+            toc("1 Foo Chapter", 2, 1, TocEntryKind::Chapter),
+            toc("II Second Part", 5, 0, TocEntryKind::Part),
+            toc("1 Bar Chapter", 6, 1, TocEntryKind::Chapter),
+        ];
+        let doc = reflow_with_outline(&result, &toc_entries, &[], 10, &Default::default());
+        let headings = collect_headings(&doc);
+        let titles: Vec<&str> = headings.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(titles.contains(&"1 Foo Chapter"), "Missing Foo: {titles:?}");
+        assert!(titles.contains(&"1 Bar Chapter"), "Missing Bar: {titles:?}");
     }
 
     #[test]
-    fn test_place_heading_fallback_empty_page() {
-        // Heading targets a page with no content — inject at end
-        let nodes = vec![
-            tp(5, "Content on page 5"),
+    fn test_reflow_non_toc_paragraph_title_not_suppressed() {
+        // A ParagraphTitle that does NOT match any TOC entry should still appear.
+        let sections = vec![
+            (3, RegionKind::ParagraphTitle, "1.3.1 Sub-detail"),
+            (3, RegionKind::Text, "Content about sub-detail."),
         ];
-        let result = place(nodes, &[(10, 2, "1.4 Conclusions", false)]);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[1], (10, "H:1.4 Conclusions".into()));
+        let result = make_extraction(&sections, 5);
+        let toc_entries = vec![toc("1.3 Results", 4, 2, TocEntryKind::Section)];
+        let doc = reflow_with_outline(&result, &toc_entries, &[], 5, &Default::default());
+        let headings = collect_headings(&doc);
+        // "1.3.1 Sub-detail" is deeper than max TOC depth (2), so infer_heading_depth
+        // should promote it to a sub-heading. It should NOT be suppressed.
+        let sub_count = headings.iter().filter(|(_, t)| t.contains("Sub-detail")).count();
+        assert!(sub_count >= 1, "Sub-heading should not be suppressed: {headings:?}");
     }
 
     #[test]
-    fn test_place_heading_chapter_match() {
-        // "Chapter 3 Concepts" in TOC matches "Chapter 3 Concepts" on page
-        // parse_section_and_text strips "Chapter" label → section="3", text="Concepts"
-        let nodes = vec![
-            tp(30, "Chapter 3 Concepts"),
-            tp(30, "Body text"),
+    fn test_reflow_labeled_block_not_suppressed() {
+        // "Figure 3.2" ParagraphTitle should become bold text, not be suppressed.
+        let sections = vec![
+            (5, RegionKind::ParagraphTitle, "Figure 3.2"),
+            (5, RegionKind::Text, "A figure description."),
         ];
-        let result = place(nodes, &[(30, 1, "Chapter 3 Concepts", false)]);
-        assert_eq!(result[0], (30, "H:3 Concepts".into()));
+        let result = make_extraction(&sections, 10);
+        let toc_entries = vec![toc("3 Methods", 5, 1, TocEntryKind::Chapter)];
+        let doc = reflow_with_outline(&result, &toc_entries, &[], 10, &Default::default());
+        // "Figure 3.2" should not appear as a heading
+        let headings = collect_headings(&doc);
+        let fig_heading = headings.iter().any(|(_, t)| t.contains("Figure 3.2"));
+        assert!(!fig_heading, "Figure label should not be a heading: {headings:?}");
     }
 
     // ── code detection tests ──────────────────────────────────────────

@@ -82,9 +82,14 @@ fn extract_row_cells(tr_html: &str) -> Vec<ParsedCell> {
         let colspan = parse_span_attr(opening_tag_lower, "colspan");
         let rowspan = parse_span_attr(opening_tag_lower, "rowspan");
 
-        let close_tag = lower[tag_close..]
-            .find("</th>")
-            .or_else(|| lower[tag_close..].find("</td>"));
+        // Find the matching close tag — must match the opening tag type
+        // to avoid grabbing </th> when inside a <td>.
+        let is_th = opening_tag_lower.starts_with("<th");
+        let close_tag = if is_th {
+            lower[tag_close..].find("</th>")
+        } else {
+            lower[tag_close..].find("</td>")
+        };
 
         let cell_content_end = match close_tag {
             Some(p) => tag_close + p,
@@ -176,6 +181,32 @@ fn build_table_grid(html: &str) -> (Vec<Vec<Option<String>>>, usize) {
             }
 
             col += cell.colspan;
+        }
+    }
+
+    // Fix: if header rows are narrower than body rows, the TableFormer
+    // skeleton is missing empty leading cells (e.g., the top-left corner
+    // of a table with row labels). Shift header content right to align.
+    // Must check BEFORE padding all rows to uniform width.
+    if thead_row_count > 0 && thead_row_count < grid.len() {
+        let header_max_len = grid[..thead_row_count]
+            .iter()
+            .map(|r| r.len())
+            .max()
+            .unwrap_or(0);
+        let body_max_len = grid[thead_row_count..]
+            .iter()
+            .map(|r| r.len())
+            .max()
+            .unwrap_or(0);
+
+        if body_max_len > header_max_len {
+            let shift = body_max_len - header_max_len;
+            for row in grid.iter_mut().take(thead_row_count) {
+                let mut padded = vec![None; shift];
+                padded.append(row);
+                *row = padded;
+            }
         }
     }
 
@@ -609,5 +640,122 @@ mod tests {
         let lines: Vec<&str> = md.lines().collect();
         assert_eq!(lines[2], "| tall | x |");
         assert_eq!(lines[3], "| tall | y |");
+    }
+
+    #[test]
+    fn missing_top_left_corner_cell() {
+        // Header has 6 cols (3 colspan=2), body has 7 (1 label + 6 data).
+        // The empty top-left corner cell is missing from the header.
+        let html = "<table><thead>\
+                     <tr><th colspan=\"2\">Group A</th><th colspan=\"2\">Group B</th><th colspan=\"2\">Group C</th></tr>\
+                     <tr><th>X</th><th>Y</th><th>X</th><th>Y</th><th>X</th><th>Y</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>Row1</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td></tr>\
+                     <tr><td>Row2</td><td>7</td><td>8</td><td>9</td><td>10</td><td>11</td><td>12</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        // Header should be padded on the left to align with 7-column body
+        assert_eq!(lines[0], "|  | Group A X | Group A Y | Group B X | Group B Y | Group C X | Group C Y |");
+        // Data rows should have 7 columns
+        assert!(lines[2].starts_with("| Row1 |"));
+        assert!(lines[2].ends_with("| 6 |"));
+    }
+
+    #[test]
+    fn deferred_plus_table() {
+        // Real-world table from GPU Zen Zero: 2-row header with colspan=2 groups.
+        // The empty corner cell IS present in both header rows as <td></td>.
+        let html = "<table><thead>\
+                     <tr><td></td><th colspan=\"2\">Deferred+ (single pass)</th>\
+                     <th colspan=\"2\">Deferred+ (multi-pass)</th>\
+                     <th colspan=\"2\">Clustered forward renderer</th></tr>\
+                     <tr><td></td><th>Culling on</th><th>Culling off</th>\
+                     <th>Culling on</th><th>Culling off</th>\
+                     <th>Culling on</th><th>Culling off</th></tr>\
+                     </thead>\
+                     <tr><td>Frame time</td><td>5.86</td><td>6.92</td>\
+                     <td>6.50</td><td>8.29</td><td>9.33</td><td>12.47</td></tr>\
+                     </table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        eprintln!("Header: {}", lines[0]);
+        eprintln!("Sep:    {}", lines[1]);
+        eprintln!("Data:   {}", lines[2]);
+        // Header should have 7 columns with proper parent-child pairing
+        assert!(lines[0].contains("Deferred+ (single pass) Culling on"),
+            "First Deferred+ group should pair with Culling on: {}", lines[0]);
+        assert!(lines[0].contains("Deferred+ (single pass) Culling off"),
+            "First Deferred+ group should pair with Culling off: {}", lines[0]);
+        // Data row should have 7 columns
+        assert_eq!(lines[2], "| Frame time | 5.86 | 6.92 | 6.50 | 8.29 | 9.33 | 12.47 |");
+    }
+
+    #[test]
+    fn aligned_header_not_shifted() {
+        // Header and body have same column count — no shift needed
+        let html = "<table><thead>\
+                     <tr><th></th><th colspan=\"2\">Group</th></tr>\
+                     <tr><th></th><th>A</th><th>B</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>X</td><td>1</td><td>2</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "|  | Group A | Group B |");
+        assert_eq!(lines[2], "| X | 1 | 2 |");
+    }
+
+    #[test]
+    fn td_th_close_tag_mismatch() {
+        // Regression: <td> in a row with <th> cells must find </td>, not </th>.
+        // Before the fix, <td></td><th>A</th> would parse as one cell
+        // containing "</td><th>A" because </th> was found before </td>.
+        let html = "<table><thead>\
+                     <tr><td>label</td><th>A</th><th>B</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>x</td><td>1</td><td>2</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "| label | A | B |", "td/th cells must not merge");
+        assert_eq!(lines[2], "| x | 1 | 2 |");
+    }
+
+    #[test]
+    fn td_empty_corner_with_th_colspan() {
+        // Empty <td> corner cell followed by <th colspan> groups.
+        // The <td></td> must not consume the following <th>.
+        let html = "<table><thead>\
+                     <tr><td></td><th colspan=\"2\">Group</th></tr>\
+                     <tr><td></td><th>X</th><th>Y</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>R1</td><td>1</td><td>2</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        assert_eq!(lines[0], "|  | Group X | Group Y |");
+        assert_eq!(lines[2], "| R1 | 1 | 2 |");
+    }
+
+    #[test]
+    fn header_shift_missing_corner() {
+        // Header rows have 6 cols (no corner cell), body has 7.
+        // Header should be padded on the left.
+        let html = "<table><thead>\
+                     <tr><th colspan=\"3\">A</th><th colspan=\"3\">B</th></tr>\
+                     <tr><th>a1</th><th>a2</th><th>a3</th><th>b1</th><th>b2</th><th>b3</th></tr>\
+                     </thead><tbody>\
+                     <tr><td>Row</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td><td>6</td></tr>\
+                     </tbody></table>";
+        let md = html_table_to_markdown(html).unwrap();
+        let lines: Vec<&str> = md.lines().collect();
+        // Header must be shifted right to align with 7-col body
+        assert!(lines[0].starts_with("|  |"), "header should have empty first col: {}", lines[0]);
+        assert!(lines[2].starts_with("| Row |"), "body should start with Row: {}", lines[2]);
+        // Both should have 7 columns
+        let header_cols = lines[0].matches('|').count() - 1;
+        let body_cols = lines[2].matches('|').count() - 1;
+        assert_eq!(header_cols, body_cols, "header and body must have same column count");
     }
 }
