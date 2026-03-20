@@ -255,21 +255,105 @@ fn appendix_letter(text: &str) -> Option<char> {
     None
 }
 
-/// Check if a heading text is a labeled block (Example, Tip, Algorithm)
+/// Check if a heading text is a labeled block (Example, Figure, Theorem, etc.)
 /// that should be treated as content rather than a structural heading.
+///
+/// Case-insensitive matching with flexible numbering: "Figure 2-4",
+/// "EXAMPLE 3.1", "Definition 1", "Proof", etc.
 fn is_labeled_block(text: &str) -> bool {
     let text = text.trim();
-    text.starts_with("Example ")
-        || text.starts_with("Tip ")
-        || text.starts_with("Algorithm ")
-        || text.starts_with("Figure ")
-        || text.starts_with("Fig. ")
-        || text.starts_with("Fig ")
-        || text.starts_with("Table ")
-        || text.starts_with("TABLE ")
-        || text.starts_with("Listing ")
-        || text.starts_with("FIGURE ")
-        || text.starts_with("ACM Reference Format")
+    let labels = [
+        "example", "tip", "algorithm", "figure", "fig.", "fig",
+        "table", "listing", "exercise", "definition", "theorem",
+        "lemma", "corollary", "proposition", "proof", "remark",
+    ];
+    let lower = text.to_lowercase();
+    for label in &labels {
+        if lower.starts_with(label) {
+            let rest = &lower[label.len()..];
+            if rest.is_empty() {
+                // Bare label like "Proof" — only if short (not a sentence)
+                return text.len() < 40;
+            }
+            let next = rest.chars().next().unwrap();
+            // Must be followed by space, digit, dot, hyphen, or colon
+            if next == ' ' || next == '.' || next == '-' || next == ':'
+                || next.is_ascii_digit()
+            {
+                return true;
+            }
+        }
+    }
+    lower.starts_with("acm reference format")
+}
+
+/// Detect if a line contains leader dots (TOC-style dot patterns).
+///
+/// Matches patterns like:
+/// - `"Introduction .................. 3"` (dense dots + page number)
+/// - `"3.1 Introduction . . . . . . . 3-1"` (spaced dots + hyphenated page)
+/// - `"Contents ..................."` (dense dots, no page number)
+fn has_leader_dots(line: &str) -> bool {
+    let t = line.trim();
+    if t.len() < 10 {
+        return false;
+    }
+    // Pattern 1: 3+ consecutive dots with page-number-like ending
+    if t.contains("...") {
+        let last_word = t.split_whitespace().last().unwrap_or("");
+        if is_page_number_like(last_word) {
+            return true;
+        }
+        // Dense dots (5+) even without a page number
+        if t.contains(".....") {
+            return true;
+        }
+    }
+    // Pattern 2: Spaced dots ". . ." with page-number-like ending
+    if t.contains(". . .") {
+        let last_word = t.split_whitespace().last().unwrap_or("");
+        if is_page_number_like(last_word) {
+            return true;
+        }
+    }
+    // Pattern 3: Many dots (10+) making up >20% of the line
+    let dot_count = t.chars().filter(|c| *c == '.').count();
+    if dot_count >= 10 && (dot_count as f32 / t.len() as f32) > 0.2 {
+        return true;
+    }
+    false
+}
+
+/// Check if a string looks like a page number: "3", "142", "3-1", "A-3", "xii".
+fn is_page_number_like(s: &str) -> bool {
+    let s = s.trim_end_matches(|c: char| matches!(c, '.' | ')' | ']'));
+    if s.is_empty() || s.len() > 5 {
+        return false;
+    }
+    // Pure digits: "3", "15", "142"
+    if s.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    // Hyphenated: "3-1", "A-3"
+    if s.contains('-') {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() == 2
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.len() <= 4 && p.chars().all(|c| c.is_ascii_alphanumeric()))
+        {
+            return true;
+        }
+    }
+    // Roman numerals: "xii", "iv", "VII"
+    let lower = s.to_lowercase();
+    if lower
+        .chars()
+        .all(|c| matches!(c, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
+    {
+        return true;
+    }
+    false
 }
 
 /// Check if a heading text is a back-matter section (references, index, etc.)
@@ -824,25 +908,19 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
     }
 
     // --- Fix O: Filter TOC-like body content (mini-TOCs at chapter starts) ---
+    // Covers both Text and FormattedText regions with leader dot patterns.
     for sec in &mut sections {
-        if !sec.is_text {
+        if !sec.is_text && sec.kind != RegionKind::FormattedText {
             continue;
         }
         let text = sec.markdown.trim();
         let lines: Vec<&str> = text.lines().collect();
-        if lines.len() < 4 {
+        if lines.len() < 3 {
             continue;
         }
-        // Count lines with leader dots + page number pattern
         let toc_lines = lines
             .iter()
-            .filter(|line| {
-                let t = line.trim();
-                (t.contains("...") || t.contains(". . ."))
-                    && t.split_whitespace()
-                        .last()
-                        .map_or(false, |w| w.chars().all(|c| c.is_ascii_digit()) && w.len() <= 4)
-            })
+            .filter(|line| has_leader_dots(line.trim()))
             .count();
         if toc_lines as f32 / lines.len() as f32 > 0.4 {
             sec.markdown.clear();
@@ -1155,7 +1233,15 @@ fn section_to_content_node(sec: &Section) -> ReflowNode {
         }
         RegionKind::Image | RegionKind::Chart | RegionKind::Seal => {
             let (path, caption) = parse_figure_markdown(text);
-            ReflowNode::Figure { path, caption }
+            if path.is_empty() {
+                // No image path — emit caption as text if present
+                ReflowNode::Text {
+                    content: caption.unwrap_or_default(),
+                    footnotes: Vec::new(),
+                }
+            } else {
+                ReflowNode::Figure { path, caption }
+            }
         }
         RegionKind::Table => {
             let (content, caption) = split_table_caption(text);
@@ -1166,7 +1252,14 @@ fn section_to_content_node(sec: &Section) -> ReflowNode {
         },
         RegionKind::FigureGroup => {
             let (path, caption) = parse_figure_markdown(text);
-            ReflowNode::FigureGroup { path, caption }
+            if path.is_empty() {
+                ReflowNode::Text {
+                    content: caption.unwrap_or_default(),
+                    footnotes: Vec::new(),
+                }
+            } else {
+                ReflowNode::FigureGroup { path, caption }
+            }
         }
         RegionKind::References => ReflowNode::References {
             content: text.to_string(),
@@ -2340,36 +2433,58 @@ fn dedup_footnotes(flat_nodes: &mut Vec<ReflowNode>) {
 fn dedup_heading_echo(flat_nodes: &mut Vec<ReflowNode>) {
     let mut i = 0;
     while i + 1 < flat_nodes.len() {
-        let title_norm = if let ReflowNode::Heading { text, section, .. } = &flat_nodes[i] {
+        let (title_norm, heading_depth) = if let ReflowNode::Heading { text, section, depth, .. } = &flat_nodes[i] {
             let combined = format_heading_title(section.as_deref(), text);
             let n = normalize_title(&combined);
-            if n.len() >= 5 { Some(n) } else { None }
+            if n.len() >= 5 { (Some(n), *depth) } else { (None, 0) }
         } else {
-            None
+            (None, 0)
         };
 
         if let Some(title_norm) = title_norm {
-            if let ReflowNode::Text { content, .. } = &flat_nodes[i + 1] {
-                let content_norm = normalize_title(content);
-                // Match by normalized text OR by section number prefix
-                let section_match = {
-                    // Extract section number from both (e.g. "1.4.1" or "Chapter 10")
-                    let title_num = title_norm.split_whitespace().next().unwrap_or("");
-                    let content_num = content_norm.split_whitespace().next().unwrap_or("");
-                    !title_num.is_empty()
-                        && title_num == content_num
-                        && (title_num.contains('.') || title_num.starts_with("chapter"))
-                };
-                if content_norm == title_norm || content_norm.starts_with(&title_norm) || section_match {
-                    // Try to strip the duplicate prefix from the content
-                    let remainder = strip_title_echo(content, &title_norm);
-                    if remainder.trim().is_empty() {
-                        flat_nodes.remove(i + 1);
-                        continue;
-                    } else {
-                        if let ReflowNode::Text { content, .. } = &mut flat_nodes[i + 1] {
-                            *content = remainder;
+            // Search within a window of up to 5 nodes for the echo.
+            // Stop at the next heading of same or shallower depth.
+            let search_end = (i + 6).min(flat_nodes.len());
+            let mut echo_idx = None;
+
+            for j in (i + 1)..search_end {
+                match &flat_nodes[j] {
+                    ReflowNode::Heading { depth, .. } if *depth <= heading_depth => break,
+                    ReflowNode::Text { content, .. } => {
+                        let content_norm = normalize_title(content);
+                        let section_match = {
+                            let title_num = title_norm.split_whitespace().next().unwrap_or("");
+                            let content_num = content_norm.split_whitespace().next().unwrap_or("");
+                            !title_num.is_empty()
+                                && title_num == content_num
+                                && (title_num.contains('.') || title_num.starts_with("chapter"))
+                        };
+                        if content_norm == title_norm
+                            || content_norm.starts_with(&title_norm)
+                            || section_match
+                        {
+                            echo_idx = Some(j);
+                            break;
                         }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(j) = echo_idx {
+                let content = if let ReflowNode::Text { content, .. } = &flat_nodes[j] {
+                    content.clone()
+                } else {
+                    i += 1;
+                    continue;
+                };
+                let remainder = strip_title_echo(&content, &title_norm);
+                if remainder.trim().is_empty() {
+                    flat_nodes.remove(j);
+                    continue;
+                } else {
+                    if let ReflowNode::Text { content, .. } = &mut flat_nodes[j] {
+                        *content = remainder;
                     }
                 }
             }
@@ -3731,7 +3846,11 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 }
             }
             ReflowNode::Figure { path, caption } => {
-                if let Some(cap) = caption {
+                if path.is_empty() {
+                    if let Some(cap) = caption {
+                        parts.push(cap.clone());
+                    }
+                } else if let Some(cap) = caption {
                     parts.push(format!("![]({path})\n\n{cap}"));
                 } else {
                     parts.push(format!("![]({path})"));
@@ -3749,7 +3868,11 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 parts.push(format!("```\n{content}\n```"));
             }
             ReflowNode::FigureGroup { path, caption } => {
-                if let Some(cap) = caption {
+                if path.is_empty() {
+                    if let Some(cap) = caption {
+                        parts.push(cap.clone());
+                    }
+                } else if let Some(cap) = caption {
                     parts.push(format!("![]({path})\n\n{cap}"));
                 } else {
                     parts.push(format!("![]({path})"));
@@ -4052,14 +4175,24 @@ fn region_to_markdown(region: &Region) -> String {
         }
         RegionKind::Image | RegionKind::Chart | RegionKind::Seal => {
             let path = region.image_path.as_deref().unwrap_or("");
-            let caption_text = region
-                .caption
-                .as_ref()
-                .and_then(|c| c.text.as_deref());
-            if let Some(cap) = caption_text {
-                format!("![]({path})\n\n{}", bold_caption_label(cap))
+            if path.is_empty() {
+                // No image path — emit just the caption if present
+                region
+                    .caption
+                    .as_ref()
+                    .and_then(|c| c.text.as_deref())
+                    .map(|cap| bold_caption_label(cap))
+                    .unwrap_or_default()
             } else {
-                format!("![]({path})")
+                let caption_text = region
+                    .caption
+                    .as_ref()
+                    .and_then(|c| c.text.as_deref());
+                if let Some(cap) = caption_text {
+                    format!("![]({path})\n\n{}", bold_caption_label(cap))
+                } else {
+                    format!("![]({path})")
+                }
             }
         }
         RegionKind::Algorithm => {
@@ -5826,5 +5959,226 @@ mod tests {
         ];
         let result = place(nodes, &[(30, 1, "Chapter 3 Concepts", false)]);
         assert_eq!(result[0], (30, "H:3 Concepts".into()));
+    }
+
+    // ── is_labeled_block tests ───────────────────────────────────────
+
+    #[test]
+    fn test_is_labeled_block_basic() {
+        assert!(is_labeled_block("Example 3"));
+        assert!(is_labeled_block("Figure 1"));
+        assert!(is_labeled_block("Table 2"));
+        assert!(is_labeled_block("Listing 4"));
+        assert!(is_labeled_block("Algorithm 1"));
+        assert!(is_labeled_block("Fig. 5"));
+        assert!(is_labeled_block("Fig 5"));
+    }
+
+    #[test]
+    fn test_is_labeled_block_hyphenated() {
+        assert!(is_labeled_block("Figure 2-4"));
+        assert!(is_labeled_block("Example 3-3. A Sample Vertex Shader"));
+        assert!(is_labeled_block("Table 3-1: Performance Results"));
+    }
+
+    #[test]
+    fn test_is_labeled_block_case_insensitive() {
+        assert!(is_labeled_block("EXAMPLE 1"));
+        assert!(is_labeled_block("FIGURE 2"));
+        assert!(is_labeled_block("TABLE 3"));
+        assert!(is_labeled_block("figure 1"));
+    }
+
+    #[test]
+    fn test_is_labeled_block_dotted() {
+        assert!(is_labeled_block("Figure 2.4"));
+        assert!(is_labeled_block("Table 1.2.3"));
+        assert!(is_labeled_block("Example 3.1: Details"));
+    }
+
+    #[test]
+    fn test_is_labeled_block_extended() {
+        assert!(is_labeled_block("Definition 3.1"));
+        assert!(is_labeled_block("Theorem 2"));
+        assert!(is_labeled_block("Lemma 1"));
+        assert!(is_labeled_block("Corollary 4.2"));
+        assert!(is_labeled_block("Proposition 1"));
+    }
+
+    #[test]
+    fn test_is_labeled_block_bare_short() {
+        assert!(is_labeled_block("Proof"));
+        assert!(is_labeled_block("Remark"));
+        // Long sentence starting with a label word → not a block
+        assert!(!is_labeled_block(
+            "Examples of convergence in nonlinear optimization problems"
+        ));
+    }
+
+    #[test]
+    fn test_is_labeled_block_not_headings() {
+        assert!(!is_labeled_block("Introduction"));
+        assert!(!is_labeled_block("1.2 Methods"));
+        assert!(!is_labeled_block("Background"));
+        assert!(!is_labeled_block("Conclusions and Future Work"));
+    }
+
+    #[test]
+    fn test_is_labeled_block_partial_word() {
+        assert!(!is_labeled_block("Figurehead of the organization"));
+        assert!(!is_labeled_block("Tipping point analysis"));
+    }
+
+    #[test]
+    fn test_is_labeled_block_acm() {
+        assert!(is_labeled_block("ACM Reference Format"));
+    }
+
+    // ── has_leader_dots / is_page_number_like tests ──────────────────
+
+    #[test]
+    fn test_has_leader_dots_dense() {
+        assert!(has_leader_dots("Introduction .................. 3"));
+        assert!(has_leader_dots("3.1 Introduction .......................... 3-1"));
+        assert!(has_leader_dots("Background ........ 15"));
+    }
+
+    #[test]
+    fn test_has_leader_dots_spaced() {
+        assert!(has_leader_dots("2.1 Methods . . . . . . . . . . . 23"));
+    }
+
+    #[test]
+    fn test_has_leader_dots_no_page() {
+        assert!(has_leader_dots("Contents ..................."));
+    }
+
+    #[test]
+    fn test_has_leader_dots_roman() {
+        assert!(has_leader_dots("Preface ............... xii"));
+    }
+
+    #[test]
+    fn test_has_leader_dots_hyphenated() {
+        assert!(has_leader_dots("A.2 Setup .............. A-3"));
+    }
+
+    #[test]
+    fn test_has_leader_dots_no_false_positive() {
+        assert!(!has_leader_dots("Dr. Smith et al. found that..."));
+        assert!(!has_leader_dots("i.e. the approach works well."));
+        assert!(!has_leader_dots("Section 3.1.2 describes the method."));
+    }
+
+    #[test]
+    fn test_has_leader_dots_ellipsis_prose() {
+        assert!(!has_leader_dots("He said... and then left."));
+        assert!(!has_leader_dots("The results were... inconclusive."));
+    }
+
+    #[test]
+    fn test_is_page_number_like() {
+        assert!(is_page_number_like("3"));
+        assert!(is_page_number_like("142"));
+        assert!(is_page_number_like("3-1"));
+        assert!(is_page_number_like("A-3"));
+        assert!(is_page_number_like("xii"));
+        assert!(is_page_number_like("iv"));
+        assert!(!is_page_number_like("hello"));
+        assert!(!is_page_number_like("123456")); // too long
+        assert!(!is_page_number_like(""));
+    }
+
+    // ── Empty image / heading echo tests ─────────────────────────────
+
+    #[test]
+    fn test_render_empty_figure_skipped() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: Vec::new(),
+            children: vec![ReflowNode::Figure {
+                path: String::new(),
+                caption: Some("A caption".into()),
+            }],
+        };
+        let md = render_markdown_from_reflow(&doc);
+        assert!(!md.contains("![]()"), "empty image ref should not appear");
+        assert!(md.contains("A caption"), "caption should still render");
+    }
+
+    #[test]
+    fn test_render_figure_with_path() {
+        let doc = ReflowDocument {
+            title: None,
+            toc: Vec::new(),
+            children: vec![ReflowNode::Figure {
+                path: "images/p1_0.png".into(),
+                caption: None,
+            }],
+        };
+        let md = render_markdown_from_reflow(&doc);
+        assert!(md.contains("![](images/p1_0.png)"));
+    }
+
+    #[test]
+    fn test_dedup_heading_echo_exact() {
+        let mut nodes = vec![
+            ReflowNode::Heading {
+                depth: 1,
+                text: "Introduction".into(),
+                section: Some("3.1".into()),
+                children: Vec::new(),
+            },
+            ReflowNode::Text {
+                content: "3.1 Introduction".into(),
+                footnotes: Vec::new(),
+            },
+            ReflowNode::Text {
+                content: "Actual body text here.".into(),
+                footnotes: Vec::new(),
+            },
+        ];
+        dedup_heading_echo(&mut nodes);
+        assert_eq!(nodes.len(), 2, "echo should be removed");
+    }
+
+    #[test]
+    fn test_dedup_heading_echo_preserves_unrelated() {
+        let mut nodes = vec![
+            ReflowNode::Heading {
+                depth: 1,
+                text: "Methods".into(),
+                section: Some("2.1".into()),
+                children: Vec::new(),
+            },
+            ReflowNode::Text {
+                content: "Completely different paragraph.".into(),
+                footnotes: Vec::new(),
+            },
+        ];
+        dedup_heading_echo(&mut nodes);
+        assert_eq!(nodes.len(), 2, "unrelated text should not be removed");
+    }
+
+    #[test]
+    fn test_dedup_heading_echo_across_formula() {
+        let mut nodes = vec![
+            ReflowNode::Heading {
+                depth: 1,
+                text: "Results".into(),
+                section: Some("4.2".into()),
+                children: Vec::new(),
+            },
+            ReflowNode::Formula {
+                content: Some("$$x^2$$".into()),
+                path: None,
+            },
+            ReflowNode::Text {
+                content: "4.2 Results".into(),
+                footnotes: Vec::new(),
+            },
+        ];
+        dedup_heading_echo(&mut nodes);
+        assert_eq!(nodes.len(), 2, "echo past formula should be removed");
     }
 }

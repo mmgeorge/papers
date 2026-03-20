@@ -2608,12 +2608,12 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Introduction".into(),
+                    text: "1 Introduction".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Intro paragraph one.".into(), footnotes: vec![] },
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "1.1 Background".into(),
+                            text: "1.1 Background".into(), section: None,
                             children: vec![
                                 ReflowNode::Text { content: "Background text.".into(), footnotes: vec![] },
                             ],
@@ -2622,7 +2622,7 @@ mod tests {
                 },
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "2 Methods".into(),
+                    text: "2 Methods".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Methods paragraph.".into(), footnotes: vec![] },
                     ],
@@ -2658,7 +2658,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Math".into(),
+                    text: "1 Math".into(), section: None,
                     children: vec![
                         ReflowNode::Text {
                             content: "The energy is given by".into(),
@@ -2695,7 +2695,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Math".into(),
+                    text: "1 Math".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "See the formula below.".into(), footnotes: vec![] },
                         ReflowNode::Formula { content: None, path: Some("images/eq1.png".into()) },
@@ -2718,7 +2718,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Results".into(),
+                    text: "1 Results".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Some results.".into(), footnotes: vec![] },
                         ReflowNode::Figure {
@@ -2757,7 +2757,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Results".into(),
+                    text: "1 Results".into(), section: None,
                     children: vec![
                         ReflowNode::Figure {
                             path: "fig1.png".into(),
@@ -2796,7 +2796,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Intro".into(),
+                    text: "1 Intro".into(), section: None,
                     children: vec![
                         ReflowNode::Text {
                             content: "Main text with a citation.".into(),
@@ -2822,7 +2822,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Steps".into(),
+                    text: "1 Steps".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "The steps are:".into(), footnotes: vec![] },
                         ReflowNode::List {
@@ -2849,16 +2849,16 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Chapter".into(),
+                    text: "1 Chapter".into(), section: None,
                     children: vec![
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "1.1 Section".into(),
+                            text: "1.1 Section".into(), section: None,
                             children: vec![
                                 ReflowNode::Text { content: "Section text.".into(), footnotes: vec![] },
                                 ReflowNode::Heading {
                                     depth: 3,
-                                    title: "1.1.1 Subsection".into(),
+                                    text: "1.1.1 Subsection".into(), section: None,
                                     children: vec![
                                         ReflowNode::Text { content: "Subsection text.".into(), footnotes: vec![] },
                                     ],
@@ -2893,7 +2893,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Intro".into(),
+                    text: "1 Intro".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Main content.".into(), footnotes: vec![] },
                     ],
@@ -2901,7 +2901,7 @@ mod tests {
                 ReflowNode::References { content: "[1] Smith 2020.".into() },
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "Appendix".into(),
+                    text: "Appendix".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "This should be skipped.".into(), footnotes: vec![] },
                     ],
@@ -2943,12 +2943,12 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Empty Chapter".into(),
+                    text: "1 Empty Chapter".into(), section: None,
                     children: vec![],
                 },
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "2 Real Chapter".into(),
+                    text: "2 Real Chapter".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Real content.".into(), footnotes: vec![] },
                     ],
@@ -2972,7 +2972,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Code".into(),
+                    text: "1 Code".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Example code:".into(), footnotes: vec![] },
                         ReflowNode::CodeBlock {
@@ -2999,12 +2999,12 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Ch".into(),
+                    text: "1 Ch".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "P1.".into(), footnotes: vec![] },
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "1.1 Sec".into(),
+                            text: "1.1 Sec".into(), section: None,
                             children: vec![
                                 ReflowNode::Text { content: "P2.".into(), footnotes: vec![] },
                             ],
@@ -3034,7 +3034,7 @@ mod tests {
                 },
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Intro".into(),
+                    text: "1 Intro".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Real content.".into(), footnotes: vec![] },
                     ],
@@ -3057,7 +3057,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Intro".into(),
+                    text: "1 Intro".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Main text.".into(), footnotes: vec![] },
                         ReflowNode::Footnote {
@@ -3095,7 +3095,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Chapter".into(),
+                    text: "1 Chapter".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: para1.clone(), footnotes: vec![] },
                         ReflowNode::Text { content: para2.clone(), footnotes: vec![] },
@@ -3125,11 +3125,11 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Chapter".into(),
+                    text: "1 Chapter".into(), section: None,
                     children: vec![
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "1.1 Section A".into(),
+                            text: "1.1 Section A".into(), section: None,
                             children: vec![
                                 ReflowNode::Text { content: words(310), footnotes: vec![] },
                                 ReflowNode::Text { content: "A short tail.".into(), footnotes: vec![] },
@@ -3137,7 +3137,7 @@ mod tests {
                         },
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "1.2 Section B".into(),
+                            text: "1.2 Section B".into(), section: None,
                             children: vec![
                                 ReflowNode::Text { content: "Tiny section.".into(), footnotes: vec![] },
                             ],
@@ -3167,7 +3167,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Chapter".into(),
+                    text: "1 Chapter".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "First paragraph of chapter.".into(), footnotes: vec![] },
                         ReflowNode::Text { content: "Second short paragraph.".into(), footnotes: vec![] },
@@ -3198,7 +3198,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Math".into(),
+                    text: "1 Math".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: big_para, footnotes: vec![] },
                         ReflowNode::Formula {
@@ -3235,18 +3235,18 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 First".into(),
+                    text: "1 First".into(), section: None,
                     children: vec![
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "1.1 Sec A".into(),
+                            text: "1.1 Sec A".into(), section: None,
                             children: vec![
                                 ReflowNode::Text { content: "Content A.".into(), footnotes: vec![] },
                             ],
                         },
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "1.2 Sec B".into(),
+                            text: "1.2 Sec B".into(), section: None,
                             children: vec![
                                 ReflowNode::Text { content: "Content B.".into(), footnotes: vec![] },
                             ],
@@ -3255,11 +3255,11 @@ mod tests {
                 },
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "2 Second".into(),
+                    text: "2 Second".into(), section: None,
                     children: vec![
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "2.1 Sec C".into(),
+                            text: "2.1 Sec C".into(), section: None,
                             children: vec![
                                 ReflowNode::Text { content: "Content C.".into(), footnotes: vec![] },
                             ],
@@ -3287,7 +3287,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Figures".into(),
+                    text: "1 Figures".into(), section: None,
                     children: vec![
                         ReflowNode::FigureGroup {
                             path: "images/group1.png".into(),
@@ -3314,7 +3314,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Methods".into(),
+                    text: "1 Methods".into(), section: None,
                     children: vec![
                         ReflowNode::Algorithm {
                             content: "Algorithm 1: Training Loop\n1. Forward pass\n2. Backward pass\n3. Update weights".into(),
@@ -3347,7 +3347,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Points".into(),
+                    text: "1 Points".into(), section: None,
                     children: vec![
                         ReflowNode::List {
                             list_type: "bulleted".into(),
@@ -3374,7 +3374,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Misc".into(),
+                    text: "1 Misc".into(), section: None,
                     children: vec![
                         ReflowNode::FormattedText { content: "Key: Value\nFoo: Bar".into() },
                     ],
@@ -3396,7 +3396,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Intro".into(),
+                    text: "1 Intro".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Main text.".into(), footnotes: vec![] },
                     ],
@@ -3422,14 +3422,14 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Intro".into(),
+                    text: "1 Intro".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Before references.".into(), footnotes: vec![] },
                     ],
                 },
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "References".into(),
+                    text: "References".into(), section: None,
                     children: vec![
                         ReflowNode::Text { content: "Should not appear.".into(), footnotes: vec![] },
                     ],
@@ -3454,7 +3454,7 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Results".into(),
+                    text: "1 Results".into(), section: None,
                     children: vec![
                         ReflowNode::Figure {
                             path: "fig1.png".into(),
@@ -3497,23 +3497,23 @@ mod tests {
             children: vec![
                 ReflowNode::Heading {
                     depth: 1,
-                    title: "1 Chapter".into(),
+                    text: "1 Chapter".into(), section: None,
                     children: vec![
                         ReflowNode::Heading {
                             depth: 2,
-                            title: "1.1 Section".into(),
+                            text: "1.1 Section".into(), section: None,
                             children: vec![
                                 ReflowNode::Heading {
                                     depth: 3,
-                                    title: "1.1.1 Subsection".into(),
+                                    text: "1.1.1 Subsection".into(), section: None,
                                     children: vec![
                                         ReflowNode::Heading {
                                             depth: 4,
-                                            title: "1.1.1.1 Sub-subsection".into(),
+                                            text: "1.1.1.1 Sub-subsection".into(), section: None,
                                             children: vec![
                                                 ReflowNode::Heading {
                                                     depth: 5,
-                                                    title: "Deep heading".into(),
+                                                    text: "Deep heading".into(), section: None,
                                                     children: vec![
                                                         ReflowNode::Text {
                                                             content: "Deeply nested content.".into(),
@@ -3566,13 +3566,15 @@ mod tests {
                 });
                 chapter_children.push(ReflowNode::Heading {
                     depth: 2,
-                    title: format!("{ch}.{sec} Section"),
+                    text: format!("{ch}.{sec} Section"),
+                    section: None,
                     children: sec_children,
                 });
             }
             children.push(ReflowNode::Heading {
                 depth: 1,
-                title: format!("{ch} Chapter {ch}"),
+                text: format!("{ch} Chapter {ch}"),
+                section: None,
                 children: chapter_children,
             });
         }

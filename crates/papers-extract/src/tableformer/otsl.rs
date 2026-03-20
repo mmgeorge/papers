@@ -66,10 +66,12 @@ pub fn otsl_to_html(tokens: &[i64]) -> String {
         return String::new();
     }
 
-    // Pad to square (longest row)
+    // Pad to square (longest row).
+    // Use ECEL (empty cell) — NOT LCEL, which would be interpreted as
+    // colspan continuation and inflate every trailing cell's span.
     let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     for row in &mut rows {
-        row.resize(max_cols, LCEL);
+        row.resize(max_cols, ECEL);
     }
 
     // Build HTML
