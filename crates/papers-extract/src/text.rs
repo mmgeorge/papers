@@ -1421,6 +1421,31 @@ fn build_line_text(
         false
     };
 
+    // Compute adaptive space threshold from the gap distribution.
+    // In well-typeset text, there's a bimodal distribution: small kerning
+    // gaps (intra-word) and larger word gaps. The threshold should sit
+    // between these two clusters. If the font-metric threshold is too high,
+    // this adaptive value catches the actual word boundaries.
+    let adaptive_threshold = {
+        let mut gaps: Vec<f32> = Vec::new();
+        let mut pr: Option<f32> = None;
+        for elem in elements.iter() {
+            if let LineElement::Char(c) = elem {
+                if c.codepoint.is_control() || c.codepoint == ' ' {
+                    continue;
+                }
+                if let Some(prev) = pr {
+                    let gap = c.bbox[0] - prev;
+                    if gap > 0.01 {
+                        gaps.push(gap);
+                    }
+                }
+                pr = Some(c.bbox[2]);
+            }
+        }
+        compute_adaptive_space_threshold(&mut gaps)
+    };
+
     for (ei, elem) in elements.iter().enumerate() {
         match elem {
             LineElement::Char(c) => {
@@ -1439,11 +1464,16 @@ fn build_line_text(
                     if has_glyph || !c.codepoint.is_control() {
                         if let Some(pr) = prev_right {
                             let gap = c.bbox[0] - pr;
-                            let min_floor = avg_width * 0.25;
-                            let threshold = if c.space_threshold > 0.0 {
+                            let min_floor = avg_width * 0.20;
+                            let font_threshold = if c.space_threshold > 0.0 {
                                 c.space_threshold.max(min_floor)
                             } else {
                                 avg_width * 0.3
+                            };
+                            let threshold = if adaptive_threshold > 0.0 {
+                                font_threshold.min(adaptive_threshold).max(min_floor)
+                            } else {
+                                font_threshold
                             };
                             if threshold > 0.0 && gap >= threshold && !text.ends_with(' ') {
                                 text.push(' ');
@@ -1466,13 +1496,23 @@ fn build_line_text(
                     if let Some(pr) = prev_right {
                         let gap = c.bbox[0] - pr;
                         // Use font's space threshold, but enforce a minimum
-                        // floor of avg_width * 0.25 to avoid TeX kerning gaps
+                        // floor of avg_width * 0.20 to avoid TeX kerning gaps
                         // being misread as word boundaries.
-                        let min_floor = avg_width * 0.25;
-                        let threshold = if c.space_threshold > 0.0 {
+                        // Also use the adaptive line threshold if available
+                        // (computed from the actual gap distribution).
+                        let min_floor = avg_width * 0.20;
+                        let font_threshold = if c.space_threshold > 0.0 {
                             c.space_threshold.max(min_floor)
                         } else {
                             avg_width * 0.3
+                        };
+                        // Use the smaller of font threshold and adaptive threshold.
+                        // The adaptive threshold catches tightly-typeset PDFs where
+                        // the font metrics overestimate the word gap.
+                        let threshold = if adaptive_threshold > 0.0 {
+                            font_threshold.min(adaptive_threshold).max(min_floor)
+                        } else {
+                            font_threshold
                         };
                         if threshold > 0.0 && gap >= threshold && !text.ends_with(' ') {
                             // Close italic before bold (proper nesting)
@@ -1628,6 +1668,43 @@ fn build_line_text(
 }
 
 /// Collapse runs of multiple spaces into a single space and trim.
+/// Compute an adaptive space threshold from the gap distribution in a line.
+///
+/// Looks for a natural break point between small kerning gaps and larger
+/// word gaps. If found, returns a threshold between the two clusters.
+/// Returns 0.0 if no clear bimodal distribution is detected.
+fn compute_adaptive_space_threshold(gaps: &mut Vec<f32>) -> f32 {
+    if gaps.len() < 4 {
+        return 0.0; // not enough data
+    }
+    gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Find the largest jump between consecutive sorted gaps.
+    // This typically separates kerning gaps from word gaps.
+    let mut max_jump = 0.0f32;
+    let mut max_jump_idx = 0;
+    for i in 1..gaps.len() {
+        let jump = gaps[i] - gaps[i - 1];
+        if jump > max_jump {
+            max_jump = jump;
+            max_jump_idx = i;
+        }
+    }
+
+    // The jump must be significant: at least 30% of the median gap,
+    // and there must be at least 2 gaps on each side of the split.
+    let median = gaps[gaps.len() / 2];
+    if max_jump < median * 0.3 || max_jump_idx < 2 || max_jump_idx >= gaps.len() - 1 {
+        return 0.0;
+    }
+
+    // Threshold = midpoint between the top of the lower cluster
+    // and the bottom of the upper cluster.
+    let lower_max = gaps[max_jump_idx - 1];
+    let upper_min = gaps[max_jump_idx];
+    (lower_max + upper_min) / 2.0
+}
+
 fn collapse_spaces(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     let mut prev_space = false;
