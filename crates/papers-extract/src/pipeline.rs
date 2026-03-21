@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use image::DynamicImage;
 use pdfium_render::prelude::*;
@@ -19,6 +19,72 @@ use crate::text;
 use crate::toc;
 use crate::types::*;
 use crate::{ExtractOptions, FormulaModel, FormulaParseMode, TableModel};
+
+// ── Timing infrastructure ──────────────────────────────────────────────
+
+/// Accumulated timings for the extraction pipeline.
+#[derive(Default)]
+struct Timings {
+    model_load: Duration,
+    pdf_load: Duration,
+    text_extract: Duration,
+    toc_parse: Duration,
+    render: Duration,
+    char_extract: Duration,
+    layout_detect: Duration,
+    column_split: Duration,
+    char_formula: Duration,
+    formula_ocr: Duration,
+    table_ocr: Duration,
+    region_build: Duration,
+    post_process: Duration,
+    output_json: Duration,
+    output_reflow: Duration,
+    output_markdown: Duration,
+    output_images: Duration,
+    output_debug: Duration,
+}
+
+impl Timings {
+    fn print_summary(&self, total: Duration) {
+        let fmt = |d: Duration| -> String {
+            let ms = d.as_secs_f64() * 1000.0;
+            if ms >= 1000.0 {
+                format!("{:.1}s", ms / 1000.0)
+            } else {
+                format!("{:.0}ms", ms)
+            }
+        };
+        let pct = |d: Duration| -> String {
+            let p = d.as_secs_f64() / total.as_secs_f64() * 100.0;
+            format!("{:.0}%", p)
+        };
+
+        eprintln!();
+        eprintln!("  ┌─ Timing breakdown ─────────────────────────");
+        eprintln!("  │ Model loading     {:>8}  {:>4}", fmt(self.model_load), pct(self.model_load));
+        eprintln!("  │ PDF load + TOC    {:>8}  {:>4}", fmt(self.pdf_load + self.text_extract + self.toc_parse), pct(self.pdf_load + self.text_extract + self.toc_parse));
+        eprintln!("  │ Page rendering    {:>8}  {:>4}", fmt(self.render), pct(self.render));
+        eprintln!("  │ Char extraction   {:>8}  {:>4}", fmt(self.char_extract), pct(self.char_extract));
+        eprintln!("  │ Layout detection  {:>8}  {:>4}", fmt(self.layout_detect), pct(self.layout_detect));
+        eprintln!("  │ Column splitting  {:>8}  {:>4}", fmt(self.column_split), pct(self.column_split));
+        eprintln!("  │ Char-based formulas {:>6}  {:>4}", fmt(self.char_formula), pct(self.char_formula));
+        eprintln!("  │ Formula OCR       {:>8}  {:>4}", fmt(self.formula_ocr), pct(self.formula_ocr));
+        eprintln!("  │ Table OCR         {:>8}  {:>4}", fmt(self.table_ocr), pct(self.table_ocr));
+        eprintln!("  │ Region building   {:>8}  {:>4}", fmt(self.region_build), pct(self.region_build));
+        eprintln!("  │ Post-processing   {:>8}  {:>4}", fmt(self.post_process), pct(self.post_process));
+        eprintln!("  │ Output: JSON      {:>8}  {:>4}", fmt(self.output_json), pct(self.output_json));
+        eprintln!("  │ Output: reflow    {:>8}  {:>4}", fmt(self.output_reflow), pct(self.output_reflow));
+        eprintln!("  │ Output: markdown  {:>8}  {:>4}", fmt(self.output_markdown), pct(self.output_markdown));
+        eprintln!("  │ Output: images    {:>8}  {:>4}", fmt(self.output_images), pct(self.output_images));
+        if self.output_debug > Duration::ZERO {
+            eprintln!("  │ Output: debug     {:>8}  {:>4}", fmt(self.output_debug), pct(self.output_debug));
+        }
+        eprintln!("  │ ─────────────────────────────────────────");
+        eprintln!("  │ Total             {:>8}", fmt(total));
+        eprintln!("  └───────────────────────────────────────────");
+    }
+}
 
 // ── Engine dispatch enums ────────────────────────────────────────────
 
@@ -103,6 +169,7 @@ pub struct Pipeline {
     layout: LayoutDetector,
     formula: FormulaEngine,
     table: TableEngine,
+    model_load_time: Duration,
     options: PipelineOptions,
 }
 
@@ -123,6 +190,7 @@ struct PipelineOptions {
 impl Pipeline {
     /// Create a new pipeline, loading models and pdfium.
     pub fn new(options: &ExtractOptions) -> Result<Self, ExtractError> {
+        let t_model = Instant::now();
         eprint!("\r  Loading models: ort");
         models::init_ort_runtime()?;
         let pdfium = pdf::load_pdfium(options.pdfium_path.as_deref())?;
@@ -160,6 +228,7 @@ impl Pipeline {
                 TableEngine::TableFormer(models::build_tableformer_predictor(tf_paths)?)
             }
         };
+        let model_load_time = t_model.elapsed();
         eprint!("\r{}\r", " ".repeat(60));
 
         Ok(Self {
@@ -167,6 +236,7 @@ impl Pipeline {
             layout,
             formula,
             table,
+            model_load_time,
             options: PipelineOptions {
                 dpi: options.dpi,
                 confidence_threshold: options.confidence_threshold,
@@ -189,6 +259,10 @@ impl Pipeline {
         output_dir: &Path,
     ) -> Result<ExtractionResult, ExtractError> {
         let start = Instant::now();
+        let mut timings = Timings {
+            model_load: self.model_load_time,
+            ..Timings::default()
+        };
 
         let filename = pdf_path
             .file_name()
@@ -202,14 +276,16 @@ impl Pipeline {
             .unwrap_or("document");
 
         // Load the PDF
+        let t = Instant::now();
         let doc = self
             .pdfium
             .load_pdf_from_file(pdf_path, None)
             .map_err(|e| ExtractError::Pdf(format!("Failed to load PDF: {e}")))?;
-
         let total_pages = doc.pages().len() as u32;
+        timings.pdf_load = t.elapsed();
 
         // Quick first pass: extract text layer chars from all pages for TOC parsing.
+        let t = Instant::now();
         let page_chars: Vec<(Vec<PdfChar>, f32)> = (0..total_pages)
             .map(|i| {
                 let page = doc.pages().get(i as u16).unwrap();
@@ -218,6 +294,9 @@ impl Pipeline {
                 (chars, height)
             })
             .collect();
+        timings.text_extract = t.elapsed();
+
+        let t = Instant::now();
         let mut toc_result = toc::parse_toc(&page_chars);
         if let Some(ref mut toc) = toc_result {
             eprintln!(
@@ -228,6 +307,7 @@ impl Pipeline {
             // Auto-number unnumbered TOC entries so --section works.
             crate::output::auto_number_toc_entries(&mut toc.entries);
         }
+        timings.toc_parse = t.elapsed();
 
         let mut pages = Vec::new();
         let mut page_images = Vec::new();
@@ -258,17 +338,142 @@ impl Pipeline {
         };
         let page_count = page_indices.len() as u32;
 
-        for (i, page_idx) in page_indices.iter().enumerate() {
-            eprint!(
-                "\r  Page {}/{page_count}: layout",
-                i + 1,
-            );
-            let page = doc.pages().get(*page_idx as u16).map_err(|e| {
-                ExtractError::Pdf(format!("Failed to get page {page_idx}: {e}"))
-            })?;
-            let (result_page, page_img) = self.process_page(&page, *page_idx, page_count, output_dir)?;
-            page_images.push(page_img);
-            pages.push(result_page);
+        // Process pages in batches for layout detection, pipelining CPU rendering
+        // with GPU layout detection. While the GPU processes batch N, the CPU
+        // renders batch N+1's pages (pdfium is single-threaded, but the GPU
+        // work runs on a scoped thread so the main thread is free).
+        const LAYOUT_BATCH_SIZE: usize = 1;
+
+        // Helper: render a batch of pages (CPU-bound, must run on main thread due to pdfium).
+        // Returns (dims, images, chars, render_time, char_time).
+        let render_batch = |indices: &[u32], progress_base: usize| -> Result<(
+            Vec<(f32, f32)>, Vec<DynamicImage>, Vec<Vec<PdfChar>>, Duration, Duration,
+        ), ExtractError> {
+            let mut dims = Vec::with_capacity(indices.len());
+            let mut images = Vec::with_capacity(indices.len());
+            let mut chars_vec = Vec::with_capacity(indices.len());
+            let mut render_time = Duration::ZERO;
+            let mut char_time = Duration::ZERO;
+
+            for (j, page_idx) in indices.iter().enumerate() {
+                let progress_num = progress_base + j + 1;
+                eprint!("\r  Page {progress_num}/{page_count}: render");
+                let page = doc.pages().get(*page_idx as u16).map_err(|e| {
+                    ExtractError::Pdf(format!("Failed to get page {page_idx}: {e}"))
+                })?;
+                let width_pt = page.width().value;
+                let height_pt = page.height().value;
+
+                let t = Instant::now();
+                let page_image = pdf::render_page(&page, self.options.dpi)?;
+                render_time += t.elapsed();
+
+                let t = Instant::now();
+                let mut page_chars = pdf::extract_page_chars(&page, *page_idx)?;
+                let crop = pdf::crop_offset(&page);
+                pdf::apply_crop_offset(&mut page_chars, crop);
+                char_time += t.elapsed();
+
+                dims.push((width_pt, height_pt));
+                images.push(page_image);
+                chars_vec.push(page_chars);
+            }
+            Ok((dims, images, chars_vec, render_time, char_time))
+        };
+
+        // Render the first batch on the main thread
+        let batch_ranges: Vec<(usize, usize)> = (0..page_indices.len())
+            .step_by(LAYOUT_BATCH_SIZE)
+            .map(|s| (s, (s + LAYOUT_BATCH_SIZE).min(page_indices.len())))
+            .collect();
+
+        if let Some(&(first_start, first_end)) = batch_ranges.first() {
+            // Pre-render the first batch
+            let (mut pending_dims, mut pending_images, mut pending_chars, render_t, char_t) =
+                render_batch(&page_indices[first_start..first_end], first_start)?;
+            timings.render += render_t;
+            timings.char_extract += char_t;
+
+            for (batch_idx, &(batch_start, batch_end)) in batch_ranges.iter().enumerate() {
+                let cur_indices = &page_indices[batch_start..batch_end];
+                let next_range = batch_ranges.get(batch_idx + 1).copied();
+
+                // Take ownership of the current batch's data (rendered in previous iteration)
+                let detect_images = std::mem::take(&mut pending_images);
+                let detect_chars = std::mem::take(&mut pending_chars);
+                let detect_dims = std::mem::take(&mut pending_dims);
+
+                // Pipeline: run GPU detection on a scoped thread while the main
+                // thread renders the next batch. std::thread::scope ensures
+                // borrows are safe (joins before scope exits).
+                let threshold = self.options.confidence_threshold;
+                let layout = &self.layout;
+
+                eprint!(
+                    "\r  Page {}-{}/{page_count}: layout+render",
+                    batch_start + 1,
+                    batch_end,
+                );
+
+                let (batch_detections, next_batch) = std::thread::scope(|s| {
+                    // Spawn GPU layout detection on a thread
+                    let detect_handle = s.spawn(|| -> Result<(Vec<Vec<crate::layout::DetectedRegion>>, Duration), ExtractError> {
+                        let t = Instant::now();
+                        let image_refs: Vec<&DynamicImage> = detect_images.iter().collect();
+                        let result = layout.detect_batch(&image_refs, threshold)?;
+                        Ok((result, t.elapsed()))
+                    });
+
+                    // Main thread: render next batch concurrently (if any)
+                    let next = if let Some((next_start, next_end)) = next_range {
+                        Some(render_batch(&page_indices[next_start..next_end], next_start))
+                    } else {
+                        None
+                    };
+
+                    let detections = detect_handle.join().expect("layout detect thread panicked");
+                    (detections, next)
+                });
+
+                let (batch_detections, detect_time) = batch_detections?;
+                timings.layout_detect += detect_time;
+
+                // Stash next batch's rendered data for the next iteration
+                if let Some(next_result) = next_batch {
+                    let (next_dims, next_images, next_chars, render_t, char_t) = next_result?;
+                    timings.render += render_t;
+                    timings.char_extract += char_t;
+                    pending_dims = next_dims;
+                    pending_images = next_images;
+                    pending_chars = next_chars;
+                }
+
+                // Process each page with its pre-computed detections
+                for (j, ((page_image, chars), detected)) in detect_images
+                    .into_iter()
+                    .zip(detect_chars.into_iter())
+                    .zip(batch_detections.into_iter())
+                    .enumerate()
+                {
+                    let page_idx = cur_indices[j];
+                    let progress_num = batch_start + j + 1;
+                    eprint!("\r  Page {progress_num}/{page_count}: process");
+                    let (width_pt, height_pt) = detect_dims[j];
+                    let (result_page, page_img) = self.process_page_with_detections(
+                        page_image,
+                        &chars,
+                        detected,
+                        page_idx,
+                        page_count,
+                        width_pt,
+                        height_pt,
+                        output_dir,
+                        &mut timings,
+                    )?;
+                    page_images.push(page_img);
+                    pages.push(result_page);
+                }
+            }
         }
         // Clear the progress line
         eprint!("\r{}\r", " ".repeat(60));
@@ -286,14 +491,16 @@ impl Pipeline {
 
         // Write output files
         eprint!("\r  Writing output...");
-        let t_out = Instant::now();
         std::fs::create_dir_all(output_dir)?;
         let json_path = output_dir.join(format!("{stem}.json"));
         let md_path = output_dir.join(format!("{stem}.md"));
         let images_dir = output_dir.join("images");
 
+        let t = Instant::now();
         output::write_json(&result, &json_path)?;
+        timings.output_json = t.elapsed();
 
+        let t = Instant::now();
         let watermarks = output::detect_watermarks(&page_chars);
         let reflow_doc = if let Some(ref toc) = toc_result {
             output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages, &watermarks)
@@ -302,10 +509,14 @@ impl Pipeline {
         };
         let reflow_path = output_dir.join(format!("{stem}.reflow.json"));
         output::write_reflow_json(&reflow_doc, &reflow_path)?;
+        timings.output_reflow = t.elapsed();
 
+        let t = Instant::now();
         let md = output::render_markdown_from_reflow(&reflow_doc);
         std::fs::write(&md_path, md)?;
+        timings.output_markdown = t.elapsed();
 
+        let t = Instant::now();
         if self.options.extract_images {
             output::write_images(&result.pages, &page_images, &images_dir)?;
         }
@@ -327,8 +538,10 @@ impl Pipeline {
             let formulas_dir = output_dir.join("formulas");
             output::write_formula_images(&result.pages, &page_images, &formulas_dir)?;
         }
+        timings.output_images = t.elapsed();
 
         if self.options.debug.is_enabled() {
+            let t = Instant::now();
             eprint!("\r  Writing debug layout...");
             output::write_debug(
                 &self.pdfium,
@@ -337,55 +550,41 @@ impl Pipeline {
                 output_dir,
                 self.options.debug,
             )?;
+            timings.output_debug = t.elapsed();
         }
-        let out_secs = t_out.elapsed().as_secs_f64();
-        if out_secs >= 0.5 {
-            eprintln!("\r  Output: {out_secs:.1}s{}",
-                " ".repeat(40),
-            );
-        } else {
-            // Clear the progress line
-            eprint!("\r{}\r", " ".repeat(60));
-        }
+
+        // Clear the progress line and print timing summary
+        eprint!("\r{}\r", " ".repeat(60));
+        timings.print_summary(start.elapsed());
 
         Ok(result)
     }
 
-    /// Process a single page: render, detect layout, extract content.
-    fn process_page(
+    /// Process a single page with pre-computed render, chars, and layout detections.
+    fn process_page_with_detections(
         &self,
-        page: &PdfPage,
+        page_image: DynamicImage,
+        chars: &[PdfChar],
+        detected: Vec<crate::layout::DetectedRegion>,
         page_idx: u32,
         page_count: u32,
+        width_pt: f32,
+        height_pt: f32,
         output_dir: &Path,
+        timings: &mut Timings,
     ) -> Result<(Page, DynamicImage), ExtractError> {
         let page_num = page_idx + 1;
-        let width_pt = page.width().value;
-        let height_pt = page.height().value;
-
-        // Render page to image
-        let page_image = pdf::render_page(page, self.options.dpi)?;
-
-        // Extract characters from text layer and adjust for CropBox offset.
-        // Pdfium returns char bboxes in MediaBox coordinates, but the rendered
-        // image (and layout model) uses the CropBox area. Apply the offset so
-        // char positions align with layout-detected region bboxes.
-        let mut chars = pdf::extract_page_chars(page, page_idx)?;
-        let crop = pdf::crop_offset(page);
-        pdf::apply_crop_offset(&mut chars, crop);
-
-        // Run direct layout detection (correct bboxes + reading order)
-        let detected = self
-            .layout
-            .detect(&page_image, self.options.confidence_threshold)?;
 
         let scale = self.options.dpi as f32 / 72.0;
 
         // Split wide text regions that span both columns in two-column layouts.
-        let detected = split_cross_column_regions(detected, &chars, width_pt, height_pt, scale);
+        let t = Instant::now();
+        let detected = split_cross_column_regions(detected, chars, width_pt, height_pt, scale);
+        timings.column_split += t.elapsed();
 
         // Phase A: try char-based extraction for inline formulas (skip expensive ML OCR).
         // Also compute expanded bboxes (bracket-aware) for formulas that fall through to OCR.
+        let t = Instant::now();
         let parse_mode = self.options.formula_parse_mode;
         let mut char_based_latex: HashMap<usize, String> = HashMap::new();
         let mut expanded_bboxes: HashMap<usize, [f32; 4]> = HashMap::new();
@@ -422,9 +621,12 @@ impl Pipeline {
             }
         }
 
+        timings.char_formula += t.elapsed();
+
         // Crop formula regions (display + inline not already handled) and run batched recognition.
         // In Manual mode, skip OCR entirely — only char-based results are used.
         // Use expanded bboxes (from bracket expansion) when available.
+        let t = Instant::now();
         let formula_entries: Vec<(usize, DynamicImage)> = if parse_mode == FormulaParseMode::Manual {
             Vec::new()
         } else {
@@ -508,7 +710,10 @@ impl Pipeline {
             );
         }
 
+        timings.formula_ocr += t.elapsed();
+
         // Crop table regions and run batched recognition
+        let t = Instant::now();
         let table_entries: Vec<(usize, DynamicImage)> = detected
             .iter()
             .enumerate()
@@ -551,7 +756,10 @@ impl Pipeline {
             )?;
         }
 
+        timings.table_ocr += t.elapsed();
+
         // Build regions from layout detection + formula/table results
+        let t = Instant::now();
         let mut regions = self.build_regions(
             &detected,
             &formula_results,
@@ -563,7 +771,10 @@ impl Pipeline {
             height_pt,
         )?;
 
+        timings.region_build += t.elapsed();
+
         // Suppress sub-panel detections contained within a larger visual region
+        let t = Instant::now();
         figure::suppress_contained_visuals(&mut regions);
 
         // Suppress duplicate Abstract/Text regions sharing the same bbox
@@ -607,6 +818,8 @@ impl Pipeline {
                 }
             }
         }
+
+        timings.post_process += t.elapsed();
 
         let result_page = Page {
             page: page_idx + 1,

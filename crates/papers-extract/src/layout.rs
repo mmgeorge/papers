@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use image::imageops::FilterType;
 use image::DynamicImage;
 use ndarray::Array4;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::value::TensorRef;
 
@@ -61,6 +62,8 @@ impl LayoutDetector {
     pub fn new(model_path: &Path) -> Result<Self, ExtractError> {
         let session = Session::builder()
             .map_err(|e| ExtractError::Model(format!("Failed to create session builder: {e}")))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| ExtractError::Model(format!("Failed to set optimization level: {e}")))?
             .with_execution_providers([
                 #[cfg(target_os = "windows")]
                 ort::execution_providers::CUDAExecutionProvider::default().build(),
@@ -85,16 +88,60 @@ impl LayoutDetector {
         image: &DynamicImage,
         threshold: f32,
     ) -> Result<Vec<DetectedRegion>, ExtractError> {
-        let (tensor, orig_h, orig_w) = preprocess(image);
+        let results = self.detect_batch(&[image], threshold)?;
+        Ok(results.into_iter().next().unwrap_or_default())
+    }
 
-        let scale_factor = ndarray::array![[800.0 / orig_h, 800.0 / orig_w]];
-        let im_shape = ndarray::array![[800.0f32, 800.0]];
+    /// Run batched layout detection on multiple images in a single inference call.
+    ///
+    /// Uses the model's dynamic batch dimension to process N images at once,
+    /// reducing per-image GPU kernel launch overhead. The second model output
+    /// (`fetch_name_1`, i32 batch indices) maps each detection to its source image.
+    pub fn detect_batch(
+        &self,
+        images: &[&DynamicImage],
+        threshold: f32,
+    ) -> Result<Vec<Vec<DetectedRegion>>, ExtractError> {
+        let n = images.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
 
-        let image_input = TensorRef::from_array_view(&tensor)
+        // Preprocess all images and collect original dimensions
+        let mut all_data = Vec::with_capacity(n * 3 * 800 * 800);
+        let mut orig_dims: Vec<(f32, f32)> = Vec::with_capacity(n);
+        let mut scale_data = Vec::with_capacity(n * 2);
+        let mut shape_data = Vec::with_capacity(n * 2);
+
+        for image in images {
+            let (tensor, orig_h, orig_w) = preprocess(image);
+            all_data.extend_from_slice(tensor.as_slice().unwrap());
+            orig_dims.push((orig_w, orig_h));
+            scale_data.push(800.0 / orig_h);
+            scale_data.push(800.0 / orig_w);
+            shape_data.push(800.0f32);
+            shape_data.push(800.0f32);
+        }
+
+        // Build batched tensors: [N, 3, 800, 800], [N, 2], [N, 2]
+        let image_tensor = ndarray::ArrayD::from_shape_vec(
+            vec![n, 3, 800, 800],
+            all_data,
+        ).map_err(|e| ExtractError::Layout(format!("batch image tensor: {e}")))?;
+        let scale_tensor = ndarray::ArrayD::from_shape_vec(
+            vec![n, 2],
+            scale_data,
+        ).map_err(|e| ExtractError::Layout(format!("batch scale tensor: {e}")))?;
+        let shape_tensor = ndarray::ArrayD::from_shape_vec(
+            vec![n, 2],
+            shape_data,
+        ).map_err(|e| ExtractError::Layout(format!("batch shape tensor: {e}")))?;
+
+        let image_input = TensorRef::from_array_view(&image_tensor)
             .map_err(|e| ExtractError::Layout(format!("Failed to create image tensor: {e}")))?;
-        let scale_input = TensorRef::from_array_view(&scale_factor)
+        let scale_input = TensorRef::from_array_view(&scale_tensor)
             .map_err(|e| ExtractError::Layout(format!("Failed to create scale tensor: {e}")))?;
-        let shape_input = TensorRef::from_array_view(&im_shape)
+        let shape_input = TensorRef::from_array_view(&shape_tensor)
             .map_err(|e| ExtractError::Layout(format!("Failed to create shape tensor: {e}")))?;
 
         let mut session = self
@@ -110,12 +157,78 @@ impl LayoutDetector {
             ])
             .map_err(|e| ExtractError::Layout(format!("Layout inference failed: {e}")))?;
 
-        let output_view = outputs[0]
+        // fetch_name_0: [total_detections, 7] — boxes for all images
+        let boxes = outputs[0]
             .try_extract_array::<f32>()
-            .map_err(|e| ExtractError::Layout(format!("Failed to extract output tensor: {e}")))?;
+            .map_err(|e| ExtractError::Layout(format!("Failed to extract boxes: {e}")))?;
+        // fetch_name_1: [total_detections] i32 — batch index per detection
+        let batch_idx_output = outputs[1]
+            .try_extract_array::<i32>()
+            .map_err(|e| ExtractError::Layout(format!("Failed to extract batch indices: {e}")))?;
 
-        let regions = postprocess(&output_view, orig_w, orig_h, threshold);
-        Ok(regions)
+        // fetch_name_1 is NmsRasterizeNum: [batch_size] i32 — count of valid
+        // detections per image. Boxes are [total_rows, 7] laid out as max_per_image
+        // rows per batch image (padded with score=0 for unused slots).
+        let nms_counts = batch_idx_output;
+
+
+        // Split detections by batch image using nms_counts.
+        // Boxes layout: [N * max_per_image, 7] where each image gets max_per_image
+        // rows (padded with score=0). nms_counts[i] = number of valid detections
+        // for image i. Valid rows for image i start at i * max_per_image.
+        let mut results: Vec<Vec<DetectedRegion>> = (0..n).map(|_| Vec::new()).collect();
+        let boxes_shape = boxes.shape();
+        if boxes_shape.len() == 2 && boxes_shape[1] == 7 {
+            let total_rows = boxes_shape[0];
+            let max_per_image = if n > 0 { total_rows / n } else { total_rows };
+            let counts = nms_counts.as_slice()
+                .ok_or_else(|| ExtractError::Layout("nms counts not contiguous".into()))?;
+
+            for bi in 0..n {
+                let valid = counts.get(bi).copied().unwrap_or(0).max(0) as usize;
+                let start = bi * max_per_image;
+                let (orig_w, orig_h) = orig_dims[bi];
+
+                for i in start..start + valid.min(max_per_image) {
+                    if i >= total_rows {
+                        break;
+                    }
+                    let class_id = boxes[[i, 0]] as usize;
+                    let score = boxes[[i, 1]];
+
+                    if score < threshold || class_id >= ID2LABEL.len() {
+                        continue;
+                    }
+                    let label = ID2LABEL[class_id];
+                    let kind = match RegionKind::from_label(label) {
+                        Some(k) => k,
+                        None => continue,
+                    };
+                    results[bi].push(DetectedRegion {
+                        kind,
+                        bbox_px: [
+                            boxes[[i, 2]].clamp(0.0, orig_w),
+                            boxes[[i, 3]].clamp(0.0, orig_h),
+                            boxes[[i, 4]].clamp(0.0, orig_w),
+                            boxes[[i, 5]].clamp(0.0, orig_h),
+                        ],
+                        confidence: score,
+                        order_key: boxes[[i, 6]],
+                    });
+                }
+            }
+        }
+
+        // Sort each image's detections by reading order
+        for regions in &mut results {
+            regions.sort_by(|a, b| {
+                a.order_key
+                    .partial_cmp(&b.order_key)
+                    .unwrap_or(Ordering::Equal)
+            });
+        }
+
+        Ok(results)
     }
 }
 
