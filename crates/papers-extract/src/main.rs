@@ -38,6 +38,10 @@ struct Cli {
     #[arg(long)]
     reflow_only: bool,
 
+    /// Text-only extraction: skip all ML models, extract from PDF text layer only
+    #[arg(long, conflicts_with_all = ["reflow_only", "write_layout", "formula", "formula_parse_mode"])]
+    text_only: bool,
+
     /// Skip image extraction
     #[arg(long)]
     skip_images: bool,
@@ -119,8 +123,32 @@ fn main() {
             Some(LayoutDebugArg::Pdf) => DebugMode::Pdf,
             None => DebugMode::Off,
         },
+        text_only: cli.text_only,
         ..ExtractOptions::default()
     };
+
+    if cli.text_only {
+        eprintln!(
+            "Text-only: {} → {}",
+            cli.pdf.display(),
+            output_dir.display()
+        );
+        match papers_extract::extract_text_only(&cli.pdf, &output_dir, &options) {
+            Ok(result) => {
+                eprintln!(
+                    "Done: {} pages, {} regions, {:.1}s",
+                    result.metadata.page_count,
+                    result.pages.iter().map(|p| p.regions.len()).sum::<usize>(),
+                    result.metadata.extraction_time_ms as f64 / 1000.0,
+                );
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        }
+        return;
+    }
 
     if cli.reflow_only {
         eprintln!(

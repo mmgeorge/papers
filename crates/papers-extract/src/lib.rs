@@ -12,6 +12,7 @@ pub mod pipeline;
 pub mod reading_order;
 pub mod tableformer;
 pub mod text;
+pub mod text_only;
 pub mod toc;
 pub mod types;
 
@@ -53,6 +54,8 @@ pub struct ExtractOptions {
     pub debug: DebugMode,
     /// Dump cropped formula region images to `formulas/` in the output directory.
     pub dump_formulas: bool,
+    /// Text-only mode: skip all ML models, extract from PDF text layer only.
+    pub text_only: bool,
 }
 
 impl Default for ExtractOptions {
@@ -73,6 +76,7 @@ impl Default for ExtractOptions {
             section: None,
             debug: DebugMode::Off,
             dump_formulas: false,
+            text_only: false,
         }
     }
 }
@@ -251,4 +255,182 @@ pub fn reflow_only(
     eprintln!("  Reflow done in {:.1}ms", elapsed.as_secs_f64() * 1000.0);
 
     Ok(())
+}
+
+/// Text-only extraction: extract from the PDF text layer using geometric heuristics.
+///
+/// Skips all ML model loading/inference (layout detection, formula OCR, table OCR).
+/// Produces the same `ExtractionResult` format, compatible with existing reflow and
+/// ingest pipelines. Uses font-based heading detection for document structure.
+pub fn extract_text_only(
+    pdf_path: &Path,
+    output_dir: &Path,
+    options: &ExtractOptions,
+) -> Result<ExtractionResult, ExtractError> {
+    let start = std::time::Instant::now();
+
+    let pdfium = pdf::load_pdfium(options.pdfium_path.as_deref())?;
+
+    let filename = pdf_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("document.pdf")
+        .to_string();
+
+    let stem = pdf_path
+        .file_stem()
+        .and_then(|f| f.to_str())
+        .unwrap_or("document");
+
+    // Load the PDF
+    let doc = pdfium
+        .load_pdf_from_file(pdf_path, None)
+        .map_err(|e| ExtractError::Pdf(format!("Failed to load PDF: {e}")))?;
+    let total_pages = doc.pages().len() as u32;
+
+    // Extract text layer chars from all pages (for TOC + heading detection)
+    eprint!("\r  Extracting text layer...");
+    let mut page_chars: Vec<(Vec<pdf::PdfChar>, f32)> = Vec::with_capacity(total_pages as usize);
+    let mut page_widths: Vec<f32> = Vec::with_capacity(total_pages as usize);
+    for i in 0..total_pages {
+        let page = doc.pages().get(i as u16).unwrap();
+        let mut chars = pdf::extract_page_chars(&page, i).unwrap_or_default();
+        let crop = pdf::crop_offset(&page);
+        pdf::apply_crop_offset(&mut chars, crop);
+        let height = page.height().value;
+        let width = page.width().value;
+        page_widths.push(width);
+        page_chars.push((chars, height));
+    }
+
+    // Parse TOC
+    let mut toc_result = toc::parse_toc(&page_chars);
+    if let Some(ref mut toc) = toc_result {
+        eprintln!(
+            "\r  TOC: {} entries from {} pages",
+            toc.entries.len(),
+            toc.toc_pages.len(),
+        );
+        output::auto_number_toc_entries(&mut toc.entries);
+    }
+
+    // Font-based heading detection (works on raw PdfChars, no models)
+    eprint!("\r  Detecting headings...");
+    let heading_result = headings::extract_headings(&page_chars);
+    eprintln!(
+        "\r  Headings: {} detected ({} font groups)",
+        heading_result.headings.len(),
+        heading_result.font_groups.len(),
+    );
+
+    // Determine which pages to process
+    let page_indices: Vec<u32> = if let Some(ref pages) = options.pages {
+        pages
+            .iter()
+            .map(|p| p - 1)
+            .filter(|&p| p < total_pages)
+            .collect()
+    } else if options.chapter.is_some() || options.section.is_some() {
+        pipeline::resolve_toc_page_range(
+            &toc_result,
+            total_pages,
+            options.chapter.as_deref(),
+            options.section.as_deref(),
+        )?
+    } else if let Some(p) = options.page {
+        if p == 0 || p > total_pages {
+            return Err(ExtractError::Pdf(format!(
+                "Page {p} out of range (document has {total_pages} pages)"
+            )));
+        }
+        vec![p - 1]
+    } else {
+        (0..total_pages).collect()
+    };
+    let page_count = page_indices.len() as u32;
+
+    // Process each page
+    let mut pages = Vec::with_capacity(page_count as usize);
+    for (progress, &page_idx) in page_indices.iter().enumerate() {
+        eprint!("\r  Page {}/{page_count}: text blocks", progress + 1);
+        let (ref chars, height_pt) = page_chars[page_idx as usize];
+        let width_pt = page_widths[page_idx as usize];
+
+        // Filter headings for this page (1-indexed)
+        let page_headings: Vec<&headings::DetectedHeading> = heading_result
+            .headings
+            .iter()
+            .filter(|h| h.page == page_idx + 1)
+            .collect();
+
+        let regions = text_only::extract_page_text_blocks(
+            chars,
+            height_pt,
+            width_pt,
+            page_idx,
+            &page_headings,
+        );
+
+        pages.push(Page {
+            page: page_idx + 1,
+            width_pt,
+            height_pt,
+            dpi: 0,
+            regions,
+        });
+    }
+    eprint!("\r{}\r", " ".repeat(60));
+
+    // Post-processing: filter running headers across pages.
+    // Running headers are the topmost ParagraphTitle on each page whose text
+    // repeats (or nearly repeats) across many pages.
+    text_only::filter_running_headers(&mut pages);
+
+    // Check for empty extraction (likely scanned PDF)
+    let total_regions: usize = pages.iter().map(|p| p.regions.len()).sum();
+    if total_regions == 0 {
+        eprintln!(
+            "  Warning: no text extracted from {} pages. Is this a scanned PDF?",
+            page_count
+        );
+    }
+
+    let extraction_time_ms = start.elapsed().as_millis() as u64;
+    let result = ExtractionResult {
+        metadata: Metadata {
+            filename,
+            page_count,
+            extraction_time_ms,
+        },
+        pages,
+    };
+
+    // Write outputs
+    std::fs::create_dir_all(output_dir)?;
+
+    let json_path = output_dir.join(format!("{stem}.json"));
+    output::write_json(&result, &json_path)?;
+
+    let watermarks = output::detect_watermarks(&page_chars);
+    let reflow_doc = if let Some(ref toc) = toc_result {
+        output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages, &watermarks)
+    } else {
+        output::reflow(&result, &watermarks)
+    };
+    let reflow_path = output_dir.join(format!("{stem}.reflow.json"));
+    output::write_reflow_json(&reflow_doc, &reflow_path)?;
+
+    let md = output::render_markdown_from_reflow(&reflow_doc);
+    let md_path = output_dir.join(format!("{stem}.md"));
+    std::fs::write(&md_path, md)?;
+
+    let elapsed = start.elapsed();
+    eprintln!(
+        "  Done: {} pages, {} regions, {:.1}s (text-only)",
+        page_count,
+        total_regions,
+        elapsed.as_secs_f64(),
+    );
+
+    Ok(result)
 }

@@ -1608,7 +1608,7 @@ fn strip_structural_regions(regions: &mut Vec<Region>) {
 }
 
 /// Resolve `--chapter` or `--section` to a set of 0-indexed PDF page indices.
-fn resolve_toc_page_range(
+pub(crate) fn resolve_toc_page_range(
     toc_result: &Option<toc::TocResult>,
     total_pages: u32,
     chapter: Option<&str>,

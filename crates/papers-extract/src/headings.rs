@@ -82,12 +82,12 @@ pub struct DetectedHeading {
     pub page: u32,
     /// Total characters contained under this heading (until next same-or-shallower heading).
     pub contained_chars: usize,
-    /// Y-center position for internal ordering (not serialized).
+    /// Y-center position in PDF coordinates (Y-up) for internal ordering (not serialized).
     #[serde(skip_serializing)]
-    y_center: f32,
+    pub(crate) y_center: f32,
     /// Right edge X coordinate for adjacency checks (not serialized).
     #[serde(skip_serializing)]
-    x_right: f32,
+    pub(crate) x_right: f32,
 }
 
 /// Font profile: body text identification and heading level assignments.
