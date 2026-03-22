@@ -1040,7 +1040,7 @@ impl Pipeline {
                     // Detect drop caps masquerading as formulas: a single
                     // uppercase letter with the rest of the paragraph as
                     // superscript/subscript (e.g. P^{hysics is a hot...}).
-                    if let Some(plain_text) = detect_drop_cap(&fr.latex) {
+                    if let Some(plain_text) = crate::text_cleanup::detect_drop_cap(&fr.latex) {
                         region.kind = RegionKind::Text;
                         kind = RegionKind::Text;
                         region.text = Some(plain_text);
@@ -1669,61 +1669,7 @@ pub(crate) fn resolve_toc_page_range(
     Ok((start..end).collect())
 }
 
-/// Detect drop caps masquerading as formulas.
-///
-/// Pattern: a single uppercase letter followed by `^{...}` or `_{...}` where
-/// the braced content is 50+ chars of prose (has spaces, mostly alphabetic).
-/// Returns the expanded plain text if detected.
-///
-/// Example: `"P^{hysics is a hot topic...}"` → `Some("Physics is a hot topic...")`
-fn detect_drop_cap(latex: &str) -> Option<String> {
-    let t = latex.trim();
-    if t.len() < 55 {
-        return None;
-    }
-    let bytes = t.as_bytes();
-    // Must start with a single uppercase letter
-    let base = bytes[0] as char;
-    if !base.is_ascii_uppercase() {
-        return None;
-    }
-    // Followed by ^ or _
-    if bytes.len() < 4 {
-        return None;
-    }
-    let marker = bytes[1] as char;
-    if marker != '^' && marker != '_' {
-        return None;
-    }
-    // Then an opening brace
-    if bytes[2] as char != '{' {
-        return None;
-    }
-    // Find closing brace
-    let rest = &t[3..];
-    let close = rest.rfind('}')?;
-    let content = &rest[..close];
-    if content.len() < 50 {
-        return None;
-    }
-    // Must be prose-like: has multiple spaces
-    let space_count = content.chars().filter(|c| *c == ' ').count();
-    if space_count < 5 {
-        return None;
-    }
-    // Mostly alphabetic prose (>70% alpha or space, no backslashes)
-    if content.contains('\\') {
-        return None; // LaTeX commands → real formula
-    }
-    let alpha = content
-        .chars()
-        .filter(|c| c.is_alphabetic() || *c == ' ')
-        .count();
-    if (alpha as f32 / content.len() as f32) < 0.7 {
-        return None;
-    }
-    Some(format!("{base}{content}"))
-}
+// detect_drop_cap moved to crate::text_cleanup::detect_drop_cap
 
 #[cfg(test)]
 mod tests {
@@ -1952,66 +1898,7 @@ mod tests {
         assert!(regions[1].consumed);
     }
 
-    // ── Drop cap detection tests ─────────────────────────────────────
-
-    #[test]
-    fn test_detect_drop_cap_basic() {
-        let latex = "P^{hysics is a hot topic in computer games and these days physics simulations are everywhere}";
-        let result = detect_drop_cap(latex);
-        assert!(result.is_some());
-        assert!(result.unwrap().starts_with("Physics is a hot"));
-    }
-
-    #[test]
-    fn test_detect_drop_cap_subscript() {
-        let latex = "T_{he quick brown fox jumps over the lazy dog and keeps on running endlessly through fields}";
-        let result = detect_drop_cap(latex);
-        assert!(result.is_some());
-        assert!(result.unwrap().starts_with("The quick brown"));
-    }
-
-    #[test]
-    fn test_detect_drop_cap_short_not_matched() {
-        assert!(detect_drop_cap("P^{2}").is_none());
-        assert!(detect_drop_cap("x^{n}").is_none());
-    }
-
-    #[test]
-    fn test_detect_drop_cap_multi_letter_base() {
-        let latex = "PQ^{some long text that goes on for quite a while in a paragraph of text about things}";
-        assert!(detect_drop_cap(latex).is_none());
-    }
-
-    #[test]
-    fn test_detect_drop_cap_lowercase_base() {
-        let latex = "p^{hysics is a hot topic in computer games and these days physics simulations are everywhere}";
-        assert!(detect_drop_cap(latex).is_none());
-    }
-
-    #[test]
-    fn test_detect_drop_cap_no_spaces() {
-        let latex = "A^{bcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghij}";
-        assert!(detect_drop_cap(latex).is_none());
-    }
-
-    #[test]
-    fn test_detect_drop_cap_math_content() {
-        let latex = r"X^{\alpha + \beta + \gamma + \delta + \epsilon + \zeta + \eta + \theta + \iota + \kappa}";
-        assert!(detect_drop_cap(latex).is_none());
-    }
-
-    #[test]
-    fn test_detect_drop_cap_legitimate_formulas() {
-        assert!(detect_drop_cap("E = mc^{2}").is_none());
-        assert!(detect_drop_cap("x^{n} + y^{n} = z^{n}").is_none());
-        assert!(detect_drop_cap(r"\sum_{i=0}^{n} x_i").is_none());
-    }
-
-    #[test]
-    fn test_detect_drop_cap_no_closing_brace() {
-        let latex = "P^{hysics is a hot topic in computer games and these days physics simulations";
-        assert!(detect_drop_cap(latex).is_none());
-    }
+    // Drop cap detection tests moved to text_cleanup.rs
 }
 
 /// Detect if a Text region likely contains a display formula.

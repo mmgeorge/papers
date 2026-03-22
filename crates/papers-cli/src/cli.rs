@@ -122,6 +122,10 @@ pub enum EntityCommand {
         /// Write layout debug output: "images" for annotated PNGs, "pdf" for PNGs + debug PDF
         #[arg(long, value_name = "MODE")]
         write_layout: Option<LayoutDebugArg>,
+
+        /// Text-only mode: skip all ML models, extract from PDF text layer only
+        #[arg(long)]
+        text_only: bool,
     },
     /// Manage papers CLI configuration
     Config {

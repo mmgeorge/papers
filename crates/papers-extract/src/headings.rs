@@ -316,7 +316,7 @@ pub fn normalize_font_family(font_name: &str) -> String {
 // ── Size Bucketing ──────────────────────────────────────────────────
 
 /// Convert a size (em_size or height) to a bucket key (0.5pt bins).
-fn size_to_bucket(size: f32) -> HeightBucket {
+pub(crate) fn size_to_bucket(size: f32) -> HeightBucket {
     (size * 2.0).round() as HeightBucket
 }
 
@@ -874,19 +874,22 @@ pub fn merge_heading_segments(
                 let max_y_gap = seg.median_height * 1.5;
 
                 if y_gap < max_y_gap {
-                    // Merge: append text with space separator
-                    if y_gap < seg.median_height * 0.6 {
-                        // Same line — append with space
-                        last.title.push(' ');
+                    // Before merging, check if the new segment starts with a
+                    // different section number than the previous heading. If so,
+                    // they're separate headings that happen to be close together.
+                    // e.g., "3.2 Inequality Constraints" + "3.3 Frictional Contacts"
+                    let is_new_section = has_different_numbering(&last.title, &seg.text);
+                    if is_new_section {
+                        false
                     } else {
-                        // Next line — append with space
+                        // Merge: append text with space separator
                         last.title.push(' ');
+                        last.title.push_str(&seg.text);
+                        // Update y_center and x_right to track the latest segment
+                        last.y_center = seg.y_center;
+                        last.x_right = seg.x_right;
+                        true
                     }
-                    last.title.push_str(&seg.text);
-                    // Update y_center and x_right to track the latest segment
-                    last.y_center = seg.y_center;
-                    last.x_right = seg.x_right;
-                    true
                 } else {
                     false
                 }
@@ -915,6 +918,37 @@ pub fn merge_heading_segments(
     }
 
     headings
+}
+
+/// Check if two heading texts start with different section numbers.
+/// e.g., "3.2 Inequality Constraints" and "3.3 Frictional Contacts" → true
+/// "Vertex Block" and "Descent" → false (no numbers)
+fn has_different_numbering(title_a: &str, title_b: &str) -> bool {
+    let num_a = extract_leading_number(title_a);
+    let num_b = extract_leading_number(title_b);
+    match (num_a, num_b) {
+        (Some(a), Some(b)) => a != b,
+        _ => false, // If either has no number, can't determine → allow merge
+    }
+}
+
+/// Extract the leading number prefix like "3.2" from "3.2 Inequality Constraints"
+fn extract_leading_number(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let end = text.find(|c: char| c == ' ' || c == '\t').unwrap_or(text.len());
+    let prefix = &text[..end];
+    if prefix.is_empty() {
+        return None;
+    }
+    // Must start with a digit and contain only digits and dots
+    if !prefix.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    if prefix.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        Some(prefix)
+    } else {
+        None
+    }
 }
 
 /// Merge lone roman numeral headings with the next heading on the same page.

@@ -261,30 +261,11 @@ fn appendix_letter(text: &str) -> Option<char> {
 /// Case-insensitive matching with flexible numbering: "Figure 2-4",
 /// "EXAMPLE 3.1", "Definition 1", "Proof", etc.
 fn is_labeled_block(text: &str) -> bool {
-    let text = text.trim();
-    let labels = [
-        "example", "tip", "algorithm", "figure", "fig.", "fig",
-        "table", "listing", "exercise", "definition", "theorem",
-        "lemma", "corollary", "proposition", "proof", "remark",
-    ];
-    let lower = text.to_lowercase();
-    for label in &labels {
-        if lower.starts_with(label) {
-            let rest = &lower[label.len()..];
-            if rest.is_empty() {
-                // Bare label like "Proof" — only if short (not a sentence)
-                return text.len() < 40;
-            }
-            let next = rest.chars().next().unwrap();
-            // Must be followed by space, digit, dot, hyphen, or colon
-            if next == ' ' || next == '.' || next == '-' || next == ':'
-                || next.is_ascii_digit()
-            {
-                return true;
-            }
-        }
+    // Use shared label constants from text_cleanup
+    if crate::text_cleanup::match_label_prefix(text).is_some() {
+        return true;
     }
-    lower.starts_with("acm reference format")
+    text.trim().to_lowercase().starts_with("acm reference format")
 }
 
 /// Detect if a line contains leader dots (TOC-style dot patterns).
@@ -1397,7 +1378,12 @@ pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<
     }
 
     // Post-process and build the heading tree.
-    postprocess_flat_nodes(&mut flat_nodes, false);
+    // Note: `has_parts` flag is false here — the non-outline reflow path
+    // is used for documents without a TOC (papers). For papers, the
+    // heading-by-numbering reorder can misplace content in two-column
+    // layouts. We pass `true` to skip it, since font-based heading
+    // detection + XY-Cut already produces correct reading order.
+    postprocess_flat_nodes(&mut flat_nodes, true);
     build_heading_tree(flat_nodes)
 }
 
@@ -2671,12 +2657,11 @@ fn reorder_headings_by_numbering(flat_nodes: &mut Vec<ReflowNode>) {
                 if let Some(ihi) = insert_after_hi {
                     let target_idx = heading_indices[ihi].0;
                     if target_idx < cur_idx {
-                        // Move the heading (and its trailing content) right
-                        // after target_idx. Find how many content nodes follow
-                        // the heading before the next heading.
-                        let next_heading = heading_indices.get(hi + 1).map(|(idx, _)| *idx).unwrap_or(flat_nodes.len());
-                        let block_end = next_heading.min(cur_idx + 1); // just the heading for now
-
+                        // Move ONLY the heading node, not trailing content.
+                        // Content nodes are already in correct reading order from
+                        // XY-Cut / page ordering. Moving content with the heading
+                        // breaks two-column papers where sections on the same page
+                        // have content interleaved by column position.
                         let node = flat_nodes.remove(cur_idx);
                         flat_nodes.insert(target_idx + 1, node);
                         moved = true;
@@ -4228,6 +4213,14 @@ fn region_to_markdown(region: &Region) -> String {
             if let Some(ref latex) = region.latex {
                 let s = strip_dollar_delimiters(latex);
                 format!("$${s}$$")
+            } else if let Some(ref text) = region.text {
+                // Text-only extraction: no LaTeX available, use raw text
+                let t = text.trim();
+                if t.is_empty() {
+                    String::new()
+                } else {
+                    format!("$${t}$$")
+                }
             } else {
                 String::new()
             }

@@ -1981,6 +1981,7 @@ async fn papers_main() {
             skip_images,
             formula,
             write_layout,
+            text_only,
         } => {
             let output_dir = output.unwrap_or_else(|| {
                 pdf.parent()
@@ -2000,13 +2001,23 @@ async fn papers_main() {
                     Some(cli::LayoutDebugArg::Pdf) => papers_extract::DebugMode::Pdf,
                     None => papers_extract::DebugMode::Off,
                 },
+                text_only,
                 ..papers_extract::ExtractOptions::default()
             };
 
-            eprintln!("Extracting {} → {}", pdf.display(), output_dir.display());
+            eprintln!(
+                "Extracting {} → {}{}",
+                pdf.display(),
+                output_dir.display(),
+                if text_only { " (text-only)" } else { "" },
+            );
 
             let result = tokio::task::spawn_blocking(move || {
-                papers_extract::extract(&pdf, &output_dir, &options)
+                if text_only {
+                    papers_extract::extract_text_only(&pdf, &output_dir, &options)
+                } else {
+                    papers_extract::extract(&pdf, &output_dir, &options)
+                }
             })
             .await
             .unwrap();
