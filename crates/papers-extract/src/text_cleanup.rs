@@ -256,6 +256,17 @@ pub fn label_to_region_kind(prefix: &str) -> crate::types::RegionKind {
 
 // ── Formula detection ───────────────────────────────────────────────
 
+/// Check if a word is a PDF ligature artifact — garbled glyph substitutions
+/// that look like words but aren't. Common: absolute value bars |...| rendered
+/// as "fi"/"fifi" ligatures, or other ligature combos (ff, fl, ffl, ffi).
+fn is_ligature_artifact(w: &str) -> bool {
+    matches!(
+        w,
+        "fi" | "fl" | "ff" | "ffi" | "ffl" | "fifi" | "fifl" | "fffi" | "fffl"
+            | "fii" | "fif" | "fife" | "filt"
+    )
+}
+
 /// Check if a character is a math symbol or operator.
 pub(crate) fn is_math_char(c: char) -> bool {
     matches!(
@@ -294,22 +305,39 @@ pub(crate) fn is_math_italic_unicode(c: char) -> bool {
 pub fn is_likely_formula_text(text: &str) -> bool {
     let trimmed = text.trim();
     let total = trimmed.chars().count();
-    // Minimum 5 chars — anything shorter is an inline fragment, not a display formula
-    if total < 5 || total > 200 {
+    // Minimum 5 chars — anything shorter is an inline fragment, not a display formula.
+    // No upper limit — piecewise formulas and multi-line formulas can be very long.
+    if total < 5 {
         return false;
     }
 
+    // Content char count: exclude our formatting markers ($, _, {, }, ^)
+    // that are added by extract_region_text(). These inflate the char count
+    // and dilute math_ratio, sabotaging detection on our own output.
+    let content_total = trimmed
+        .chars()
+        .filter(|c| !matches!(c, '$' | '{' | '}' | '_' | '^'))
+        .count()
+        .max(1);
+
     // Reject pseudocode/algorithm lines — these contain math but are code, not formulas.
-    // ← alone is NOT a pseudocode signal (it's used in math: x_i ← argmin ...),
-    // but ← combined with pseudocode keywords IS.
+    // Key distinction: pseudocode control-flow keywords START the line
+    // (e.g., "if x > 0 then", "for i = 1 to n"), while piecewise math
+    // formulas use "if" in the MIDDLE (e.g., "value, if condition").
     let lower = trimmed.to_lowercase();
-    let pseudocode_keywords = ["for ", "end ", "if ", "then", "else", "while ",
-                                "return ", "repeat", "until", "do "];
-    let has_pseudocode_keyword = pseudocode_keywords.iter().any(|kw| lower.contains(kw));
-    if has_pseudocode_keyword {
+    // Keywords that signal pseudocode only at the START of the line
+    let start_keywords = ["for ", "if ", "while ", "return ", "repeat "];
+    if start_keywords.iter().any(|kw| lower.starts_with(kw)) {
         return false;
     }
-    // ← with \\leftarrow LaTeX command is pseudocode when combined with other signals
+    // Compound pseudocode patterns anywhere in the text
+    if lower.contains("end for") || lower.contains("end if")
+        || lower.contains("end while") || lower.contains("endif")
+        || lower.contains("endfor") || lower.contains("endwhile")
+    {
+        return false;
+    }
+    // ← with \\leftarrow LaTeX command is pseudocode
     if trimmed.contains("\\leftarrow") {
         return false;
     }
@@ -341,22 +369,26 @@ pub fn is_likely_formula_text(text: &str) -> bool {
             | '±' | '·')
     }) || trimmed.contains("argmin") || trimmed.contains("argmax");
 
-    // Count "prose words": ≥4 ASCII alphabetic letters.
+    // Count "prose words": ≥4 ASCII alphabetic letters, excluding PDF
+    // ligature artifacts. Absolute value bars |...| often get garbled as
+    // "fi"/"fifi" ligatures, which look like prose words but aren't.
     let prose_words = trimmed
         .split_whitespace()
         .filter(|w| {
             w.len() >= 4
                 && w.chars().all(|c| c.is_ascii_alphabetic())
                 && !w.starts_with('$')
+                && !is_ligature_artifact(w)
         })
         .count();
 
     // Count ASCII alphabetic chars — high ratio means prose (even garbled
     // prose with no spaces like "updateofEquation12when𝜆min").
     let ascii_alpha = trimmed.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    let ascii_alpha_ratio = ascii_alpha as f32 / total.max(1) as f32;
+    let ascii_alpha_ratio = ascii_alpha as f32 / content_total as f32;
 
-    let math_ratio = math_chars as f32 / total.max(1) as f32;
+    // Use content_total (excluding formatting markers) for ratios
+    let math_ratio = math_chars as f32 / content_total as f32;
 
     // High math italic density = garbled math from PDF text layer → almost
     // certainly a formula, BUT only if the line isn't dominated by ASCII
@@ -377,8 +409,8 @@ pub fn is_likely_formula_text(text: &str) -> bool {
         return false;
     }
 
-    // High math symbol density + few prose words → formula
-    if math_ratio > 0.15 && prose_words <= 1 && total < 120 {
+    // High math symbol density + few prose words → formula (short-medium texts)
+    if math_ratio > 0.15 && prose_words <= 1 && content_total < 120 {
         return true;
     }
 
@@ -387,8 +419,16 @@ pub fn is_likely_formula_text(text: &str) -> bool {
         return true;
     }
 
-    // Contains $ markers (from text layer LaTeX) with math content and an operator
-    if dollar_signs >= 2 && has_operator && prose_words <= 1 && total < 120 {
+    // Contains $ markers (from text layer LaTeX) with math content and an operator.
+    // $ markers are our own font-analysis signal — if we wrapped content in $...$,
+    // we know it's math. No size limit needed since this IS our detection.
+    if dollar_signs >= 2 && has_operator && prose_words <= 2 {
+        return true;
+    }
+
+    // Long text with very high math density — multi-line formulas (piecewise, matrices).
+    // Requires stronger signals since longer texts have more noise.
+    if content_total >= 120 && math_ratio > 0.2 && prose_words <= 2 && ascii_alpha_ratio < 0.4 {
         return true;
     }
 

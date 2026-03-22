@@ -427,13 +427,17 @@ fn partition_heading_chars(
         }
 
         let family = crate::headings::normalize_font_family(&c.font_name);
-        // A char is heading-font ONLY if it's in a heading font family
-        // AND not in a formula zone. Bold math variables (f_i, H_i) use
-        // the heading font but appear inside formulas — they should stay
-        // in the body pool.
+        // A char is heading-font if it's in a heading font family.
+        // Formula zones suppress heading detection for bold math variables
+        // (f_i, H_i) that use the heading font — UNLESS the char is near
+        // a known heading position. The font IS the definitive signal for
+        // headings; formula zones should not override confirmed headings.
         let img_y = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
+        let pdf_y = (c.bbox[1] + c.bbox[3]) / 2.0;
         let in_formula_zone = formula_zones.iter().any(|&(yt, yb)| img_y >= yt && img_y <= yb);
-        let is_heading_char = heading_families.contains(&family) && !in_formula_zone;
+        let near_known_heading = known_headings.iter().any(|h| (h.y_center - pdf_y).abs() < 15.0);
+        let is_heading_char = heading_families.contains(&family)
+            && (!in_formula_zone || near_known_heading);
 
         if is_heading_char {
             if !in_heading {
@@ -660,6 +664,7 @@ pub fn extract_page_text_blocks(
     // Step 4: Two-pass classification.
     // Pass 1: identify DisplayFormula blocks and collect their bboxes.
     // Pass 2: extract text for non-formula blocks, excluding chars in formula bboxes.
+    let has_font_headings = !heading_families.is_empty();
     let page_median_font = if blocks.is_empty() {
         10.0
     } else {
@@ -685,7 +690,7 @@ pub fn extract_page_text_blocks(
             if trimmed.len() < MIN_TEXT_LEN || is_formula_fragment(trimmed) {
                 return false;
             }
-            let kind = classify_block(block, trimmed, headings, page_height_pt, page_median_font);
+            let kind = classify_block(block, trimmed, headings, page_height_pt, page_median_font, has_font_headings);
             kind == RegionKind::Text && text_cleanup::is_likely_formula_text(trimmed)
         })
         .collect();
@@ -847,7 +852,7 @@ pub fn extract_page_text_blocks(
         let mut kind = if is_formula {
             RegionKind::DisplayFormula
         } else {
-            classify_block(block, trimmed, headings, page_height_pt, page_median_font)
+            classify_block(block, trimmed, headings, page_height_pt, page_median_font, has_font_headings)
         };
         let mut formula_tag = None;
 
@@ -1153,14 +1158,31 @@ fn group_into_blocks(lines: &[Line], heading_ys: &[f32]) -> Vec<Block> {
         .collect();
 
     // Pre-mark which lines look like display formulas.
-    // A display formula is on its own line with only an equation number or
-    // whitespace to its left/right — it doesn't share the line with prose.
-    // Detection is content-based via `is_likely_formula_text()`.
+    // Two detection paths:
+    // 1. Content-based: `is_likely_formula_text()` — operators, math symbols, prose rejection
+    // 2. Font-based: if a line has ≥3 math italic Unicode chars (U+1D400-1D7FF) and
+    //    no prose words, it's a formula. These chars ARE the font signal — they're
+    //    mathematical alphanumeric symbols that only appear in math content.
+    //    This is the same signal our `extract_region_text()` uses to add `$...$` markers.
     let mut line_is_formula: Vec<bool> = lines
         .iter()
         .map(|line| {
             let t = line.text.trim();
-            t.len() >= 5 && crate::text_cleanup::is_likely_formula_text(t)
+            let total = t.chars().count();
+            if total < 3 {
+                return false;
+            }
+            // Path 1: content-based heuristics
+            let p1 = total >= 5 && crate::text_cleanup::is_likely_formula_text(t);
+            // Path 2: font-based — math italic Unicode chars are a direct
+            // font signal. Require ≥3 to avoid false positives from prose
+            // with a single inline math variable.
+            let math_italic = t.chars().filter(|c| crate::text_cleanup::is_math_italic_unicode(*c)).count();
+            let prose_words = t.split_whitespace()
+                .filter(|w| w.len() >= 4 && w.chars().all(|c| c.is_ascii_alphabetic()))
+                .count();
+            let p2 = math_italic >= 3 && prose_words == 0;
+            p1 || p2
         })
         .collect();
 
@@ -1206,8 +1228,11 @@ fn group_into_blocks(lines: &[Line], heading_ys: &[f32]) -> Vec<Block> {
             let prose_words = t.split_whitespace()
                 .filter(|w| w.len() >= 4 && w.chars().all(|c| c.is_ascii_alphabetic()))
                 .count();
-            // Math content or digits (e.g., numerator "1") + no prose → fragment
-            if (math_italic >= 1 || math_syms >= 1 || has_digits) && prose_words == 0 {
+            // A line with no ASCII letters at all (pure symbols, braces,
+            // operators) is formula structure when adjacent to a formula.
+            let no_ascii_alpha = !t.chars().any(|c| c.is_ascii_alphabetic());
+            // Math content, digits, or pure symbols + no prose → fragment
+            if (math_italic >= 1 || math_syms >= 1 || has_digits || no_ascii_alpha) && prose_words == 0 {
                 line_is_formula[i] = true;
                 changed = true;
             }
@@ -1316,14 +1341,13 @@ fn classify_block(
     text: &str,
     headings: &[&DetectedHeading],
     page_height_pt: f32,
-    page_median_font: f32,
+    _page_median_font: f32,
+    has_font_headings: bool,
 ) -> RegionKind {
     let line_count = block.line_count;
 
-    // Check against both block center and block top edge (in PDF Y-up coords).
-    // The heading may be at the TOP of a multi-line block (fused heading + body text).
     let block_center_pdf_y = page_height_pt - (block.bbox[1] + block.bbox[3]) / 2.0;
-    let block_top_pdf_y = page_height_pt - block.bbox[1]; // top in image = high Y in PDF
+    let block_top_pdf_y = page_height_pt - block.bbox[1];
     let avg_line_height = (block.bbox[3] - block.bbox[1]) / line_count.max(1) as f32;
 
     for heading in headings {
@@ -1333,6 +1357,14 @@ fn classify_block(
             continue;
         }
         if titles_match_strict(&heading.title, text) {
+            // When font-based headings are active, only classify as heading
+            // if the block is a single line. Multi-line blocks that happen
+            // to start with heading text are body blocks with fused heading
+            // chars — the font IS the definitive signal, and body-font text
+            // should never be absorbed into a heading region.
+            if has_font_headings && line_count > 2 {
+                continue;
+            }
             if block.is_topmost && line_count == 1 && !titles_match_exact(&heading.title, text) {
                 return RegionKind::Text;
             }
