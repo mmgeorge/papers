@@ -36,6 +36,10 @@ struct ImgChar {
     codepoint: char,
 }
 
+impl text_cleanup::HasBbox for ImgChar {
+    fn bbox(&self) -> [f32; 4] { self.bbox }
+}
+
 /// A line of characters grouped by Y-proximity.
 struct Line {
     y_center: f32,
@@ -867,13 +871,26 @@ pub fn extract_page_text_blocks(
                 extracted = formula_text;
                 formula_tag = tag;
                 kind = RegionKind::DisplayFormula;
-            } else if block.line_count >= 3 {
-                let has_math_markers = trimmed.contains('$')
-                    || trimmed.chars().any(|c| {
-                        let cp = c as u32;
-                        (0x1D400..=0x1D7FF).contains(&cp)
-                    });
-                if !has_math_markers && crate::output::code_score(trimmed) >= 3 {
+            } else {
+                // Algorithm detection: line numbers (e.g., "1:", "2:") are
+                // a definitive structural signal, even for 1-2 line blocks.
+                // Pseudocode legitimately contains math variables — the
+                // distinction is structure, not content.
+                // Check for algorithm line numbers (e.g., "3:", "15:") anywhere
+                // in the text — they may not be at the start of a line because
+                // extracted text often lacks proper line breaks.
+                let has_line_numbers = text_cleanup::has_algorithm_line_number(trimmed);
+
+                let is_algorithm = if has_line_numbers {
+                    true
+                } else if block.line_count >= 3 {
+                    let has_math_markers = trimmed.contains('$')
+                        || trimmed.chars().any(|c| text_cleanup::is_math_italic_unicode(c));
+                    !has_math_markers && crate::output::code_score(trimmed) >= 3
+                } else {
+                    false
+                };
+                if is_algorithm {
                     let preserved = text::extract_region_text(
                         &extraction_chars,
                         block.bbox,
@@ -884,6 +901,77 @@ pub fn extract_page_text_blocks(
                     );
                     extracted = text_cleanup::clean_block_text(&preserved);
                     kind = RegionKind::Algorithm;
+                }
+            }
+        }
+
+        // Algorithm caption split: if an Algorithm block starts with
+        // "Algorithm N <title>", split into a FigureTitle caption and
+        // an Algorithm body. The caption is everything before the first
+        // line number "N:".
+        if kind == RegionKind::Algorithm {
+            let lower_ext = extracted.to_lowercase();
+            if lower_ext.starts_with("algorithm ") {
+                if let Some(split_pos) = find_first_line_number_pos(&extracted) {
+                    let caption_text = extracted[..split_pos].trim().to_string();
+                    let body_text = extracted[split_pos..].trim().to_string();
+
+                    // Emit caption
+                    let caption_id = format!("p{}_{}_cap", page_idx + 1, block_idx);
+                    regions.push(Region {
+                        id: caption_id,
+                        kind: RegionKind::FigureTitle,
+                        bbox: block.bbox,
+                        confidence: 1.0,
+                        order: 0,
+                        text: Some(caption_text),
+                        html: None, latex: None, image_path: None,
+                        caption: None, chart_type: None, tag: None,
+                        items: None, formula_source: None, ocr_confidence: None,
+                        consumed: false,
+                    });
+
+                    // Emit body (re-extract with preserved layout, strip caption)
+                    let preserved = text::extract_region_text(
+                        &extraction_chars,
+                        block.bbox,
+                        page_height_pt,
+                        &[], &[],
+                        text::AssemblyMode::PreserveLayout,
+                    );
+                    // Strip the caption line from the preserved text.
+                    // The caption is the first line; body starts at the first
+                    // line beginning with a digit (the line number).
+                    let body_preserved = {
+                        let mut found = false;
+                        let mut pos = 0;
+                        for (i, line) in preserved.split('\n').enumerate() {
+                            if i > 0 && line.trim_start().starts_with(|c: char| c.is_ascii_digit()) {
+                                found = true;
+                                break;
+                            }
+                            pos += line.len() + 1; // +1 for \n
+                        }
+                        if found {
+                            text_cleanup::clean_block_text(preserved[pos..].trim())
+                        } else {
+                            text_cleanup::clean_block_text(&preserved)
+                        }
+                    };
+                    let body_id = format!("p{}_{}", page_idx + 1, block_idx);
+                    regions.push(Region {
+                        id: body_id,
+                        kind: RegionKind::Algorithm,
+                        bbox: block.bbox,
+                        confidence: 1.0,
+                        order: 0,
+                        text: Some(body_preserved),
+                        html: None, latex: None, image_path: None,
+                        caption: None, chart_type: None, tag: None,
+                        items: None, formula_source: None, ocr_confidence: None,
+                        consumed: false,
+                    });
+                    continue; // skip normal region push
                 }
             }
         }
@@ -1043,14 +1131,22 @@ fn group_into_lines(chars: &[ImgChar]) -> Vec<Line> {
 
     let mut lines = Vec::new();
     let mut line_start = 0;
-    let mut current_y = (chars[sorted[0]].bbox[1] + chars[sorted[0]].bbox[3]) / 2.0;
+    let mut line_y_min = chars[sorted[0]].bbox[1];
+    let mut line_y_max = chars[sorted[0]].bbox[3];
 
     for i in 1..sorted.len() {
-        let cy = (chars[sorted[i]].bbox[1] + chars[sorted[i]].bbox[3]) / 2.0;
-        if (cy - current_y).abs() > y_threshold {
+        let c = &chars[sorted[i]];
+        let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+        let pad = y_threshold * 0.6;
+
+        if cy >= line_y_min - pad && cy <= line_y_max + pad {
+            line_y_min = line_y_min.min(c.bbox[1]);
+            line_y_max = line_y_max.max(c.bbox[3]);
+        } else {
             lines.push(build_line(chars, &sorted[line_start..i]));
             line_start = i;
-            current_y = cy;
+            line_y_min = c.bbox[1];
+            line_y_max = c.bbox[3];
         }
     }
     lines.push(build_line(chars, &sorted[line_start..]));
@@ -1157,19 +1253,54 @@ fn group_into_blocks(lines: &[Line], heading_ys: &[f32]) -> Vec<Block> {
         })
         .collect();
 
+    // Detect algorithm zones: Y-ranges containing numbered pseudocode lines.
+    // Line numbers ("1:", "15:", "37:") are an unambiguous structural signal —
+    // display formulas NEVER have them. Lines inside algorithm zones should NOT
+    // be detected as formula, even if they contain math italic chars.
+    let line_has_number: Vec<bool> = lines
+        .iter()
+        .map(|line| {
+            let t = line.text.trim();
+            // Check if any whitespace-separated token is "N:" (1-3 digits + colon)
+            text_cleanup::has_algorithm_line_number(t)
+        })
+        .collect();
+
+    // Build algorithm zones from clusters of numbered lines.
+    // If ≥2 numbered lines exist within close Y-proximity, the Y-range
+    // between them (plus padding) is an algorithm zone.
+    let algo_zones: Vec<(f32, f32)> = {
+        let numbered_ys: Vec<f32> = lines
+            .iter()
+            .zip(line_has_number.iter())
+            .filter(|(_, has)| **has)
+            .map(|(l, _)| l.y_center)
+            .collect();
+        if numbered_ys.len() >= 2 {
+            // Single zone spanning all numbered lines, with padding
+            let y_min = numbered_ys.iter().cloned().fold(f32::MAX, f32::min);
+            let y_max = numbered_ys.iter().cloned().fold(f32::MIN, f32::max);
+            let pad = avg_line_height * 2.0;
+            vec![(y_min - pad, y_max + pad)]
+        } else {
+            Vec::new()
+        }
+    };
+
     // Pre-mark which lines look like display formulas.
-    // Two detection paths:
-    // 1. Content-based: `is_likely_formula_text()` — operators, math symbols, prose rejection
-    // 2. Font-based: if a line has ≥3 math italic Unicode chars (U+1D400-1D7FF) and
-    //    no prose words, it's a formula. These chars ARE the font signal — they're
-    //    mathematical alphanumeric symbols that only appear in math content.
-    //    This is the same signal our `extract_region_text()` uses to add `$...$` markers.
+    // Suppressed in algorithm zones — pseudocode with math variables is
+    // algorithm content, not display formulas.
     let mut line_is_formula: Vec<bool> = lines
         .iter()
         .map(|line| {
             let t = line.text.trim();
             let total = t.chars().count();
             if total < 3 {
+                return false;
+            }
+            // Suppress formula detection inside algorithm zones
+            let in_algo = algo_zones.iter().any(|&(yt, yb)| line.y_center >= yt && line.y_center <= yb);
+            if in_algo {
                 return false;
             }
             // Path 1: content-based heuristics
@@ -1246,18 +1377,39 @@ fn group_into_blocks(lines: &[Line], heading_ys: &[f32]) -> Vec<Block> {
         let prev = &lines[i - 1];
         let curr = &lines[i];
 
+        // Suppress heuristic breaks inside algorithm zones. Algorithm
+        // pseudocode has subscript fragments, varying indentation, and
+        // font size changes that trigger y_break/x_break/font_break —
+        // but these are all within one logical algorithm block. Line
+        // numbers are the structural signal; formatting heuristics
+        // should not override them.
+        let both_in_algo = algo_zones.iter().any(|&(yt, yb)| {
+            prev.y_center >= yt && prev.y_center <= yb
+                && curr.y_center >= yt && curr.y_center <= yb
+        });
+
+        // Subscript/superscript fragments: tiny lines (≤3 chars) at a
+        // different Y are attached to their parent line, not separate
+        // content. They should never cause heuristic breaks.
+        let prev_chars = prev.text.trim().chars().count();
+        let curr_chars = curr.text.trim().chars().count();
+        let either_is_fragment = prev_chars <= 3 || curr_chars <= 3;
+
         let y_gap = (curr.y_center - prev.y_center).abs();
-        let y_break = para_threshold > 0.0 && y_gap > para_threshold;
+        let y_break = !both_in_algo && !either_is_fragment
+            && para_threshold > 0.0 && y_gap > para_threshold;
 
         let x_overlap = prev.x_max.min(curr.x_max) - prev.x_min.max(curr.x_min);
-        let x_break = x_overlap < -avg_char_width;
+        let x_break = !both_in_algo && !either_is_fragment
+            && x_overlap < -avg_char_width;
 
         let font_ratio = if prev.font_size > 0.0 && curr.font_size > 0.0 {
             (prev.font_size / curr.font_size).max(curr.font_size / prev.font_size)
         } else {
             1.0
         };
-        let font_break = font_ratio > 1.3;
+        let font_break = !both_in_algo && !either_is_fragment
+            && font_ratio > 1.3;
 
         // Heading break: force split before a heading line or after a heading line
         let heading_break = line_is_heading[i] || line_is_heading[i - 1];
@@ -1309,6 +1461,31 @@ fn build_block(lines: &[Line], start: usize, end: usize) -> Block {
         is_bold: bold_count > line_count / 2,
         is_topmost: false,
     }
+}
+
+// ── Algorithm caption splitting ─────────────────────────────────────
+
+/// Find the byte position of the first "N:" line-number token in text.
+/// Returns the position of the digit, suitable for splitting caption from body.
+fn find_first_line_number_pos(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if !b.is_ascii_digit() {
+            continue;
+        }
+        // Must be at word boundary (start of text or preceded by whitespace)
+        if i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+            continue;
+        }
+        // Find the colon after 1-3 digits
+        let rest = &text[i..];
+        if let Some(colon) = rest.find(':') {
+            if colon >= 1 && colon <= 3 && rest[..colon].chars().all(|c| c.is_ascii_digit()) {
+                return Some(i);
+            }
+        }
+    }
+    None
 }
 
 // ── Formula fragment detection ──────────────────────────────────────

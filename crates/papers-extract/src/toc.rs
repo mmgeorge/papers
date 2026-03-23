@@ -85,6 +85,10 @@ struct TocChar {
     is_italic: bool,
 }
 
+impl crate::text_cleanup::HasBbox for TocChar {
+    fn bbox(&self) -> [f32; 4] { self.bbox }
+}
+
 /// A single line of text extracted from a TOC page.
 #[derive(Debug, Clone)]
 struct TocRawLine {
@@ -715,7 +719,6 @@ fn build_lines_from_chars(
         if (ch_y - current_y).abs() <= y_threshold {
             current_line.push(ch);
         } else {
-            // Sort current line by x
             current_line.sort_by(|a, b| {
                 a.bbox[0]
                     .partial_cmp(&b.bbox[0])
@@ -726,7 +729,6 @@ fn build_lines_from_chars(
             current_y = ch_y;
         }
     }
-    // Don't forget last line
     current_line.sort_by(|a, b| {
         a.bbox[0]
             .partial_cmp(&b.bbox[0])

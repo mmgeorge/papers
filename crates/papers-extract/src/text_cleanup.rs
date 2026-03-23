@@ -1,6 +1,140 @@
 //! Shared text post-processing utilities used by both the layout pipeline
 //! and the text-only extraction path.
 
+// ── Geometric grouping ─────────────────────────────────────────────
+
+/// Trait for items with a bounding box, enabling shared geometric grouping.
+pub(crate) trait HasBbox {
+    fn bbox(&self) -> [f32; 4]; // [x1, y1, x2, y2]
+}
+
+/// Result of Y-proximity line grouping.
+pub(crate) struct LineGrouping {
+    /// Each inner Vec contains indices into the original slice, representing
+    /// one line. Lines are sorted top-to-bottom; indices within each line
+    /// are sorted left-to-right by bbox x1.
+    pub groups: Vec<Vec<usize>>,
+    /// Average height of input items (useful for downstream block grouping).
+    pub avg_height: f32,
+}
+
+/// Group items into lines by Y-proximity using bbox-based tracking.
+///
+/// A char belongs to the current line if its Y-center falls within the
+/// line's Y extent (y_min to y_max) plus padding. This correctly handles
+/// subscripts and superscripts — their centers fall within the parent
+/// line's bbox, so they stay grouped.
+///
+/// `pad_factor` controls how much to expand beyond the line bbox.
+/// Use 0.3 for text-only path (no orphan merge), 0.0 for ML path
+/// (which has its own orphan-merge post-pass).
+pub(crate) fn group_by_y_proximity<T: HasBbox>(items: &[T]) -> LineGrouping {
+    group_by_y_proximity_padded(items, 0.3)
+}
+
+/// Like `group_by_y_proximity` but with explicit pad factor.
+pub(crate) fn group_by_y_proximity_padded<T: HasBbox>(items: &[T], pad_factor: f32) -> LineGrouping {
+    if items.is_empty() {
+        return LineGrouping { groups: Vec::new(), avg_height: 0.0 };
+    }
+
+    // Sort indices by center-Y then X
+    let mut sorted: Vec<usize> = (0..items.len()).collect();
+    sorted.sort_by(|&a, &b| {
+        let ab = items[a].bbox();
+        let bb = items[b].bbox();
+        let ay = (ab[1] + ab[3]) / 2.0;
+        let by = (bb[1] + bb[3]) / 2.0;
+        ay.partial_cmp(&by)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(ab[0].partial_cmp(&bb[0]).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    // Compute average height (skip items with height < 0.5 — zero-height glyphs)
+    let heights: Vec<f32> = items
+        .iter()
+        .map(|item| {
+            let b = item.bbox();
+            (b[3] - b[1]).abs()
+        })
+        .filter(|&h| h > 0.5)
+        .collect();
+    let avg_height = if heights.is_empty() {
+        10.0
+    } else {
+        heights.iter().sum::<f32>() / heights.len() as f32
+    };
+    let pad = avg_height * pad_factor;
+
+    // Group by Y-proximity using line bbox tracking
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut current_group: Vec<usize> = vec![sorted[0]];
+    let first_bbox = items[sorted[0]].bbox();
+    let mut line_y_min = first_bbox[1];
+    let mut line_y_max = first_bbox[3];
+
+    for &idx in &sorted[1..] {
+        let b = items[idx].bbox();
+        let cy = (b[1] + b[3]) / 2.0;
+
+        if cy >= line_y_min - pad && cy <= line_y_max + pad {
+            // Within line extent — same line. Expand extent.
+            line_y_min = line_y_min.min(b[1]);
+            line_y_max = line_y_max.max(b[3]);
+            current_group.push(idx);
+        } else {
+            // New line. Sort current group by X before finalizing.
+            current_group.sort_by(|&a, &b| {
+                items[a].bbox()[0]
+                    .partial_cmp(&items[b].bbox()[0])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            groups.push(current_group);
+            current_group = vec![idx];
+            line_y_min = b[1];
+            line_y_max = b[3];
+        }
+    }
+    // Finalize last group
+    current_group.sort_by(|&a, &b| {
+        items[a].bbox()[0]
+            .partial_cmp(&items[b].bbox()[0])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    groups.push(current_group);
+
+    LineGrouping { groups, avg_height }
+}
+
+// ── Shared utility functions ───────────────────────────────────────
+
+/// Check if text contains algorithm line numbers (e.g., "3:", "15:").
+///
+/// Returns true if any whitespace-separated token matches `\d{1,3}:`.
+pub(crate) fn has_algorithm_line_number(text: &str) -> bool {
+    text.split_whitespace().any(|w| {
+        w.len() >= 2
+            && w.len() <= 4
+            && w.ends_with(':')
+            && w[..w.len() - 1].chars().all(|c| c.is_ascii_digit())
+    })
+}
+
+/// Count prose words in text — words of >=4 ASCII alphabetic characters,
+/// excluding `$`-prefixed tokens and PDF ligature artifacts ("fi", "fifi").
+pub(crate) fn count_prose_words(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|w| {
+            w.len() >= 4
+                && w.chars().all(|c| c.is_ascii_alphabetic())
+                && !w.starts_with('$')
+                && !is_ligature_artifact(w)
+        })
+        .count()
+}
+
+// ── Text post-processing ───────────────────────────────────────────
+
 /// Detect drop caps masquerading as formulas.
 ///
 /// Pattern: a single uppercase letter followed by `^{...}` or `_{...}` where
@@ -249,6 +383,8 @@ pub fn match_label_prefix(text: &str) -> Option<&'static str> {
 pub fn label_to_region_kind(prefix: &str) -> crate::types::RegionKind {
     if TABLE_CAPTION_PREFIXES.contains(&prefix) {
         crate::types::RegionKind::TableTitle
+    } else if prefix == "algorithm" {
+        crate::types::RegionKind::Algorithm
     } else {
         crate::types::RegionKind::FigureTitle
     }
@@ -369,18 +505,7 @@ pub fn is_likely_formula_text(text: &str) -> bool {
             | '±' | '·')
     }) || trimmed.contains("argmin") || trimmed.contains("argmax");
 
-    // Count "prose words": ≥4 ASCII alphabetic letters, excluding PDF
-    // ligature artifacts. Absolute value bars |...| often get garbled as
-    // "fi"/"fifi" ligatures, which look like prose words but aren't.
-    let prose_words = trimmed
-        .split_whitespace()
-        .filter(|w| {
-            w.len() >= 4
-                && w.chars().all(|c| c.is_ascii_alphabetic())
-                && !w.starts_with('$')
-                && !is_ligature_artifact(w)
-        })
-        .count();
+    let prose_words = count_prose_words(trimmed);
 
     // Count ASCII alphabetic chars — high ratio means prose (even garbled
     // prose with no spaces like "updateofEquation12when𝜆min").
@@ -747,7 +872,7 @@ mod tests {
     fn test_label_to_kind_figure() {
         assert_eq!(label_to_region_kind("figure"), crate::types::RegionKind::FigureTitle);
         assert_eq!(label_to_region_kind("theorem"), crate::types::RegionKind::FigureTitle);
-        assert_eq!(label_to_region_kind("algorithm"), crate::types::RegionKind::FigureTitle);
+        assert_eq!(label_to_region_kind("algorithm"), crate::types::RegionKind::Algorithm);
         assert_eq!(label_to_region_kind("proof"), crate::types::RegionKind::FigureTitle);
     }
 

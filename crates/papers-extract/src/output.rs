@@ -3424,35 +3424,41 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
                 }
             }
             ReflowNode::Algorithm { content } => {
-                // Algorithm regions can be: real pseudocode, programming code, or
-                // misclassified prose. Check structural signals to decide.
                 let is_pseudocode = looks_like_pseudocode(content);
-                if is_pseudocode || looks_like_code(content) || code_score(content) >= 2 {
-                    // Check if it's actually prose with math — full sentences without
-                    // algorithmic structure shouldn't be code blocks
-                    let has_math = content.matches('$').count() >= 2
-                        || content.contains("[[FORMULA")
-                        || count_italic_spans(content) >= 2;
-                    if has_math && !is_pseudocode && !looks_like_code(content) {
-                        // Math-heavy prose misclassified as Algorithm
-                        *node = ReflowNode::Text {
-                            content: content.replace('\n', " "),
-                            footnotes: Vec::new(),
-                        };
-                    } else {
-                        let trimmed = trim_trailing_prose(content);
-                        let lang = if is_pseudocode {
-                            None
-                        } else {
-                            guess_language(&trimmed)
-                        };
-                        *node = ReflowNode::CodeBlock {
-                            content: trimmed,
-                            language: lang,
-                        };
-                    }
+                let is_code = looks_like_code(content);
+                let has_line_nums = crate::text_cleanup::has_algorithm_line_number(content);
+                let has_math = content.matches('$').count() >= 2
+                    || content.contains("[[FORMULA")
+                    || count_italic_spans(content) >= 2;
+                let trimmed = trim_trailing_prose(content);
+                let lang = guess_language(&trimmed);
+
+                if lang.is_some() {
+                    // Recognized programming language → CodeBlock
+                    *node = ReflowNode::CodeBlock {
+                        content: trimmed,
+                        language: lang,
+                    };
+                } else if is_pseudocode || has_line_nums {
+                    // Pseudocode or has line numbers → keep as Algorithm
+                    *node = ReflowNode::Algorithm {
+                        content: trimmed,
+                    };
+                } else if has_math && !is_code {
+                    // Math-heavy content without code signals — ML model
+                    // misclassified prose as Algorithm. Demote to Text.
+                    *node = ReflowNode::Text {
+                        content: content.replace('\n', " "),
+                        footnotes: Vec::new(),
+                    };
+                } else if is_code || code_score(content) >= 2 {
+                    // Code without recognized language → CodeBlock
+                    *node = ReflowNode::CodeBlock {
+                        content: trimmed,
+                        language: None,
+                    };
                 } else {
-                    // Not code — demote to Text so it renders as prose
+                    // No signals at all → demote to Text
                     *node = ReflowNode::Text {
                         content: content.replace('\n', " "),
                         footnotes: Vec::new(),
@@ -3463,7 +3469,7 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
         }
     }
 
-    // Step 2: Merge consecutive CodeBlock nodes
+    // Step 2: Merge consecutive CodeBlock nodes and consecutive Algorithm nodes
     let mut i = 0;
     while i + 1 < flat_nodes.len() {
         let is_code_pair = matches!(&flat_nodes[i], ReflowNode::CodeBlock { .. })
@@ -3473,13 +3479,23 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
                 if let ReflowNode::CodeBlock { content: c1, language: l1 } = &mut flat_nodes[i] {
                     c1.push('\n');
                     c1.push_str(&c2);
-                    // Keep the more specific language
                     if l1.is_none() && l2.is_some() {
                         *l1 = l2;
                     }
                 }
             }
-            continue; // re-check same position for further merging
+            continue;
+        }
+        let is_algo_pair = matches!(&flat_nodes[i], ReflowNode::Algorithm { .. })
+            && matches!(&flat_nodes[i + 1], ReflowNode::Algorithm { .. });
+        if is_algo_pair {
+            if let ReflowNode::Algorithm { content: c2 } = flat_nodes.remove(i + 1) {
+                if let ReflowNode::Algorithm { content: c1 } = &mut flat_nodes[i] {
+                    c1.push('\n');
+                    c1.push_str(&c2);
+                }
+            }
+            continue;
         }
         i += 1;
     }
@@ -3917,8 +3933,20 @@ fn render_children(children: &[ReflowNode], parts: &mut Vec<String>) {
                 }
             }
             ReflowNode::Algorithm { content } => {
-                // Wrap algorithm/code content in fenced code block
-                parts.push(format!("```\n{content}\n```"));
+                // Render algorithm with preserved newlines and indentation.
+                // NOT fenced code blocks (``` kills $...$ LaTeX math).
+                // Trailing "  " on each line = markdown <br> line break.
+                let formatted: Vec<String> = content
+                    .lines()
+                    .map(|line| {
+                        if line.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!("{line}  ")
+                        }
+                    })
+                    .collect();
+                parts.push(formatted.join("\n"));
             }
             ReflowNode::FigureGroup { path, caption } => {
                 if path.is_empty() {
