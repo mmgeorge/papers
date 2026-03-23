@@ -396,15 +396,25 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
             )
     });
 
-    // Compute average element height for threshold
-    let avg_height = sorted
-        .iter()
-        .map(|e| {
-            let b = e.bbox();
-            (b[3] - b[1]).abs()
-        })
-        .sum::<f32>()
-        / sorted.len() as f32;
+    // Use MEDIAN element height for threshold — subscripts/superscripts
+    // have smaller heights that drag down the average, making the threshold
+    // too tight and splitting lines at subscript boundaries.
+    let avg_height = {
+        let mut heights: Vec<f32> = sorted
+            .iter()
+            .map(|e| {
+                let b = e.bbox();
+                (b[3] - b[1]).abs()
+            })
+            .filter(|&h| h > 0.5)
+            .collect();
+        if heights.is_empty() {
+            10.0
+        } else {
+            heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            heights[heights.len() / 2]
+        }
+    };
     let y_threshold = avg_height * 0.5;
 
     let mut lines: Vec<Vec<&LineElement>> = vec![];
