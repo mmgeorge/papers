@@ -446,40 +446,203 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
         lines.push(current_line);
     }
 
-    // Post-pass: merge orphan lines (≤2 visible chars) into the nearest adjacent
-    // line when the Y gap is within avg_height (a looser threshold than the
-    // initial grouping). This rescues stray characters like '←' that are rendered
-    // at a slightly different vertical position in the PDF.
-    let merge_threshold = avg_height;
-    let mut merged: Vec<Vec<&LineElement>> = Vec::with_capacity(lines.len());
-    for line in lines {
-        let visible_count = line
+    // Post-pass: merge fragment lines into their nearest baseline.
+    //
+    // Two-tier strategy:
+    //   - Tiny fragments (≤2 visible chars): merge with avg_height Y-threshold
+    //     into the previous line (original behavior, handles lone subscripts).
+    //   - Larger fragments (3–15 visible chars): merge with tighter Y-threshold
+    //     (avg_height * 0.75) AND require the fragment's X-extent be ≥ 70% of
+    //     the target's (fraction parts span similar width as their baseline).
+    //     Additionally, check that most of the fragment's chars don't collide
+    //     in X with the target's chars — this prevents garbling when superscripts
+    //     sit directly above formula symbols.
+    //
+    // Both tiers check prev AND next neighbors, picking the one with the most
+    // X-overlap. This handles superscripts that are Y-closer to the previous
+    // line but X-overlap with the next.
+    let small_threshold = avg_height;
+    let large_threshold = avg_height * 0.75;
+    let max_fragment_chars = 15usize;
+
+    // Compute per-line metadata: (center_y, x_min, x_max, visible_count)
+    let line_meta: Vec<(f32, f32, f32, usize)> = lines
+        .iter()
+        .map(|line| {
+            let cy = line_center_y(line);
+            let x_min = line
+                .iter()
+                .map(|e| e.bbox()[0])
+                .fold(f32::MAX, f32::min);
+            let x_max = line
+                .iter()
+                .map(|e| e.bbox()[2])
+                .fold(f32::MIN, f32::max);
+            let visible = line
+                .iter()
+                .filter(|e| match e {
+                    LineElement::Char(c) => {
+                        !c.codepoint.is_whitespace() && !c.codepoint.is_control()
+                    }
+                    LineElement::Formula { .. } | LineElement::FormulaPlaceholder { .. } => true,
+                })
+                .count();
+            (cy, x_min, x_max, visible)
+        })
+        .collect();
+
+    // Check if merging fragment chars into target would cause X-position
+    // collisions (garbling). Returns true if > 50% of the fragment's visible
+    // chars have a target char within `tolerance` in center-X.
+    let has_x_conflicts = |frag: &[&LineElement], target: &[&LineElement]| -> bool {
+        let tolerance = avg_height * 0.4;
+        let target_xs: Vec<f32> = target
             .iter()
             .filter(|e| match e {
                 LineElement::Char(c) => !c.codepoint.is_whitespace() && !c.codepoint.is_control(),
-                LineElement::Formula { .. } | LineElement::FormulaPlaceholder { .. } => true,
+                _ => true,
             })
+            .map(|e| e.center_x())
+            .collect();
+        if target_xs.is_empty() {
+            return false;
+        }
+        let frag_visible: Vec<f32> = frag
+            .iter()
+            .filter(|e| match e {
+                LineElement::Char(c) => !c.codepoint.is_whitespace() && !c.codepoint.is_control(),
+                _ => true,
+            })
+            .map(|e| e.center_x())
+            .collect();
+        if frag_visible.is_empty() {
+            return false;
+        }
+        let conflicts = frag_visible
+            .iter()
+            .filter(|&&fx| target_xs.iter().any(|&tx| (fx - tx).abs() < tolerance))
             .count();
-        if visible_count <= 2 && !merged.is_empty() {
-            // Check Y gap to the previous line
-            let prev_y = line_center_y(merged.last().unwrap());
-            let this_y = line_center_y(&line);
-            if (this_y - prev_y).abs() <= merge_threshold {
-                // Merge into previous line, then re-sort by X
-                let prev = merged.last_mut().unwrap();
-                prev.extend(line);
-                prev.sort_by(|a, b| {
-                    a.center_x()
-                        .partial_cmp(&b.center_x())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                continue;
+        conflicts > frag_visible.len() / 2
+    };
+
+    // Determine merge target for each line (if any).
+    let mut merge_into: Vec<Option<usize>> = (0..lines.len())
+        .map(|i| {
+            let (cy, x_min, x_max, visible) = line_meta[i];
+            if visible > max_fragment_chars {
+                return None;
+            }
+            let threshold = if visible <= 2 {
+                small_threshold
+            } else {
+                large_threshold
+            };
+            let x_extent = x_max - x_min;
+
+            let mut best: Option<(usize, f32)> = None;
+            for j in [i.wrapping_sub(1), i + 1] {
+                if j >= lines.len() {
+                    continue;
+                }
+                let (ncy, nx_min, nx_max, n_vis) = line_meta[j];
+                // Don't merge into a neighbor with strictly fewer visible chars
+                if n_vis < visible {
+                    continue;
+                }
+                let y_gap = (cy - ncy).abs();
+                if y_gap > threshold {
+                    continue;
+                }
+                // For larger fragments: require similar X-extent (fraction parts
+                // span the same width as their baseline, unlike isolated short lines).
+                // High ext_ratio (≥ 0.85) means the fragment spans nearly the full
+                // formula width — trusted as a fraction, merge unconditionally.
+                // Medium ext_ratio (0.7–0.85) might be a superscript annotation;
+                // only merge if the chars don't collide in X with the target's.
+                if visible > 2 {
+                    let n_extent = nx_max - nx_min;
+                    let ext_ratio =
+                        if n_extent > 0.0 { x_extent / n_extent } else { 0.0 };
+                    if ext_ratio < 0.7 {
+                        continue;
+                    }
+                    if ext_ratio < 0.85
+                        && has_x_conflicts(&lines[i], &lines[j])
+                    {
+                        continue;
+                    }
+                }
+                let overlap = (x_max.min(nx_max) - x_min.max(nx_min)).max(0.0);
+                if best.is_none() || overlap > best.unwrap().1 {
+                    best = Some((j, overlap));
+                }
+            }
+            best.map(|(j, _)| j)
+        })
+        .collect();
+
+    // Resolve cycles: when two lines mutually target each other (A→B, B→A),
+    // keep the one with more visible chars (or lower index) as the anchor.
+    for i in 0..merge_into.len() {
+        if let Some(j) = merge_into[i] {
+            if merge_into.get(j).copied().flatten() == Some(i) {
+                let vi = line_meta[i].3;
+                let vj = line_meta[j].3;
+                if vi > vj || (vi == vj && i < j) {
+                    merge_into[i] = None;
+                }
             }
         }
-        merged.push(line);
     }
 
-    merged
+    // Resolve chains: if i→j→k (not a cycle), follow to ultimate anchor.
+    // Repeat to handle multi-hop chains.
+    for _ in 0..4 {
+        let mut changed = false;
+        for i in 0..merge_into.len() {
+            if let Some(j) = merge_into[i] {
+                if let Some(k) = merge_into[j] {
+                    if k != i {
+                        merge_into[i] = Some(k);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Apply merges: first place non-fragment lines, then merge fragments in.
+    let mut result: Vec<Vec<&LineElement>> = Vec::new();
+    let mut orig_to_result: Vec<Option<usize>> = vec![None; lines.len()];
+
+    for (i, line) in lines.iter().enumerate() {
+        if merge_into[i].is_none() {
+            orig_to_result[i] = Some(result.len());
+            result.push(line.clone());
+        }
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(target) = merge_into[i] {
+            if let Some(ri) = orig_to_result[target] {
+                result[ri].extend(line.iter().copied());
+            } else {
+                // Target is also a fragment — keep standalone
+                result.push(line.clone());
+            }
+        }
+    }
+    for line in &mut result {
+        line.sort_by(|a, b| {
+            a.center_x()
+                .partial_cmp(&b.center_x())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    result
 }
 
 /// Assemble lines of elements into flowing text with paragraph detection.
