@@ -1028,8 +1028,32 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
                 continue;
             }
             if sections[i].is_short_line {
-                i += 1;
-                continue;
+                // Allow short lines through only if they look like a paragraph
+                // continuation: starts with a lowercase letter AND the nearest
+                // previous text section ends mid-sentence. This excludes labels
+                // like "(a) Reference" or "Fig. 3." which start with uppercase,
+                // digits, or punctuation.
+                let text = sections[i].markdown.trim();
+                let starts_lower =
+                    text.chars().next().map_or(false, |c| c.is_lowercase());
+                let prev_ends_mid = starts_lower
+                    && (0..i)
+                        .rev()
+                        .find(|&k| {
+                            sections[k].is_text
+                                && !sections[k].markdown.trim().is_empty()
+                        })
+                        .map(|k| {
+                            let prev = sections[k].markdown.trim();
+                            prev.ends_with(|c: char| {
+                                !matches!(c, '.' | '!' | '?' | ':' | '"' | '\u{201D}')
+                            })
+                        })
+                        .unwrap_or(false);
+                if !prev_ends_mid {
+                    i += 1;
+                    continue;
+                }
             }
             let mut blocked = false;
             let mut prev_text = None;
