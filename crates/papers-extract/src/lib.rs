@@ -377,45 +377,56 @@ fn trim_formula_image(
     // A "whitespace row" has very few ink pixels (< 2% of width)
     let ws_threshold = (w as f32 * 0.02).max(2.0) as u32;
 
-    // Scan OUTWARD from the formula center to find whitespace bands.
+    // Find all whitespace bands (runs of ≥ min_ws_run whitespace rows),
+    // then pick the bands nearest the formula bbox to crop.
     //
-    // Critical: we must start from the CENTER of the formula, not from
-    // the bbox edges. The bbox edges are inflated by loose_bounds() and
-    // may be ABOVE the prose line. Starting from the center ensures we
-    // scan through the formula content first, then through the actual
-    // prose-formula gap, finding the correct whitespace band.
-    let formula_center = (orig_y_top + orig_y_bot) / 2;
+    // Previous approach scanned outward from the formula CENTER, but for
+    // multi-line formulas the center can land in an internal gap between
+    // formula lines, causing it to clip the formula instead of the prose.
     let min_ws_run = 3u32;
 
-    // Scan upward from center to find the top whitespace band
-    let mut crop_top = 0u32;
-    let mut ws_run = 0u32;
-    for y in (0..formula_center.min(h)).rev() {
+    let mut bands: Vec<(u32, u32)> = Vec::new(); // (start_y, end_y) inclusive
+    let mut band_start: Option<u32> = None;
+    for y in 0..h {
         if row_ink[y as usize] <= ws_threshold {
-            ws_run += 1;
-            if ws_run >= min_ws_run {
-                crop_top = y + ws_run;
-                break;
+            if band_start.is_none() {
+                band_start = Some(y);
             }
         } else {
-            ws_run = 0;
+            if let Some(start) = band_start {
+                if y - start >= min_ws_run {
+                    bands.push((start, y - 1));
+                }
+                band_start = None;
+            }
+        }
+    }
+    if let Some(start) = band_start {
+        if h - start >= min_ws_run {
+            bands.push((start, h - 1));
         }
     }
 
-    // Scan downward from center to find the bottom whitespace band
-    let mut crop_bot = h.saturating_sub(1);
-    ws_run = 0;
-    for y in formula_center.min(h)..h {
-        if row_ink[y as usize] <= ws_threshold {
-            ws_run += 1;
-            if ws_run >= min_ws_run {
-                crop_bot = y - ws_run;
-                break;
-            }
-        } else {
-            ws_run = 0;
-        }
-    }
+    // Slack for bbox inflation (loose_bounds can inflate by ~14pt = ~28px at 144 DPI).
+    let slack = 30u32;
+
+    // crop_top: whitespace band closest to (but above) the formula bbox top.
+    // Filter to bands whose bottom edge is near/above the bbox top — this
+    // excludes internal formula gaps which are well below orig_y_top.
+    let crop_top = bands
+        .iter()
+        .filter(|(_, end)| *end <= orig_y_top + slack)
+        .max_by_key(|(_, end)| *end)
+        .map(|(_, end)| end + 1)
+        .unwrap_or(0);
+
+    // crop_bot: whitespace band closest to (but below) the formula bbox bottom.
+    let crop_bot = bands
+        .iter()
+        .filter(|(start, _)| *start >= orig_y_bot.saturating_sub(slack))
+        .min_by_key(|(start, _)| *start)
+        .map(|(start, _)| start - 1)
+        .unwrap_or(h.saturating_sub(1));
 
     // Find left/right ink bounds within the vertical crop
     let mut left = w;
@@ -704,7 +715,7 @@ pub fn extract_text_only(
                     //    find the actual gap between formula and prose
                     let y_center = (region.bbox[1] + region.bbox[3]) / 2.0;
                     let bbox_half_h = (region.bbox[3] - region.bbox[1]) / 2.0;
-                    let v_expand = bbox_half_h + 25.0; // generous vertical
+                    let v_expand = bbox_half_h + 15.0; // fixed padding (~1 text line)
                     // Modest horizontal padding — formula fragments have
                     // already been merged into the formula bbox during
                     // block post-processing, so we don't need aggressive
