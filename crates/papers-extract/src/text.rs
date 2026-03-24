@@ -448,15 +448,16 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
 
     // Post-pass: merge fragment lines into their nearest baseline.
     //
-    // Two-tier strategy:
-    //   - Tiny fragments (≤2 visible chars): merge with avg_height Y-threshold
-    //     into the previous line (original behavior, handles lone subscripts).
-    //   - Larger fragments (3–15 visible chars): merge with tighter Y-threshold
-    //     (avg_height * 0.75) AND require the fragment's X-extent be ≥ 70% of
-    //     the target's (fraction parts span similar width as their baseline).
-    //     Additionally, check that most of the fragment's chars don't collide
-    //     in X with the target's chars — this prevents garbling when superscripts
-    //     sit directly above formula symbols.
+    // Two-tier Y-threshold by fragment size:
+    //   - Tiny fragments (≤2 visible chars): avg_height (original behavior).
+    //   - Larger fragments (3–15 visible chars): avg_height * 0.75 (tighter,
+    //     separates fraction gaps ~3-7pt from algorithm line gaps ~8-13pt).
+    //
+    // For larger fragments, three X-extent guards prevent garbling:
+    //   1. ext_ratio ≥ 0.85 → trusted fraction (always merge).
+    //   2. ext_ratio ≥ 0.45 + sparse target + left-margin offset ≥ 20%
+    //      → formula superscript annotation (merge).
+    //   3. ext_ratio ≥ 0.7 + no per-char X-conflicts → medium case (merge).
     //
     // Both tiers check prev AND next neighbors, picking the one with the most
     // X-overlap. This handles superscripts that are Y-closer to the previous
@@ -539,13 +540,18 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
             };
             let x_extent = x_max - x_min;
 
-            let mut best: Option<(usize, f32)> = None;
+            // Track candidates in two tiers: strong (ext_ratio ≥ 0.7)
+            // and weak (sparse formula path, ext_ratio 0.45–0.7). Strong
+            // candidates are always preferred to avoid garbling when a
+            // superscript annotation sits between two formula lines.
+            let mut strong: Option<(usize, f32)> = None; // (index, overlap)
+            let mut weak: Option<(usize, f32)> = None;
+
             for j in [i.wrapping_sub(1), i + 1] {
                 if j >= lines.len() {
                     continue;
                 }
                 let (ncy, nx_min, nx_max, n_vis) = line_meta[j];
-                // Don't merge into a neighbor with strictly fewer visible chars
                 if n_vis < visible {
                     continue;
                 }
@@ -553,31 +559,63 @@ fn group_elements_into_lines<'a>(elements: &'a [LineElement<'a>]) -> Vec<Vec<&'a
                 if y_gap > threshold {
                     continue;
                 }
-                // For larger fragments: require similar X-extent (fraction parts
-                // span the same width as their baseline, unlike isolated short lines).
-                // High ext_ratio (≥ 0.85) means the fragment spans nearly the full
-                // formula width — trusted as a fraction, merge unconditionally.
-                // Medium ext_ratio (0.7–0.85) might be a superscript annotation;
-                // only merge if the chars don't collide in X with the target's.
+
                 if visible > 2 {
                     let n_extent = nx_max - nx_min;
                     let ext_ratio =
                         if n_extent > 0.0 { x_extent / n_extent } else { 0.0 };
-                    if ext_ratio < 0.7 {
-                        continue;
-                    }
-                    if ext_ratio < 0.85
-                        && has_x_conflicts(&lines[i], &lines[j])
+
+                    // Tier selection:
+                    // strong: ext_ratio ≥ 0.85 (fraction), or ≥ 0.7 w/o conflicts
+                    // weak:   ext_ratio ≥ 0.45 + sparse target + left offset
+                    let tier = if ext_ratio >= 0.85 {
+                        Some(true) // strong
+                    } else if ext_ratio >= 0.7
+                        && !has_x_conflicts(&lines[i], &lines[j])
                     {
-                        continue;
+                        Some(true) // strong
+                    } else if ext_ratio >= 0.45
+                        && n_extent > 0.0
+                        && (n_vis as f32 / n_extent) < 0.17
+                    {
+                        // Sparse formula target — allow only if fragment
+                        // doesn't share left margin with target (shared
+                        // margin = independent algorithm line, not annotation)
+                        let offset = (x_min - nx_min).max(0.0);
+                        if offset / n_extent >= 0.2 {
+                            Some(false) // weak
+                        } else {
+                            None // blocked
+                        }
+                    } else {
+                        None // blocked
+                    };
+
+                    match tier {
+                        None => continue,
+                        Some(is_strong) => {
+                            let overlap =
+                                (x_max.min(nx_max) - x_min.max(nx_min)).max(0.0);
+                            let slot = if is_strong {
+                                &mut strong
+                            } else {
+                                &mut weak
+                            };
+                            if slot.is_none() || overlap > slot.unwrap().1 {
+                                *slot = Some((j, overlap));
+                            }
+                        }
                     }
-                }
-                let overlap = (x_max.min(nx_max) - x_min.max(nx_min)).max(0.0);
-                if best.is_none() || overlap > best.unwrap().1 {
-                    best = Some((j, overlap));
+                } else {
+                    // Tiny fragments (vis ≤ 2): no ext_ratio check
+                    let overlap =
+                        (x_max.min(nx_max) - x_min.max(nx_min)).max(0.0);
+                    if strong.is_none() || overlap > strong.unwrap().1 {
+                        strong = Some((j, overlap));
+                    }
                 }
             }
-            best.map(|(j, _)| j)
+            strong.or(weak).map(|(j, _)| j)
         })
         .collect();
 
