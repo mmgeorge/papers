@@ -354,6 +354,17 @@ pub const ALL_LABEL_PREFIXES: &[&str] = &[
     "tip",
 ];
 
+/// Prefixes for visual element captions (figure, table, algorithm).
+/// These require stricter validation to distinguish captions from prose
+/// references like "Figure 12 shows..." or "Table 3 and Table 4".
+const VISUAL_CAPTION_PREFIXES: &[&str] = &[
+    "figure", "fig.", "fig",
+    "table", "tab.", "tab", "tbl.",
+    "algorithm", "alg.", "alg",
+    "listing", "pseudocode", "procedure", "code",
+    "plate", "scheme", "chart", "graph", "diagram",
+];
+
 /// Check if text starts with a recognized caption/label prefix.
 /// Returns the matching prefix if found.
 pub fn match_label_prefix(text: &str) -> Option<&'static str> {
@@ -371,12 +382,78 @@ pub fn match_label_prefix(text: &str) -> Option<&'static str> {
                 if next == ' ' || next == '.' || next == '-'
                     || next == ':' || next.is_ascii_digit()
                 {
+                    // For visual caption prefixes (figure, table, etc.),
+                    // require a separator (. : ) —) after the number to
+                    // distinguish real captions from prose references like
+                    // "Figure 12 shows..." or "Table 3 and Table 4".
+                    if VISUAL_CAPTION_PREFIXES.contains(&prefix) {
+                        if !is_visual_caption(rest) {
+                            continue;
+                        }
+                    }
                     return Some(prefix);
                 }
             }
         }
     }
     None
+}
+
+/// Check whether text after a visual caption prefix looks like an actual
+/// caption rather than a prose reference.
+///
+/// Captions: "Figure 12. Description", "Fig. 3 Stress test", "Table 1)"
+/// Prose: "Figure 12 shows a challenging collision case, where a heavy..."
+///
+/// Rule: skip whitespace + digits (the number), then:
+/// - If a separator follows (`.` `:` `)` `*`) → definitely a caption.
+/// - If no separator but text after the number is short (<80 chars) → caption.
+/// - If no separator and text is long → likely prose reference → reject.
+fn is_visual_caption(rest: &str) -> bool {
+    let mut i = 0;
+    let bytes = rest.as_bytes();
+
+    // Skip leading whitespace
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+
+    // If no digit follows, could be a bare label — accept
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+        return true;
+    }
+
+    // Consume digits
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+
+    // Consume optional letter suffix (e.g., "4a", "12b")
+    if i < bytes.len() && bytes[i].is_ascii_lowercase() {
+        i += 1;
+    }
+
+    // Consume optional hyphen-range (e.g., "2-4")
+    if i < bytes.len() && bytes[i] == b'-' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+    }
+
+    // Check what follows the number
+    if i >= bytes.len() {
+        return true; // "Figure 12" at end — bare caption
+    }
+
+    match bytes[i] {
+        b'.' | b':' | b')' | b'*' => true, // Separator → caption
+        _ => {
+            // No separator — accept only if remaining text is short.
+            // Long text like "Figure 12 shows a challenging..." is prose.
+            rest[i..].len() < 80
+        }
+    }
 }
 
 /// Classify a label prefix into a RegionKind.

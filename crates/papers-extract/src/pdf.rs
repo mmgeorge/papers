@@ -378,6 +378,390 @@ fn compute_space_width_ratio(char_info: &PdfPageTextChar, font_name: &str) -> f3
     }
 }
 
+/// Try to recover a Form XObject's `/BBox` from the clip path on its children.
+///
+/// pdfium converts the Form's `/BBox` into a clip path applied to each child
+/// during content parsing. The clip path is already transformed to page space
+/// (PDF Y-up coordinates). We read it back to get the true visual boundary
+/// that `FPDFPageObj_GetBounds()` ignores.
+///
+/// Returns `[left, bottom, right, top]` in PDF coordinates, or `None` if no
+/// rectangular clip path is found.
+fn form_clip_bbox(
+    form: &PdfPageXObjectFormObject,
+    form_obj: &PdfPageObject,
+) -> Option<[f32; 4]> {
+    // Get the form's placement matrix (maps local coords → page coords).
+    let mat = form_obj.matrix().ok()?;
+    let (a, b, c, d, e, f) = (mat.a(), mat.b(), mat.c(), mat.d(), mat.e(), mat.f());
+
+    // Collect all rectangular clips from children and return the LARGEST one.
+    // Children may have both the /BBox clip (outermost) and internal content
+    // clips (tighter). CheckClip strips the /BBox clip from children that fit
+    // inside it, leaving only internal clips. By taking the largest, we get
+    // the /BBox when available, or the best approximation otherwise.
+    let mut best: Option<[f32; 4]> = None;
+    let mut best_area: f32 = 0.0;
+
+    for i in 0..form.len() {
+        let Ok(child) = form.get(i) else {
+            continue;
+        };
+        let Some(clip) = child.get_clip_path() else {
+            continue;
+        };
+        if clip.is_empty() {
+            continue;
+        }
+
+        // Check all sub-paths — /BBox might not be at index 0 if there are
+        // multiple clips (nested forms, content clips).
+        let sub_path_count = clip.len().min(10);
+        for sp_idx in 0..sub_path_count {
+            let Ok(sub_path) = clip.get(sp_idx) else {
+                continue;
+            };
+            if sub_path.len() < 4 {
+                continue;
+            }
+
+            let (Ok(p0), Ok(p2)) = (sub_path.get(0), sub_path.get(2)) else {
+                continue;
+            };
+
+            let lx1 = p0.x().value.min(p2.x().value);
+            let ly1 = p0.y().value.min(p2.y().value);
+            let lx2 = p0.x().value.max(p2.x().value);
+            let ly2 = p0.y().value.max(p2.y().value);
+
+            if (lx2 - lx1) < 10.0 || (ly2 - ly1) < 10.0 {
+                continue;
+            }
+
+            // Transform to page space
+            let corners = [
+                (a * lx1 + c * ly1 + e, b * lx1 + d * ly1 + f),
+                (a * lx2 + c * ly1 + e, b * lx2 + d * ly1 + f),
+                (a * lx2 + c * ly2 + e, b * lx2 + d * ly2 + f),
+                (a * lx1 + c * ly2 + e, b * lx1 + d * ly2 + f),
+            ];
+            let px1 = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+            let py1 = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
+            let px2 = corners.iter().map(|c| c.0).fold(f32::NEG_INFINITY, f32::max);
+            let py2 = corners.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+
+            let area = (px2 - px1) * (py2 - py1);
+            if area > best_area {
+                best_area = area;
+                best = Some([px1, py1, px2, py2]);
+            }
+        }
+    }
+    best
+}
+
+/// Detect figure-sized visual objects on a PDF page.
+///
+/// Returns bounding boxes (image-space, Y-down) for all Image and Form XObject
+/// page objects that pass size filters. For Form XObjects, recovers the `/BBox`
+/// clipping boundary from child clip paths (the true visual extent) and
+/// transforms it to page space. Falls back to `obj.bounds()` when no clip path
+/// is available (e.g. for direct Image objects).
+pub fn detect_page_figures(
+    page: &PdfPage,
+    page_height_pt: f32,
+    page_width_pt: f32,
+    crop: (f32, f32),
+) -> Vec<[f32; 4]> {
+    let mut figures: Vec<[f32; 4]> = Vec::new();
+    let (dx, dy) = crop;
+
+    for obj in page.objects().iter() {
+        let obj_type = obj.object_type();
+        if obj_type != PdfPageObjectType::Image
+            && obj_type != PdfPageObjectType::XObjectForm
+        {
+            continue;
+        }
+
+        // For Form XObjects, try to recover /BBox from child clip paths.
+        // obj.bounds() returns the raw union of child bounds which can
+        // extend beyond the /BBox clipping boundary, causing text bleed.
+        if obj_type == PdfPageObjectType::XObjectForm {
+            if let Some(form) = obj.as_x_object_form_object() {
+                if let Some(clip_rect) = form_clip_bbox(form, &obj) {
+                    let w_pt = clip_rect[2] - clip_rect[0];
+                    let h_pt = clip_rect[3] - clip_rect[1];
+
+                    if w_pt < 50.0 || h_pt < 50.0 {
+                        continue;
+                    }
+                    if w_pt > page_width_pt * 0.9 && h_pt > page_height_pt * 0.9 {
+                        continue;
+                    }
+
+                    // Convert PDF Y-up to image Y-down, apply crop offset
+                    let img_x1 = clip_rect[0] - dx;
+                    let img_y1 = page_height_pt - clip_rect[3] - dy;
+                    let img_x2 = clip_rect[2] - dx;
+                    let img_y2 = page_height_pt - clip_rect[1] - dy;
+                    let bbox = [img_x1, img_y1, img_x2, img_y2];
+
+                    if !is_dominated(&figures, &bbox) {
+                        figures.push(bbox);
+                    }
+                    continue;
+                }
+                // Fall through to obj.bounds() if no clip path found
+            }
+        }
+
+        let Ok(rect) = obj.bounds() else {
+            continue;
+        };
+
+        let w_pt = rect.width().value;
+        let h_pt = rect.height().value;
+
+        if w_pt < 50.0 || h_pt < 50.0 {
+            continue;
+        }
+        if w_pt > page_width_pt * 0.9 && h_pt > page_height_pt * 0.9 {
+            continue;
+        }
+
+        // Convert PDF Y-up to image Y-down, apply crop offset
+        let img_y1 = page_height_pt - rect.top().value - dy;
+        let img_y2 = page_height_pt - rect.bottom().value - dy;
+        let img_x1 = rect.left().value - dx;
+        let img_x2 = rect.right().value - dx;
+        let bbox = [img_x1, img_y1, img_x2, img_y2];
+
+        if !is_dominated(&figures, &bbox) {
+            figures.push(bbox);
+        }
+    }
+
+    // Detect thin Path objects (lines) near figure bboxes: connector lines,
+    // axis lines, tick marks. These bridge gaps between labels and graphics.
+    // Includes both horizontal lines (h < 3pt) and vertical lines (w < 3pt).
+    let mut connectors: Vec<[f32; 4]> = Vec::new();
+    for obj in page.objects().iter() {
+        if obj.object_type() != PdfPageObjectType::Path {
+            continue;
+        }
+        let Ok(rect) = obj.bounds() else { continue };
+        let w = rect.width().value;
+        let h = rect.height().value;
+        // Thin line: one dimension < 3pt, the other > 5pt
+        let is_thin_line = (h < 3.0 && w > 5.0) || (w < 3.0 && h > 5.0);
+        if !is_thin_line {
+            continue;
+        }
+        let img_y1 = page_height_pt - rect.top().value - dy;
+        let img_y2 = page_height_pt - rect.bottom().value - dy;
+        let img_x1 = rect.left().value - dx;
+        let img_x2 = rect.right().value - dx;
+        let path_bbox = [img_x1, img_y1, img_x2, img_y2];
+
+        // Only include if adjacent to an existing figure (gap ≤ 10pt)
+        let near_figure = figures.iter().any(|fig| {
+            let x_gap = (path_bbox[0] - fig[2]).max(fig[0] - path_bbox[2]).max(0.0);
+            let y_gap = (path_bbox[1] - fig[3]).max(fig[1] - path_bbox[3]).max(0.0);
+            x_gap <= 10.0 && y_gap <= 10.0
+        });
+        if near_figure {
+            connectors.push(path_bbox);
+        }
+    }
+    figures.extend(connectors);
+
+    // Merge nearby bboxes into composite figures. Sub-panels of the same
+    // figure overlap in one dimension and are adjacent in the other.
+    // Repeat until no more merges occur (transitive closure).
+    merge_nearby_bboxes(&mut figures);
+
+    figures
+}
+
+/// Merge bboxes that overlap or are close together into composite groups.
+///
+/// Two bboxes merge if they overlap in one axis and the gap in the other
+/// axis is small (≤10pt). This groups side-by-side or stacked sub-panels
+/// into a single figure bbox.
+fn merge_nearby_bboxes(bboxes: &mut Vec<[f32; 4]>) {
+    const GAP_THRESHOLD: f32 = 10.0;
+
+    loop {
+        let mut merged = false;
+        let mut i = 0;
+        while i < bboxes.len() {
+            let mut j = i + 1;
+            while j < bboxes.len() {
+                let [ax1, ay1, ax2, ay2] = bboxes[i];
+                let [bx1, by1, bx2, by2] = bboxes[j];
+
+                // Check if they overlap or are close in both dimensions
+                let x_overlap = ax2.min(bx2) - ax1.max(bx1);
+                let y_overlap = ay2.min(by2) - ay1.max(by1);
+
+                // They share vertical extent and are horizontally close (side-by-side)
+                let side_by_side = y_overlap > 0.0
+                    && (bx1 - ax2).max(ax1 - bx2) <= GAP_THRESHOLD;
+
+                // They share horizontal extent and are vertically close (stacked)
+                let stacked = x_overlap > 0.0
+                    && (by1 - ay2).max(ay1 - by2) <= GAP_THRESHOLD;
+
+                if side_by_side || stacked {
+                    // Merge: expand bbox[i] to include bbox[j]
+                    bboxes[i] = [
+                        ax1.min(bx1), ay1.min(by1),
+                        ax2.max(bx2), ay2.max(by2),
+                    ];
+                    bboxes.remove(j);
+                    merged = true;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+        if !merged {
+            break;
+        }
+    }
+}
+
+/// Check if a bbox is mostly covered (>50%) by an existing figure bbox.
+fn is_dominated(figures: &[[f32; 4]], bbox: &[f32; 4]) -> bool {
+    figures.iter().any(|existing| {
+        let [ex1, ey1, ex2, ey2] = *existing;
+        let x_overlap = bbox[2].min(ex2) - bbox[0].max(ex1);
+        let y_overlap = bbox[3].min(ey2) - bbox[1].max(ey1);
+        if x_overlap <= 0.0 || y_overlap <= 0.0 {
+            return false;
+        }
+        let overlap_area = x_overlap * y_overlap;
+        let this_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]);
+        this_area > 0.0 && overlap_area / this_area > 0.5
+    })
+}
+
+/// Detect table regions on a PDF page by finding clusters of horizontal rules.
+///
+/// Tables in academic papers typically have ≥3 horizontal rules (top rule,
+/// header separator, bottom rule). We detect these from PDF path objects and
+/// cluster them by vertical proximity + horizontal overlap.
+///
+/// Returns table bounding boxes in image space (Y-down, PDF points).
+pub fn detect_page_tables(
+    page: &PdfPage,
+    page_height_pt: f32,
+    page_width_pt: f32,
+    crop: (f32, f32),
+) -> Vec<[f32; 4]> {
+    let (dx, dy) = crop;
+
+    // Collect horizontal and vertical rules from path objects
+    let mut h_rules: Vec<(f32, f32, f32)> = Vec::new(); // (y_center, x_min, x_max)
+    let mut v_rules: Vec<(f32, f32, f32)> = Vec::new(); // (x_center, y_min, y_max)
+
+    for obj in page.objects().iter() {
+        if obj.object_type() != PdfPageObjectType::Path {
+            continue;
+        }
+
+        let Ok(rect) = obj.bounds() else {
+            continue;
+        };
+
+        let w = rect.width().value;
+        let h = rect.height().value;
+
+        // Convert to image space
+        let y_top = page_height_pt - rect.top().value - dy;
+        let y_bot = page_height_pt - rect.bottom().value - dy;
+        let x_left = rect.left().value - dx;
+        let x_right = rect.right().value - dx;
+
+        // Horizontal rule: thin and wide
+        if h < 3.0 && w > 50.0 {
+            h_rules.push(((y_top + y_bot) / 2.0, x_left, x_right));
+        }
+
+        // Vertical rule: tall and thin (for chart grid detection)
+        if w < 3.0 && h > 30.0 {
+            v_rules.push(((x_left + x_right) / 2.0, y_top, y_bot));
+        }
+    }
+
+    if h_rules.len() < 3 {
+        return Vec::new();
+    }
+
+    // Cluster horizontal rules by X-extent alignment. Two rules belong to the
+    // same table if their x_min and x_max match within a tolerance.
+    let x_tol = 10.0f32;
+    let mut clusters: Vec<Vec<(f32, f32, f32)>> = Vec::new();
+
+    for &rule in &h_rules {
+        let (_, x_min, x_max) = rule;
+        let matched = clusters.iter_mut().find(|c| {
+            let (_, cx_min, cx_max) = c[0];
+            (x_min - cx_min).abs() < x_tol && (x_max - cx_max).abs() < x_tol
+        });
+        if let Some(cluster) = matched {
+            cluster.push(rule);
+        } else {
+            clusters.push(vec![rule]);
+        }
+    }
+
+    // Keep only clusters with ≥3 rules AND sufficient vertical extent.
+    // A real table spans at least ~20pt (header + one row); graph axis
+    // tick marks cluster in <5pt of vertical space.
+    clusters.retain(|c| {
+        if c.len() < 3 {
+            return false;
+        }
+        let y_min = c.iter().map(|r| r.0).fold(f32::MAX, f32::min);
+        let y_max = c.iter().map(|r| r.0).fold(f32::MIN, f32::max);
+        (y_max - y_min) >= 20.0
+    });
+
+    // Convert clusters to bounding boxes, filtering out chart grids
+    let padding = 5.0;
+    clusters
+        .iter()
+        .filter_map(|cluster| {
+            let y_min = cluster.iter().map(|r| r.0).fold(f32::MAX, f32::min);
+            let y_max = cluster.iter().map(|r| r.0).fold(f32::MIN, f32::max);
+            let x_min = cluster.iter().map(|r| r.1).fold(f32::MAX, f32::min);
+            let x_max = cluster.iter().map(|r| r.2).fold(f32::MIN, f32::max);
+
+            // Filter chart grids: if this area also contains ≥3 vertical rules,
+            // it's likely a chart with grid lines, not a table.
+            let v_count = v_rules.iter().filter(|&&(vx, vy_min, vy_max)| {
+                vx >= x_min - 5.0
+                    && vx <= x_max + 5.0
+                    && vy_min <= y_max + 5.0
+                    && vy_max >= y_min - 5.0
+            }).count();
+            if v_count >= 3 {
+                return None;
+            }
+
+            Some([
+                x_min.max(0.0),
+                (y_min - padding).max(0.0),
+                x_max.min(page_width_pt),
+                (y_max + padding).min(page_height_pt),
+            ])
+        })
+        .collect()
+}
+
 /// Load the pdfium library.
 ///
 /// Search order: explicit path → `PDFIUM_PATH` env var (set by

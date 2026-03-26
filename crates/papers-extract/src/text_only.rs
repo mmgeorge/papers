@@ -976,6 +976,43 @@ pub fn extract_page_text_blocks(
             }
         }
 
+        // Embedded caption splitting: Text blocks on figure-dense pages
+        // can contain captions merged with sub-panel labels and prose from
+        // adjacent columns. Split them out as separate FigureTitle regions.
+        if kind == RegionKind::Text {
+            let splits = split_embedded_captions(&extracted);
+            if !splits.is_empty() {
+                // Compute per-segment bboxes from character positions.
+                // Each segment corresponds to a visual line or group of lines.
+                // Find chars within the block and group them by which segment
+                // their text contributes to.
+                let seg_bboxes = compute_split_bboxes(
+                    &extraction_chars,
+                    block.bbox,
+                    &splits,
+                    page_height_pt,
+                );
+
+                for (seg_idx, (seg_text, seg_kind)) in splits.into_iter().enumerate() {
+                    let seg_id = format!("p{}_{}_{}", page_idx + 1, block_idx, seg_idx);
+                    let seg_bbox = seg_bboxes.get(seg_idx).copied().unwrap_or(block.bbox);
+                    regions.push(Region {
+                        id: seg_id,
+                        kind: seg_kind,
+                        bbox: seg_bbox,
+                        confidence: 1.0,
+                        order: 0,
+                        text: Some(seg_text),
+                        html: None, latex: None, image_path: None,
+                        caption: None, chart_type: None, tag: None,
+                        items: None, formula_source: None, ocr_confidence: None,
+                        consumed: false,
+                    });
+                }
+                continue; // skip normal region push
+            }
+        }
+
         let id = format!("p{}_{}", page_idx + 1, block_idx);
         regions.push(Region {
             id,
@@ -1511,7 +1548,293 @@ fn is_formula_fragment(text: &str) -> bool {
     word_ratio < MIN_ALPHA_RATIO
 }
 
+/// Compute per-segment bboxes after `split_embedded_captions`.
+///
+/// Groups chars within the block by Y-position into lines, then assigns
+/// lines to segments based on cumulative character count matching each
+/// segment's text length.
+fn compute_split_bboxes(
+    chars: &[crate::pdf::PdfChar],
+    block_bbox: [f32; 4],
+    segments: &[(String, crate::types::RegionKind)],
+    page_height_pt: f32,
+) -> Vec<[f32; 4]> {
+    // block_bbox is in image space (Y-down). PdfChar.bbox is in PDF space (Y-up).
+    // Convert block_bbox to PDF space for char filtering.
+    let pdf_x1 = block_bbox[0];
+    let pdf_x2 = block_bbox[2];
+    let pdf_y1 = page_height_pt - block_bbox[3]; // img bottom → PDF bottom
+    let pdf_y2 = page_height_pt - block_bbox[1]; // img top → PDF top
+
+    // Collect chars that fall within the block's bbox (in PDF space)
+    let block_chars: Vec<&crate::pdf::PdfChar> = chars
+        .iter()
+        .filter(|c| {
+            let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
+            let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+            cx >= pdf_x1 - 1.0
+                && cx <= pdf_x2 + 1.0
+                && cy >= pdf_y1 - 1.0
+                && cy <= pdf_y2 + 1.0
+        })
+        .collect();
+
+    if block_chars.is_empty() {
+        return segments.iter().map(|_| block_bbox).collect();
+    }
+
+    // Group chars into lines by Y proximity
+    let mut lines: Vec<Vec<&crate::pdf::PdfChar>> = Vec::new();
+    let mut sorted = block_chars.clone();
+    sorted.sort_by(|a, b| {
+        let ay = (a.bbox[1] + a.bbox[3]) / 2.0;
+        let by = (b.bbox[1] + b.bbox[3]) / 2.0;
+        ay.partial_cmp(&by).unwrap()
+    });
+
+    for ch in &sorted {
+        let cy = (ch.bbox[1] + ch.bbox[3]) / 2.0;
+        let added = lines.last_mut().and_then(|line| {
+            let line_cy = (line[0].bbox[1] + line[0].bbox[3]) / 2.0;
+            if (cy - line_cy).abs() < 5.0 {
+                line.push(ch);
+                Some(())
+            } else {
+                None
+            }
+        });
+        if added.is_none() {
+            lines.push(vec![ch]);
+        }
+    }
+
+    // Compute char count per line
+    let line_char_counts: Vec<usize> = lines.iter().map(|l| l.len()).collect();
+    let total_chars: usize = line_char_counts.iter().sum();
+
+    // Assign lines to segments proportionally by text length
+    let seg_char_targets: Vec<usize> = segments
+        .iter()
+        .map(|(text, _)| text.chars().filter(|c| !c.is_whitespace()).count())
+        .collect();
+    let total_seg_chars: usize = seg_char_targets.iter().sum();
+
+    if total_seg_chars == 0 || total_chars == 0 {
+        return segments.iter().map(|_| block_bbox).collect();
+    }
+
+    // Walk through lines, assigning them to segments
+    let mut result = Vec::with_capacity(segments.len());
+    let mut line_idx = 0;
+    let mut chars_used = 0usize;
+
+    for (seg_i, target) in seg_char_targets.iter().enumerate() {
+        let mut seg_x1 = f32::MAX;
+        let mut seg_y1 = f32::MAX;
+        let mut seg_x2 = f32::MIN;
+        let mut seg_y2 = f32::MIN;
+
+        // How many lines should this segment consume (at least 1 per segment)
+        let lines_for_seg = if seg_i == segments.len() - 1 {
+            lines.len() - line_idx
+        } else {
+            let proportion = *target as f64 / total_seg_chars as f64;
+            ((proportion * lines.len() as f64).round() as usize).max(1)
+        };
+        let chars_for_seg = lines[line_idx..].iter()
+            .take(lines_for_seg)
+            .map(|l| l.len())
+            .sum::<usize>()
+            .max(1);
+
+        let mut seg_chars_consumed = 0;
+        while line_idx < lines.len() && seg_chars_consumed < chars_for_seg {
+            for ch in &lines[line_idx] {
+                seg_x1 = seg_x1.min(ch.bbox[0]);
+                seg_y1 = seg_y1.min(ch.bbox[1]);
+                seg_x2 = seg_x2.max(ch.bbox[2]);
+                seg_y2 = seg_y2.max(ch.bbox[3]);
+            }
+            seg_chars_consumed += lines[line_idx].len();
+            line_idx += 1;
+        }
+        chars_used += seg_chars_consumed;
+
+        if seg_x1 < seg_x2 && seg_y1 < seg_y2 {
+            // Convert from PDF space (Y-up) back to image space (Y-down)
+            let img_y1 = page_height_pt - seg_y2;
+            let img_y2 = page_height_pt - seg_y1;
+            result.push([seg_x1, img_y1, seg_x2, img_y2]);
+        } else {
+            result.push(block_bbox);
+        }
+    }
+
+    result
+}
+
 // ── Classification ──────────────────────────────────────────────────
+
+/// Split a Text block that contains embedded figure/table captions.
+///
+/// On figure-dense pages, text extraction can merge sub-panel labels,
+/// captions, and prose from adjacent columns into one block like:
+///   "(a) *VBD* (b) *AVBD* Fig. 6. *A card tower held by friction...*"
+///
+/// This function finds caption patterns mid-text and splits the block
+/// into [Text, FigureTitle, Text, FigureTitle, ...] segments.
+///
+/// Returns empty Vec if no splitting is needed (block starts with a
+/// caption or contains none).
+fn split_embedded_captions(text: &str) -> Vec<(String, RegionKind)> {
+    // Find all caption pattern positions in the text.
+    // We look for patterns like "Fig. N.", "Figure N.", "Table N." that
+    // appear MID-text (not at position 0 — those are already handled).
+    let lower = text.to_lowercase();
+    let caption_prefixes: &[&str] = &[
+        "figure ", "fig. ", "fig ",
+        "table ", "tab. ", "tab ", "tbl. ",
+    ];
+
+    let mut match_positions: Vec<(usize, &str)> = Vec::new();
+    for &prefix in caption_prefixes {
+        let mut search_start = 0;
+        while let Some(pos) = lower[search_start..].find(prefix) {
+            let abs_pos = search_start + pos;
+            search_start = abs_pos + prefix.len();
+
+            // Must not be at the very start (handled by classify_block)
+            if abs_pos == 0 {
+                continue;
+            }
+            let prev = lower.as_bytes()[abs_pos - 1];
+            if prev != b' ' && prev != b'*' && prev != b')' {
+                continue;
+            }
+
+            // Verify this looks like a real caption (has number + separator)
+            if text_cleanup::match_label_prefix(&lower[abs_pos..]).is_none() {
+                continue;
+            }
+
+            // Reject prose references: "shown in Figure 7.", "of Table 1.",
+            // "(Figure 3)", "and Figure 5" — these are inline references,
+            // not standalone captions.
+            if is_prose_reference(&lower, abs_pos) {
+                continue;
+            }
+
+            // For mid-text matches, require stronger evidence than the
+            // block-start case. The segment text after the number must have
+            // either a separator (. : )) after the number OR italic markers
+            // (*...*). Without these, short tails like "Figure 6 shows a"
+            // (end-of-block prose) pass the length check falsely.
+            let after_prefix = &lower[abs_pos + prefix.len()..];
+            let has_separator = {
+                let mut it = after_prefix.chars().skip_while(|c| c.is_whitespace());
+                // skip digits
+                let mut it = it.skip_while(|c| c.is_ascii_digit());
+                // skip optional letter suffix
+                let mut saw_letter = false;
+                let next = it.clone().next();
+                if next.map_or(false, |c| c.is_ascii_lowercase()) {
+                    saw_letter = true;
+                    it.next();
+                }
+                matches!(it.next(), Some('.') | Some(':') | Some(')'))
+            };
+            let has_italic = text[abs_pos..].contains('*');
+            if !has_separator && !has_italic {
+                continue;
+            }
+
+            match_positions.push((abs_pos, prefix));
+        }
+    }
+
+    if match_positions.is_empty() {
+        return Vec::new();
+    }
+
+    // Sort by position
+    match_positions.sort_by_key(|(pos, _)| *pos);
+    // Deduplicate overlapping matches (e.g., "fig. " and "fig " both matching)
+    match_positions.dedup_by(|(a, _), (b, _)| (*a as isize - *b as isize).unsigned_abs() < 5);
+
+    // Build segments: split at each caption position
+    let mut segments: Vec<(String, RegionKind)> = Vec::new();
+    let mut cursor = 0;
+
+    for (pos, prefix) in &match_positions {
+        // Text before this caption
+        if *pos > cursor {
+            let before = text[cursor..*pos].trim();
+            if before.len() >= MIN_TEXT_LEN {
+                segments.push((before.to_string(), RegionKind::Text));
+            }
+        }
+        cursor = *pos;
+    }
+
+    // Everything from the last cursor to end — could contain one or more captions.
+    // Split remaining text at each caption boundary.
+    let remaining_positions: Vec<usize> = match_positions.iter().map(|(p, _)| *p).collect();
+    for (i, &pos) in remaining_positions.iter().enumerate() {
+        let end = if i + 1 < remaining_positions.len() {
+            remaining_positions[i + 1]
+        } else {
+            text.len()
+        };
+        let caption_text = text[pos..end].trim();
+        if caption_text.len() >= MIN_TEXT_LEN {
+            let kind = text_cleanup::match_label_prefix(caption_text)
+                .map(text_cleanup::label_to_region_kind)
+                .unwrap_or(RegionKind::Text);
+            segments.push((caption_text.to_string(), kind));
+        }
+    }
+
+    // Only return if we actually split (produced 2+ segments with at least one caption)
+    let has_caption = segments.iter().any(|(_, k)| k.is_caption());
+    if segments.len() >= 2 && has_caption {
+        segments
+    } else {
+        Vec::new()
+    }
+}
+
+/// Check if a figure/table reference at `pos` in the lowercased text is a
+/// prose reference (e.g., "shown in Figure 7.", "of Table 1.") rather than
+/// a standalone caption.
+///
+/// Looks at the word(s) immediately before the match. If they're reference
+/// prepositions or conjunctions, it's prose.
+fn is_prose_reference(lower: &str, pos: usize) -> bool {
+    // Extract the last ~20 chars before the match position
+    let before = &lower[..pos];
+    let before = before.trim_end();
+
+    // Common patterns preceding prose figure/table references
+    const REFERENCE_SUFFIXES: &[&str] = &[
+        " in",
+        " see",
+        " of",
+        " and",
+        " or",
+        " from",
+        " with",
+        " using",
+        " than",
+        "(", // "(Figure 3)"
+    ];
+
+    for suffix in REFERENCE_SUFFIXES {
+        if before.ends_with(suffix) {
+            return true;
+        }
+    }
+    false
+}
 
 fn classify_block(
     block: &Block,

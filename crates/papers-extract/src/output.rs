@@ -1250,7 +1250,20 @@ fn section_to_content_node(sec: &Section) -> ReflowNode {
         }
         RegionKind::Table => {
             let (content, caption) = split_table_caption(text);
-            ReflowNode::Table { content, caption }
+            if content.is_empty() {
+                // Image-only table (text-only path) — treat like a figure
+                let (path, caption) = parse_figure_markdown(text);
+                if path.is_empty() {
+                    ReflowNode::Text {
+                        content: caption.unwrap_or_default(),
+                        footnotes: Vec::new(),
+                    }
+                } else {
+                    ReflowNode::Figure { path, caption }
+                }
+            } else {
+                ReflowNode::Table { content, caption }
+            }
         }
         RegionKind::Algorithm => ReflowNode::Algorithm {
             content: text.to_string(),
@@ -4249,16 +4262,26 @@ fn region_to_markdown(region: &Region) -> String {
                 .text
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .or(region.html.as_deref())
-                .unwrap_or_default();
+                .or(region.html.as_deref());
             let caption_text = region
                 .caption
                 .as_ref()
                 .and_then(|c| c.text.as_deref());
-            if let Some(cap) = caption_text {
-                format!("{table_md}\n\n{}", bold_caption_label(cap))
+            if let Some(md) = table_md {
+                if let Some(cap) = caption_text {
+                    format!("{md}\n\n{}", bold_caption_label(cap))
+                } else {
+                    md.to_string()
+                }
+            } else if let Some(path) = region.image_path.as_deref() {
+                // Image-only table (text-only path): emit as figure
+                if let Some(cap) = caption_text {
+                    format!("![]({path})\n\n{}", bold_caption_label(cap))
+                } else {
+                    format!("![]({path})")
+                }
             } else {
-                table_md.to_string()
+                String::new()
             }
         }
         RegionKind::DisplayFormula => {

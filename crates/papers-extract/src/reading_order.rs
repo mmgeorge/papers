@@ -29,16 +29,20 @@ fn xy_cut_recursive(regions: &mut [Region], indices: &mut [usize], order: &mut u
     let y_gap = find_largest_y_gap(regions, indices);
     let x_gap = find_largest_x_gap(regions, indices);
 
-    // Pick the axis with the larger gap
+    // Pick the axis with the larger gap.
+    // Bias toward X (column) splits: column boundaries in multi-column
+    // layouts are the primary structural feature and should be detected
+    // even when a paragraph gap is marginally larger.
+    const COLUMN_BIAS: f32 = 1.5;
     match (&y_gap, &x_gap) {
         (Some(yg), Some(xg)) => {
-            if xg.size >= yg.size {
-                // X gap is larger: split into left/right (columns)
+            if xg.size * COLUMN_BIAS >= yg.size {
+                // X gap wins: split into left/right (columns)
                 let (left, right) = partition_by_x(regions, indices, xg.position);
                 xy_cut_recursive(regions, &mut left.clone(), order);
                 xy_cut_recursive(regions, &mut right.clone(), order);
             } else {
-                // Y gap is larger: split into top/bottom (rows)
+                // Y gap is clearly larger: split into top/bottom (rows)
                 let (top, bottom) = partition_by_y(regions, indices, yg.position);
                 xy_cut_recursive(regions, &mut top.clone(), order);
                 xy_cut_recursive(regions, &mut bottom.clone(), order);

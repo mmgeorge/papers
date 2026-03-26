@@ -112,6 +112,63 @@ pub fn crop_region(
 ///
 /// Must be called **before** [`group_figure_regions`] so individual items
 /// have captions attached before grouping and promotion.
+/// Associate only TableTitle captions with Table regions (bbox-based).
+/// Table bboxes from path detection are reliable, unlike Form XObject bboxes.
+pub fn associate_captions_tables_only(regions: &mut [Region]) {
+    // Filter to only Table parents and TableTitle captions, then delegate.
+    // We reuse the existing logic but only process tables.
+    if regions.is_empty() {
+        return;
+    }
+
+    let max_distance = median_region_height(regions) * 2.0;
+
+    let caption_data: Vec<(usize, [f32; 4], Option<String>)> = regions
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == RegionKind::TableTitle)
+        .map(|(i, r)| (i, r.bbox, r.text.clone()))
+        .collect();
+
+    let parent_indices: Vec<usize> = regions
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| !r.consumed && r.kind == RegionKind::Table)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut assigned_captions: Vec<bool> = vec![false; caption_data.len()];
+
+    for &parent_idx in &parent_indices {
+        let parent_bbox = regions[parent_idx].bbox;
+        let mut best_caption: Option<(usize, f32)> = None;
+
+        for (cap_idx, &(_, cap_bbox, _)) in caption_data.iter().enumerate() {
+            if assigned_captions[cap_idx] {
+                continue;
+            }
+            let distance = edge_distance(parent_bbox, cap_bbox);
+            if distance > max_distance * 2.0 {
+                continue;
+            }
+            let is_better = match best_caption {
+                None => true,
+                Some((_, best_dist)) => distance < best_dist,
+            };
+            if is_better {
+                best_caption = Some((cap_idx, distance));
+            }
+        }
+
+        if let Some((cap_idx, _)) = best_caption {
+            assigned_captions[cap_idx] = true;
+            let cap_region_idx = caption_data[cap_idx].0;
+            regions[parent_idx].caption = Some(Box::new(regions[cap_region_idx].clone()));
+            regions[cap_region_idx].consumed = true;
+        }
+    }
+}
+
 pub fn associate_captions(regions: &mut [Region]) {
     if regions.is_empty() {
         return;

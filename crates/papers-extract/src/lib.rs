@@ -348,6 +348,157 @@ fn compute_formula_crop_bbox(
 /// `orig_y_top` and `orig_y_bot` are the pixel Y coordinates of the original
 /// text-layer bbox within the expanded image — used to identify which content
 /// band contains the formula.
+/// Expand figure bboxes to include adjacent sub-figure label text regions.
+///
+/// PDF authors often place sub-figure labels (e.g. "(a) Reference") as separate
+/// text objects adjacent to the figure graphics. We absorb short, non-caption
+/// text regions within a small gap of the figure into the figure bbox, so they
+/// appear in the cropped figure image and are suppressed from the text output.
+fn expand_with_labels(
+    figure_bboxes: &mut Vec<[f32; 4]>,
+    regions: &mut [Region],
+) {
+    loop {
+        let mut expanded = false;
+        for fig_bbox in figure_bboxes.iter_mut() {
+            for region in regions.iter_mut() {
+                if region.consumed {
+                    continue;
+                }
+                // Only absorb plain text regions, not headings/captions/images
+                if region.kind != RegionKind::Text {
+                    continue;
+                }
+
+                let text = match region.text.as_deref() {
+                    Some(t) => t.trim(),
+                    None => continue,
+                };
+
+                // Must not start with a caption prefix
+                if is_figure_caption_prefix(text) {
+                    continue;
+                }
+
+                // Must be short (≤50 chars) OR contain sub-figure label patterns
+                // like "(a)", "(b)" which indicate a multi-label block
+                if text.len() > 50 && !has_subfigure_labels(text) {
+                    continue;
+                }
+
+                // Must overlap vertically with the figure
+                let y_overlap =
+                    fig_bbox[3].min(region.bbox[3]) - fig_bbox[1].max(region.bbox[1]);
+                if y_overlap <= 0.0 {
+                    continue;
+                }
+
+                // Must be adjacent (gap ≤ 10pt)
+                let x_gap = (region.bbox[0] - fig_bbox[2])
+                    .max(fig_bbox[0] - region.bbox[2])
+                    .max(0.0);
+                let y_gap = (region.bbox[1] - fig_bbox[3])
+                    .max(fig_bbox[1] - region.bbox[3])
+                    .max(0.0);
+                if x_gap > 10.0 || y_gap > 10.0 {
+                    continue;
+                }
+
+                // Expand figure bbox to include this label
+                fig_bbox[0] = fig_bbox[0].min(region.bbox[0]);
+                fig_bbox[1] = fig_bbox[1].min(region.bbox[1]);
+                fig_bbox[2] = fig_bbox[2].max(region.bbox[2]);
+                fig_bbox[3] = fig_bbox[3].max(region.bbox[3]);
+
+                region.consumed = true;
+                expanded = true;
+            }
+        }
+        if !expanded {
+            break;
+        }
+    }
+
+}
+
+/// Check if text contains sub-figure label patterns like "(a)", "(b)", "(1)", "(2)".
+/// Returns true if ≥2 such patterns are found, indicating a multi-label block
+/// (e.g. "(a) Reference (b) AVBD, 5 iterations (c) ...").
+fn has_subfigure_labels(text: &str) -> bool {
+    let mut count = 0;
+    let bytes = text.as_bytes();
+    for i in 0..bytes.len().saturating_sub(2) {
+        if bytes[i] == b'(' {
+            let c = bytes[i + 1];
+            if (c.is_ascii_lowercase() || c.is_ascii_digit()) && bytes[i + 2] == b')' {
+                count += 1;
+                if count >= 2 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Check if text starts with a caption prefix (Fig., Table, Algorithm, etc.)
+fn is_figure_caption_prefix(text: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "fig.", "fig ", "figure",
+        "table", "tab.", "tab ", "tbl.",
+        "algorithm", "alg.", "alg ",
+    ];
+    let lower = text.to_lowercase();
+    PREFIXES.iter().any(|p| lower.starts_with(p))
+}
+
+/// Trim whitespace rows from the top and bottom of a figure image.
+/// Scans for rows where the average pixel brightness is near-white
+/// (>250 for RGB) and crops them out, leaving a small padding.
+fn trim_figure_whitespace(img: &image::DynamicImage) -> image::DynamicImage {
+    use image::GenericImageView;
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return img.clone();
+    }
+
+    let rgb = img.to_rgb8();
+    let ws_threshold = 2; // max non-white pixels per row (< 1% of width)
+    let min_ink = (w as usize) / 100;
+
+    // Count non-white pixels per row
+    let row_ink: Vec<usize> = (0..h)
+        .map(|y| {
+            (0..w)
+                .filter(|&x| {
+                    let p = rgb.get_pixel(x, y);
+                    p[0] < 245 || p[1] < 245 || p[2] < 245
+                })
+                .count()
+        })
+        .collect();
+
+    // Find first and last rows with content
+    let top = row_ink
+        .iter()
+        .position(|&ink| ink > min_ink.max(ws_threshold))
+        .unwrap_or(0);
+    let bottom = row_ink
+        .iter()
+        .rposition(|&ink| ink > min_ink.max(ws_threshold))
+        .unwrap_or(h as usize - 1);
+
+    let pad = 4u32;
+    let crop_top = (top as u32).saturating_sub(pad);
+    let crop_bottom = ((bottom as u32) + pad + 1).min(h);
+
+    if crop_top >= crop_bottom || crop_bottom - crop_top < 20 {
+        return img.clone();
+    }
+
+    img.crop_imm(0, crop_top, w, crop_bottom - crop_top)
+}
+
 fn trim_formula_image(
     img: &image::DynamicImage,
     orig_y_top: u32,
@@ -612,6 +763,301 @@ pub fn extract_text_only(
     // repeats (or nearly repeats) across many pages.
     text_only::filter_running_headers(&mut pages);
 
+    // ── Visual content extraction ──────────────────────────────────────
+    // Detect figures from Form XObject bounds and tables from path rules.
+    // Render pages with pdfium and crop at the detected bounds to get
+    // composite images showing figures as they appear in the PDF.
+    if options.extract_images {
+        for (i, &page_idx) in page_indices.iter().enumerate() {
+            let page = doc.pages().get(page_idx as u16).unwrap();
+            let height_pt = page_chars[page_idx as usize].1;
+            let width_pt = page_widths[page_idx as usize];
+            let crop = pdf::crop_offset(&page);
+
+            // Detect tables via horizontal rules (path objects).
+            let exclude_bboxes: Vec<[f32; 4]> = pages[i]
+                .regions
+                .iter()
+                .filter(|r| !r.consumed && r.kind == RegionKind::Algorithm)
+                .map(|r| r.bbox)
+                .collect();
+            let table_bboxes: Vec<[f32; 4]> = pdf::detect_page_tables(&page, height_pt, width_pt, crop)
+                .into_iter()
+                .filter(|tbl| {
+                    !exclude_bboxes.iter().any(|ex| {
+                        let x_overlap = tbl[2].min(ex[2]) - tbl[0].max(ex[0]);
+                        let y_overlap = tbl[3].min(ex[3]) - tbl[1].max(ex[1]);
+                        x_overlap > 0.0 && y_overlap > 0.0
+                    })
+                })
+                .collect();
+            for (tbl_idx, bbox) in table_bboxes.into_iter().enumerate() {
+                let id = format!("p{}_tbl_{}", page_idx + 1, tbl_idx);
+                let rel_path = format!("images/tables/{id}.png");
+                pages[i].regions.push(Region {
+                    id, kind: RegionKind::Table, bbox, confidence: 1.0,
+                    order: 0, text: None, html: None, latex: None,
+                    formula_source: None, ocr_confidence: None,
+                    image_path: Some(rel_path), caption: None,
+                    chart_type: None, tag: None, items: None, consumed: false,
+                });
+            }
+
+            // Suppress text inside table bboxes
+            let tbl_bboxes: Vec<[f32; 4]> = pages[i].regions.iter()
+                .filter(|r| r.kind == RegionKind::Table && !r.consumed)
+                .map(|r| r.bbox).collect();
+            if !tbl_bboxes.is_empty() {
+                for region in &mut pages[i].regions {
+                    if region.consumed || region.kind == RegionKind::Table || region.kind.is_caption() {
+                        continue;
+                    }
+                    let cx = (region.bbox[0] + region.bbox[2]) / 2.0;
+                    let cy = (region.bbox[1] + region.bbox[3]) / 2.0;
+                    if tbl_bboxes.iter().any(|b| cx >= b[0] && cx <= b[2] && cy >= b[1] && cy <= b[3]) {
+                        region.consumed = true;
+                    }
+                }
+            }
+            figure::associate_captions_tables_only(&mut pages[i].regions);
+
+            // ── Figure detection from Form XObject bounds ──
+            // Large Form XObjects (>3 children) are figure containers.
+            // Their declared bounds from FPDFPageObj_GetBounds() give the
+            // figure's placement on the page. We render the page and crop
+            // at these bounds to get composite figure images.
+            let mut figure_bboxes = pdf::detect_page_figures(&page, height_pt, width_pt, crop);
+
+            // Absorb adjacent sub-figure labels into figure bboxes.
+            // Labels like "(a) Reference" are separate text objects on the page,
+            // not inside the Form XObject. This expands figure bboxes to include
+            // them and marks them consumed so they don't appear in text output.
+            expand_with_labels(&mut figure_bboxes, &mut pages[i].regions);
+
+            // Associate each figure bbox with the nearest FigureTitle caption
+            // using reading order: find the FigureTitle whose Y-center is
+            // closest to the figure bbox's Y-center in the same column.
+            let mut x_centers: Vec<f32> = pages[i].regions.iter()
+                .filter(|r| !r.consumed && r.kind != RegionKind::Image)
+                .map(|r| (r.bbox[0] + r.bbox[2]) / 2.0)
+                .collect();
+            x_centers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let col_boundary = if x_centers.len() >= 4 {
+                let mut max_gap = 0.0f32;
+                let mut boundary = 0.0f32;
+                for w in x_centers.windows(2) {
+                    if w[1] - w[0] > max_gap {
+                        max_gap = w[1] - w[0];
+                        boundary = (w[0] + w[1]) / 2.0;
+                    }
+                }
+                if max_gap > 50.0 { Some(boundary) } else { None }
+            } else {
+                None
+            };
+
+            // Clip figure bboxes to column edges to prevent text bleed.
+            if let Some(bnd) = col_boundary {
+                let left_x1 = pages[i].regions.iter()
+                    .filter(|r| !r.consumed && (r.bbox[0] + r.bbox[2]) / 2.0 < bnd)
+                    .map(|r| r.bbox[0]).fold(f32::MAX, f32::min);
+                let left_x2 = pages[i].regions.iter()
+                    .filter(|r| !r.consumed && (r.bbox[0] + r.bbox[2]) / 2.0 < bnd)
+                    .map(|r| r.bbox[2]).fold(f32::MIN, f32::max);
+                let right_x1 = pages[i].regions.iter()
+                    .filter(|r| !r.consumed && (r.bbox[0] + r.bbox[2]) / 2.0 >= bnd)
+                    .map(|r| r.bbox[0]).fold(f32::MAX, f32::min);
+                let right_x2 = pages[i].regions.iter()
+                    .filter(|r| !r.consumed && (r.bbox[0] + r.bbox[2]) / 2.0 >= bnd)
+                    .map(|r| r.bbox[2]).fold(f32::MIN, f32::max);
+
+                for bbox in &mut figure_bboxes {
+                    let fig_cx = (bbox[0] + bbox[2]) / 2.0;
+                    if fig_cx < bnd {
+                        bbox[0] = bbox[0].max(left_x1);
+                        bbox[2] = bbox[2].min(left_x2);
+                    } else {
+                        bbox[0] = bbox[0].max(right_x1);
+                        bbox[2] = bbox[2].min(right_x2);
+                    }
+                }
+            }
+
+            // Collect FigureTitle captions
+            let fig_captions: Vec<(usize, [f32; 4])> = pages[i].regions.iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    r.kind == RegionKind::FigureTitle && !r.consumed
+                        && r.text.as_deref().unwrap_or("").to_lowercase().starts_with("fig")
+                })
+                .map(|(idx, r)| (idx, r.bbox))
+                .collect();
+
+            let mut used_captions: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+            for (fig_idx, fig_bbox) in figure_bboxes.iter().enumerate() {
+                let fig_cx = (fig_bbox[0] + fig_bbox[2]) / 2.0;
+                let fig_cy = (fig_bbox[1] + fig_bbox[3]) / 2.0;
+                let fig_is_right = col_boundary.map_or(false, |b| fig_cx > b);
+
+                // Find the nearest unassigned caption in the same column,
+                // preferring captions below the figure (natural layout).
+                let best_cap = fig_captions.iter()
+                    .filter(|(idx, _)| !used_captions.contains(idx))
+                    .filter(|(_, cap_bbox)| {
+                        let cap_cx = (cap_bbox[0] + cap_bbox[2]) / 2.0;
+                        let cap_is_right = col_boundary.map_or(false, |b| cap_cx > b);
+                        cap_is_right == fig_is_right
+                    })
+                    .min_by(|(_, a), (_, b)| {
+                        let a_cy = (a[1] + a[3]) / 2.0;
+                        let b_cy = (b[1] + b[3]) / 2.0;
+                        let da = (a_cy - fig_cy).abs();
+                        let db = (b_cy - fig_cy).abs();
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(idx, _)| *idx);
+
+                let id = format!("p{}_fig_{}", page_idx + 1, fig_idx);
+                let rel_path = format!("images/figures/{id}.png");
+
+                let (caption, order) = if let Some(cap_idx) = best_cap {
+                    used_captions.insert(cap_idx);
+                    let cap_clone = Box::new(pages[i].regions[cap_idx].clone());
+                    let cap_order = pages[i].regions[cap_idx].order;
+                    pages[i].regions[cap_idx].consumed = true;
+                    (Some(cap_clone), cap_order.saturating_sub(1))
+                } else {
+                    // No caption — place by Y position
+                    let order = pages[i].regions.iter()
+                        .filter(|r| !r.consumed && r.kind != RegionKind::Image)
+                        .filter(|r| (r.bbox[1] + r.bbox[3]) / 2.0 <= fig_cy)
+                        .map(|r| r.order)
+                        .max()
+                        .unwrap_or(0);
+                    (None, order)
+                };
+
+                // Suppress text regions inside the figure bbox
+                for region in &mut pages[i].regions {
+                    if region.consumed || region.kind == RegionKind::Image
+                        || region.kind == RegionKind::FigureTitle
+                        || region.kind == RegionKind::ParagraphTitle
+                    {
+                        continue;
+                    }
+                    let cx = (region.bbox[0] + region.bbox[2]) / 2.0;
+                    let cy = (region.bbox[1] + region.bbox[3]) / 2.0;
+                    if cx >= fig_bbox[0] && cx <= fig_bbox[2]
+                        && cy >= fig_bbox[1] && cy <= fig_bbox[3]
+                    {
+                        region.consumed = true;
+                    }
+                }
+
+                pages[i].regions.push(Region {
+                    id, kind: RegionKind::Image, bbox: *fig_bbox,
+                    confidence: 1.0, order,
+                    text: None, html: None, latex: None,
+                    formula_source: None, ocr_confidence: None,
+                    image_path: Some(rel_path), caption,
+                    chart_type: None, tag: None, items: None,
+                    consumed: false,
+                });
+            }
+
+            // Handle FigureTitle captions that didn't match any Form XObject
+            // (vector-only figures with no Form XObject container).
+            // For these, compute a figure slot from text coordinates.
+            for (cap_idx, cap_bbox) in &fig_captions {
+                if used_captions.contains(cap_idx) {
+                    continue;
+                }
+                let cap_order = pages[i].regions[*cap_idx].order;
+                let cap_cx = (cap_bbox[0] + cap_bbox[2]) / 2.0;
+                let cap_is_right = col_boundary.map_or(false, |b| cap_cx > b);
+
+                // Slot: from previous heading/caption/figure to top of this caption.
+                // Include consumed regions as boundaries — a consumed FigureTitle
+                // or Image (Form XObject figure) should still fence the slot.
+                let slot_bottom = cap_bbox[1];
+                let slot_top = pages[i].regions.iter()
+                    .filter(|r| {
+                        r.order < cap_order
+                            && (r.kind == RegionKind::ParagraphTitle
+                                || r.kind == RegionKind::FigureTitle
+                                || r.kind == RegionKind::Image)
+                    })
+                    .filter(|r| {
+                        let cx = (r.bbox[0] + r.bbox[2]) / 2.0;
+                        col_boundary.map_or(true, |b| (cx > b) == cap_is_right)
+                            && r.bbox[3] < slot_bottom
+                    })
+                    .map(|r| r.bbox[3])
+                    .fold(f32::MIN, f32::max);
+                let slot_top = if slot_top == f32::MIN { 35.0 } else { slot_top };
+
+                if slot_bottom - slot_top < 30.0 {
+                    continue;
+                }
+
+                // Use column edges for left/right
+                let (slot_left, slot_right) = if let Some(bnd) = col_boundary {
+                    if cap_is_right {
+                        let x1 = pages[i].regions.iter()
+                            .filter(|r| !r.consumed && (r.bbox[0] + r.bbox[2]) / 2.0 >= bnd)
+                            .map(|r| r.bbox[0]).fold(f32::MAX, f32::min);
+                        let x2 = pages[i].regions.iter()
+                            .filter(|r| !r.consumed && (r.bbox[0] + r.bbox[2]) / 2.0 >= bnd)
+                            .map(|r| r.bbox[2]).fold(f32::MIN, f32::max);
+                        (x1, x2)
+                    } else {
+                        let x1 = pages[i].regions.iter()
+                            .filter(|r| !r.consumed && (r.bbox[0] + r.bbox[2]) / 2.0 < bnd)
+                            .map(|r| r.bbox[0]).fold(f32::MAX, f32::min);
+                        let x2 = pages[i].regions.iter()
+                            .filter(|r| !r.consumed && (r.bbox[0] + r.bbox[2]) / 2.0 < bnd)
+                            .map(|r| r.bbox[2]).fold(f32::MIN, f32::max);
+                        (x1, x2)
+                    }
+                } else {
+                    (cap_bbox[0], cap_bbox[2])
+                };
+
+                let slot_bbox = [slot_left.max(0.0), slot_top, slot_right.min(width_pt), slot_bottom];
+                let fig_id = format!("p{}_figslot_{}", page_idx + 1, cap_idx);
+                let rel_path = format!("images/figures/{fig_id}.png");
+
+                let cap_clone = Box::new(pages[i].regions[*cap_idx].clone());
+                pages[i].regions[*cap_idx].consumed = true;
+
+                pages[i].regions.push(Region {
+                    id: fig_id, kind: RegionKind::Image, bbox: slot_bbox,
+                    confidence: 1.0, order: cap_order.saturating_sub(1),
+                    text: None, html: None, latex: None,
+                    formula_source: None, ocr_confidence: None,
+                    image_path: Some(rel_path), caption: Some(cap_clone),
+                    chart_type: None, tag: None, items: None,
+                    consumed: false,
+                });
+            }
+
+            pages[i].regions.sort_by_key(|r| r.order);
+        }
+
+        let fig_count: usize = pages.iter()
+            .flat_map(|p| &p.regions)
+            .filter(|r| r.kind == RegionKind::Image && !r.consumed)
+            .count();
+        let tbl_count: usize = pages.iter()
+            .flat_map(|p| &p.regions)
+            .filter(|r| r.kind == RegionKind::Table && !r.consumed)
+            .count();
+        if fig_count > 0 || tbl_count > 0 {
+            eprintln!("  Visual: {fig_count} figures, {tbl_count} tables detected");
+        }
+    }
+
     // Check for empty extraction (likely scanned PDF)
     let total_regions: usize = pages.iter().map(|p| p.regions.len()).sum();
     if total_regions == 0 {
@@ -622,26 +1068,34 @@ pub fn extract_text_only(
     }
 
     let extraction_time_ms = start.elapsed().as_millis() as u64;
-    // Render pages with display formulas and crop formula images.
+    // Render pages with display formulas / tables and crop images.
     // This reuses the same code as the layout path's manual formula mode:
-    // render the page, crop at formula bbox, save as PNG, set image_path.
+    // render the page, crop at formula/table bbox, save as PNG, set image_path.
     let mut page_images: Vec<Option<image::DynamicImage>> = vec![None; pages.len()];
     {
-        let formula_pages: std::collections::HashSet<u32> = pages
+        // Pages that need rendering: formulas, tables, or figure slots.
+        let render_pages: std::collections::HashSet<u32> = pages
             .iter()
             .filter(|p| {
                 p.regions.iter().any(|r| {
-                    r.kind == RegionKind::DisplayFormula && r.latex.is_none() && !r.consumed
+                    (r.kind == RegionKind::DisplayFormula && r.latex.is_none() && !r.consumed)
+                        || (r.kind == RegionKind::Table
+                            && r.image_path.is_some()
+                            && r.text.is_none()
+                            && !r.consumed)
+                        || (r.kind == RegionKind::Image
+                            && r.image_path.is_some()
+                            && !r.consumed)
                 })
             })
             .map(|p| p.page)
             .collect();
 
-        if !formula_pages.is_empty() {
-            eprint!("\r  Rendering {} pages for formula images...", formula_pages.len());
+        if !render_pages.is_empty() {
+            eprint!("\r  Rendering {} pages for images...", render_pages.len());
             for (i, &page_idx) in page_indices.iter().enumerate() {
                 let page_num = page_idx + 1;
-                if !formula_pages.contains(&page_num) {
+                if !render_pages.contains(&page_num) {
                     continue;
                 }
                 let page = doc.pages().get(page_idx as u16).unwrap();
@@ -744,6 +1198,79 @@ pub fn extract_text_only(
                     let path = formula_img_dir.join(format!("{}.png", region.id));
                     if let Err(e) = cropped.save(&path) {
                         eprintln!("  Warning: failed to save formula image {}: {e}", region.id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Write table images for pages that were rendered
+    {
+        let table_img_dir = output_dir.join("images/tables");
+        let has_table_images = result.pages.iter().any(|p| {
+            p.regions
+                .iter()
+                .any(|r| r.kind == RegionKind::Table && r.image_path.is_some() && !r.consumed)
+        });
+        if has_table_images {
+            std::fs::create_dir_all(&table_img_dir)?;
+            for (page, maybe_img) in result.pages.iter().zip(page_images.iter()) {
+                let Some(img) = maybe_img else { continue };
+                for region in &page.regions {
+                    if region.kind != RegionKind::Table
+                        || region.image_path.is_none()
+                        || region.consumed
+                    {
+                        continue;
+                    }
+                    let cropped = figure::crop_region(
+                        img,
+                        region.bbox,
+                        page.width_pt,
+                        page.height_pt,
+                        page.dpi,
+                    );
+                    let path = table_img_dir.join(format!("{}.png", region.id));
+                    if let Err(e) = cropped.save(&path) {
+                        eprintln!("  Warning: failed to save table image {}: {e}", region.id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Write figure slot images (cropped from rendered pages)
+    {
+        let fig_img_dir = output_dir.join("images/figures");
+        let has_figs = result.pages.iter().any(|p| {
+            p.regions.iter().any(|r| r.kind == RegionKind::Image && r.image_path.is_some() && !r.consumed)
+        });
+        if has_figs {
+            std::fs::create_dir_all(&fig_img_dir)?;
+            for (page, maybe_img) in result.pages.iter().zip(page_images.iter()) {
+                let Some(img) = maybe_img else { continue };
+                for region in &page.regions {
+                    if region.kind != RegionKind::Image
+                        || region.image_path.is_none()
+                        || region.consumed
+                    {
+                        continue;
+                    }
+                    let cropped = figure::crop_region(
+                        img,
+                        region.bbox,
+                        page.width_pt,
+                        page.height_pt,
+                        page.dpi,
+                    );
+                    // Trim whitespace from top and bottom of the figure.
+                    // The slot can extend to the page top when there's no
+                    // heading above, capturing empty space and page headers.
+                    let trimmed = trim_figure_whitespace(&cropped);
+                    let rel_path = region.image_path.as_ref().unwrap();
+                    let full_path = output_dir.join(rel_path);
+                    if let Err(e) = trimmed.save(&full_path) {
+                        eprintln!("  Warning: failed to save figure image {}: {e}", region.id);
                     }
                 }
             }
