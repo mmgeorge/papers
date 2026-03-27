@@ -628,8 +628,8 @@ fn build_lines_from_chars(
         .iter()
         .filter(|c| c.codepoint == ' ')
         .map(|c| {
-            let y_img = page_height - (c.bbox[1] + c.bbox[3]) / 2.0;
-            (c.bbox[0], y_img)
+            let y = (c.bbox[1] + c.bbox[3]) / 2.0;
+            (c.bbox[0], y)
         })
         .collect();
 
@@ -641,8 +641,8 @@ fn build_lines_from_chars(
         if c.codepoint == ' ' {
             continue;
         }
-        let y1 = page_height - c.bbox[3];
-        let y2 = page_height - c.bbox[1];
+        let y1 = c.bbox[1];
+        let y2 = c.bbox[3];
         // Expand ligatures: fi, fl, ff, ffi, ffl
         if let Some(ligature) = crate::pdf::expand_ligature(c.codepoint) {
             let has_glyph = (c.bbox[2] - c.bbox[0]) > 0.1;

@@ -404,14 +404,14 @@ pub fn detect_watermarks(page_chars: &[(Vec<PdfChar>, f32)]) -> std::collections
         let Some(dominant) = dominant else { continue };
 
         // Look at chars in the bottom 20% of the page.
-        // CropBox-relative PDF coords: y=0 is bottom, y=page_height is top.
-        let bottom_threshold = *page_height * 0.20;
+        // Image space (Y-down): y=0 is top, y=page_height is bottom.
+        let bottom_threshold = *page_height * 0.80;
         let bottom_chars: Vec<&PdfChar> = chars
             .iter()
             .filter(|c| {
                 !c.codepoint.is_control()
                     && c.codepoint != ' '
-                    && c.bbox[3] < bottom_threshold // top of char in bottom 20%
+                    && c.bbox[1] > bottom_threshold // top of char in bottom 20%
             })
             .collect();
 

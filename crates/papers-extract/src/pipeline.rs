@@ -289,8 +289,9 @@ impl Pipeline {
         let page_chars: Vec<(Vec<PdfChar>, f32)> = (0..total_pages)
             .map(|i| {
                 let page = doc.pages().get(i as u16).unwrap();
-                let chars = pdf::extract_page_chars(&page, i).unwrap_or_default();
+                let mut chars = pdf::extract_page_chars(&page, i).unwrap_or_default();
                 let height = page.height().value;
+                pdf::normalize_chars_to_image_space(&mut chars, height);
                 (chars, height)
             })
             .collect();
@@ -372,6 +373,7 @@ impl Pipeline {
                 let mut page_chars = pdf::extract_page_chars(&page, *page_idx)?;
                 let crop = pdf::crop_offset(&page);
                 pdf::apply_crop_offset(&mut page_chars, crop);
+                pdf::normalize_chars_to_image_space(&mut page_chars, height_pt);
                 char_time += t.elapsed();
 
                 dims.push((width_pt, height_pt));
@@ -2020,8 +2022,8 @@ fn trim_algorithm_bbox(chars: &[PdfChar], bbox: [f32; 4], page_height_pt: f32) -
     // Sort chars by Y (image space: higher Y = lower on page)
     let mut by_y: Vec<(f32, &str)> = region_chars.iter()
         .map(|c| {
-            let cy_img = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
-            (cy_img, c.font_name.as_str())
+            let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+            (cy, c.font_name.as_str())
         })
         .collect();
     by_y.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -2121,8 +2123,7 @@ fn is_formatted_text(chars: &[&PdfChar], page_height_pt: f32, bbox: [f32; 4]) ->
     // Count distinct lines
     let mut line_ys: Vec<f32> = Vec::new();
     for c in chars {
-        // Use image-space Y for grouping
-        let cy = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
+        let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
         if !line_ys.iter().any(|&ly| (ly - cy).abs() < y_thresh) {
             line_ys.push(cy);
         }
@@ -2140,7 +2141,7 @@ fn is_formatted_text(chars: &[&PdfChar], page_height_pt: f32, bbox: [f32; 4]) ->
         // Collect chars on this line
         let line_chars: Vec<&&PdfChar> = chars.iter()
             .filter(|c| {
-                let cy = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
+                let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
                 (cy - ly).abs() < y_thresh
             })
             .collect();

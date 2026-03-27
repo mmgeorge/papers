@@ -354,8 +354,8 @@ pub fn fill_table_html(
     let img_chars: Vec<[f32; 4]> = chars
         .iter()
         .map(|c| {
-            // PdfChar bbox is bottom-left origin; convert to Y-down top-left
-            [c.bbox[0], page_height_pt - c.bbox[3], c.bbox[2], page_height_pt - c.bbox[1]]
+            // PdfChar bbox is already image space (Y-down) after normalization
+            c.bbox
         })
         .collect();
 

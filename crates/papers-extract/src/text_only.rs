@@ -436,10 +436,9 @@ fn partition_heading_chars(
         // (f_i, H_i) that use the heading font — UNLESS the char is near
         // a known heading position. The font IS the definitive signal for
         // headings; formula zones should not override confirmed headings.
-        let img_y = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
-        let pdf_y = (c.bbox[1] + c.bbox[3]) / 2.0;
-        let in_formula_zone = formula_zones.iter().any(|&(yt, yb)| img_y >= yt && img_y <= yb);
-        let near_known_heading = known_headings.iter().any(|h| (h.y_center - pdf_y).abs() < 15.0);
+        let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+        let in_formula_zone = formula_zones.iter().any(|&(yt, yb)| cy >= yt && cy <= yb);
+        let near_known_heading = known_headings.iter().any(|h| (h.y_center - cy).abs() < 15.0);
         let is_heading_char = heading_families.contains(&family)
             && (!in_formula_zone || near_known_heading);
 
@@ -479,8 +478,8 @@ fn partition_heading_chars(
             }
             let x1 = c.bbox[0];
             let x2 = c.bbox[2];
-            let y1 = page_height_pt - c.bbox[3]; // image space Y-down
-            let y2 = page_height_pt - c.bbox[1];
+            let y1 = c.bbox[1];
+            let y2 = c.bbox[3];
 
             bbox[0] = bbox[0].min(x1);
             bbox[1] = bbox[1].min(y1);
@@ -546,11 +545,10 @@ fn partition_heading_chars(
     for (region, run_start, run_end) in heading_regions {
         let region_text = region.text.as_deref().unwrap_or("");
         let region_center_y = (region.bbox[1] + region.bbox[3]) / 2.0;
-        let region_pdf_y = page_height_pt - region_center_y;
 
         let matches_known = known_headings.iter().any(|h| {
-            // Y-position match (within ~20pt)
-            let y_close = (h.y_center - region_pdf_y).abs() < 20.0;
+            // Y-position match (within ~20pt) — both in image space
+            let y_close = (h.y_center - region_center_y).abs() < 20.0;
             // Text match (heading title is prefix of region text or vice versa)
             let h_norm = h.title.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
             let r_norm = region_text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
@@ -811,10 +809,10 @@ pub fn extract_page_text_blocks(
             let filtered: Vec<PdfChar> = body_chars
                 .iter()
                 .filter(|c| {
-                    let cy_img = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
+                    let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
                     let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
                     !formula_bboxes.iter().any(|fb| {
-                        cx >= fb[0] && cx <= fb[2] && cy_img >= fb[1] && cy_img <= fb[3]
+                        cx >= fb[0] && cx <= fb[2] && cy >= fb[1] && cy <= fb[3]
                     })
                 })
                 .cloned()
@@ -1069,8 +1067,8 @@ fn convert_and_filter(
                 return None;
             }
 
-            let y1 = page_height_pt - c.bbox[3];
-            let y2 = page_height_pt - c.bbox[1];
+            let y1 = c.bbox[1];
+            let y2 = c.bbox[3];
             let x1 = c.bbox[0];
             let x2 = c.bbox[2];
 
@@ -1557,25 +1555,18 @@ fn compute_split_bboxes(
     chars: &[crate::pdf::PdfChar],
     block_bbox: [f32; 4],
     segments: &[(String, crate::types::RegionKind)],
-    page_height_pt: f32,
+    _page_height_pt: f32,
 ) -> Vec<[f32; 4]> {
-    // block_bbox is in image space (Y-down). PdfChar.bbox is in PDF space (Y-up).
-    // Convert block_bbox to PDF space for char filtering.
-    let pdf_x1 = block_bbox[0];
-    let pdf_x2 = block_bbox[2];
-    let pdf_y1 = page_height_pt - block_bbox[3]; // img bottom → PDF bottom
-    let pdf_y2 = page_height_pt - block_bbox[1]; // img top → PDF top
-
-    // Collect chars that fall within the block's bbox (in PDF space)
+    // Both block_bbox and PdfChar.bbox are in image space (Y-down) after normalization.
     let block_chars: Vec<&crate::pdf::PdfChar> = chars
         .iter()
         .filter(|c| {
             let cx = (c.bbox[0] + c.bbox[2]) / 2.0;
             let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
-            cx >= pdf_x1 - 1.0
-                && cx <= pdf_x2 + 1.0
-                && cy >= pdf_y1 - 1.0
-                && cy <= pdf_y2 + 1.0
+            cx >= block_bbox[0] - 1.0
+                && cx <= block_bbox[2] + 1.0
+                && cy >= block_bbox[1] - 1.0
+                && cy <= block_bbox[3] + 1.0
         })
         .collect();
 
@@ -1583,7 +1574,8 @@ fn compute_split_bboxes(
         return segments.iter().map(|_| block_bbox).collect();
     }
 
-    // Group chars into lines by Y proximity
+    // Group chars into lines by Y proximity.
+    // Ascending image-space Y = top-to-bottom visual order.
     let mut lines: Vec<Vec<&crate::pdf::PdfChar>> = Vec::new();
     let mut sorted = block_chars.clone();
     sorted.sort_by(|a, b| {
@@ -1608,9 +1600,7 @@ fn compute_split_bboxes(
         }
     }
 
-    // Compute char count per line
-    let line_char_counts: Vec<usize> = lines.iter().map(|l| l.len()).collect();
-    let total_chars: usize = line_char_counts.iter().sum();
+    let total_chars: usize = lines.iter().map(|l| l.len()).sum();
 
     // Assign lines to segments proportionally by text length
     let seg_char_targets: Vec<usize> = segments
@@ -1623,10 +1613,9 @@ fn compute_split_bboxes(
         return segments.iter().map(|_| block_bbox).collect();
     }
 
-    // Walk through lines, assigning them to segments
+    // Walk through lines top-to-bottom, assigning to segments in order
     let mut result = Vec::with_capacity(segments.len());
     let mut line_idx = 0;
-    let mut chars_used = 0usize;
 
     for (seg_i, target) in seg_char_targets.iter().enumerate() {
         let mut seg_x1 = f32::MAX;
@@ -1634,7 +1623,6 @@ fn compute_split_bboxes(
         let mut seg_x2 = f32::MIN;
         let mut seg_y2 = f32::MIN;
 
-        // How many lines should this segment consume (at least 1 per segment)
         let lines_for_seg = if seg_i == segments.len() - 1 {
             lines.len() - line_idx
         } else {
@@ -1658,13 +1646,9 @@ fn compute_split_bboxes(
             seg_chars_consumed += lines[line_idx].len();
             line_idx += 1;
         }
-        chars_used += seg_chars_consumed;
 
         if seg_x1 < seg_x2 && seg_y1 < seg_y2 {
-            // Convert from PDF space (Y-up) back to image space (Y-down)
-            let img_y1 = page_height_pt - seg_y2;
-            let img_y2 = page_height_pt - seg_y1;
-            result.push([seg_x1, img_y1, seg_x2, img_y2]);
+            result.push([seg_x1, seg_y1, seg_x2, seg_y2]);
         } else {
             result.push(block_bbox);
         }
@@ -1846,13 +1830,14 @@ fn classify_block(
 ) -> RegionKind {
     let line_count = block.line_count;
 
-    let block_center_pdf_y = page_height_pt - (block.bbox[1] + block.bbox[3]) / 2.0;
-    let block_top_pdf_y = page_height_pt - block.bbox[1];
+    // Both block.bbox and heading.y_center are in image space (Y-down)
+    let block_center_y = (block.bbox[1] + block.bbox[3]) / 2.0;
+    let block_top_y = block.bbox[1];
     let avg_line_height = (block.bbox[3] - block.bbox[1]) / line_count.max(1) as f32;
 
     for heading in headings {
-        let near_center = (heading.y_center - block_center_pdf_y).abs() <= avg_line_height * 1.5;
-        let near_top = (heading.y_center - block_top_pdf_y).abs() <= avg_line_height * 2.0;
+        let near_center = (heading.y_center - block_center_y).abs() <= avg_line_height * 1.5;
+        let near_top = (heading.y_center - block_top_y).abs() <= avg_line_height * 2.0;
         if !near_center && !near_top {
             continue;
         }

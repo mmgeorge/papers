@@ -218,8 +218,9 @@ pub fn reflow_only(
     let page_chars: Vec<(Vec<pdf::PdfChar>, f32)> = (0..total_pages)
         .map(|i| {
             let page = doc.pages().get(i as u16).unwrap();
-            let chars = pdf::extract_page_chars(&page, i).unwrap_or_default();
+            let mut chars = pdf::extract_page_chars(&page, i).unwrap_or_default();
             let height = page.height().value;
+            pdf::normalize_chars_to_image_space(&mut chars, height);
             (chars, height)
         })
         .collect();
@@ -278,9 +279,8 @@ fn compute_formula_crop_bbox(
     for c in chars {
         if c.codepoint == '\n' {
             // \n char's bbox is a zero-area point at the previous char's position.
-            // Convert to image space Y.
-            let img_y = page_height_pt - (c.bbox[1] + c.bbox[3]) / 2.0;
-            newline_ys.push(img_y);
+            let y = (c.bbox[1] + c.bbox[3]) / 2.0;
+            newline_ys.push(y);
         }
     }
     newline_ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -383,13 +383,6 @@ fn expand_with_labels(
                 // Must be short (≤50 chars) OR contain sub-figure label patterns
                 // like "(a)", "(b)" which indicate a multi-label block
                 if text.len() > 50 && !has_subfigure_labels(text) {
-                    continue;
-                }
-
-                // Must overlap vertically with the figure
-                let y_overlap =
-                    fig_bbox[3].min(region.bbox[3]) - fig_bbox[1].max(region.bbox[1]);
-                if y_overlap <= 0.0 {
                     continue;
                 }
 
@@ -650,6 +643,7 @@ pub fn extract_text_only(
         pdf::apply_crop_offset(&mut chars, crop);
         let height = page.height().value;
         let width = page.width().value;
+        pdf::normalize_chars_to_image_space(&mut chars, height);
         page_widths.push(width);
         page_chars.push((chars, height));
     }
@@ -895,7 +889,7 @@ pub fn extract_text_only(
 
             let mut used_captions: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-            for (fig_idx, fig_bbox) in figure_bboxes.iter().enumerate() {
+            for (fig_idx, fig_bbox) in figure_bboxes.iter_mut().enumerate() {
                 let fig_cx = (fig_bbox[0] + fig_bbox[2]) / 2.0;
                 let fig_cy = (fig_bbox[1] + fig_bbox[3]) / 2.0;
                 let fig_is_right = col_boundary.map_or(false, |b| fig_cx > b);
@@ -938,7 +932,10 @@ pub fn extract_text_only(
                     (None, order)
                 };
 
-                // Suppress text regions inside the figure bbox
+                // Suppress text regions inside the figure bbox.
+                // If a consumed region extends beyond the figure bbox, expand
+                // the bbox — the region is figure-internal content (axis labels,
+                // legend entries) whose chars extend past the Form /BBox clip.
                 for region in &mut pages[i].regions {
                     if region.consumed || region.kind == RegionKind::Image
                         || region.kind == RegionKind::FigureTitle
@@ -952,6 +949,11 @@ pub fn extract_text_only(
                         && cy >= fig_bbox[1] && cy <= fig_bbox[3]
                     {
                         region.consumed = true;
+                        // Expand figure bbox to include the full region extent
+                        fig_bbox[0] = fig_bbox[0].min(region.bbox[0]);
+                        fig_bbox[1] = fig_bbox[1].min(region.bbox[1]);
+                        fig_bbox[2] = fig_bbox[2].max(region.bbox[2]);
+                        fig_bbox[3] = fig_bbox[3].max(region.bbox[3]);
                     }
                 }
 
@@ -997,6 +999,43 @@ pub fn extract_text_only(
                     .fold(f32::MIN, f32::max);
                 let slot_top = if slot_top == f32::MIN { 35.0 } else { slot_top };
 
+                // Push slot_top past short text at the top of the slot that
+                // is likely an axis label from the figure above (e.g. "frames"
+                // sitting just below a consumed Fig. 8 caption).
+                let slot_top = {
+                    let mut top = slot_top;
+                    loop {
+                        let mut pushed = false;
+                        for r in pages[i].regions.iter() {
+                            if r.consumed || r.kind != RegionKind::Text {
+                                continue;
+                            }
+                            let cx = (r.bbox[0] + r.bbox[2]) / 2.0;
+                            let same_col =
+                                col_boundary.map_or(true, |b| (cx > b) == cap_is_right);
+                            if !same_col {
+                                continue;
+                            }
+                            let text = r.text.as_deref().unwrap_or("").trim();
+                            // Short text (≤20 chars) right at slot_top (≤5pt gap) —
+                            // axis labels, not body text or sub-figure labels
+                            if text.len() <= 20
+                                && !has_subfigure_labels(text)
+                                && r.bbox[1] >= top
+                                && r.bbox[1] <= top + 5.0
+                                && r.bbox[3] < slot_bottom
+                            {
+                                top = r.bbox[3];
+                                pushed = true;
+                            }
+                        }
+                        if !pushed {
+                            break;
+                        }
+                    }
+                    top
+                };
+
                 if slot_bottom - slot_top < 30.0 {
                     continue;
                 }
@@ -1040,6 +1079,51 @@ pub fn extract_text_only(
                     chart_type: None, tag: None, items: None,
                     consumed: false,
                 });
+            }
+
+            // Consume sub-figure labels and short axis labels that sit
+            // immediately below consumed figure captions. These are text-layer
+            // duplicates of labels already visible in the figure crop.
+            // We suppress them from text output but do NOT expand the Image bbox.
+            let mut labels_to_consume: Vec<usize> = Vec::new();
+            for region in pages[i].regions.iter() {
+                if region.kind != RegionKind::Image || region.consumed {
+                    continue;
+                }
+                let Some(cap) = &region.caption else { continue };
+                let cap_bottom = cap.bbox[3];
+                let cap_left = cap.bbox[0];
+                let cap_right = cap.bbox[2];
+
+                for (j, r) in pages[i].regions.iter().enumerate() {
+                    if r.consumed || r.kind != RegionKind::Text {
+                        continue;
+                    }
+                    let text = r.text.as_deref().unwrap_or("").trim();
+                    // Must be below (or touching) the caption bottom, gap ≤ 3pt
+                    if r.bbox[1] < cap_bottom - 3.0 {
+                        continue;
+                    }
+                    let y_gap = r.bbox[1] - cap_bottom;
+                    if y_gap > 3.0 {
+                        continue;
+                    }
+                    // Must overlap horizontally with the caption
+                    let x_overlap = cap_right.min(r.bbox[2]) - cap_left.max(r.bbox[0]);
+                    if x_overlap <= 0.0 {
+                        continue;
+                    }
+                    let is_subfig = has_subfigure_labels(text);
+                    let is_axis_label =
+                        text.len() <= 20 && !is_figure_caption_prefix(text);
+                    if !is_subfig && !is_axis_label {
+                        continue;
+                    }
+                    labels_to_consume.push(j);
+                }
+            }
+            for j in labels_to_consume {
+                pages[i].regions[j].consumed = true;
             }
 
             pages[i].regions.sort_by_key(|r| r.order);

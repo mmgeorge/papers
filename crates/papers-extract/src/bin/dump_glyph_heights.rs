@@ -30,8 +30,9 @@ fn main() {
             .get(page_idx as u16)
             .expect("Failed to get page");
 
-        let chars =
+        let mut chars =
             papers_extract::pdf::extract_page_chars(&page, page_idx).expect("extract_page_chars");
+        papers_extract::pdf::normalize_chars_to_image_space(&mut chars, page.height().value);
 
         println!("==============================");
         println!("PAGE {} ({} chars)", page_num, chars.len());

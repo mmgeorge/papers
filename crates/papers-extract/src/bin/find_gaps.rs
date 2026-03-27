@@ -25,8 +25,9 @@ fn main() {
 
     for page_idx in 0..num_pages {
         let page = doc.pages().get(page_idx).expect("Failed to get page");
-        let chars = papers_extract::pdf::extract_page_chars(&page, page_idx as u32)
+        let mut chars = papers_extract::pdf::extract_page_chars(&page, page_idx as u32)
             .expect("Failed to extract chars");
+        papers_extract::pdf::normalize_chars_to_image_space(&mut chars, page.height().value);
 
         // Build the string of codepoints (filtering control chars)
         let codepoints: Vec<char> = chars.iter().map(|c| c.codepoint).collect();

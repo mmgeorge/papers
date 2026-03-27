@@ -77,15 +77,10 @@ impl LineElement<'_> {
 /// Convert a PdfChar (PDF Y-up coords) to image space (Y-down coords).
 fn to_image_char<'a>(c: &'a PdfChar, page_height_pt: f32) -> ImageChar<'a> {
     // PdfChar.bbox = [left, bottom, right, top] in PDF space (Y-up)
-    // Image space = [x1, y1, x2, y2] where y1 = top, y2 = bottom (Y-down)
+    // PdfChar.bbox is already in image space (Y-down) after normalization
     ImageChar {
         codepoint: c.codepoint,
-        bbox: [
-            c.bbox[0],                      // x1 = left (unchanged)
-            page_height_pt - c.bbox[3],      // y1 = page_height - top (now top in Y-down)
-            c.bbox[2],                       // x2 = right (unchanged)
-            page_height_pt - c.bbox[1],      // y2 = page_height - bottom (now bottom in Y-down)
-        ],
+        bbox: c.bbox,
         space_threshold: c.space_threshold,
         font_size: c.font_size,
         is_italic: c.is_italic,
@@ -2742,14 +2737,11 @@ mod tests {
         make_char_image_space_italic(c, x, y_top_img, w, h, page_h, false)
     }
 
-    fn make_char_image_space_italic(c: char, x: f32, y_top_img: f32, w: f32, h: f32, page_h: f32, is_italic: bool) -> PdfChar {
-        // In image space: y_top_img is the top of the char (small value = near top of page)
-        // In PDF space: top = page_h - y_top_img, bottom = page_h - (y_top_img + h)
-        let pdf_top = page_h - y_top_img;
-        let pdf_bottom = page_h - (y_top_img + h);
+    fn make_char_image_space_italic(c: char, x: f32, y_top_img: f32, w: f32, h: f32, _page_h: f32, is_italic: bool) -> PdfChar {
+        // PdfChar.bbox is in image space (Y-down) after normalization
         PdfChar {
             codepoint: c,
-            bbox: [x, pdf_bottom, x + w, pdf_top],
+            bbox: [x, y_top_img, x + w, y_top_img + h],
             space_threshold: 1.5,
             font_name: String::new(),
             font_size: 10.0,
@@ -2913,27 +2905,13 @@ mod tests {
     }
 
     #[test]
-    fn test_y_axis_conversion() {
-        // Verify that PdfChar Y-up coords are correctly converted to image Y-down
+    fn test_y_axis_passthrough() {
+        // PdfChar.bbox is already in image space (Y-down) after normalization.
+        // to_image_char should pass through coordinates unchanged.
         let page_h = 800.0;
-        // A char at the TOP of the page in PDF space: bottom=790, top=800
+        // A char at the TOP of the page in image space: y1=0, y2=10
         let top_char = PdfChar {
             codepoint: 'T',
-            bbox: [100.0, 790.0, 110.0, 800.0],
-            space_threshold: 0.0,
-            font_name: String::new(),
-            font_size: 10.0,
-            is_italic: false,
-            is_bold: false,
-        };
-        let img = to_image_char(&top_char, page_h);
-        // In image space, this should be near y=0 (top of page)
-        assert!((img.bbox[1] - 0.0).abs() < 0.01, "Top char y1 should be ~0, got {}", img.bbox[1]);
-        assert!((img.bbox[3] - 10.0).abs() < 0.01, "Top char y2 should be ~10, got {}", img.bbox[3]);
-
-        // A char at the BOTTOM of the page in PDF space: bottom=0, top=10
-        let bottom_char = PdfChar {
-            codepoint: 'B',
             bbox: [100.0, 0.0, 110.0, 10.0],
             space_threshold: 0.0,
             font_name: String::new(),
@@ -2941,8 +2919,21 @@ mod tests {
             is_italic: false,
             is_bold: false,
         };
+        let img = to_image_char(&top_char, page_h);
+        assert!((img.bbox[1] - 0.0).abs() < 0.01, "Top char y1 should be ~0, got {}", img.bbox[1]);
+        assert!((img.bbox[3] - 10.0).abs() < 0.01, "Top char y2 should be ~10, got {}", img.bbox[3]);
+
+        // A char at the BOTTOM of the page in image space: y1=790, y2=800
+        let bottom_char = PdfChar {
+            codepoint: 'B',
+            bbox: [100.0, 790.0, 110.0, 800.0],
+            space_threshold: 0.0,
+            font_name: String::new(),
+            font_size: 10.0,
+            is_italic: false,
+            is_bold: false,
+        };
         let img = to_image_char(&bottom_char, page_h);
-        // In image space, this should be near y=790 (bottom of page)
         assert!((img.bbox[1] - 790.0).abs() < 0.01, "Bottom char y1 should be ~790, got {}", img.bbox[1]);
         assert!((img.bbox[3] - 800.0).abs() < 0.01, "Bottom char y2 should be ~800, got {}", img.bbox[3]);
     }
@@ -3589,11 +3580,9 @@ mod tests {
         page_h: f32,
         font_size: f32,
     ) -> PdfChar {
-        let pdf_top = page_h - y_top_img;
-        let pdf_bottom = page_h - (y_top_img + h);
         PdfChar {
             codepoint: c,
-            bbox: [x, pdf_bottom, x + w, pdf_top],
+            bbox: [x, y_top_img, x + w, y_top_img + h],
             space_threshold: 1.5,
             font_name: String::new(),
             font_size,
@@ -3969,11 +3958,9 @@ mod tests {
 
     /// Helper: make a PdfChar with explicit font_size, positioned in image-space.
     fn make_formula_char(c: char, x: f32, y_top: f32, w: f32, h: f32, font_size: f32) -> PdfChar {
-        let pdf_top = PAGE_H - y_top;
-        let pdf_bottom = PAGE_H - (y_top + h);
         PdfChar {
             codepoint: c,
-            bbox: [x, pdf_bottom, x + w, pdf_top],
+            bbox: [x, y_top, x + w, y_top + h],
             space_threshold: 1.5,
             font_name: String::new(),
             font_size,

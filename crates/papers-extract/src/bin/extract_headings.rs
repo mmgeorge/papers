@@ -66,11 +66,12 @@ fn main() {
             .unwrap_or_else(|_| panic!("Failed to get page {}", page_idx + 1));
 
         let height = page.height().value;
-        let chars = papers_extract::pdf::extract_page_chars(&page, page_idx)
+        let mut chars = papers_extract::pdf::extract_page_chars(&page, page_idx)
             .unwrap_or_else(|e| {
                 eprintln!("Warning: failed to extract chars from page {}: {e}", page_idx + 1);
                 Vec::new()
             });
+        papers_extract::pdf::normalize_chars_to_image_space(&mut chars, height);
 
         page_chars.push((chars, height));
     }

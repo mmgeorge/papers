@@ -177,8 +177,9 @@ fn main() {
     println!();
 
     // 3. Dump per-character data (using extract_page_chars — filtered/mapped only)
-    let chars = papers_extract::pdf::extract_page_chars(&page, page_idx)
+    let mut chars = papers_extract::pdf::extract_page_chars(&page, page_idx)
         .expect("Failed to extract chars");
+    papers_extract::pdf::normalize_chars_to_image_space(&mut chars, page.height().value);
 
     println!("=== PER-CHARACTER DATA ({} chars) ===", chars.len());
     println!("char | left     | bottom   | right    | top      | width");

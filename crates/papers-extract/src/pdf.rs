@@ -7,11 +7,17 @@ use pdfium_render::prelude::*;
 use crate::error::ExtractError;
 
 /// A character extracted from the PDF text layer with its bounding box.
+///
+/// After calling [`normalize_chars_to_image_space`], `bbox` is in image space
+/// (Y-down, origin at top-left). Before normalization, `bbox` is in PDF space
+/// (Y-up, origin at bottom-left). All downstream code should use normalized chars.
 #[derive(Debug, Clone)]
 pub struct PdfChar {
     pub codepoint: char,
-    /// Bounding box in PDF points (72pt/inch): [x1, y1, x2, y2]
-    /// where (x1, y1) is bottom-left and (x2, y2) is top-right.
+    /// Bounding box in points (72pt/inch): [x1, y1, x2, y2].
+    ///
+    /// After normalization: image space (Y-down) where (x1, y1) is top-left
+    /// and (x2, y2) is bottom-right.
     pub bbox: [f32; 4],
     /// Pre-computed gap threshold for word boundary detection, in PDF points.
     ///
@@ -60,6 +66,21 @@ pub fn apply_crop_offset(chars: &mut [PdfChar], offset: (f32, f32)) {
         c.bbox[1] -= dy;
         c.bbox[2] -= dx;
         c.bbox[3] -= dy;
+    }
+}
+
+/// Convert PdfChar bboxes from PDF space (Y-up) to image space (Y-down).
+///
+/// Must be called after [`apply_crop_offset`] and before any downstream use.
+/// After this, `bbox[1]` is the top edge (smallest Y) and `bbox[3]` is the
+/// bottom edge (largest Y), matching the image coordinate convention used by
+/// `Region.bbox` and rendered page images.
+pub fn normalize_chars_to_image_space(chars: &mut [PdfChar], page_height_pt: f32) {
+    for c in chars.iter_mut() {
+        let img_y1 = page_height_pt - c.bbox[3]; // PDF top → image top (smallest)
+        let img_y2 = page_height_pt - c.bbox[1]; // PDF bottom → image bottom (largest)
+        c.bbox[1] = img_y1;
+        c.bbox[3] = img_y2;
     }
 }
 
@@ -576,12 +597,83 @@ pub fn detect_page_figures(
     }
     figures.extend(connectors);
 
+    // Detect Text objects (axis labels, legend entries, sub-figure labels)
+    // near figure bboxes. Each PDF text object (BT...ET block) is evaluated
+    // individually — this avoids the problem of merged text blocks being
+    // too long to pass label filters.
+    let mut text_labels: Vec<[f32; 4]> = Vec::new();
+    for obj in page.objects().iter() {
+        if obj.object_type() != PdfPageObjectType::Text {
+            continue;
+        }
+        let Ok(rect) = obj.bounds() else { continue };
+        let w = rect.width().value;
+        let h = rect.height().value;
+
+        // Only single-line text: one dimension must be small.
+        // Horizontal labels: h < 20pt. Rotated labels (e.g. Y-axis): w < 20pt.
+        if w >= 20.0 && h >= 20.0 {
+            continue;
+        }
+        // Skip very tiny objects (noise)
+        if w < 2.0 && h < 2.0 {
+            continue;
+        }
+
+        // Skip caption-prefix text objects ("Fig.", "Table", etc.)
+        if let Some(text_obj) = obj.as_text_object() {
+            let text = text_obj.text();
+            if is_caption_prefix_text(text.trim()) {
+                continue;
+            }
+        }
+
+        let img_y1 = page_height_pt - rect.top().value - dy;
+        let img_y2 = page_height_pt - rect.bottom().value - dy;
+        let img_x1 = rect.left().value - dx;
+        let img_x2 = rect.right().value - dx;
+        let text_bbox = [img_x1, img_y1, img_x2, img_y2];
+
+        // Directional inclusion: captions are always BELOW figures, so use
+        // strict overlap for text below the figure. For text above, left, or
+        // right (axis labels, legends), allow gap ≤ 10pt.
+        let near_figure = figures.iter().any(|fig| {
+            let x_gap = (text_bbox[0] - fig[2]).max(fig[0] - text_bbox[2]).max(0.0);
+            let y_gap = (text_bbox[1] - fig[3]).max(fig[1] - text_bbox[3]).max(0.0);
+            let text_cy = (text_bbox[1] + text_bbox[3]) / 2.0;
+            let is_below = text_cy > fig[3];
+
+            if is_below {
+                // Text below figure: require Y overlap to exclude captions
+                let y_overlap = text_bbox[3].min(fig[3]) - text_bbox[1].max(fig[1]);
+                x_gap <= 10.0 && y_overlap > 0.0
+            } else {
+                // Text above/left/right: allow small gap
+                x_gap <= 10.0 && y_gap <= 10.0
+            }
+        });
+        if near_figure {
+            text_labels.push(text_bbox);
+        }
+    }
+    figures.extend(text_labels);
+
     // Merge nearby bboxes into composite figures. Sub-panels of the same
     // figure overlap in one dimension and are adjacent in the other.
     // Repeat until no more merges occur (transitive closure).
     merge_nearby_bboxes(&mut figures);
 
     figures
+}
+
+/// Check if text starts with a figure/table caption prefix.
+fn is_caption_prefix_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.starts_with("fig")
+        || lower.starts_with("table")
+        || lower.starts_with("tab.")
+        || lower.starts_with("algorithm")
+        || lower.starts_with("alg.")
 }
 
 /// Merge bboxes that overlap or are close together into composite groups.
