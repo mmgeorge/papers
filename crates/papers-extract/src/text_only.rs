@@ -309,19 +309,32 @@ fn split_chars_into_columns(
         }
 
         // For each gap, check if this Y-band is spanning.
-        // A Y-band is spanning if it has chars whose center_x falls
-        // INSIDE the gap region. Separate column lines have no chars
-        // in the gap; spanning lines (titles, captions) have chars
-        // flowing through it.
+        // A Y-band is spanning if text flows continuously from one column
+        // through the gap into the other. We verify:
+        // 1. Chars exist on both sides of the gap
+        // 2. No large horizontal break between consecutive chars (sorted by X)
+        // This distinguishes two separate column lines (~20-30pt break at the
+        // column boundary) from a spanning title (~3-6pt char spacing throughout).
         let mut is_spanning = false;
+        let band_cxs: Vec<f32> = band_chars
+            .iter()
+            .map(|&i| (chars[i].bbox[0] + chars[i].bbox[2]) / 2.0)
+            .collect();
         for gap in gaps {
-            let has_chars_in_gap = band_chars.iter().any(|&i| {
-                let cx = (chars[i].bbox[0] + chars[i].bbox[2]) / 2.0;
-                cx >= gap.start && cx <= gap.end
-            });
-            if has_chars_in_gap {
-                is_spanning = true;
-                break;
+            let has_left = band_cxs.iter().any(|&cx| cx < gap.start);
+            let has_right = band_cxs.iter().any(|&cx| cx > gap.end);
+            if has_left && has_right {
+                let mut sorted_cxs = band_cxs.clone();
+                sorted_cxs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let max_char_gap = sorted_cxs
+                    .windows(2)
+                    .map(|w| w[1] - w[0])
+                    .fold(0.0f32, f32::max);
+                let gap_width = gap.end - gap.start;
+                if max_char_gap < gap_width * 0.5 {
+                    is_spanning = true;
+                    break;
+                }
             }
         }
 
@@ -2240,6 +2253,70 @@ mod tests {
         assert!(!columns[0].is_empty(), "Left column should have chars from y=200");
         assert!(!columns[1].is_empty(), "Right column should have chars from y=200");
         assert!(!spanning.is_empty(), "Title at y=100 should be spanning (chars every 10pt through gap)");
+    }
+
+    #[test]
+    fn test_split_edge_char_not_spanning() {
+        // Regression: right-column char at the gap boundary should NOT trigger
+        // spanning. The gap [295, 319] overshoots into the right column, and
+        // a right-column char `(` at bbox [317.7, 287, 320.3, 299] (cx=319.0)
+        // would previously trigger false spanning for the entire Y-band.
+        let gap = ColumnGap { midpoint: 307.0, start: 295.0, end: 319.0 };
+
+        let mut chars = Vec::new();
+        // Left column chars at y=290: x from 50 to 280 (every 10pt, width 6)
+        for i in 0..24 {
+            chars.push(make_char(50.0 + i as f32 * 10.0, 290.0, 6.0, 10.0));
+        }
+        // Right column chars at y=290: first char near gap boundary, then regular
+        chars.push(ImgChar {
+            bbox: [317.7, 287.0, 320.3, 299.4], // cx=319.0, exactly at gap.end
+            font_size: 10.0,
+            is_bold: false,
+            codepoint: '(',
+        });
+        for i in 1..24 {
+            chars.push(make_char(320.0 + i as f32 * 10.0, 290.0, 6.0, 10.0));
+        }
+
+        let (spanning, columns) = split_chars_into_columns(&chars, &[gap]);
+        assert!(
+            spanning.is_empty(),
+            "Edge char at cx=319 should NOT trigger spanning; got {} spanning chars",
+            spanning.len()
+        );
+        assert!(!columns[0].is_empty(), "Left column should have chars");
+        assert!(!columns[1].is_empty(), "Right column should have chars");
+    }
+
+    #[test]
+    fn test_split_true_spanning_still_detected() {
+        // A full-width title with chars flowing continuously through the gap
+        // should still be detected as spanning.
+        let gap = ColumnGap { midpoint: 307.0, start: 295.0, end: 319.0 };
+
+        let mut chars = Vec::new();
+        // Spanning title at y=100: chars every 8pt from x=50 to x=530
+        // Max char gap = 8pt - 6pt(width) = 2pt between chars. gap_width*0.5 = 12.
+        // 2 < 12 → spanning.
+        for i in 0..60 {
+            chars.push(make_char(50.0 + i as f32 * 8.0, 100.0, 6.0, 10.0));
+        }
+        // Column lines at y=200: separate columns with large gap
+        for i in 0..24 {
+            chars.push(make_char(50.0 + i as f32 * 10.0, 200.0, 6.0, 10.0));
+        }
+        for i in 0..24 {
+            chars.push(make_char(330.0 + i as f32 * 10.0, 200.0, 6.0, 10.0));
+        }
+
+        let (spanning, columns) = split_chars_into_columns(&chars, &[gap]);
+        assert!(
+            !spanning.is_empty(),
+            "Full-width title should be detected as spanning"
+        );
+        assert!(!columns[0].is_empty(), "Left column at y=200 should have chars");
+        assert!(!columns[1].is_empty(), "Right column at y=200 should have chars");
     }
 
     // ── Running header normalization ──
