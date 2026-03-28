@@ -1736,7 +1736,7 @@ pub fn reflow_with_outline(
     // heading) but flagged so we can embed the TOC listing under them.
     let toc_page_set: std::collections::HashSet<u32> = toc_pages.iter().copied().collect();
     let mut headings: Vec<(u32, u32, String, bool)> = Vec::new();
-    for entry in toc_entries {
+    for (eidx, entry) in toc_entries.iter().enumerate() {
         let pdf_page = toc_page_to_pdf_page(entry.page_value, offset, fm_offset, total_pages);
         let Some(page) = pdf_page else { continue };
         // Detect "Contents" entries: either by title or by pointing to a TOC page.
@@ -1767,9 +1767,20 @@ pub fn reflow_with_outline(
         .map(|((p, _, _, _), _)| *p);
 
     if let Some(body_start) = first_body_page {
+        // Find the index of the first body entry in TOC order — only clamp
+        // FrontMatter entries that appear BEFORE it (actual front matter).
+        // Back-matter entries like References/Index appear after body content
+        // and should keep their real page positions.
+        let first_body_idx = toc_entries.iter()
+            .position(|e| !matches!(e.kind, TocEntryKind::FrontMatter))
+            .unwrap_or(toc_entries.len());
+
         // Headings still correspond 1:1 to toc_entries at this point.
-        for (heading, entry) in headings.iter_mut().zip(toc_entries.iter()) {
-            if matches!(entry.kind, TocEntryKind::FrontMatter) && heading.0 >= body_start {
+        for (i, (heading, entry)) in headings.iter_mut().zip(toc_entries.iter()).enumerate() {
+            if i < first_body_idx
+                && matches!(entry.kind, TocEntryKind::FrontMatter)
+                && heading.0 >= body_start
+            {
                 // Clamp to just before the first body heading.
                 heading.0 = body_start.saturating_sub(1);
             }
@@ -3506,6 +3517,146 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
         }
     }
 
+    // Step 1b: Detect code listings split across consecutive Text nodes.
+    // A sequence of Text nodes where some start with "# " (code comments) and
+    // others contain assignments/function calls collectively form a code block,
+    // even though individually none scores high enough.
+    {
+        let mut i = 0;
+        while i < flat_nodes.len() {
+            // Look for a Text node starting with "# " (potential code comment)
+            let starts_with_comment = matches!(&flat_nodes[i], ReflowNode::Text { content, .. }
+                if content.trim().starts_with("# ")
+                    && !content.trim().starts_with("#include")
+                    && !content.trim().starts_with("#define"));
+            if !starts_with_comment {
+                i += 1;
+                continue;
+            }
+
+            // Scan forward: collect consecutive Text/Formula nodes that look
+            // like part of a code listing (comments + assignments + calls)
+            let mut end = i + 1;
+            let mut comment_count = 1u32;
+            while end < flat_nodes.len() {
+                match &flat_nodes[end] {
+                    ReflowNode::Text { content, .. } => {
+                        let t = content.trim();
+                        let word_count = t.split_whitespace().count();
+                        if t.starts_with("# ") {
+                            comment_count += 1;
+                        } else if word_count > 20
+                            && !t.contains('=')
+                            && !t.contains(".append(")
+                            && !t.contains("list_plot(")
+                        {
+                            // Long prose without code patterns — stop.
+                            break;
+                        } else if word_count > 40 {
+                            // Very long text — almost certainly prose even
+                            // if it contains an `=` somewhere.
+                            break;
+                        }
+                    }
+                    ReflowNode::Formula { .. } => {
+                        // Formulas between code lines (e.g., $$a=0.00001$$)
+                        // could be code assignments rendered as formulas
+                    }
+                    ReflowNode::CodeBlock { .. } | ReflowNode::Algorithm { .. } => {
+                        // Already-detected code blocks are part of the listing
+                        comment_count += 1; // count as additional code evidence
+                    }
+                    _ => break,
+                }
+                end += 1;
+            }
+
+            // Need at least 2 comment lines and 3+ nodes to be confident
+            if comment_count >= 2 && end - i >= 3 {
+                // Combine all text into one block and check code_score
+                let mut combined = String::new();
+                for j in i..end {
+                    match &flat_nodes[j] {
+                        ReflowNode::Text { content, .. } => {
+                            if !combined.is_empty() { combined.push('\n'); }
+                            combined.push_str(content.trim());
+                        }
+                        ReflowNode::Formula { content, .. } => {
+                            if let Some(c) = content {
+                                if !combined.is_empty() { combined.push('\n'); }
+                                combined.push_str(c);
+                            }
+                        }
+                        ReflowNode::CodeBlock { content, .. }
+                        | ReflowNode::Algorithm { content, .. } => {
+                            if !combined.is_empty() { combined.push('\n'); }
+                            combined.push_str(content);
+                        }
+                        _ => {}
+                    }
+                }
+                // Promote the entire run to a single CodeBlock
+                let lang = guess_language(&combined);
+                let code_node = ReflowNode::CodeBlock {
+                    content: combined,
+                    language: lang,
+                };
+                flat_nodes.splice(i..end, std::iter::once(code_node));
+                // Don't increment i — check if next node continues the code
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // Step 1c: Promote short Text nodes that are code comments or assignments
+    // when they are near a CodeBlock. This catches fragments that Step 1b missed.
+    // Run multiple passes until stable, since promoting one node may enable
+    // promoting its neighbor.
+    loop {
+        let mut changed = false;
+        for i in 0..flat_nodes.len() {
+            let should_promote = {
+                let content = match &flat_nodes[i] {
+                    ReflowNode::Text { content, .. } => content,
+                    _ => continue,
+                };
+                let t = content.trim();
+                let is_comment = t.starts_with("# ")
+                    && !t.starts_with("#include")
+                    && !t.starts_with("#define");
+                let is_short_code = t.split_whitespace().count() <= 20
+                    && (t.contains('=') || t.contains(".append(") || t.contains("list_plot("))
+                    && !t.contains(". ");
+                if !is_comment && !is_short_code {
+                    false
+                } else {
+                    let prev_is_code = i > 0
+                        && matches!(&flat_nodes[i - 1], ReflowNode::CodeBlock { .. });
+                    let next_is_code = i + 1 < flat_nodes.len()
+                        && matches!(&flat_nodes[i + 1], ReflowNode::CodeBlock { .. });
+                    let next_is_comment = if let Some(ReflowNode::Text { content: nc, .. }) = flat_nodes.get(i + 1) {
+                        nc.trim().starts_with("# ")
+                    } else {
+                        false
+                    };
+                    prev_is_code || next_is_code || next_is_comment
+                }
+            };
+            if should_promote {
+                if let ReflowNode::Text { content, .. } = &flat_nodes[i] {
+                    let code_content = content.clone();
+                    flat_nodes[i] = ReflowNode::CodeBlock {
+                        content: code_content,
+                        language: None,
+                    };
+                    changed = true;
+                }
+            }
+        }
+        if !changed { break; }
+    }
+
     // Step 2: Merge consecutive CodeBlock nodes and consecutive Algorithm nodes
     let mut i = 0;
     while i + 1 < flat_nodes.len() {
@@ -3607,16 +3758,23 @@ fn looks_like_code(text: &str) -> bool {
 
     // === Strong negative signals — definitely not code ===
 
-    // LaTeX math ($...$) or formula placeholders → academic prose
-    if trimmed.matches('$').count() >= 2 {
+    // LaTeX math ($...$) or formula placeholders → academic prose.
+    // Exception: if the text also has multiple "# " comment lines, the $
+    // may be from code variable interpolation or embedded formulas in code.
+    let hash_comment_lines = trimmed.lines()
+        .filter(|l| l.trim().starts_with("# "))
+        .count();
+    if trimmed.matches('$').count() >= 2 && hash_comment_lines < 2 {
         return false;
     }
-    if trimmed.contains("[[FORMULA") {
+    if trimmed.contains("[[FORMULA") && hash_comment_lines < 2 {
         return false;
     }
     // Italic markers (*word*) → formatted prose, not code.
     // Count actual italic spans, not bare * (which appear as multiplication in code).
-    if count_italic_spans(trimmed) >= 2 {
+    // Exception: if the text has multiple "# " comment lines, the * are likely
+    // multiplication operators in code, not italic markers.
+    if count_italic_spans(trimmed) >= 2 && hash_comment_lines < 2 {
         return false;
     }
 
@@ -3627,7 +3785,7 @@ fn looks_like_code(text: &str) -> bool {
     } else { 0 };
 
     // Long text with typical English word lengths → prose
-    if word_count > 20 && avg_word_len >= 3 && avg_word_len <= 8 {
+    if word_count > 20 && avg_word_len >= 3 && avg_word_len <= 8 && hash_comment_lines < 2 {
         let code_symbol_count = trimmed.chars()
             .filter(|c| matches!(c, '{' | '}' | ';' | '#'))
             .count();
@@ -3673,6 +3831,20 @@ pub fn code_score(text: &str) -> u32 {
     // Python
     if text.contains("def ") && text.contains("self") { score += 2; }
     if text.contains("import ") && text.contains("from ") { score += 2; }
+    // Python/shell comment lines: "# comment text" (not "#include" etc.)
+    // Count lines starting with "# " — multiple comment lines are a strong signal.
+    let comment_lines = text.lines()
+        .filter(|l| {
+            let t = l.trim();
+            t.starts_with("# ") && !t.starts_with("#include") && !t.starts_with("#define")
+                && !t.starts_with("#ifdef") && !t.starts_with("#pragma")
+        })
+        .count();
+    if comment_lines >= 2 { score += 3; }
+    else if comment_lines == 1 { score += 1; }
+    // Python assignment patterns: variable=value without spaces around =
+    if text.contains("=[") || text.contains("=0") || text.contains("=-") { score += 1; }
+    if text.contains(".append(") || text.contains("list_plot(") || text.contains("range(") { score += 2; }
 
     // JavaScript/TypeScript
     if text.contains("const ") && text.contains(" => ") { score += 2; }
@@ -4173,17 +4345,11 @@ fn escape_leading_hashes(text: &str) -> String {
         if i > 0 {
             out.push('\n');
         }
-        // Only escape # when it looks like a code directive (#include, #define,
-        // #ifdef, #version, etc.) or a standalone # symbol, NOT when it looks
-        // like a markdown heading (## Title).
+        // Always escape # at line start in Text nodes. Real headings come
+        // from Heading nodes, not Text content. Unescaped # in text would
+        // render as false headings (e.g., code comments, HCL directives).
         if line.starts_with('#') {
-            let after_hashes = line.trim_start_matches('#');
-            let is_heading_like = after_hashes.starts_with(' ')
-                && after_hashes.len() > 1
-                && after_hashes.chars().nth(1).map_or(false, |c| c.is_uppercase());
-            if !is_heading_like {
-                out.push('\\');
-            }
+            out.push('\\');
         }
         out.push_str(line);
     }

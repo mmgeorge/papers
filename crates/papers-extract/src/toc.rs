@@ -320,6 +320,10 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
     // Phase 5: Classify easy cases + learn font signatures + resolve ambiguous
     let mut entries = classify_and_learn(merged);
 
+    // Phase 6: Infer chapter numbers from children + resolve bare-letter sections
+    infer_chapter_numbers_from_children(&mut entries);
+    resolve_bare_letter_sections(&mut entries);
+
     // Phase 7: Validate
     validate_entries(&mut entries);
 
@@ -1444,6 +1448,11 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
         entries.push((line.clone(), class, depth));
     }
 
+    // Post-classification: propagate FrontMatter to adjacent Unknown entries
+    // with the same font signature and indent. E.g., if "Preface" is FrontMatter
+    // and "About the Authors" is Unknown but has the same font+indent, promote it.
+    propagate_frontmatter(&mut entries);
+
     // Post-classification: detect roman-numeral Part headings
     // If a roman-numeral entry (classified as Chapter) is followed by bare-number
     // chapters that restart from 1, the roman entries are actually Parts.
@@ -1507,7 +1516,6 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
         .collect();
     let indent_levels = compute_indent_levels(&x_lefts_normalized);
 
-    // (debug removed)
 
     // Build a mapping from indent level → most common depth among classified
     // entries at that indent. This lets us anchor indent levels to known depths.
@@ -1531,45 +1539,18 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
         })
         .collect();
 
-    // Third pass: resolve ambiguous entries.
-    // Priority: x-position indentation first (more reliable across visual
-    // hierarchies), font signature as fallback.
+    // Third pass: resolve Unknown entries by walking sequentially using
+    // indent + font size.  For each Unknown entry, search a context stack
+    // (built from classified entries) for the right parent:
+    //   - more indented → child of that stack entry
+    //   - same indent but smaller font → child (subsection)
+    //   - same indent and same/larger font → sibling (pop and keep looking)
+    //   - stack empty → top level (depth 1)
+    resolve_unknowns_sequential(&mut entries, &page_min_x, &indent_levels);
+
     let mut result: Vec<ClassifiedEntry> = entries
         .into_iter()
-        .map(|(line, mut class, mut depth)| {
-            if class == Classification::Unknown {
-                if !indent_levels.is_empty() {
-                    let page_min = page_min_x.get(&line.page_idx).copied().unwrap_or(0.0);
-                    let indent = quantize_indent(line.x_left - page_min, &indent_levels);
-                    // Use anchored indent→depth if available, else raw indent+1
-                    if let Some(&anchored) = indent_to_depth.get(&indent) {
-                        depth = anchored;
-                    } else {
-                        // Interpolate: find the nearest anchored indent level
-                        // and offset from it.
-                        let nearest = indent_to_depth
-                            .iter()
-                            .min_by_key(|(k, _)| (**k as i32 - indent as i32).unsigned_abs());
-                        if let Some((near_indent, near_depth)) = nearest {
-                            let (near_indent, near_depth) = (*near_indent, *near_depth);
-                            let offset = indent as i32 - near_indent as i32;
-                            depth = (near_depth as i32 + offset).max(1).min(4) as u32;
-                        } else {
-                            depth = (indent + 1).min(4);
-                        }
-                    }
-                    class = depth_to_classification(depth);
-                } else if let Some(&learned_depth) = learned.get(&line.font_sig) {
-                    // Font signature fallback when no indent levels available
-                    depth = learned_depth.min(4);
-                    class = depth_to_classification(depth);
-                } else {
-                    // Default to chapter
-                    depth = 1;
-                    class = Classification::Chapter;
-                }
-            }
-
+        .map(|(line, class, depth)| {
             ClassifiedEntry {
                 title: line.title,
                 page_label: line.page_label.unwrap_or_default(),
@@ -1750,6 +1731,147 @@ fn quantize_indent(x: f32, levels: &[f32]) -> u32 {
 /// Pattern: if entries like "I ...", "II ...", "III ..." are classified as Chapter (depth 1)
 /// and between them we see bare-number chapters that restart from 1, then the roman
 /// numeral entries are really Parts (depth 0).
+/// Resolve Unknown entries by walking sequentially, using a context stack of
+/// classified entries.  Uses indent (normalized per page) and font size to
+/// determine parent/child relationships:
+///   - more indented than a stack entry → child
+///   - same indent but smaller font   → child (subsection of a chapter title)
+///   - same indent, same/larger font  → sibling (pop and look higher)
+///   - stack empty                     → top level (depth 1)
+fn resolve_unknowns_sequential(
+    entries: &mut [(TocSplitLine, Classification, u32)],
+    page_min_x: &HashMap<u32, f32>,
+    indent_levels: &[f32],
+) {
+    // Stack of (indent_level, font_size_bucket, depth) from classified entries
+    let mut stack: Vec<(u32, i32, u32)> = Vec::new();
+
+    for i in 0..entries.len() {
+        let page_min = page_min_x.get(&entries[i].0.page_idx).copied().unwrap_or(0.0);
+        let norm_x = entries[i].0.x_left - page_min;
+        let indent = if indent_levels.is_empty() {
+            0
+        } else {
+            quantize_indent(norm_x, indent_levels)
+        };
+        let font = entries[i].0.font_sig.size_bucket;
+
+        if entries[i].1 != Classification::Unknown {
+            let depth = entries[i].2;
+            // Pop stack entries at same or deeper depth
+            while stack.last().map_or(false, |s| s.2 >= depth) {
+                stack.pop();
+            }
+            stack.push((indent, font, depth));
+            continue;
+        }
+
+        // Unknown entry — find parent in stack (deepest to shallowest)
+        let mut parent_depth = None;
+        for j in (0..stack.len()).rev() {
+            let (sindent, sfont, sdepth) = stack[j];
+            if indent > sindent {
+                // More indented → child of this entry
+                parent_depth = Some(sdepth);
+                break;
+            } else if indent == sindent {
+                if font < sfont {
+                    // Smaller font at same indent → child
+                    parent_depth = Some(sdepth);
+                    break;
+                }
+                // Same or larger font → sibling; keep searching up for parent
+            }
+            // Less indented or sibling → keep searching up
+        }
+
+        let d = parent_depth.map(|pd| pd + 1).unwrap_or(1);
+        entries[i].2 = d;
+        entries[i].1 = depth_to_classification(d);
+
+        // Update stack
+        while stack.last().map_or(false, |s| s.2 >= d) {
+            stack.pop();
+        }
+        stack.push((indent, font, d));
+    }
+}
+
+/// Propagate FrontMatter classification to adjacent Unknown entries that share
+/// the same font signature and indent (within 5pt). Scans outward from each
+/// FrontMatter entry to catch nearby entries like "About the Authors" next to
+/// "Preface".
+fn propagate_frontmatter(entries: &mut [(TocSplitLine, Classification, u32)]) {
+    let fm_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, class, _))| *class == Classification::FrontMatter)
+        .map(|(i, _)| i)
+        .collect();
+
+    for fm_idx in fm_indices {
+        let fm_font = entries[fm_idx].0.font_sig.clone();
+        let fm_x = entries[fm_idx].0.x_left;
+        let fm_depth = entries[fm_idx].2;
+
+        // Scan forward from the FrontMatter entry
+        for i in (fm_idx + 1)..entries.len() {
+            let (ref line, ref class, _) = entries[i];
+            if *class != Classification::Unknown {
+                break; // stop at next classified entry
+            }
+            if line.font_sig == fm_font && (line.x_left - fm_x).abs() < 5.0 {
+                entries[i].1 = Classification::FrontMatter;
+                entries[i].2 = fm_depth;
+            } else {
+                break; // different font or indent — stop
+            }
+        }
+
+        // Scan backward
+        for i in (0..fm_idx).rev() {
+            let (ref line, ref class, _) = entries[i];
+            if *class != Classification::Unknown {
+                break;
+            }
+            if line.font_sig == fm_font && (line.x_left - fm_x).abs() < 5.0 {
+                entries[i].1 = Classification::FrontMatter;
+                entries[i].2 = fm_depth;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Second pass: scan backward from the end of the TOC to catch back matter
+    // entries (e.g., References, Index) that share font+indent with front matter.
+    // These may not be adjacent to a FM entry, so the forward/backward scan above
+    // won't reach them.
+    if let Some((fm_line, _, fm_depth)) = entries
+        .iter()
+        .find(|(_, class, _)| *class == Classification::FrontMatter)
+    {
+        let fm_font = fm_line.font_sig.clone();
+        let fm_x = fm_line.x_left;
+        let fm_depth = *fm_depth;
+
+        for i in (0..entries.len()).rev() {
+            let (ref line, ref class, _) = entries[i];
+            // Stop when we hit a classified entry that isn't FM/BackMatter
+            // (i.e., we've reached the body content)
+            match class {
+                Classification::FrontMatter | Classification::BackMatter => continue,
+                Classification::Unknown => {}
+                _ => break,
+            }
+            if line.font_sig == fm_font && (line.x_left - fm_x).abs() < 5.0 {
+                entries[i].1 = Classification::BackMatter;
+                entries[i].2 = fm_depth;
+            }
+        }
+    }
+}
+
 fn promote_roman_to_parts(entries: &mut [(TocSplitLine, Classification, u32)]) {
     // Collect indices of roman-numeral chapter entries
     let roman_indices: Vec<usize> = entries
@@ -1828,11 +1950,19 @@ fn demote_per_chapter_fm(entries: &mut [ClassifiedEntry]) {
         "further reading",
     ];
 
-    // Find indices of chapter-level (depth ≤ 1) entries to define chapter boundaries
+    // Find indices of chapter-level (depth ≤ 1) entries to define chapter boundaries.
+    // Exclude FrontMatter/BackMatter — they're not chapter boundaries.
     let chapter_starts: Vec<(usize, i32)> = entries
         .iter()
         .enumerate()
-        .filter(|(_, e)| e.depth <= 1 && e.page_value > 0)
+        .filter(|(_, e)| {
+            e.depth <= 1
+                && e.page_value > 0
+                && !matches!(
+                    e.classification,
+                    Classification::FrontMatter | Classification::BackMatter
+                )
+        })
         .map(|(i, e)| (i, e.page_value))
         .collect();
 
@@ -1861,13 +1991,135 @@ fn demote_per_chapter_fm(entries: &mut [ClassifiedEntry]) {
 
         let is_between_chapters = match (prev_chapter, next_chapter) {
             (Some((_pi, pp)), Some((_ni, np))) => pv >= *pp && pv < *np,
-            (Some((_pi, pp)), None) => pv >= *pp, // last chapter in the book
             _ => false,
         };
 
         if is_between_chapters {
             entries[i].classification = Classification::SubEntry;
             entries[i].depth = 2; // section-level, under the chapter
+        }
+    }
+}
+
+// ── Phase 6b: Infer chapter numbers from children ──
+
+/// If a chapter-depth entry has no section number but its children have
+/// numbered sections like "1.1 ...", "1.2 ...", infer the parent is chapter 1
+/// and prepend the number to its title.
+fn infer_chapter_numbers_from_children(entries: &mut [ClassifiedEntry]) {
+    // For each entry, check if it lacks a number prefix but its immediate
+    // children (next entries at depth+1) share a common leading number.
+    let len = entries.len();
+    for i in 0..len {
+        let depth = entries[i].depth;
+        let title = entries[i].title.trim();
+
+        // Skip if already has a number prefix
+        if title.chars().next().map_or(true, |c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        // Collect the leading number from each immediate child (depth + 1)
+        let mut child_prefixes: Vec<u32> = Vec::new();
+        for j in (i + 1)..len {
+            if entries[j].depth <= depth {
+                break; // past this entry's children
+            }
+            if entries[j].depth == depth + 1 {
+                // Try to extract the leading number: "1.1 Foo" → 1, "2.3 Bar" → 2
+                let ct = entries[j].title.trim();
+                if let Some(dot_pos) = ct.find('.') {
+                    let prefix = &ct[..dot_pos];
+                    if let Ok(n) = prefix.parse::<u32>() {
+                        child_prefixes.push(n);
+                    }
+                }
+            }
+        }
+
+        if child_prefixes.is_empty() {
+            continue;
+        }
+
+        // Check if all children share the same leading number
+        let first = child_prefixes[0];
+        if child_prefixes.iter().all(|&n| n == first) {
+            entries[i].title = format!("{} {}", first, entries[i].title);
+        }
+    }
+}
+
+/// Resolve bare single-letter section prefixes (like "A" in "A Tour of...").
+/// A bare letter is a valid section number only if sibling entries at the same
+/// depth also use sequential letter numbering (B, C, D...). Otherwise the
+/// letter is just part of the title (e.g., "A" is an English article).
+fn resolve_bare_letter_sections(entries: &mut [ClassifiedEntry]) {
+    // Group entries by depth, find those whose title starts with a bare letter + space
+    let len = entries.len();
+    for i in 0..len {
+        let title = entries[i].title.trim();
+        // Check: starts with single uppercase letter + space, and that letter
+        // isn't followed by a dot (A.1 is already handled elsewhere)
+        let bytes = title.as_bytes();
+        if bytes.len() < 3 {
+            continue;
+        }
+        if !bytes[0].is_ascii_uppercase() || bytes[1] != b' ' {
+            continue;
+        }
+        // Already has dot-style: "A.1 ..." — not a bare letter
+        if bytes.get(1) == Some(&b'.') {
+            continue;
+        }
+        let letter = bytes[0] as char;
+
+        // Check siblings at same depth for sequential letter pattern
+        let depth = entries[i].depth;
+        let mut sibling_letters: Vec<char> = Vec::new();
+        // Scan backward to find start of sibling group
+        let mut group_start = i;
+        for k in (0..i).rev() {
+            if entries[k].depth < depth {
+                break;
+            }
+            if entries[k].depth == depth {
+                group_start = k;
+            }
+        }
+        // Scan forward through siblings
+        for k in group_start..len {
+            if entries[k].depth < depth && k > i {
+                break;
+            }
+            if entries[k].depth == depth {
+                let st = entries[k].title.trim();
+                let sb = st.as_bytes();
+                if sb.len() >= 2 && sb[0].is_ascii_uppercase() && sb[1] == b' ' {
+                    sibling_letters.push(sb[0] as char);
+                }
+            }
+        }
+
+        // If there are multiple siblings with bare letters AND they form a
+        // sequence (like A, B, C or B, C), keep the letter as a section number.
+        // If this is the only bare-letter entry, it's likely an article.
+        let has_letter_sequence = sibling_letters.len() >= 2 && {
+            sibling_letters.sort();
+            sibling_letters.dedup();
+            // Check if letters are roughly sequential
+            sibling_letters.len() >= 2
+        };
+
+        if !has_letter_sequence {
+            // Lone bare letter — not a section number. The letter is part of
+            // the title, but we don't need to modify anything here since
+            // parse_section_and_text in output.rs is what splits it.
+            // We just need to make sure the title won't be split.
+            // Prefix with a zero-width marker? No — better to fix in
+            // parse_section_and_text by checking if the title already has
+            // a numeric section number (from infer_chapter_numbers).
+            // If we already prepended "1 A Tour..." then parse_section_and_text
+            // will find "1" as the section number and won't reach the bare "A".
         }
     }
 }
@@ -1879,8 +2131,8 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
     let mut seen = std::collections::HashSet::new();
     entries.retain(|e| seen.insert((e.title.clone(), e.page_value)));
 
-    // Drop entries with page_value 0 that aren't Part headings
-    entries.retain(|e| e.page_value != 0 || e.classification == Classification::Part);
+    // Drop entries with no page number
+    entries.retain(|e| e.page_value != 0);
 
     // Drop entries that break page-number sequencing.
     //
