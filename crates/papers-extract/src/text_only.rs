@@ -691,11 +691,30 @@ pub fn extract_page_text_blocks(
     // Pass 1: pre-classify blocks to find formulas
     let block_is_formula: Vec<bool> = blocks
         .iter()
-        .map(|block| {
+        .enumerate()
+        .map(|(idx, block)| {
+            // Clip extraction bbox vertically to avoid capturing prose chars
+            // from adjacent blocks that overlap (e.g., formula subscripts
+            // extending into prose above/below, or formula brackets extending
+            // up into prose text).
+            let mut classify_bbox = block.bbox;
+            if idx > 0 {
+                let prev_bottom = blocks[idx - 1].bbox[3];
+                if classify_bbox[1] < prev_bottom {
+                    classify_bbox[1] = prev_bottom;
+                }
+            }
+            if idx + 1 < blocks.len() {
+                let next_top = blocks[idx + 1].bbox[1];
+                if classify_bbox[3] > next_top {
+                    classify_bbox[3] = next_top;
+                }
+            }
+
             // Quick text extraction for classification only
             let extracted = text::extract_region_text(
                 &body_chars,
-                block.bbox,
+                classify_bbox,
                 page_height_pt,
                 &[],
                 &[],
@@ -1176,6 +1195,17 @@ fn group_into_lines(chars: &[ImgChar]) -> Vec<Line> {
     let avg_height: f32 =
         chars.iter().map(|c| c.bbox[3] - c.bbox[1]).sum::<f32>() / chars.len() as f32;
     let y_threshold = avg_height * 0.5;
+    // Cap line height to prevent chaining through vertical formula elements
+    // (fractions, subscripts) into adjacent prose. Split formula components
+    // are re-merged by the downstream formula expansion step.
+    // Use median height (robust to outliers like tall formula symbols) rather
+    // than mean, which gets inflated by ∑/∫ glyphs.
+    let max_line_height = {
+        let mut heights: Vec<f32> = chars.iter().map(|c| c.bbox[3] - c.bbox[1]).collect();
+        heights.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_h = heights[heights.len() / 2];
+        median_h * 3.0
+    };
 
     let mut lines = Vec::new();
     let mut line_start = 0;
@@ -1187,9 +1217,13 @@ fn group_into_lines(chars: &[ImgChar]) -> Vec<Line> {
         let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
         let pad = y_threshold * 0.6;
 
-        if cy >= line_y_min - pad && cy <= line_y_max + pad {
-            line_y_min = line_y_min.min(c.bbox[1]);
-            line_y_max = line_y_max.max(c.bbox[3]);
+        let would_y_min = line_y_min.min(c.bbox[1]);
+        let would_y_max = line_y_max.max(c.bbox[3]);
+        let would_height = would_y_max - would_y_min;
+
+        if cy >= line_y_min - pad && cy <= line_y_max + pad && would_height <= max_line_height {
+            line_y_min = would_y_min;
+            line_y_max = would_y_max;
         } else {
             lines.push(build_line(chars, &sorted[line_start..i]));
             line_start = i;
@@ -1338,12 +1372,20 @@ fn group_into_blocks(lines: &[Line], heading_ys: &[f32]) -> Vec<Block> {
     // Pre-mark which lines look like display formulas.
     // Suppressed in algorithm zones — pseudocode with math variables is
     // algorithm content, not display formulas.
+    let max_line_width: f32 = lines.iter().map(|l| l.x_max - l.x_min).fold(0.0f32, f32::max);
     let mut line_is_formula: Vec<bool> = lines
         .iter()
         .map(|line| {
             let t = line.text.trim();
             let total = t.chars().count();
             if total < 3 {
+                return false;
+            }
+            // Display formulas are narrower than the text column (they're
+            // centered/indented). Full-width lines are prose, even if they
+            // contain math symbols or garbled formula+prose text.
+            let line_width = line.x_max - line.x_min;
+            if line_width > max_line_width * 0.85 {
                 return false;
             }
             // Suppress formula detection inside algorithm zones
