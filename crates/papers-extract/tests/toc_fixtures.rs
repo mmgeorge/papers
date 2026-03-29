@@ -94,7 +94,8 @@ fn toc_fixtures() {
         let fixture_path = fixture_dir.join(format!("{stem}.md"));
 
         let expected = std::fs::read_to_string(&fixture_path)
-            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", fixture_path.display()));
+            .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", fixture_path.display()))
+            .replace("\r\n", "\n");
 
         // Load PDF and extract page chars.
         let doc = match pdfium.load_pdf_from_file(&pdf_path, None) {
