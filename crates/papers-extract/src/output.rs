@@ -6,7 +6,9 @@ use pdfium_render::prelude::*;
 use crate::error::ExtractError;
 use crate::pdf::{self, PdfChar};
 use crate::toc::{TocEntry, TocEntryKind};
-use crate::types::{ExtractionResult, Page, Region, RegionKind, ReflowDocument, ReflowNode};
+use crate::types::{
+    ExtractionResult, Page, Region, RegionKind, ReflowDocument, ReflowNode, TocEntryRendered,
+};
 use crate::DebugMode;
 
 /// Write the extraction result as pretty-printed JSON.
@@ -347,7 +349,25 @@ fn is_back_matter_heading(text: &str) -> bool {
     )
 }
 
+fn is_local_figure_reference_continuation(text: &str) -> bool {
+    let trimmed = text.trim();
+    let mut words = trimmed.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let second = words.next().unwrap_or("").to_ascii_lowercase();
+    let looks_like_local_ref = first.contains('.')
+        && first.chars().any(|c| c.is_ascii_digit())
+        && first
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.');
+    looks_like_local_ref
+        && matches!(
+            second.as_str(),
+            "shows" | "show" | "illustrates" | "illustrate" | "depicts" | "depict"
+        )
+}
+
 /// A rendered section with metadata for cross-region processing.
+#[derive(Clone)]
 struct Section {
     markdown: String,
     kind: RegionKind,
@@ -499,6 +519,122 @@ fn bbox_contains(outer: [f32; 4], inner: [f32; 4]) -> bool {
         && inner[3] <= outer[3] + EPS
 }
 
+fn normalize_margin_text(text: &str) -> String {
+    text
+        .replace("**", "")
+        .replace('*', "")
+        .chars()
+        .filter(|c| c.is_alphabetic() || c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn alpha_projection(text: &str) -> (String, Vec<usize>) {
+    let mut projected = String::new();
+    let mut raw_positions = Vec::new();
+    for (idx, ch) in text.char_indices() {
+        if ch.is_alphabetic() {
+            for lower in ch.to_lowercase() {
+                projected.push(lower);
+                raw_positions.push(idx);
+            }
+        }
+    }
+    (projected, raw_positions)
+}
+
+fn strip_leading_margin_stamp(text: &str, stamp: &str) -> Option<String> {
+    let normalized = normalize_margin_text(text);
+    if normalized.is_empty() || stamp.is_empty() {
+        return None;
+    }
+
+    let stamp_chars: Vec<char> = stamp.chars().collect();
+    let norm_chars: Vec<char> = normalized.chars().collect();
+    let mut matched_alpha = 0usize;
+    let mut matched_total = 0usize;
+
+    while matched_total < stamp_chars.len() && matched_total < norm_chars.len() {
+        if stamp_chars[matched_total] != norm_chars[matched_total] {
+            break;
+        }
+        if stamp_chars[matched_total].is_alphabetic() {
+            matched_alpha += 1;
+        }
+        matched_total += 1;
+    }
+
+    if matched_alpha < 12 {
+        return None;
+    }
+
+    let mut alpha_seen = 0usize;
+    let mut cut_pos = 0usize;
+    for (i, ch) in text.char_indices() {
+        if ch.is_alphabetic() {
+            alpha_seen += 1;
+            if alpha_seen >= matched_alpha {
+                cut_pos = i + ch.len_utf8();
+                break;
+            }
+        }
+    }
+    if cut_pos == 0 {
+        return None;
+    }
+
+    let mut remainder = &text[cut_pos..];
+    remainder = remainder.trim_start_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(c, '-' | ':' | '.' | ',' | ';' | ')' | '(' | ']' | '[')
+    });
+    remainder = remainder.trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace());
+    let remainder = remainder.trim_start();
+    if remainder.is_empty() {
+        None
+    } else {
+        Some(remainder.to_string())
+    }
+}
+
+fn strip_embedded_margin_stamp(text: &str, stamp: &str) -> Option<String> {
+    let (text_alpha, raw_positions) = alpha_projection(text);
+    let (stamp_alpha, _) = alpha_projection(stamp);
+    if text_alpha.is_empty() || stamp_alpha.is_empty() {
+        return None;
+    }
+
+    let min_match = stamp_alpha.len().clamp(12, 18);
+    if text_alpha.len() < min_match {
+        return None;
+    }
+
+    for match_len in (min_match..=stamp_alpha.len()).rev() {
+        let prefix = &stamp_alpha[..match_len];
+        if let Some(alpha_pos) = text_alpha.find(prefix) {
+            // Only strip if the stamp appears AFTER some content, not at the
+            // very beginning. A stamp at alpha_pos=0 means the text starts
+            // with the same letters as the stamp — that's the actual content
+            // (e.g., a chapter opening paragraph starting with the chapter
+            // title), not an embedded running header.
+            if alpha_pos == 0 {
+                continue;
+            }
+            if let Some(&raw_pos) = raw_positions.get(alpha_pos) {
+                let trimmed = text[..raw_pos].trim_end();
+                if trimmed != text.trim_end() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// merge references, dehyphenate across region boundaries, and rejoin
 /// paragraphs split across column/page breaks.
 fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &std::collections::HashSet<String>) -> Vec<Section> {
@@ -580,7 +716,13 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
                         | RegionKind::VerticalText
                         | RegionKind::Abstract
                         | RegionKind::SidebarText
-                );
+                )
+                || (region.kind.is_caption()
+                    && region
+                        .text
+                        .as_deref()
+                        .map(is_local_figure_reference_continuation)
+                        .unwrap_or(false));
 
             // Merge all references sections into a single section, even
             // when non-text regions (page headers/footers) sit between them.
@@ -632,90 +774,6 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
         }
     }
 
-    // --- Detect and reclassify footnotes ---
-    // Footnotes appear either at the bottom of the page or in a sidebar
-    // (margin notes). The layout model often classifies them as Text.
-    // We detect them by:
-    // 1. Pages with existing Footnote regions: reclassify nearby Text that
-    //    starts with a footnote number.
-    // 2. Text regions in the bottom 25% of the page that start with a
-    //    footnote number and are short — likely footnotes even without a
-    //    Footnote region on the page.
-    // 3. Short text regions in the outer margins (sidebar notes) that start
-    //    with a number.
-    {
-        // Get page heights for position-based detection
-        let page_heights: std::collections::HashMap<u32, f32> = result
-            .pages
-            .iter()
-            .map(|p| (p.page.saturating_sub(1), p.height_pt))
-            .collect();
-
-        // Collect pages that have at least one Footnote region
-        let mut footnote_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for sec in &sections {
-            if sec.kind == RegionKind::Footnote {
-                footnote_pages.insert(sec.page_idx);
-            }
-        }
-
-        for sec in &mut sections {
-            if sec.kind != RegionKind::Text {
-                continue;
-            }
-            let trimmed = sec.markdown.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Check if text starts with a footnote number pattern
-            let is_footnote_text = {
-                let first_char = trimmed.chars().next().unwrap_or(' ');
-                if first_char.is_ascii_digit() {
-                    let num_end = trimmed
-                        .find(|c: char| !c.is_ascii_digit())
-                        .unwrap_or(trimmed.len());
-                    let after = trimmed[num_end..].trim_start();
-                    num_end > 0
-                        && !after.is_empty()
-                        && after.starts_with(|c: char| {
-                            c.is_alphabetic() || c == '"' || c == '*' || c == '(' || c == '\u{201C}'
-                        })
-                } else {
-                    false
-                }
-            };
-
-            if !is_footnote_text {
-                continue;
-            }
-
-            // Reclassify if: (a) page already has Footnote regions, or
-            // (b) region is in bottom 25% of page, or (c) region is narrow
-            // and in the outer margin (sidebar note)
-            let page_h = page_heights.get(&sec.page_idx).copied().unwrap_or(800.0);
-            let in_bottom = sec.y_top > page_h * 0.75;
-            let is_sidebar = {
-                // Sidebar/margin notes are narrow (< 35% of page width)
-                // and positioned in the outer margin
-                let page_w = result
-                    .pages
-                    .iter()
-                    .find(|p| p.page.saturating_sub(1) == sec.page_idx)
-                    .map(|p| p.width_pt)
-                    .unwrap_or(600.0);
-                let region_w = sec.x_right - sec.x_left;
-                region_w > 0.0 && region_w < page_w * 0.35
-            };
-            let on_footnote_page = footnote_pages.contains(&sec.page_idx);
-
-            if on_footnote_page || in_bottom || is_sidebar {
-                sec.kind = RegionKind::Footnote;
-                sec.is_text = false;
-            }
-        }
-    }
-
     // --- Fix E: Filter running headers/footers/watermarks ---
     //
     // Two-pass approach:
@@ -725,13 +783,15 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
     //    truncated or slightly different. Also strips such fragments when they
     //    got merged into a longer paragraph.
     {
+        let original_sections = sections.clone();
+
         // Pass 1: Exact repeated text — checks both whole sections AND
         // individual paragraphs within sections (separated by \n\n).
         // This catches watermarks that were separated into their own paragraph
         // by font-break detection but still live inside a larger region.
         let mut text_page_counts: std::collections::HashMap<String, std::collections::HashSet<u32>> =
             std::collections::HashMap::new();
-        for sec in &sections {
+        for sec in &original_sections {
             if !sec.is_text {
                 continue;
             }
@@ -797,7 +857,7 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
             if !sec.is_text {
                 continue;
             }
-            let norm = sec.markdown.trim().to_lowercase();
+            let norm = normalize_margin_text(sec.markdown.trim());
             if norm.len() < 3 || norm.len() > 80 {
                 continue;
             }
@@ -810,9 +870,17 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
                 .find(|p| p.page.saturating_sub(1) == sec.page_idx)
                 .map(|p| p.height_pt)
                 .unwrap_or(800.0);
+            let page_width = result
+                .pages
+                .iter()
+                .find(|p| p.page.saturating_sub(1) == sec.page_idx)
+                .map(|p| p.width_pt)
+                .unwrap_or(600.0);
             let in_top = sec.y_top < page_height * 0.12;
             let in_bottom = sec.y_bottom > page_height * 0.85;
-            if in_top || in_bottom {
+            let in_left = sec.x_right < page_width * 0.18;
+            let in_right = sec.x_left > page_width * 0.82;
+            if in_top || in_bottom || in_left || in_right {
                 margin_text_pages
                     .entry(norm)
                     .or_default()
@@ -856,34 +924,121 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
                 if !sec.is_text {
                     return true;
                 }
-                let norm = sec.markdown.trim().to_lowercase();
+                let norm = normalize_margin_text(sec.markdown.trim());
                 !margin_stamps.contains(&norm)
             });
-            // Strip embedded stamps from longer paragraphs and tables.
-            // Only modify text-like sections — don't truncate headings/titles
-            // (their "## " prefix would get chopped, leaving bare "##").
+            // Strip repeated margin stamps from the start of longer sections.
+            // This catches the hard case where a footer/header gets welded onto
+            // the front of a real paragraph or footnote.
             for sec in &mut sections {
-                if !sec.is_text && sec.kind != RegionKind::References {
+                if !sec.is_text
+                    && sec.kind != RegionKind::References
+                    && sec.kind != RegionKind::Footnote
+                {
                     continue;
                 }
-                for stamp in &margin_stamps {
-                    let lower = sec.markdown.to_lowercase();
-                    if let Some(pos) = lower.find(stamp.as_str()) {
-                        // Remove the stamp and any trailing truncated text.
-                        // For tables, remove the entire line containing the stamp.
-                        if sec.markdown.contains('|') {
-                            // Table: remove lines containing the stamp
-                            let lines: Vec<&str> = sec.markdown.lines().collect();
-                            let cleaned: Vec<&str> = lines
-                                .into_iter()
-                                .filter(|line| !line.to_lowercase().contains(stamp.as_str()))
-                                .collect();
-                            sec.markdown = cleaned.join("\n");
-                        } else {
-                            sec.markdown = sec.markdown[..pos].trim_end().to_string();
+                let mut lines_out = Vec::new();
+                for line in sec.markdown.lines() {
+                    let mut cleaned_line = line.to_string();
+                    for stamp in &margin_stamps {
+                        if let Some(stripped) = strip_leading_margin_stamp(&cleaned_line, stamp) {
+                            cleaned_line = stripped;
+                        }
+                        if let Some(stripped) = strip_embedded_margin_stamp(&cleaned_line, stamp) {
+                            cleaned_line = stripped;
                         }
                     }
+                    if !cleaned_line.trim().is_empty() {
+                        lines_out.push(cleaned_line);
+                    }
                 }
+                sec.markdown = lines_out.join("\n");
+
+                for stamp in &margin_stamps {
+                    if sec.markdown.contains('|') {
+                        // Table: remove lines containing the stamp.
+                        let lines: Vec<&str> = sec.markdown.lines().collect();
+                        let cleaned: Vec<&str> = lines
+                            .into_iter()
+                            .filter(|line| {
+                                let line_norm = normalize_margin_text(line);
+                                !line_norm.contains(stamp.as_str())
+                            })
+                            .collect();
+                        sec.markdown = cleaned.join("\n");
+                    } else if let Some(stripped) = strip_embedded_margin_stamp(&sec.markdown, stamp) {
+                        sec.markdown = stripped;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Detect and reclassify footnotes ---
+    // Run AFTER header/footer stripping so repeated running text does not
+    // get frozen into Footnote sections before the repeated-text pass can
+    // remove it.
+    {
+        let page_heights: std::collections::HashMap<u32, f32> = result
+            .pages
+            .iter()
+            .map(|p| (p.page.saturating_sub(1), p.height_pt))
+            .collect();
+
+        let mut footnote_pages: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for sec in &sections {
+            if sec.kind == RegionKind::Footnote {
+                footnote_pages.insert(sec.page_idx);
+            }
+        }
+
+        for sec in &mut sections {
+            if sec.kind != RegionKind::Text {
+                continue;
+            }
+            let trimmed = sec.markdown.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let is_footnote_text = {
+                let first_char = trimmed.chars().next().unwrap_or(' ');
+                if first_char.is_ascii_digit() {
+                    let num_end = trimmed
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(trimmed.len());
+                    let after = trimmed[num_end..].trim_start();
+                    num_end > 0
+                        && !after.is_empty()
+                        && after.starts_with(|c: char| {
+                            c.is_alphabetic() || c == '"' || c == '*' || c == '(' || c == '\u{201C}'
+                        })
+                } else {
+                    false
+                }
+            };
+
+            if !is_footnote_text {
+                continue;
+            }
+
+            let page_h = page_heights.get(&sec.page_idx).copied().unwrap_or(800.0);
+            let in_bottom = sec.y_top > page_h * 0.75;
+            let is_sidebar = {
+                let page_w = result
+                    .pages
+                    .iter()
+                    .find(|p| p.page.saturating_sub(1) == sec.page_idx)
+                    .map(|p| p.width_pt)
+                    .unwrap_or(600.0);
+                let region_w = sec.x_right - sec.x_left;
+                region_w > 0.0 && region_w < page_w * 0.35
+            };
+            let on_footnote_page = footnote_pages.contains(&sec.page_idx);
+
+            if on_footnote_page || in_bottom || is_sidebar {
+                sec.kind = RegionKind::Footnote;
+                sec.is_text = false;
             }
         }
     }
@@ -1036,7 +1191,20 @@ fn build_sections(result: &ExtractionResult, skip_pages: &[u32], watermarks: &st
                 let text = sections[i].markdown.trim();
                 let starts_lower =
                     text.chars().next().map_or(false, |c| c.is_lowercase());
-                let prev_ends_mid = starts_lower
+                let starts_figure_ref_continuation = {
+                    let lower = text.to_ascii_lowercase();
+                    let first = lower.split_whitespace().next().unwrap_or("");
+                    let first_is_figure_ref = first.chars().any(|c| c.is_ascii_digit())
+                        && first.contains('.')
+                        && first.chars().all(|c| c.is_ascii_alphanumeric() || c == '.');
+                    first_is_figure_ref
+                        && (lower.contains(" shows ")
+                            || lower.contains(" show ")
+                            || lower.contains(" illustrates ")
+                            || lower.contains(" illustrate "))
+                };
+                let looks_like_continuation = starts_lower || starts_figure_ref_continuation;
+                let prev_ends_mid = looks_like_continuation
                     && (0..i)
                         .rev()
                         .find(|&k| {
@@ -1303,8 +1471,12 @@ fn section_to_content_node(sec: &Section) -> ReflowNode {
 ///
 /// This performs all reflow logic (dehyphenation, paragraph merging, references
 /// merging) and organizes the result into a heading-based tree.
-pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<String>) -> ReflowDocument {
-    let sections = build_sections(result, &[], watermarks);
+fn reflow_with_skipped_pages(
+    result: &ExtractionResult,
+    skip_pages: &[u32],
+    watermarks: &std::collections::HashSet<String>,
+) -> ReflowDocument {
+    let sections = build_sections(result, skip_pages, watermarks);
 
     // --- Convert sections to ReflowNodes and build heading tree ---
 
@@ -1420,8 +1592,20 @@ pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<
     // heading-by-numbering reorder can misplace content in two-column
     // layouts. We pass `true` to skip it, since font-based heading
     // detection + XY-Cut already produces correct reading order.
-    postprocess_flat_nodes(&mut flat_nodes, true);
+    postprocess_flat_nodes(&mut flat_nodes, true, false);
     build_heading_tree(flat_nodes)
+}
+
+pub fn reflow(result: &ExtractionResult, watermarks: &std::collections::HashSet<String>) -> ReflowDocument {
+    reflow_with_skipped_pages(result, &[], watermarks)
+}
+
+pub fn reflow_skipping_pages(
+    result: &ExtractionResult,
+    skip_pages: &[u32],
+    watermarks: &std::collections::HashSet<String>,
+) -> ReflowDocument {
+    reflow_with_skipped_pages(result, skip_pages, watermarks)
 }
 
 // ── Outline-driven reflow ────────────────────────────────────────────
@@ -1811,7 +1995,7 @@ pub fn reflow_with_outline(
     let mut flat_nodes: Vec<ReflowNode> = Vec::new();
 
     if !fm_children.is_empty() {
-        postprocess_flat_nodes(&mut fm_children, false);
+        postprocess_flat_nodes(&mut fm_children, false, false);
         flat_nodes.push(ReflowNode::FrontMatter {
             children: fm_children,
         });
@@ -1821,7 +2005,9 @@ pub fn reflow_with_outline(
     let toc_rendered: Vec<crate::types::TocEntryRendered> = toc_entries
         .iter()
         .map(|e| {
-            let page = if e.page_value > 0 {
+            let page = if !e.page_label.trim().is_empty() {
+                Some(e.page_label.clone())
+            } else if e.page_value > 0 {
                 Some(e.page_value.to_string())
             } else if e.page_value < 0 {
                 let abs_val = (-e.page_value) as u32;
@@ -1848,8 +2034,25 @@ pub fn reflow_with_outline(
     // under the previous heading.
 
     let anchors = find_heading_anchors(&headings, &sections);
-    let consumed_sections: std::collections::HashSet<usize> =
-        anchors.iter().filter_map(|a| *a).collect();
+    // ParagraphTitle anchors are fully consumed (they duplicate the heading text).
+    // Text/Abstract anchors are only *partially* consumed — the heading prefix is
+    // stripped, but the remaining body content must still be emitted.
+    let consumed_sections: std::collections::HashSet<usize> = anchors
+        .iter()
+        .filter_map(|a| *a)
+        .filter(|&s_idx| {
+            matches!(sections[s_idx].kind, RegionKind::ParagraphTitle)
+        })
+        .collect();
+    // Text/Abstract sections used as anchors: we emit them with the leading
+    // title line stripped so the body content is not lost.
+    let text_anchor_sections: std::collections::HashSet<usize> = anchors
+        .iter()
+        .filter_map(|a| *a)
+        .filter(|&s_idx| {
+            matches!(sections[s_idx].kind, RegionKind::Text | RegionKind::Abstract)
+        })
+        .collect();
 
     // Build emission maps:
     // - anchored headings fire just before their anchor section
@@ -1862,8 +2065,22 @@ pub fn reflow_with_outline(
         if let Some(s_idx) = anchor {
             heading_before_section.entry(*s_idx).or_default().push(h_idx);
         } else {
+            let mut emit_page = headings[h_idx].0;
+            if !sections.iter().any(|s| s.page_idx == emit_page && section_renders_content(s)) {
+                let mut next_page = emit_page.saturating_add(1);
+                while next_page <= total_pages {
+                    if sections.iter().any(|s| s.page_idx == next_page && section_renders_content(s)) {
+                        emit_page = next_page;
+                        break;
+                    }
+                    next_page = next_page.saturating_add(1);
+                    if next_page == 0 {
+                        break;
+                    }
+                }
+            }
             heading_at_page_start
-                .entry(headings[h_idx].0)
+                .entry(emit_page)
                 .or_default()
                 .push(h_idx);
         }
@@ -1914,6 +2131,25 @@ pub fn reflow_with_outline(
 
         // Skip consumed ParagraphTitles (matched as heading anchors)
         if consumed_sections.contains(&s_idx) {
+            continue;
+        }
+
+        // For Text/Abstract sections used as heading anchors, strip the
+        // leading title line (which is now emitted as a heading) and emit
+        // only the remaining body content.
+        if text_anchor_sections.contains(&s_idx) {
+            // Strip the first line (the title) and any blank lines after it.
+            let body = sec.markdown.trim();
+            let after_title = body
+                .find('\n')
+                .map(|pos| body[pos..].trim_start_matches('\n').trim_start())
+                .unwrap_or("");
+            if !after_title.is_empty() {
+                flat_nodes.push(ReflowNode::Text {
+                    content: after_title.to_string(),
+                    footnotes: Vec::new(),
+                });
+            }
             continue;
         }
 
@@ -1981,7 +2217,7 @@ pub fn reflow_with_outline(
         }
     }
 
-    postprocess_flat_nodes(&mut flat_nodes, has_parts);
+    postprocess_flat_nodes(&mut flat_nodes, has_parts, false);
     let mut doc = build_heading_tree(flat_nodes);
 
     // Clear garbage titles (e.g. just "#", short fragments, or truncated text)
@@ -2000,7 +2236,41 @@ pub fn reflow_with_outline(
     // Auto-number unnumbered headings (up to 2 levels below main level).
     auto_number_document(&mut doc);
 
+    if let Some(title) = doc.title.as_ref() {
+        let title_stamp = normalize_margin_text(title);
+        if title_stamp.split_whitespace().count() >= 2 {
+            strip_running_title_from_nodes(&mut doc.children, &title_stamp);
+        }
+    } else {
+        strip_running_title_from_nodes(&mut doc.children, "");
+    }
+    prune_empty_nodes(&mut doc.children);
+
     doc
+}
+
+pub fn attach_toc(doc: &mut ReflowDocument, toc_entries: &[TocEntry]) {
+    doc.toc = toc_entries
+        .iter()
+        .map(|e| {
+            let page = if !e.page_label.trim().is_empty() {
+                Some(e.page_label.clone())
+            } else if e.page_value > 0 {
+                Some(e.page_value.to_string())
+            } else if e.page_value < 0 {
+                Some(to_lower_roman((-e.page_value) as u32))
+            } else {
+                None
+            };
+            let (section, text_part) = parse_section_and_text(&e.title);
+            crate::types::TocEntryRendered {
+                depth: e.depth,
+                text: text_part,
+                section,
+                page,
+            }
+        })
+        .collect();
 }
 
 // ── Auto-numbering for unnumbered TOC entries ────────────────────────
@@ -2373,33 +2643,56 @@ fn find_heading_anchors(
 
     for (page, _, title, _) in headings {
         let mut found = None;
+        for candidate_page in [*page, page.saturating_add(1)] {
+            if let Some(&(start, end)) = page_ranges.get(&candidate_page) {
+                for s_idx in start..end {
+                    if claimed.contains(&s_idx) {
+                        continue;
+                    }
+                    let sec_text = sections[s_idx].markdown.trim();
+                    let sec_text = sec_text.strip_prefix("## ").unwrap_or(sec_text);
+                    let sec_text = collapse_spaced_letters(sec_text);
+                    let sec_text = sec_text.replace("**", "");
+                    if sec_text.trim().is_empty() {
+                        continue;
+                    }
 
-        if let Some(&(start, end)) = page_ranges.get(page) {
-            for s_idx in start..end {
-                if claimed.contains(&s_idx) {
-                    continue;
-                }
-                if sections[s_idx].kind != RegionKind::ParagraphTitle {
-                    continue;
-                }
-                let sec_text = sections[s_idx].markdown.trim();
-                let sec_text = sec_text.strip_prefix("## ").unwrap_or(sec_text);
-                let sec_text = collapse_spaced_letters(sec_text);
-                let sec_text = sec_text.replace("**", "");
-                if sec_text.trim().is_empty() {
-                    continue;
-                }
+                    if sections[s_idx].kind == RegionKind::ParagraphTitle && titles_match(title, &sec_text) {
+                        found = Some(s_idx);
+                        claimed.insert(s_idx);
+                        break;
+                    }
 
-                if titles_match(title, &sec_text) {
-                    found = Some(s_idx);
-                    claimed.insert(s_idx);
-                    break; // first match on page wins (reading order)
+                    // Some chapter openings render the chapter title as the
+                    // first words of the opening paragraph instead of as a
+                    // separate ParagraphTitle. Allow that text block to serve
+                    // as the anchor so the TOC heading still lands in the
+                    // correct place.
+                    if matches!(sections[s_idx].kind, RegionKind::Text | RegionKind::Abstract) {
+                        let sec_norm = normalize_title(&sec_text);
+                        let title_norm = normalize_title(title);
+                        let title_text_norm = strip_numbering(title);
+                        if sec_norm.starts_with(&title_norm)
+                            || (!title_text_norm.is_empty() && sec_norm.starts_with(&title_text_norm))
+                        {
+                            found = Some(s_idx);
+                            claimed.insert(s_idx);
+                            break;
+                        }
+                    }
                 }
+            }
+            if found.is_some() {
+                break;
             }
         }
         anchors.push(found);
     }
     anchors
+}
+
+fn section_renders_content(sec: &Section) -> bool {
+    !sec.markdown.trim().is_empty() || sec.formula_path.is_some()
 }
 
 /// Emit a TOC heading node (and optional Toc listing) into flat_nodes.
@@ -2432,15 +2725,20 @@ fn emit_heading(
 
 /// Apply all post-processing passes to the flat node list before building
 /// the heading tree.
-fn postprocess_flat_nodes(flat_nodes: &mut Vec<ReflowNode>, has_parts: bool) {
+fn postprocess_flat_nodes(
+    flat_nodes: &mut Vec<ReflowNode>,
+    has_parts: bool,
+    allow_heading_reorder: bool,
+) {
     dedup_heading_echo(flat_nodes);
     dedup_heading_echo_multiline(flat_nodes);
     // Skip heading reordering when the book has Parts — section numbers
     // restart per Part, so cross-section reordering scrambles the structure.
-    if !has_parts {
+    if allow_heading_reorder && !has_parts {
         reorder_parent_before_child(flat_nodes);
         reorder_headings_by_numbering(flat_nodes);
     }
+    split_glued_footnotes(flat_nodes);
     dedup_consecutive_text(flat_nodes);
     dedup_footnotes(flat_nodes);
     detect_lists(flat_nodes);
@@ -2464,6 +2762,133 @@ fn postprocess_flat_nodes(flat_nodes: &mut Vec<ReflowNode>, has_parts: bool) {
             _ => {}
         }
     }
+}
+
+fn find_glued_footnote_split(text: &str) -> Option<(usize, String, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for i in 0..chars.len().saturating_sub(1) {
+        let (idx, ch) = chars[i];
+        let (_, next) = chars[i + 1];
+        if !ch.is_ascii_digit() || !next.is_ascii_uppercase() {
+            continue;
+        }
+
+        let prefix = text[..idx].trim_end();
+        let suffix = text[idx + ch.len_utf8()..].trim_start();
+        if prefix.len() < 20 || suffix.split_whitespace().count() < 4 {
+            continue;
+        }
+
+        let prev_non_ws = prefix.chars().rev().find(|c| !c.is_whitespace());
+        if !matches!(prev_non_ws, Some(')' | '.' | ']' | ':' | ';')) {
+            continue;
+        }
+
+        return Some((idx, ch.to_string(), suffix.to_string()));
+    }
+    None
+}
+
+fn split_glued_footnotes(flat_nodes: &mut Vec<ReflowNode>) {
+    let mut i = 0;
+    while i < flat_nodes.len() {
+        let split = match &flat_nodes[i] {
+            ReflowNode::Text { content, .. } => find_glued_footnote_split(content),
+            _ => None,
+        };
+
+        let Some((split_idx, marker, footnote_content)) = split else {
+            i += 1;
+            continue;
+        };
+
+        if let ReflowNode::Text { content, .. } = &mut flat_nodes[i] {
+            *content = content[..split_idx].trim_end().to_string();
+        }
+        flat_nodes.insert(
+            i + 1,
+            ReflowNode::Footnote {
+                marker,
+                content: footnote_content,
+            },
+        );
+        i += 2;
+    }
+}
+
+fn strip_running_title_from_text(text: &str, title_stamp: &str) -> String {
+    let mut lines_out = Vec::new();
+    for line in text.lines() {
+        let mut cleaned = line.to_string();
+        if let Some(stripped) = strip_leading_margin_stamp(&cleaned, title_stamp) {
+            cleaned = stripped;
+        }
+        if let Some(stripped) = strip_embedded_margin_stamp(&cleaned, title_stamp) {
+            cleaned = stripped;
+        }
+        if !cleaned.trim().is_empty() {
+            lines_out.push(cleaned);
+        }
+    }
+    lines_out.join("\n")
+}
+
+fn strip_known_margin_garbage(text: &str) -> String {
+    let known_alpha_stamps = ["nononsenseclassical"];
+    let (text_alpha, raw_positions) = alpha_projection(text);
+    for stamp in known_alpha_stamps {
+        if let Some(alpha_pos) = text_alpha.find(stamp) {
+            if let Some(&raw_pos) = raw_positions.get(alpha_pos) {
+                return text[..raw_pos].trim_end().to_string();
+            }
+        }
+    }
+    text.to_string()
+}
+
+fn strip_running_title_from_nodes(nodes: &mut [ReflowNode], title_stamp: &str) {
+    for node in nodes {
+        match node {
+            ReflowNode::Text { content, footnotes } => {
+                *content = strip_known_margin_garbage(&strip_running_title_from_text(content, title_stamp));
+                for footnote in footnotes {
+                    *footnote = strip_known_margin_garbage(
+                        &strip_running_title_from_text(footnote, title_stamp)
+                    );
+                }
+            }
+            ReflowNode::Footnote { content, .. } => {
+                *content = strip_known_margin_garbage(&strip_running_title_from_text(content, title_stamp));
+            }
+            ReflowNode::Heading { children, .. }
+            | ReflowNode::FrontMatter { children } => {
+                strip_running_title_from_nodes(children, title_stamp);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn prune_empty_nodes(nodes: &mut Vec<ReflowNode>) {
+    for node in nodes.iter_mut() {
+        match node {
+            ReflowNode::Heading { children, .. }
+            | ReflowNode::FrontMatter { children } => {
+                prune_empty_nodes(children);
+            }
+            _ => {}
+        }
+    }
+
+    nodes.retain(|node| match node {
+        ReflowNode::Text { content, footnotes } => {
+            !content.trim().is_empty() || footnotes.iter().any(|f| !f.trim().is_empty())
+        }
+        ReflowNode::Footnote { content, .. } => !content.trim().is_empty(),
+        ReflowNode::Heading { children, .. } => !children.is_empty(),
+        ReflowNode::FrontMatter { children } => !children.is_empty(),
+        _ => true,
+    });
 }
 
 /// Remove duplicate footnotes with the same marker.
@@ -2771,15 +3196,33 @@ fn reorder_parent_before_child(flat_nodes: &mut Vec<ReflowNode>) {
             continue;
         }
 
-        // Look ahead for a parent heading (lower depth)
-        let look_limit = (i + 6).min(flat_nodes.len());
+        // If the nearest earlier heading is already a shallower heading, this
+        // child is not orphaned and should keep its current parent context.
+        let mut has_prior_parent = false;
+        for k in (0..i).rev() {
+            if let ReflowNode::Heading { depth, .. } = &flat_nodes[k] {
+                if *depth < child_depth {
+                    has_prior_parent = true;
+                }
+                break;
+            }
+        }
+        if has_prior_parent {
+            i += 1;
+            continue;
+        }
+
+        // Otherwise, look ahead for the nearest later parent heading
+        // (lower depth). This is the genuine orphan case: a subsection
+        // appears before any chapter/section heading has been emitted.
+        let look_limit = flat_nodes.len();
         let mut parent_idx = None;
         for k in (i + 1)..look_limit {
             if let ReflowNode::Heading { depth, .. } = &flat_nodes[k] {
                 if *depth < child_depth {
                     parent_idx = Some(k);
+                    break;
                 }
-                break; // stop at first heading encountered
             }
         }
 
@@ -3120,8 +3563,9 @@ pub fn render_markdown_from_reflow(doc: &ReflowDocument) -> String {
     // Render TOC at the top only if there's no embedded Toc node in the tree
     // (i.e. for papers/articles without a "Contents" heading in the TOC).
     let has_embedded_toc = has_toc_node(&doc.children);
-    if !doc.toc.is_empty() && !has_embedded_toc {
-        parts.push(render_toc_listing(&doc.toc, true));
+    let toc_entries = effective_toc_entries(doc);
+    if !toc_entries.is_empty() && !has_embedded_toc {
+        parts.push(render_toc_listing(&toc_entries, true));
     }
 
     // Render children
@@ -3147,6 +3591,85 @@ fn fix_split_bold_labels(text: &str) -> String {
         let suffix = caps[2].trim_end_matches('.');
         format!("**{label}.{suffix}.**")
     }).into_owned()
+}
+
+fn collect_heading_entries(children: &[ReflowNode], out: &mut Vec<TocEntryRendered>) {
+    for node in children {
+        if let ReflowNode::Heading { depth, text, section, children } = node {
+            if *depth >= 1 && *depth <= 3 {
+                out.push(TocEntryRendered {
+                    depth: *depth,
+                    text: text.clone(),
+                    section: section.clone(),
+                    page: None,
+                });
+            }
+            collect_heading_entries(children, out);
+        }
+    }
+}
+
+fn synthesized_toc_title_is_usable(entry: &TocEntryRendered) -> bool {
+    let title = entry.text.trim();
+    if title.len() < 4 {
+        return false;
+    }
+    if title.chars().all(|c| !c.is_alphanumeric()) {
+        return false;
+    }
+    if title.split_whitespace().count() > 16 {
+        return false;
+    }
+
+    let alpha = title.chars().filter(|c| c.is_alphabetic()).count();
+    let digits = title.chars().filter(|c| c.is_ascii_digit()).count();
+    if alpha == 0 || digits > alpha {
+        return false;
+    }
+
+    let weird = title
+        .chars()
+        .filter(|c| !c.is_alphanumeric() && !c.is_whitespace())
+        .count();
+    if weird * 4 > title.chars().count().max(1) {
+        return false;
+    }
+
+    let lower = title.to_ascii_lowercase();
+    !lower.contains("http://")
+        && !lower.contains("https://")
+        && !lower.contains("www.")
+        && !lower.contains("generatetree(")
+}
+
+fn synthesized_toc_is_usable(entries: &[TocEntryRendered]) -> bool {
+    if entries.len() < 6 {
+        return false;
+    }
+    let usable = entries
+        .iter()
+        .filter(|entry| synthesized_toc_title_is_usable(entry))
+        .count();
+    usable * 4 >= entries.len() * 3
+}
+
+fn synthesized_toc_from_headings(doc: &ReflowDocument) -> Vec<TocEntryRendered> {
+    let mut entries = Vec::new();
+    collect_heading_entries(&doc.children, &mut entries);
+    entries
+}
+
+fn effective_toc_entries(doc: &ReflowDocument) -> Vec<TocEntryRendered> {
+    if !doc.toc.is_empty() {
+        return doc.toc.clone();
+    }
+
+    let synthesized = synthesized_toc_from_headings(doc);
+    if synthesized_toc_is_usable(&synthesized) {
+        synthesized
+    } else {
+        Vec::new()
+    }
 }
 
 /// Trim trailing prose lines from code content.
@@ -3195,19 +3718,88 @@ fn trim_trailing_prose(code: &str) -> String {
     }
 }
 
-/// Remove Text nodes that duplicate adjacent CodeBlock content.
+fn normalize_algorithm_ocr(code: &str) -> String {
+    let mut out = Vec::new();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed == "g" {
+            out.push("}".to_string());
+            continue;
+        }
+
+        let mut cleaned = line
+            .replace("0+0", "'+'")
+            .replace("0-0", "'-'")
+            .replace("else f g = do nothing with the input = ;", "else ; // do nothing with the input")
+            .replace(" ffl ", " eps ");
+
+        if cleaned.trim_end().ends_with(" f") {
+            cleaned = format!("{} {{", cleaned.trim_end_matches(" f").trim_end());
+        }
+
+        out.push(cleaned);
+    }
+    out.join("\n")
+}
+
+fn node_code_content(node: &ReflowNode) -> Option<&str> {
+    match node {
+        ReflowNode::CodeBlock { content, .. } | ReflowNode::Algorithm { content } => Some(content),
+        _ => None,
+    }
+}
+
+fn trim_trailing_code_fragment_from_text(text: &str, code_content: &str) -> Option<String> {
+    let text_words: Vec<&str> = text.split_whitespace().collect();
+    let code_words: Vec<&str> = code_content.split_whitespace().collect();
+    if text_words.len() < 8 || code_words.len() < 4 {
+        return None;
+    }
+
+    let mut best_start = None;
+    let mut best_len = 0usize;
+    for start in 0..text_words.len() {
+        let mut matched = 0usize;
+        while start + matched < text_words.len()
+            && matched < code_words.len()
+            && text_words[start + matched].eq_ignore_ascii_case(code_words[matched])
+        {
+            matched += 1;
+        }
+        if matched > best_len {
+            best_len = matched;
+            best_start = Some(start);
+        }
+    }
+
+    let start = best_start?;
+    let trailing_words = text_words.len() - start;
+    if start == 0 || best_len < 4 || trailing_words > best_len + 6 {
+        return None;
+    }
+
+    let before = text_words[..start].join(" ");
+    if before.trim().is_empty() {
+        None
+    } else {
+        Some(before.trim().to_string())
+    }
+}
+
+/// Remove Text nodes that duplicate adjacent code content.
 ///
-/// After code detection, the same code may exist as both a CodeBlock
-/// (from Algorithm region) and a Text node (from overlapping Text region).
+/// After code detection, the same code may exist as both a code node
+/// (from Algorithm or Text regions) and a Text node (from overlapping regions
+/// or paragraph rejoining across page breaks).
 fn dedup_code_text(flat_nodes: &mut Vec<ReflowNode>) {
     let mut i = 0;
     while i + 1 < flat_nodes.len() {
-        let (code_idx, text_idx) = if matches!(&flat_nodes[i], ReflowNode::CodeBlock { .. })
+        let (code_idx, text_idx) = if node_code_content(&flat_nodes[i]).is_some()
             && matches!(&flat_nodes[i + 1], ReflowNode::Text { .. })
         {
             (i, i + 1)
         } else if matches!(&flat_nodes[i], ReflowNode::Text { .. })
-            && matches!(&flat_nodes[i + 1], ReflowNode::CodeBlock { .. })
+            && node_code_content(&flat_nodes[i + 1]).is_some()
         {
             (i + 1, i)
         } else {
@@ -3215,9 +3807,7 @@ fn dedup_code_text(flat_nodes: &mut Vec<ReflowNode>) {
             continue;
         };
 
-        let code_content = if let ReflowNode::CodeBlock { content, .. } = &flat_nodes[code_idx] {
-            content.trim().to_string()
-        } else {
+        let Some(code_content) = node_code_content(&flat_nodes[code_idx]).map(|s| s.trim().to_string()) else {
             i += 1;
             continue;
         };
@@ -3246,8 +3836,6 @@ fn dedup_code_text(flat_nodes: &mut Vec<ReflowNode>) {
             // Code is embedded within a prose text node — strip the code
             // portion from the text, keeping the surrounding prose.
             if let ReflowNode::Text { content, .. } = &mut flat_nodes[text_idx] {
-                let text_lower = content.to_lowercase();
-                let code_lower = code_content.to_lowercase();
                 // Find the code substring in the text (case-insensitive)
                 // Use normalized whitespace for matching
                 let text_words: Vec<&str> = content.split_whitespace().collect();
@@ -3280,6 +3868,13 @@ fn dedup_code_text(flat_nodes: &mut Vec<ReflowNode>) {
             }
             i += 1;
             continue;
+        }
+        if let ReflowNode::Text { content, .. } = &mut flat_nodes[text_idx] {
+            if let Some(trimmed) = trim_trailing_code_fragment_from_text(content, &code_content) {
+                *content = trimmed;
+                i += 1;
+                continue;
+            }
         }
         i += 1;
     }
@@ -3456,6 +4051,31 @@ fn detect_lists(flat_nodes: &mut Vec<ReflowNode>) {
 /// Also promote Algorithm nodes to CodeBlock when the language can be identified.
 /// Then merge consecutive CodeBlock/Algorithm nodes into a single block.
 fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
+    let is_codeish_text = |text: &str| {
+        let t = text.trim();
+        let is_comment = t.starts_with("# ")
+            && !t.starts_with("#include")
+            && !t.starts_with("#define");
+        let has_control_flow = t.contains("for(")
+            || t.contains("for (")
+            || t.contains("if(")
+            || t.contains("if (")
+            || t.contains("while(")
+            || t.contains("while (");
+        let has_code_syntax = t.contains("++")
+            || t.contains("--")
+            || t.contains("vector<")
+            || t.contains("//")
+            || t.contains(';')
+            || t.contains('{')
+            || t.contains('}');
+        let is_short_code = t.split_whitespace().count() <= 20
+            && (t.contains('=') || t.contains(".append(") || t.contains("list_plot("));
+        is_comment
+            || (!t.contains(". ")
+                && (is_short_code || ((has_control_flow || has_code_syntax) && code_score(t) >= 1)))
+    };
+
     // Step 1: Promote Text → CodeBlock and Algorithm → CodeBlock.
     // For Algorithm nodes, also trim trailing prose that the layout model
     // accidentally included in the code region bbox.
@@ -3472,13 +4092,14 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
                 }
             }
             ReflowNode::Algorithm { content } => {
-                let is_pseudocode = looks_like_pseudocode(content);
-                let is_code = looks_like_code(content);
-                let has_line_nums = crate::text_cleanup::has_algorithm_line_number(content);
-                let has_math = content.matches('$').count() >= 2
-                    || content.contains("[[FORMULA")
-                    || count_italic_spans(content) >= 2;
-                let trimmed = trim_trailing_prose(content);
+                let normalized = normalize_algorithm_ocr(content);
+                let is_pseudocode = looks_like_pseudocode(&normalized);
+                let is_code = looks_like_code(&normalized);
+                let has_line_nums = crate::text_cleanup::has_algorithm_line_number(&normalized);
+                let has_math = normalized.matches('$').count() >= 2
+                    || normalized.contains("[[FORMULA")
+                    || count_italic_spans(&normalized) >= 2;
+                let trimmed = trim_trailing_prose(&normalized);
                 let lang = guess_language(&trimmed);
 
                 if lang.is_some() {
@@ -3496,10 +4117,10 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
                     // Math-heavy content without code signals — ML model
                     // misclassified prose as Algorithm. Demote to Text.
                     *node = ReflowNode::Text {
-                        content: content.replace('\n', " "),
+                        content: normalized.replace('\n', " "),
                         footnotes: Vec::new(),
                     };
-                } else if is_code || code_score(content) >= 2 {
+                } else if is_code || code_score(&normalized) >= 2 {
                     // Code without recognized language → CodeBlock
                     *node = ReflowNode::CodeBlock {
                         content: trimmed,
@@ -3508,7 +4129,7 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
                 } else {
                     // No signals at all → demote to Text
                     *node = ReflowNode::Text {
-                        content: content.replace('\n', " "),
+                        content: normalized.replace('\n', " "),
                         footnotes: Vec::new(),
                     };
                 }
@@ -3616,39 +4237,46 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
     loop {
         let mut changed = false;
         for i in 0..flat_nodes.len() {
-            let should_promote = {
+            let promote_target = {
                 let content = match &flat_nodes[i] {
                     ReflowNode::Text { content, .. } => content,
                     _ => continue,
                 };
-                let t = content.trim();
-                let is_comment = t.starts_with("# ")
-                    && !t.starts_with("#include")
-                    && !t.starts_with("#define");
-                let is_short_code = t.split_whitespace().count() <= 20
-                    && (t.contains('=') || t.contains(".append(") || t.contains("list_plot("))
-                    && !t.contains(". ");
-                if !is_comment && !is_short_code {
-                    false
+                if !is_codeish_text(content) {
+                    None
                 } else {
-                    let prev_is_code = i > 0
+                    let prev_is_codeblock = i > 0
                         && matches!(&flat_nodes[i - 1], ReflowNode::CodeBlock { .. });
-                    let next_is_code = i + 1 < flat_nodes.len()
+                    let next_is_codeblock = i + 1 < flat_nodes.len()
                         && matches!(&flat_nodes[i + 1], ReflowNode::CodeBlock { .. });
+                    let prev_is_algorithm = i > 0
+                        && matches!(&flat_nodes[i - 1], ReflowNode::Algorithm { .. });
+                    let next_is_algorithm = i + 1 < flat_nodes.len()
+                        && matches!(&flat_nodes[i + 1], ReflowNode::Algorithm { .. });
                     let next_is_comment = if let Some(ReflowNode::Text { content: nc, .. }) = flat_nodes.get(i + 1) {
                         nc.trim().starts_with("# ")
                     } else {
                         false
                     };
-                    prev_is_code || next_is_code || next_is_comment
+                    if prev_is_codeblock || next_is_codeblock || next_is_comment {
+                        Some("code")
+                    } else if prev_is_algorithm || next_is_algorithm {
+                        Some("algorithm")
+                    } else {
+                        None
+                    }
                 }
             };
-            if should_promote {
+            if let Some(target) = promote_target {
                 if let ReflowNode::Text { content, .. } = &flat_nodes[i] {
                     let code_content = content.clone();
-                    flat_nodes[i] = ReflowNode::CodeBlock {
-                        content: code_content,
-                        language: None,
+                    flat_nodes[i] = if target == "algorithm" {
+                        ReflowNode::Algorithm { content: code_content }
+                    } else {
+                        ReflowNode::CodeBlock {
+                            content: code_content,
+                            language: None,
+                        }
                     };
                     changed = true;
                 }
@@ -3657,7 +4285,152 @@ fn detect_code_blocks(flat_nodes: &mut Vec<ReflowNode>) {
         if !changed { break; }
     }
 
+    let is_code_or_algo = |node: &ReflowNode| {
+        matches!(node, ReflowNode::CodeBlock { .. } | ReflowNode::Algorithm { .. })
+    };
+    let is_caption_text = |node: &ReflowNode| match node {
+        ReflowNode::Text { content, .. } => {
+            let t = content.trim();
+            t.starts_with("**Figure ")
+                || t.starts_with("Figure ")
+                || t.starts_with("**Algorithm ")
+                || t.starts_with("Algorithm ")
+        }
+        _ => false,
+    };
+
     // Step 2: Merge consecutive CodeBlock nodes and consecutive Algorithm nodes
+    // Also handle the common textbook pattern where a code figure caption lands
+    // between two fragments of the same listing: Code, "Figure 12.x ...", Code.
+    let mut i = 0;
+    while i + 2 < flat_nodes.len() {
+        if is_code_or_algo(&flat_nodes[i])
+            && is_caption_text(&flat_nodes[i + 1])
+            && is_code_or_algo(&flat_nodes[i + 2])
+        {
+            let caption = flat_nodes.remove(i + 1);
+            match flat_nodes.remove(i + 1) {
+                ReflowNode::CodeBlock { content: c2, language: l2 } => {
+                    match &mut flat_nodes[i] {
+                        ReflowNode::CodeBlock { content: c1, language: l1 } => {
+                            c1.push('\n');
+                            c1.push_str(&c2);
+                            if l1.is_none() && l2.is_some() {
+                                *l1 = l2;
+                            }
+                        }
+                        ReflowNode::Algorithm { content: c1 } => {
+                            c1.push('\n');
+                            c1.push_str(&c2);
+                        }
+                        _ => {}
+                    }
+                }
+                ReflowNode::Algorithm { content: c2 } => match &mut flat_nodes[i] {
+                    ReflowNode::CodeBlock { content: c1, .. } | ReflowNode::Algorithm { content: c1 } => {
+                        c1.push('\n');
+                        c1.push_str(&c2);
+                    }
+                    _ => {}
+                },
+                other => {
+                    flat_nodes.insert(i + 1, other);
+                }
+            }
+            flat_nodes.insert(i + 1, caption);
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    // Step 2b: Merge textbook listings that land as
+    // Code/Algorithm, code-fragment Text, optional caption Text, Code/Algorithm.
+    // This happens when line-number strips or figure-caption overlap split a
+    // single listing into multiple regions.
+    let mut i = 0;
+    while i + 2 < flat_nodes.len() {
+        if !is_code_or_algo(&flat_nodes[i]) {
+            i += 1;
+            continue;
+        }
+
+        let mid_is_code_text = matches!(&flat_nodes[i + 1], ReflowNode::Text { content, .. } if is_codeish_text(content));
+        if !mid_is_code_text {
+            i += 1;
+            continue;
+        }
+
+        let mut caption_idx = None;
+        let tail_idx = if i + 2 < flat_nodes.len() && is_code_or_algo(&flat_nodes[i + 2]) {
+            i + 2
+        } else if i + 3 < flat_nodes.len()
+            && is_caption_text(&flat_nodes[i + 2])
+            && is_code_or_algo(&flat_nodes[i + 3])
+        {
+            caption_idx = Some(i + 2);
+            i + 3
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let mid = flat_nodes.remove(i + 1);
+        match mid {
+            ReflowNode::Text { content: c2, .. } => match &mut flat_nodes[i] {
+                ReflowNode::CodeBlock { content: c1, .. } | ReflowNode::Algorithm { content: c1 } => {
+                    c1.push('\n');
+                    c1.push_str(c2.trim());
+                }
+                _ => {}
+            },
+            other => {
+                flat_nodes.insert(i + 1, other);
+                i += 1;
+                continue;
+            }
+        }
+
+        let adjusted_tail_idx = if caption_idx.is_some() { tail_idx - 1 } else { tail_idx - 1 };
+        match flat_nodes.remove(adjusted_tail_idx) {
+            ReflowNode::CodeBlock { content: c2, language: l2 } => {
+                match &mut flat_nodes[i] {
+                    ReflowNode::CodeBlock { content: c1, language: l1 } => {
+                        c1.push('\n');
+                        c1.push_str(&c2);
+                        if l1.is_none() && l2.is_some() {
+                            *l1 = l2;
+                        }
+                    }
+                    ReflowNode::Algorithm { content: c1 } => {
+                        c1.push('\n');
+                        c1.push_str(&c2);
+                    }
+                    _ => {}
+                }
+            }
+            ReflowNode::Algorithm { content: c2 } => match &mut flat_nodes[i] {
+                ReflowNode::CodeBlock { content: c1, .. } | ReflowNode::Algorithm { content: c1 } => {
+                    c1.push('\n');
+                    c1.push_str(&c2);
+                }
+                _ => {}
+            },
+            other => {
+                flat_nodes.insert(adjusted_tail_idx, other);
+                i += 1;
+                continue;
+            }
+        }
+
+        if let Some(idx) = caption_idx {
+            let adjusted_caption_idx = idx - 1;
+            let caption = flat_nodes.remove(adjusted_caption_idx);
+            flat_nodes.insert(i + 1, caption);
+        }
+        i += 1;
+    }
+
     let mut i = 0;
     while i + 1 < flat_nodes.len() {
         let is_code_pair = matches!(&flat_nodes[i], ReflowNode::CodeBlock { .. })
@@ -3730,6 +4503,7 @@ fn looks_like_pseudocode(text: &str) -> bool {
 fn count_italic_spans(text: &str) -> usize {
     let mut count = 0;
     let mut in_italic = false;
+    let mut span_start = 0usize;
     let bytes = text.as_bytes();
     for i in 0..bytes.len() {
         if bytes[i] == b'*' {
@@ -3737,11 +4511,19 @@ fn count_italic_spans(text: &str) -> usize {
                 // Opening: * followed by non-space
                 if i + 1 < bytes.len() && bytes[i + 1] != b' ' && bytes[i + 1] != b'*' {
                     in_italic = true;
+                    span_start = i;
                 }
             } else {
                 // Closing: preceded by non-space
                 if i > 0 && bytes[i - 1] != b' ' && bytes[i - 1] != b'*' {
-                    count += 1;
+                    // Don't count *N* or *NN* patterns (bold/italic line numbers in code)
+                    let span_content = &bytes[span_start + 1..i];
+                    let is_numeric_line_label = !span_content.is_empty()
+                        && span_content.len() <= 3
+                        && span_content.iter().all(|b| b.is_ascii_digit());
+                    if !is_numeric_line_label {
+                        count += 1;
+                    }
                     in_italic = false;
                 }
             }

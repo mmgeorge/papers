@@ -113,10 +113,16 @@ pub(crate) fn group_by_y_proximity_padded<T: HasBbox>(items: &[T], pad_factor: f
 /// Returns true if any whitespace-separated token matches `\d{1,3}:`.
 pub(crate) fn has_algorithm_line_number(text: &str) -> bool {
     text.split_whitespace().any(|w| {
-        w.len() >= 2
+        // Format: "1:" or "12:" — numeric label with trailing colon
+        (w.len() >= 2
             && w.len() <= 4
             && w.ends_with(':')
-            && w[..w.len() - 1].chars().all(|c| c.is_ascii_digit())
+            && w[..w.len() - 1].chars().all(|c| c.is_ascii_digit()))
+        // Format: "*1*" or "*12*" — bold/italic line numbers (data structures textbook style)
+        || (w.len() >= 3
+            && w.starts_with('*')
+            && w.ends_with('*')
+            && w[1..w.len() - 1].chars().all(|c| c.is_ascii_digit()))
     })
 }
 

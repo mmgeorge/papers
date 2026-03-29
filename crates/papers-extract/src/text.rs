@@ -1461,6 +1461,28 @@ fn detect_scripts<'a>(line: &[&'a LineElement<'a>]) -> Vec<LineElement<'a>> {
             }
         }
 
+        // Interlacing guard: if the first char of the script run matches the next
+        // visible base-level char after the run, this is an interlaced-duplicate
+        // PDF rendering artifact (two overlapping text renders at different font
+        // sizes / Y-offsets, causing each character to appear as a superscript of
+        // the previous one).  Skip the script and emit the base char as plain text.
+        {
+            let next_base = line[script_end..].iter().find(|e| matches!(e,
+                LineElement::Char(c)
+                    if !c.codepoint.is_control()
+                        && c.codepoint != ' '
+                        && (c.bbox[2] - c.bbox[0]) > 0.0
+                        && c.font_size / baseline_font >= SCRIPT_FONT_RATIO));
+            if let Some(LineElement::Char(nb)) = next_base {
+                if nb.codepoint == first_script.codepoint {
+                    // Interlaced duplicate: emit base as plain text, skip script
+                    result.push(clone_element(elem));
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
         // Build the LaTeX string
         let latex = if is_superscript {
             format!("{}^{{{}}}", base_char.codepoint, script_chars)
@@ -1485,6 +1507,25 @@ fn detect_scripts<'a>(line: &[&'a LineElement<'a>]) -> Vec<LineElement<'a>> {
 
         // Advance past all consumed elements (base + skipped + script run)
         i = script_end;
+    }
+
+    // Degenerate-script guard: if the result is saturated with Formula elements
+    // and has no visible plain-text Char elements at all, this is likely an
+    // interlaced-text PDF artifact (two overlapping renders of the same text at
+    // different font sizes or Y offsets, causing every character to appear as a
+    // superscript of the previous one).  Fall back to the original input so the
+    // line renders as plain text rather than an unreadable soup of $x^{y}$ tokens.
+    let formula_count = result
+        .iter()
+        .filter(|e| matches!(e, LineElement::Formula { .. }))
+        .count();
+    let plain_visible = result.iter().filter(|e| matches!(e,
+        LineElement::Char(c)
+            if !c.codepoint.is_control()
+                && c.codepoint != ' '
+                && (c.bbox[2] - c.bbox[0]) > 0.0)).count();
+    if formula_count >= 6 && plain_visible == 0 {
+        return line.iter().map(|e| clone_element(e)).collect();
     }
 
     result

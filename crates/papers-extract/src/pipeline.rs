@@ -505,7 +505,13 @@ impl Pipeline {
         let t = Instant::now();
         let watermarks = output::detect_watermarks(&page_chars);
         let reflow_doc = if let Some(ref toc) = toc_result {
-            output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages, &watermarks)
+            if toc::outline_is_usable(&toc.entries) {
+                output::reflow_with_outline(&result, &toc.entries, &toc.toc_pages, total_pages, &watermarks)
+            } else {
+                let mut doc = output::reflow_skipping_pages(&result, &toc.toc_pages, &watermarks);
+                output::attach_toc(&mut doc, &toc.entries);
+                doc
+            }
         } else {
             output::reflow(&result, &watermarks)
         };

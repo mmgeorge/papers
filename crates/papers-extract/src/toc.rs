@@ -54,6 +54,58 @@ pub struct TocResult {
     pub font_profile: TocFontProfile,
 }
 
+pub fn uses_local_page_labels(entries: &[TocEntry]) -> bool {
+    let local = entries
+        .iter()
+        .filter(|e| is_local_page_label(&e.page_label))
+        .count();
+    local >= 3 && local * 2 >= entries.len().max(1)
+}
+
+pub fn outline_is_usable(entries: &[TocEntry]) -> bool {
+    if entries.is_empty() {
+        return false;
+    }
+    if uses_local_page_labels(entries) {
+        return false;
+    }
+    let fatal = entries
+        .iter()
+        .filter(|e| toc_title_is_fatally_suspicious(&e.title))
+        .count();
+    // Allow a small number of falsely-flagged fatal entries: edge cases like
+    // version strings "3.30" (looks like section "3.30") can trigger the check.
+    // Fail only if more than 3% of entries are fatal (minimum threshold: 10).
+    if fatal > 0 && (fatal >= 10 || fatal * 33 > entries.len()) {
+        return false;
+    }
+    let suspicious = entries
+        .iter()
+        .filter(|e| toc_title_is_suspicious(&e.title))
+        .count();
+    suspicious * 10 < entries.len().max(1)
+}
+
+pub fn renderable_toc_is_usable(entries: &[TocEntry]) -> bool {
+    if entries.is_empty() {
+        return false;
+    }
+
+    let fatal = entries
+        .iter()
+        .filter(|e| toc_title_is_fatally_suspicious(&e.title))
+        .count();
+    if fatal * 6 >= entries.len().max(1) {
+        return false;
+    }
+
+    let suspicious = entries
+        .iter()
+        .filter(|e| toc_title_is_suspicious(&e.title))
+        .count();
+    suspicious * 3 < entries.len().max(1)
+}
+
 /// Learned font properties per heading depth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TocFontProfile {
@@ -378,6 +430,13 @@ fn is_toc_like_page(page_data: &(Vec<PdfChar>, f32), page_idx: u32) -> bool {
     pct_numbers >= 0.3 || pct_dots >= 0.2
 }
 
+fn normalize_toc_header_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_alphabetic())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
     let total = page_chars.len();
     let scan_limit = total.min(40).min(total / 3 + 5);
@@ -403,14 +462,20 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
         for &(idx, _) in top_indices.iter().take(3) {
             let text = lines[idx].text();
             let trimmed = text.trim().to_ascii_lowercase();
-            if trimmed.starts_with("list of") {
+            let normalized = normalize_toc_header_text(&text);
+            if trimmed.starts_with("list of") || normalized.starts_with("listof") {
                 continue;
             }
-            if trimmed == "contents" || trimmed == "table of contents" {
+            if normalized == "contents"
+                || normalized == "tableofcontents"
+                || normalized == "detailedcontents"
+                || normalized.starts_with("contents")
+                || normalized.starts_with("tableofcontents")
+            {
                 start_page = Some(page_idx as u32);
                 break;
             }
-            if fallback_page.is_none() && trimmed.contains("contents") {
+            if fallback_page.is_none() && normalized.contains("contents") {
                 fallback_page = Some(page_idx as u32);
             }
         }
@@ -601,11 +666,17 @@ fn extract_toc_lines(page_chars: &[(Vec<PdfChar>, f32)], toc_pages: &[u32]) -> V
                 .unwrap();
             let top_text = lines[top_idx].text();
             let top_lower = top_text.trim().to_ascii_lowercase();
+            let top_normalized = normalize_toc_header_text(&top_text);
             if top_lower == "contents"
                 || top_lower == "table of contents"
                 || top_lower == "detailed contents"
                 || top_lower.starts_with("contents ")
                 || top_lower.starts_with("table of contents ")
+                || top_normalized == "contents"
+                || top_normalized == "tableofcontents"
+                || top_normalized == "detailedcontents"
+                || top_normalized.starts_with("contents")
+                || top_normalized.starts_with("tableofcontents")
             {
                 lines.remove(top_idx);
             }
@@ -983,7 +1054,7 @@ fn split_two_column_lines(lines: Vec<Vec<TocChar>>, _page_height: f32) -> Vec<Ve
 // ── Phase 3: Page number extraction ──
 
 fn split_page_numbers(lines: Vec<TocRawLine>) -> Vec<TocSplitLine> {
-    lines.into_iter().map(split_single_line).collect()
+    explode_embedded_page_refs(lines.into_iter().map(split_single_line).collect())
 }
 
 fn split_single_line(line: TocRawLine) -> TocSplitLine {
@@ -1225,16 +1296,28 @@ fn try_split_by_xgap(line: &TocRawLine) -> Option<(String, String, i32)> {
 /// Strategy C: Split by last whitespace-delimited token.
 fn try_split_by_last_token(text: &str) -> Option<(String, String, i32)> {
     let trimmed = text.trim();
-    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    if parts.len() < 2 {
+    let spans = token_spans(trimmed);
+    if spans.len() < 2 {
         return None;
     }
 
-    let last = parts.last()?;
-    let (label, value) = parse_page_ref(last)?;
+    if let Some((start_idx, end_idx, label, value)) = trailing_page_ref_token_group(trimmed, &spans) {
+        let title = trimmed[..spans[start_idx].0].trim().to_string();
+        if !title.is_empty() {
+            return Some((title, label, value));
+        }
+        if start_idx > 0 {
+            let title = trimmed[..spans[start_idx - 1].0].trim().to_string();
+            if !title.is_empty() {
+                return Some((title, label, value));
+            }
+        }
+        let _ = end_idx;
+    }
 
-    // Reconstruct title without the last token
-    let title = parts[..parts.len() - 1].join(" ");
+    let last = &trimmed[spans[spans.len() - 1].0..spans[spans.len() - 1].1];
+    let (label, value) = parse_page_ref(last)?;
+    let title = trimmed[..spans[spans.len() - 1].0].trim().to_string();
     if title.is_empty() {
         return None;
     }
@@ -1242,10 +1325,46 @@ fn try_split_by_last_token(text: &str) -> Option<(String, String, i32)> {
     Some((title, label, value))
 }
 
+fn trailing_page_ref_token_group(
+    text: &str,
+    spans: &[(usize, usize)],
+) -> Option<(usize, usize, String, i32)> {
+    let max_group = spans.len().min(4);
+    for group_len in (2..=max_group).rev() {
+        let start_idx = spans.len() - group_len;
+        let candidate = text[spans[start_idx].0..spans[spans.len() - 1].1].trim();
+        if let Some((label, value)) = parse_page_ref(candidate) {
+            return Some((start_idx, spans.len(), label, value));
+        }
+    }
+
+    None
+}
+
+fn embedded_page_ref_group(
+    text: &str,
+    spans: &[(usize, usize)],
+    idx: usize,
+) -> Option<(usize, String, i32)> {
+    for end_idx in idx..(idx + 4).min(spans.len()) {
+        let candidate = text[spans[idx].0..spans[end_idx].1].trim();
+        if let Some((label, value)) =
+            parse_page_ref(candidate).or_else(|| parse_ocrish_page_ref_token(candidate))
+        {
+            return Some((end_idx + 1, label, value));
+        }
+    }
+
+    None
+}
+
 /// Parse a page reference string into (label, value).
 /// Arabic → positive, lowercase roman → negative.
 fn parse_page_ref(s: &str) -> Option<(String, i32)> {
-    let s = s.trim();
+    let s = s.trim_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(c, '.' | ',' | ';' | ':' | '·' | '•' | '|' | ')' | '(' | '[' | ']')
+    });
     if s.is_empty() {
         return None;
     }
@@ -1260,6 +1379,10 @@ fn parse_page_ref(s: &str) -> Option<(String, i32)> {
         }
     }
 
+    if is_local_page_label(&compact) {
+        return Some((compact, 0));
+    }
+
     // Try lowercase roman
     if compact.len() <= 10
         && compact
@@ -1272,6 +1395,289 @@ fn parse_page_ref(s: &str) -> Option<(String, i32)> {
     }
 
     None
+}
+
+fn parse_local_page_label_parts(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.split('-');
+    let left = parts.next()?.parse::<u32>().ok()?;
+    let right = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((left, right))
+}
+
+fn normalize_ocrish_page_digits(s: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in s.chars() {
+        let mapped = match ch {
+            '0'..='9' => ch,
+            'O' | 'o' => '0',
+            'I' | 'l' | '|' => '1',
+            'Z' | 'z' => '2',
+            'S' | 's' => '5',
+            _ => return None,
+        };
+        out.push(mapped);
+    }
+    if out.is_empty() || out.len() > 4 {
+        return None;
+    }
+    Some(out)
+}
+
+fn parse_ocrish_page_ref_token(s: &str) -> Option<(String, i32)> {
+    let normalized = normalize_ocrish_page_digits(s.trim())?;
+    let value = normalized.parse::<u32>().ok()?;
+    if value == 0 || value >= 10000 {
+        return None;
+    }
+    Some((normalized, value as i32))
+}
+
+fn is_local_page_label(s: &str) -> bool {
+    parse_local_page_label_parts(s).is_some()
+}
+
+fn explode_embedded_page_refs(lines: Vec<TocSplitLine>) -> Vec<TocSplitLine> {
+    let mut out = Vec::new();
+    for line in lines {
+        explode_embedded_page_refs_rec(line, &mut out);
+    }
+    out
+}
+
+fn explode_embedded_page_refs_rec(line: TocSplitLine, out: &mut Vec<TocSplitLine>) {
+    let Some((left_title, split_label, split_value, right_title)) =
+        find_embedded_page_ref_split(&line.title)
+    else {
+        out.push(line);
+        return;
+    };
+
+    let mut left = line.clone();
+    left.title = left_title;
+    left.page_label = Some(split_label);
+    left.page_value = Some(split_value);
+
+    let mut right = line;
+    right.title = right_title;
+
+    explode_embedded_page_refs_rec(left, out);
+    explode_embedded_page_refs_rec(right, out);
+}
+
+fn find_embedded_page_ref_split(title: &str) -> Option<(String, String, i32, String)> {
+    let tokens = token_spans(title);
+    if tokens.len() < 3 {
+        return None;
+    }
+
+    for idx in (1..tokens.len() - 1).rev() {
+        let Some((right_start_idx, label, value)) = embedded_page_ref_group(title, &tokens, idx) else {
+            continue;
+        };
+        let left = title[..tokens[idx].0].trim();
+        if right_start_idx >= tokens.len() {
+            continue;
+        }
+        let right = title[tokens[right_start_idx].0..].trim();
+        if left.is_empty() || right.is_empty() {
+            continue;
+        }
+        if looks_like_toc_entry_start(left) && looks_like_toc_entry_start(right) {
+            return Some((left.to_string(), label, value, right.to_string()));
+        }
+    }
+
+    None
+}
+
+fn token_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (idx, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(s) = start.take() {
+                spans.push((s, idx));
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, text.len()));
+    }
+    spans
+}
+
+fn looks_like_toc_entry_start(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if starts_with_heading_pattern(t) || is_part_pattern(t) {
+        return true;
+    }
+    if t.starts_with("Appendix ") || t.starts_with("APPENDIX ") || t.starts_with("APPENDICES") {
+        return true;
+    }
+    if headings::is_frontmatter_heading(t) {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "references"
+            | "addenda"
+            | "final exercises"
+            | "index"
+            | "index of names"
+            | "index of definitions"
+            | "index of symbols"
+            | "exercises"
+    )
+}
+
+fn toc_title_is_suspicious(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let tokens = token_spans(trimmed);
+    let heading_like = heading_start_count(trimmed);
+    if heading_like >= 2 {
+        return true;
+    }
+    for idx in 0..tokens.len().saturating_sub(1) {
+        let token = &trimmed[tokens[idx].0..tokens[idx].1];
+        if parse_page_ref(token).is_some() {
+            let candidate = trimmed[tokens[idx + 1].0..].trim();
+            if looks_like_toc_entry_start(candidate) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn toc_title_is_fatally_suspicious(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    if heading_start_count(trimmed) >= 2 {
+        return true;
+    }
+
+    let tokens = token_spans(trimmed);
+    if tokens.len() >= 2 {
+        let first = &trimmed[tokens[0].0..tokens[0].1];
+        let rest = trimmed[tokens[1].0..].trim();
+        if parse_page_ref(first).is_some() && looks_like_toc_entry_start(rest) {
+            // Don't flag "N M" where M is a bare number — that's more likely
+            // "chapter N at page M" than a merged entry. A real merged entry
+            // would have the rest as a multi-token title (e.g. "42 Introduction").
+            let rest_is_bare_number = rest.split_whitespace().count() == 1
+                && rest.chars().all(|c| c.is_ascii_digit());
+            if !rest_is_bare_number {
+                return true;
+            }
+        }
+        if first.chars().all(|c| c.is_ascii_digit())
+            && (rest.starts_with("PART ") || rest.starts_with("Part "))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns true if `text` starts with a NUMERIC heading identifier:
+/// a digit sequence (section number like "1.2") or a roman numeral.
+/// Does NOT match textual patterns like "Chapter N" or "Part I" —
+/// those are heading keywords that may legitimately appear at the end
+/// of a title as cross-references (e.g. "Summary of Chapter 1").
+fn starts_with_numeric_heading(text: &str) -> bool {
+    let t = text.trim();
+    // Leading digit(s): section number like "1", "1.2", "1.2.3"
+    if let Some(first) = t.chars().next() {
+        if first.is_ascii_digit() {
+            let after_digits = t
+                .char_indices()
+                .find(|(_, c)| !c.is_ascii_digit())
+                .map(|(i, c)| (i, c));
+            let is_section_num = match after_digits {
+                None => true,
+                Some((_, ' ')) => true,
+                Some((dot_i, '.')) => {
+                    let after_dot = &t[dot_i + 1..];
+                    let next_non_digit = after_dot.char_indices().find(|(_, c)| !c.is_ascii_digit());
+                    matches!(next_non_digit, None | Some((_, ' ' | '.')))
+                }
+                _ => false,
+            };
+            if is_section_num {
+                return true;
+            }
+        }
+    }
+    // Roman numeral start (uppercase) — require what follows to look like a title,
+    // not just punctuation ("X / . ." is a math expression, not a section heading).
+    if t.starts_with(|c: char| matches!(c, 'I' | 'V' | 'X' | 'L')) {
+        if let Some(space_pos) = t.find(' ') {
+            let prefix = &t[..space_pos];
+            if headings::is_roman_numeral(prefix) {
+                // Check what comes after: must be alphabetic, digit, "." separator
+                // (for "II. Title"), or end of string.
+                let after_space = t[space_pos + 1..].trim_start();
+                let after_first_char = after_space.chars().next();
+                let ok = match after_first_char {
+                    None => true,                        // just the numeral alone
+                    Some('.') => {
+                        // "II. Title" — dot separator, then alphabetic
+                        let after_dot = after_space[1..].trim_start();
+                        after_dot.chars().next().map_or(false, |c| c.is_alphabetic() || c.is_ascii_digit())
+                    }
+                    Some(c) => c.is_alphabetic() || c.is_ascii_digit(), // "II Title"
+                };
+                if ok {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn heading_start_count(text: &str) -> usize {
+    let trimmed = text.trim();
+    let tokens = token_spans(trimmed);
+    tokens
+        .iter()
+        .enumerate()
+        .filter(|(idx, (start, _))| {
+            if *idx == 0 {
+                return true;
+            }
+            let candidate = trimmed[*start..].trim();
+            // A non-initial heading start is only counted when:
+            //  1. the candidate has at least 2 tokens
+            //  2. it starts with a NUMERIC heading identifier (digits/roman)
+            //  3. the preceding token is NOT "PART"/"Chapter" etc.
+            //     (avoids "PART I . Title" → "I . Title" being a false heading start)
+            let candidate_token_count = candidate.split_whitespace().count();
+            if candidate_token_count < 2 || !starts_with_numeric_heading(candidate) {
+                return false;
+            }
+            // Skip if immediately preceded by a structural keyword that owns the numeral
+            let prev_token = &trimmed[tokens[idx - 1].0..tokens[idx - 1].1];
+            let prev_lower = prev_token.to_ascii_lowercase();
+            !matches!(prev_lower.as_str(), "part" | "chapter" | "appendix" | "section")
+        })
+        .count()
 }
 
 /// Parse a lowercase roman numeral string to its numeric value.
@@ -1397,10 +1803,38 @@ fn starts_with_heading_pattern(title: &str) -> bool {
     if is_part_pattern(t) {
         return true;
     }
-    // N.N or N
+    // N.N or N — but only if the digit prefix is a valid section number.
+    // A section number ends with a space, dot, or end-of-string.
+    // Exclude:
+    //   "5×2"      — digit followed by non-dot/non-space (×)
+    //   "2.0/GLSL" — looks like a section "2." but the suffix has "/" not space
     if let Some(first) = t.chars().next() {
         if first.is_ascii_digit() {
-            return true;
+            // Find the end of the leading digit run
+            let after_digits = t
+                .char_indices()
+                .find(|(_, c)| !c.is_ascii_digit())
+                .map(|(i, c)| (i, c));
+            let is_heading_num = match after_digits {
+                None => true,          // entire string is digits: "42"
+                Some((_, ' ')) => true, // "1 Title"
+                Some((dot_i, '.')) => {
+                    // "1.2 Title" or "1.2.3" — but NOT "2.0/GLSL"
+                    // Verify that after the dot we have digits then space/dot/end
+                    let after_dot = &t[dot_i + 1..];
+                    let next_non_digit = after_dot
+                        .char_indices()
+                        .find(|(_, c)| !c.is_ascii_digit());
+                    matches!(
+                        next_non_digit,
+                        None | Some((_, ' ' | '.'))
+                    )
+                }
+                _ => false, // "5×2" or similar — not a heading number
+            };
+            if is_heading_num {
+                return true;
+            }
         }
     }
     // Roman numeral start
@@ -1437,6 +1871,8 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
     let mut last_classified_depth = 1u32;
 
     for line in &lines {
+        let mut line = line.clone();
+        line.title = trim_to_first_heading_start(&line.title);
         if line.page_label.is_none() && !is_part_pattern(&line.title) {
             // No page number and not a Part heading → will be dropped
             continue;
@@ -1445,7 +1881,7 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
         if class != Classification::Unknown {
             last_classified_depth = depth;
         }
-        entries.push((line.clone(), class, depth));
+        entries.push((line, class, depth));
     }
 
     // Post-classification: propagate FrontMatter to adjacent Unknown entries
@@ -1571,6 +2007,42 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
     demote_per_chapter_fm(&mut result);
 
     result
+}
+
+fn trim_to_first_heading_start(title: &str) -> String {
+    let trimmed = strip_leading_page_ref_garbage(title.trim());
+    if trimmed.is_empty() || looks_like_toc_entry_start(trimmed) {
+        return trimmed.to_string();
+    }
+
+    let tokens = token_spans(trimmed);
+    for idx in 1..tokens.len() {
+        let candidate = trimmed[tokens[idx].0..].trim();
+        if looks_like_toc_entry_start(candidate) {
+            return candidate.to_string();
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn strip_leading_page_ref_garbage(title: &str) -> &str {
+    let trimmed = title.trim();
+    let tokens = token_spans(trimmed);
+    if tokens.len() < 2 {
+        return trimmed;
+    }
+
+    for idx in 0..tokens.len().saturating_sub(1).min(3) {
+        let prefix = trimmed[..tokens[idx].1].trim();
+        let rest = trimmed[tokens[idx + 1].0..].trim();
+        let prefix_looks_page = parse_page_ref(prefix).is_some() || parse_ocrish_page_ref_token(prefix).is_some();
+        if prefix_looks_page && looks_like_toc_entry_start(rest) {
+            return rest;
+        }
+    }
+
+    trimmed
 }
 
 /// Classify a TOC entry by its title text pattern.
@@ -1802,6 +2274,16 @@ fn resolve_unknowns_sequential(
 /// FrontMatter entry to catch nearby entries like "About the Authors" next to
 /// "Preface".
 fn propagate_frontmatter(entries: &mut [(TocSplitLine, Classification, u32)]) {
+    // Only propagate from FrontMatter entries that appear before the first
+    // structural (Chapter/Part) entry in the TOC. FrontMatter-classified entries
+    // within the body (e.g. "REFERENCES" at the end of a chapter, "INDEX" mid-TOC)
+    // must NOT propagate — their backward/forward scans would incorrectly promote
+    // chapter subsections. The second pass (BackMatter scan) handles genuine
+    // back-matter entries at the end of the TOC.
+    let first_chapter_idx = entries
+        .iter()
+        .position(|(_, c, _)| matches!(c, Classification::Chapter | Classification::Part));
+
     let fm_indices: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -1810,6 +2292,12 @@ fn propagate_frontmatter(entries: &mut [(TocSplitLine, Classification, u32)]) {
         .collect();
 
     for fm_idx in fm_indices {
+        // Skip FM entries that appear after the first chapter — they are within
+        // the chapter body and should not propagate to adjacent unknowns.
+        if first_chapter_idx.map_or(false, |fc| fm_idx >= fc) {
+            continue;
+        }
+
         let fm_font = entries[fm_idx].0.font_sig.clone();
         let fm_x = entries[fm_idx].0.x_left;
         let fm_depth = entries[fm_idx].2;
@@ -2129,10 +2617,50 @@ fn resolve_bare_letter_sections(entries: &mut [ClassifiedEntry]) {
 fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
     // Remove duplicates (same title + same page)
     let mut seen = std::collections::HashSet::new();
-    entries.retain(|e| seen.insert((e.title.clone(), e.page_value)));
+    entries.retain(|e| seen.insert((e.title.clone(), e.page_label.clone(), e.page_value)));
+
+    for entry in entries.iter_mut() {
+        let trimmed_title = entry.title.trim();
+        if should_strip_leading_page_number(trimmed_title, entry.page_value) {
+            if let Some(stripped) = strip_initial_numeric_token(trimmed_title) {
+                entry.title = stripped.to_string();
+            }
+        }
+        if let Some(normalized_part) = normalize_roman_part_title(entry.title.trim()) {
+            entry.title = normalized_part;
+            entry.classification = Classification::Part;
+            entry.depth = 0;
+        }
+    }
 
     // Drop entries with no page number
-    entries.retain(|e| e.page_value != 0);
+    entries.retain(|e| e.page_value != 0 || is_local_page_label(&e.page_label));
+
+    // Sort entries into document page order.
+    //
+    // Some books have a "brief TOC" (chapters only) followed by a "detailed TOC"
+    // (chapters + sections).  After deduplication the chapters end up first with
+    // increasing page values, then the sections follow with smaller page values
+    // (a huge backwards jump).  The sequencing check below would drop all of the
+    // sections.  Sorting by page order fixes this without altering depth info.
+    //
+    // Sort key:
+    //   front matter (pv < 0): map -pv so smaller roman numerals sort first
+    //   body        (pv > 0): pv directly (non-decreasing = correct)
+    //   zero-page parts:      stable at top of body (very large key within part group)
+    entries.sort_by_key(|e| {
+        let pv = e.page_value;
+        if pv < 0 {
+            // page i (-1) sorts before page ii (-2), etc.
+            -pv as i64
+        } else if pv == 0 {
+            // Part headings with no page — keep in their original relative position.
+            // We use i64::MAX so they sort last (degenerate case; rare).
+            i64::MAX
+        } else {
+            1_000_000i64 + pv as i64
+        }
+    });
 
     // Drop entries that break page-number sequencing.
     //
@@ -2146,16 +2674,70 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
     let mut in_body = false;
     let mut last_front = 0i32; // tracks most-negative front matter value seen
     let mut last_body = 0i32;
+    let mut last_local: Option<(u32, u32)> = None;
 
     entries.retain(|e| {
         let pv = e.page_value;
+        let is_local = is_local_page_label(&e.page_label);
+        let title_lower = e.title.trim().to_ascii_lowercase();
+        let trimmed_title = e.title.trim();
 
         // Part headings without a page number are always kept
         if pv == 0 && e.classification == Classification::Part {
             return true;
         }
+        if title_lower.contains("(continued)") || title_lower == "continued" {
+            tracing::debug!("TOC: dropping continuation stub: {:?}", e.title);
+            return false;
+        }
+        if title_is_enumerated_body_spill(trimmed_title) {
+            tracing::debug!("TOC: dropping enumerated body spill: {:?}", e.title);
+            return false;
+        }
+        // Only apply author-line detection to Unknown/FrontMatter/BackMatter entries.
+        // Chapter/Section entries that have had their leading number stripped can
+        // look like title-case names (e.g. "Fundamentals Of Unconstrained Optimization").
+        let is_structural = matches!(
+            e.classification,
+            Classification::Chapter
+                | Classification::Section
+                | Classification::Subsection
+                | Classification::SubSubsection
+        );
+        if !is_structural && title_looks_like_author_line(&e.title) {
+            tracing::debug!("TOC: dropping author-like entry: {:?}", e.title);
+            return false;
+        }
+        if title_looks_like_first_local_page_author_spill(e) {
+            tracing::debug!("TOC: dropping first-local-page author spill: {:?}", e.title);
+            return false;
+        }
+        if is_local {
+            let Some(curr) = parse_local_page_label_parts(&e.page_label) else {
+                return false;
+            };
+            if let Some(prev) = last_local {
+                if curr < prev {
+                    tracing::debug!(
+                        "TOC: dropping out-of-sequence local-label entry: {:?} (p.{}) after p.{}-{}",
+                        e.title,
+                        e.page_label,
+                        prev.0,
+                        prev.1
+                    );
+                    return false;
+                }
+            }
+            last_local = Some(curr);
+            return true;
+        }
 
         if pv > 0 {
+            let allow_backmatter_reorder =
+                matches!(e.classification, Classification::BackMatter) || title_is_backmatter_like(trimmed_title);
+            if allow_backmatter_reorder {
+                return true;
+            }
             // Entering or continuing the body
             if !in_body {
                 in_body = true;
@@ -2195,6 +2777,209 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
             true
         }
     });
+}
+
+fn strip_initial_numeric_token(title: &str) -> Option<&str> {
+    let trimmed = title.trim();
+    let tokens = token_spans(trimmed);
+    if tokens.len() < 2 {
+        return None;
+    }
+    let first = &trimmed[tokens[0].0..tokens[0].1];
+    if parse_page_ref(first).is_none() && parse_ocrish_page_ref_token(first).is_none() {
+        return None;
+    }
+    Some(trimmed[tokens[1].0..].trim())
+}
+
+fn should_strip_leading_page_number(title: &str, page_value: i32) -> bool {
+    let tokens = token_spans(title);
+    if tokens.len() < 2 {
+        return false;
+    }
+    let first = &title[tokens[0].0..tokens[0].1];
+    let Some((_, first_value)) = parse_page_ref(first).or_else(|| parse_ocrish_page_ref_token(first)) else {
+        return false;
+    };
+    let rest = title[tokens[1].0..].trim();
+    let second = &title[tokens[1].0..tokens[1].1];
+    let second_lower = second.to_ascii_lowercase();
+
+    if matches!(second_lower.as_str(), "appendix" | "index" | "references" | "addenda" | "final") {
+        return true;
+    }
+
+    if first_value == 0 {
+        return true;
+    }
+
+    if page_value > 0 && (page_value - first_value).abs() <= 80 {
+        return true;
+    }
+
+    if second
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
+        && page_value > 200
+        && first_value > 100
+    {
+        return true;
+    }
+
+    rest.starts_with("Global ")
+}
+
+fn title_is_enumerated_body_spill(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.len() < 80 {
+        return false;
+    }
+    let count = [" 1.", " 2.", " 3.", " 4.", " (a)", " (b)", " (c)"]
+        .iter()
+        .filter(|needle| trimmed.contains(**needle))
+        .count();
+    count >= 2
+}
+
+fn title_looks_like_author_line(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() || looks_like_toc_entry_start(trimmed) {
+        return false;
+    }
+    if headings::is_frontmatter_heading(trimmed) {
+        return false;
+    }
+
+    let tokens: Vec<&str> = trimmed
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '(' | ')')))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.len() < 2 || tokens.len() > 8 {
+        return false;
+    }
+
+    let mut capitalized = 0usize;
+    let mut connector = 0usize;
+    for token in &tokens {
+        let lower = token.to_ascii_lowercase();
+        if matches!(lower.as_str(), "and" | "&" | "de" | "van" | "von" | "da" | "del") {
+            connector += 1;
+            continue;
+        }
+        let first = token.chars().next().unwrap_or_default();
+        let mut rest = token.chars().skip(1);
+        let initials = token.len() <= 2
+            && token
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c == '.');
+        let name_like = initials
+            || (first.is_uppercase()
+                && rest.all(|c| !c.is_alphabetic() || c.is_lowercase() || c == '-' || c == '\''));
+        if name_like {
+            capitalized += 1;
+        } else {
+            return false;
+        }
+    }
+
+    capitalized + connector == tokens.len() && capitalized >= 2
+}
+
+fn title_looks_like_first_local_page_author_spill(entry: &ClassifiedEntry) -> bool {
+    if !is_local_page_label(&entry.page_label) || entry.depth == 0 {
+        return false;
+    }
+    let Some((_, local_page)) = parse_local_page_label_parts(&entry.page_label) else {
+        return false;
+    };
+    if local_page != 1 {
+        return false;
+    }
+
+    let trimmed = entry.title.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(|c| c.is_ascii_digit())
+        || looks_like_toc_entry_start(trimmed)
+        || headings::is_frontmatter_heading(trimmed)
+    {
+        return false;
+    }
+
+    let tokens: Vec<&str> = trimmed
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| matches!(c, ',' | '.' | ';' | ':' | '(' | ')')))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() || tokens.len() > 5 {
+        return false;
+    }
+
+    let all_nameish = tokens.iter().all(|token| {
+        let lower = token.to_ascii_lowercase();
+        if matches!(lower.as_str(), "and" | "&" | "de" | "van" | "von" | "da" | "del" | "der") {
+            return true;
+        }
+        token
+            .chars()
+            .all(|c| c.is_alphabetic() || c == '-' || c == '\'' || c == '.')
+    });
+    let has_capital = tokens.iter().any(|token| {
+        token
+            .chars()
+            .next()
+            .map(|c| c.is_uppercase())
+            .unwrap_or(false)
+    });
+
+    all_nameish && has_capital
+}
+
+fn title_is_backmatter_like(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("Appendix ") || trimmed.starts_with("APPENDIX ") {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower == "references"
+        || lower == "index"
+        || lower.starts_with("index of ")
+        || lower == "addenda"
+        || lower == "appendices"
+}
+
+fn normalize_roman_part_title(title: &str) -> Option<String> {
+    let trimmed = title.trim();
+    let tokens = token_spans(trimmed);
+    if tokens.len() < 3 || tokens.len() > 6 {
+        return None;
+    }
+    if trimmed.starts_with("PART ") || trimmed.starts_with("Part ") {
+        return None;
+    }
+    let first = &trimmed[tokens[0].0..tokens[0].1];
+    let second = &trimmed[tokens[1].0..tokens[1].1];
+    let rest = trimmed[tokens[2].0..].trim();
+    if second != "." || rest.is_empty() {
+        return None;
+    }
+    let roman = first.replace(' ', "");
+    if roman.is_empty()
+        || !roman
+            .chars()
+            .all(|c| matches!(c.to_ascii_uppercase(), 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M'))
+    {
+        return None;
+    }
+    if !rest.chars().any(|c| c.is_alphabetic()) {
+        return None;
+    }
+    Some(format!("PART {} . {}", roman, rest))
 }
 
 // ── Font profile building ──

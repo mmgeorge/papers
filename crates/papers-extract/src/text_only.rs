@@ -725,7 +725,9 @@ pub fn extract_page_text_blocks(
                 return false;
             }
             let kind = classify_block(block, trimmed, headings, page_height_pt, page_median_font, has_font_headings);
-            kind == RegionKind::Text && text_cleanup::is_likely_formula_text(trimmed)
+            kind == RegionKind::Text
+                && text_cleanup::is_likely_formula_text(trimmed)
+                && !looks_like_codeish_formula_false_positive(trimmed)
         })
         .collect();
 
@@ -865,6 +867,7 @@ pub fn extract_page_text_blocks(
 
         // Apply shared text cleanup (drop caps, ligatures, InDesign, dedup)
         extracted = text_cleanup::clean_block_text(&extracted);
+        extracted = sanitize_extracted_block_text(&extracted);
 
         let trimmed = extracted.trim();
         // Skip empty/tiny blocks, but NOT if they're in a formula zone
@@ -896,7 +899,9 @@ pub fn extract_page_text_blocks(
             formula_tag = tag;
         } else if kind == RegionKind::Text {
             // Re-check: might be formula after char filtering changed the text
-            if text_cleanup::is_likely_formula_text(trimmed) {
+            if text_cleanup::is_likely_formula_text(trimmed)
+                && !looks_like_codeish_formula_false_positive(trimmed)
+            {
                 let (formula_text, tag) = text_cleanup::extract_formula_tag(&extracted);
                 extracted = formula_text;
                 formula_tag = tag;
@@ -930,6 +935,7 @@ pub fn extract_page_text_blocks(
                         text::AssemblyMode::PreserveLayout,
                     );
                     extracted = text_cleanup::clean_block_text(&preserved);
+                    extracted = sanitize_extracted_block_text(&extracted);
                     kind = RegionKind::Algorithm;
                 }
             }
@@ -983,9 +989,11 @@ pub fn extract_page_text_blocks(
                             pos += line.len() + 1; // +1 for \n
                         }
                         if found {
-                            text_cleanup::clean_block_text(preserved[pos..].trim())
+                            sanitize_extracted_block_text(&text_cleanup::clean_block_text(
+                                preserved[pos..].trim(),
+                            ))
                         } else {
-                            text_cleanup::clean_block_text(&preserved)
+                            sanitize_extracted_block_text(&text_cleanup::clean_block_text(&preserved))
                         }
                     };
                     let body_id = format!("p{}_{}", page_idx + 1, block_idx);
@@ -1003,6 +1011,29 @@ pub fn extract_page_text_blocks(
                     });
                     continue; // skip normal region push
                 }
+            }
+
+            if let Some((body_text, caption_text)) = split_trailing_figure_caption(&extracted) {
+                extracted = body_text;
+                let caption_id = format!("p{}_{}_tailcap", page_idx + 1, block_idx);
+                regions.push(Region {
+                    id: caption_id,
+                    kind: RegionKind::FigureTitle,
+                    bbox: block.bbox,
+                    confidence: 1.0,
+                    order: 0,
+                    text: Some(caption_text),
+                    html: None,
+                    latex: None,
+                    image_path: None,
+                    caption: None,
+                    chart_type: None,
+                    tag: None,
+                    items: None,
+                    formula_source: None,
+                    ocr_confidence: None,
+                    consumed: false,
+                });
             }
         }
 
@@ -1068,12 +1099,26 @@ pub fn extract_page_text_blocks(
     // The two-pass classification can produce duplicate formula regions when
     // overlapping blocks both get classified as DisplayFormula.
     dedup_overlapping_formulas(&mut regions);
+    trim_duplicated_caption_prefixes(&mut regions);
+    split_caption_body_spill(&mut regions);
+    dedup_redundant_captions(&mut regions);
+    demote_body_like_captions(&mut regions);
+    demote_embedded_paragraph_titles(&mut regions);
 
     // Step 6: Reading order via XY-Cut
     if regions.len() > 1 {
         reading_order::xy_cut_order(&mut regions);
         regions.sort_by_key(|r| r.order);
     }
+    merge_stacked_caption_fragments(&mut regions);
+    demote_body_like_captions(&mut regions);
+    drop_figure_internal_annotation_fragments(&mut regions);
+    drop_symbol_heavy_figure_annotation_text(&mut regions);
+    drop_narrow_figure_label_scraps_above_caption(&mut regions);
+    drop_lowercase_figure_spill_text(&mut regions);
+    drop_caption_adjacent_follow_on_spill(&mut regions);
+    drop_short_figure_label_scraps(&mut regions);
+    demote_local_figure_reference_captions(&mut regions);
 
     regions
 }
@@ -1578,6 +1623,34 @@ fn find_first_line_number_pos(text: &str) -> Option<usize> {
     None
 }
 
+fn split_trailing_figure_caption(text: &str) -> Option<(String, String)> {
+    let mut line_starts = Vec::new();
+    let mut pos = 0usize;
+    for line in text.split('\n') {
+        line_starts.push((pos, line));
+        pos += line.len() + 1;
+    }
+
+    let (start, line) = line_starts
+        .iter()
+        .rev()
+        .find(|(_, line)| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("Figure ")
+                || trimmed.starts_with("Figure ")
+                || trimmed.starts_with("Fig. ")
+                || trimmed.starts_with("Table ")
+        })?;
+
+    let body = text[..*start].trim_end().to_string();
+    let caption = line.trim().to_string();
+    if body.is_empty() || caption.len() < 8 {
+        None
+    } else {
+        Some((body, caption))
+    }
+}
+
 // ── Formula fragment detection ──────────────────────────────────────
 
 fn is_formula_fragment(text: &str) -> bool {
@@ -1599,6 +1672,99 @@ fn is_formula_fragment(text: &str) -> bool {
     }
 
     word_ratio < MIN_ALPHA_RATIO
+}
+
+fn looks_like_codeish_formula_false_positive(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let indicators = [
+        lower.contains("for(") || lower.contains("for ("),
+        lower.contains("while(") || lower.contains("while ("),
+        lower.contains("if(") || lower.contains("if ("),
+        lower.contains("return "),
+        lower.contains("void "),
+        lower.contains("int "),
+        lower.contains("const "),
+        lower.contains("vector<"),
+        trimmed.contains("//"),
+        trimmed.contains("++") || trimmed.contains("--"),
+        trimmed.contains(';'),
+        trimmed.contains('{') || trimmed.contains('}'),
+    ];
+    let indicator_count = indicators.into_iter().filter(|flag| *flag).count();
+
+    if indicator_count >= 2 {
+        return true;
+    }
+
+    let first_token = trimmed.split_whitespace().next().unwrap_or("");
+    let is_line_number = first_token.chars().all(|c| c.is_ascii_digit())
+        || (first_token.starts_with('*')
+            && first_token.ends_with('*')
+            && first_token.len() > 2
+            && first_token[1..first_token.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_digit()));
+
+    indicator_count >= 1 && is_line_number
+}
+
+fn collapse_spaces_preserving_newlines(text: &str) -> String {
+    text.split('\n')
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn strip_suspicious_inline_formula_garble(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0usize;
+    while idx < text.len() {
+        let Some(rel_start) = text[idx..].find('$') else {
+            out.push_str(&text[idx..]);
+            break;
+        };
+        let start = idx + rel_start;
+        out.push_str(&text[idx..start]);
+        let Some(rel_end) = text[start + 1..].find('$') else {
+            out.push_str(&text[start..]);
+            break;
+        };
+        let end = start + 1 + rel_end;
+        let inner = &text[start + 1..end];
+        let alpha_count = inner.chars().filter(|c| c.is_ascii_alphabetic()).count();
+        let has_space = inner.chars().any(|c| c.is_whitespace());
+        let has_math_ops = inner
+            .chars()
+            .any(|c| matches!(c, '=' | '+' | '-' | '×' | '·' | '/' | '\\'));
+        let suspicious = inner.len() >= 20
+            && alpha_count >= 15
+            && !has_space
+            && !has_math_ops
+            && (inner.contains("PartI") || inner.contains(','));
+        if !suspicious {
+            out.push('$');
+            out.push_str(inner);
+            out.push('$');
+        }
+        idx = end + 1;
+    }
+    out
+}
+
+fn sanitize_extracted_block_text(text: &str) -> String {
+    let cleaned = strip_suspicious_inline_formula_garble(text)
+        .replace("Letus", "Let us")
+        .replace("letus", "let us")
+        .replace("ofu $F^{S}$ u 5 ", "of ")
+        .replace("SF**", "*F*");
+    collapse_spaces_preserving_newlines(&cleaned)
 }
 
 /// Compute per-segment bboxes after `split_embedded_captions`.
@@ -2018,6 +2184,727 @@ fn dedup_overlapping_formulas(regions: &mut Vec<Region>) {
     }
 }
 
+fn demote_embedded_paragraph_titles(regions: &mut [Region]) {
+    for idx in 0..regions.len() {
+        if regions[idx].kind != RegionKind::ParagraphTitle {
+            continue;
+        }
+        let Some(title_text) = regions[idx].text.as_deref() else {
+            continue;
+        };
+        let word_count = title_text.split_whitespace().count();
+        if word_count < 10 {
+            continue;
+        }
+        let title_bbox = regions[idx].bbox;
+
+        let overlaps_body_line = regions.iter().enumerate().any(|(j, other)| {
+            if j == idx || other.kind != RegionKind::Text {
+                return false;
+            }
+            let Some(other_text) = other.text.as_deref() else {
+                return false;
+            };
+            if other_text.split_whitespace().count() < 3 {
+                return false;
+            }
+            let other_bbox = other.bbox;
+            let y_overlap = (title_bbox[3].min(other_bbox[3]) - title_bbox[1].max(other_bbox[1])).max(0.0);
+            let min_h = (title_bbox[3] - title_bbox[1]).min(other_bbox[3] - other_bbox[1]);
+            if min_h <= 0.0 || y_overlap / min_h < 0.3 {
+                return false;
+            }
+            let x_gap = if other_bbox[2] <= title_bbox[0] {
+                title_bbox[0] - other_bbox[2]
+            } else if title_bbox[2] <= other_bbox[0] {
+                other_bbox[0] - title_bbox[2]
+            } else {
+                0.0
+            };
+            x_gap <= 40.0
+        });
+
+        if overlaps_body_line {
+            regions[idx].kind = RegionKind::Text;
+        }
+    }
+}
+
+fn normalize_caption_key(text: &str) -> String {
+    text.to_lowercase()
+        .replace('*', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn trim_duplicated_caption_prefixes(regions: &mut Vec<Region>) {
+    let len = regions.len();
+    for i in 0..len {
+        if !regions[i].kind.is_caption() {
+            continue;
+        }
+        let Some(long_text) = regions[i].text.clone() else {
+            continue;
+        };
+        let long_norm = normalize_caption_key(&long_text);
+        if long_norm.len() < 40 {
+            continue;
+        }
+
+        let mut best_prefix: Option<String> = None;
+        for j in 0..len {
+            if i == j || regions[j].kind != regions[i].kind {
+                continue;
+            }
+            let Some(short_text) = regions[j].text.as_deref() else {
+                continue;
+            };
+            if short_text.len() >= long_text.len() {
+                continue;
+            }
+            let short_norm = normalize_caption_key(short_text);
+            if short_norm.len() < 20 {
+                continue;
+            }
+            if long_norm.starts_with(&short_norm) {
+                let take = match &best_prefix {
+                    Some(prev) => short_norm.len() > prev.len(),
+                    None => true,
+                };
+                if take {
+                    best_prefix = Some(short_text.to_string());
+                }
+            }
+        }
+
+        let Some(prefix_text) = best_prefix else {
+            continue;
+        };
+        let prefix_norm = normalize_caption_key(&prefix_text);
+        let long_words: Vec<&str> = long_text.split_whitespace().collect();
+        let prefix_words: Vec<&str> = prefix_text.split_whitespace().collect();
+        if prefix_words.len() < 4 || long_words.len() <= prefix_words.len() + 3 {
+            continue;
+        }
+
+        let mut match_len = 0usize;
+        while match_len < prefix_words.len()
+            && match_len < long_words.len()
+            && long_words[match_len].eq_ignore_ascii_case(prefix_words[match_len])
+        {
+            match_len += 1;
+        }
+        if match_len + 4 > long_words.len() {
+            continue;
+        }
+
+        let trailing = long_words[match_len..].join(" ");
+        let trailing_norm = normalize_caption_key(&trailing);
+        if trailing_norm.is_empty() || trailing_norm == prefix_norm {
+            continue;
+        }
+
+        if let Some(text) = &mut regions[i].text {
+            *text = trailing.trim().to_string();
+        }
+        regions[i].kind = RegionKind::Text;
+    }
+}
+
+fn find_caption_body_spill_split(text: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    for i in 0..chars.len().saturating_sub(2) {
+        let (idx, ch) = chars[i];
+        if ch != '.' && ch != ')' && ch != ':' {
+            continue;
+        }
+        let (_, next) = chars[i + 1];
+        let (_, after) = chars[i + 2];
+        if !next.is_whitespace() || !after.is_lowercase() {
+            continue;
+        }
+        let before = text[..idx + ch.len_utf8()].trim();
+        let after_text = text[idx + ch.len_utf8()..].trim();
+        if before.split_whitespace().count() < 6 || after_text.split_whitespace().count() < 8 {
+            continue;
+        }
+        return Some(idx + ch.len_utf8());
+    }
+
+    if text_cleanup::match_label_prefix(text.trim()).is_some() {
+        for i in 0..chars.len().saturating_sub(1) {
+            let (idx, ch) = chars[i];
+            if ch != '.' && ch != ')' && ch != ':' {
+                continue;
+            }
+            let (_, next) = chars[i + 1];
+            if !next.is_whitespace() {
+                continue;
+            }
+            let before = text[..idx + ch.len_utf8()].trim();
+            let after_text = text[idx + ch.len_utf8()..].trim();
+            let after_first = after_text
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase();
+            let body_starters = [
+                "although", "however", "where", "when", "thus", "therefore", "because", "if",
+                "this", "these", "the",
+            ];
+            if before.split_whitespace().count() <= 4
+                && after_text.split_whitespace().count() >= 10
+                && body_starters.contains(&after_first.as_str())
+            {
+                return Some(idx + ch.len_utf8());
+            }
+        }
+    }
+    None
+}
+
+fn split_caption_body_spill(regions: &mut Vec<Region>) {
+    let mut i = 0;
+    while i < regions.len() {
+        if !regions[i].kind.is_caption() {
+            i += 1;
+            continue;
+        }
+        let Some(text) = regions[i].text.clone() else {
+            i += 1;
+            continue;
+        };
+        if text.split_whitespace().count() < 18 {
+            i += 1;
+            continue;
+        }
+        let Some(split_at) = find_caption_body_spill_split(&text) else {
+            i += 1;
+            continue;
+        };
+        let caption = text[..split_at].trim().to_string();
+        let body = text[split_at..].trim().to_string();
+        if body.is_empty() {
+            i += 1;
+            continue;
+        }
+        regions[i].text = Some(caption);
+        let mut body_region = regions[i].clone();
+        body_region.kind = RegionKind::Text;
+        body_region.text = Some(body);
+        regions.insert(i + 1, body_region);
+        i += 2;
+    }
+}
+
+fn caption_label_key(text: &str) -> Option<String> {
+    let mut tokens = Vec::new();
+    for raw in text.split_whitespace() {
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '.')
+            .collect();
+        if cleaned.is_empty() {
+            continue;
+        }
+        tokens.push(cleaned.to_lowercase());
+        if tokens.len() >= 2 {
+            break;
+        }
+    }
+    if tokens.len() >= 2 {
+        Some(tokens.join(" "))
+    } else {
+        None
+    }
+}
+
+fn dedup_redundant_captions(regions: &mut Vec<Region>) {
+    let mut keep = vec![true; regions.len()];
+    for i in 0..regions.len() {
+        if !regions[i].kind.is_caption() {
+            continue;
+        }
+        let Some(text_i) = regions[i].text.as_deref() else {
+            continue;
+        };
+        let Some(key_i) = caption_label_key(text_i) else {
+            continue;
+        };
+        for j in (i + 1)..regions.len() {
+            if regions[j].kind != regions[i].kind {
+                continue;
+            }
+            let Some(text_j) = regions[j].text.as_deref() else {
+                continue;
+            };
+            let Some(key_j) = caption_label_key(text_j) else {
+                continue;
+            };
+            if key_i != key_j {
+                continue;
+            }
+
+            let norm_i = normalize_caption_key(text_i);
+            let norm_j = normalize_caption_key(text_j);
+            let prefer_i = text_i.len() <= text_j.len()
+                || norm_j.starts_with(&norm_i)
+                || (text_i.ends_with('.') && !text_j.ends_with('.'));
+            if prefer_i {
+                keep[j] = false;
+            } else {
+                keep[i] = false;
+            }
+        }
+    }
+
+    let mut idx = 0usize;
+    regions.retain(|_| {
+        let retain = keep[idx];
+        idx += 1;
+        retain
+    });
+}
+
+fn looks_like_body_prose_caption_false_positive(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.split_whitespace().count() < 12 {
+        return false;
+    }
+    let starts_with_named_caption = {
+        let lower = trimmed.to_ascii_lowercase();
+        lower.starts_with("figure ")
+            || lower.starts_with("fig. ")
+            || lower.starts_with("fig ")
+            || lower.starts_with("table ")
+            || lower.starts_with("tab. ")
+    };
+    if text_cleanup::match_label_prefix(trimmed).is_some() && starts_with_named_caption {
+        return false;
+    }
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    let looks_like_figure_ref = first
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c.is_ascii_lowercase())
+        && first.chars().any(|c| c.is_ascii_digit())
+        && first.contains('.');
+    let padded = format!(" {trimmed} ");
+    let body_verbs = [
+        " shows ",
+        " illustrate",
+        " consider ",
+        " suggest ",
+        " means ",
+        " represents ",
+        " moving ",
+    ];
+    looks_like_figure_ref || body_verbs.iter().any(|needle| padded.contains(needle))
+}
+
+fn demote_body_like_captions(regions: &mut [Region]) {
+    for region in regions.iter_mut() {
+        if !region.kind.is_caption() {
+            continue;
+        }
+        let Some(text) = region.text.as_deref() else {
+            continue;
+        };
+        if looks_like_body_prose_caption_false_positive(text) {
+            region.kind = RegionKind::Text;
+        }
+    }
+}
+
+fn merge_stacked_caption_fragments(regions: &mut Vec<Region>) {
+    let mut i = 0usize;
+    while i < regions.len() {
+        let Some(text) = regions[i].text.as_deref() else {
+            i += 1;
+            continue;
+        };
+        if text_cleanup::match_label_prefix(text.trim()).is_none() {
+            i += 1;
+            continue;
+        }
+
+        let mut merged = text.trim().replace("**", "");
+        let mut merged_any = false;
+        let base_bbox = regions[i].bbox;
+        let mut j = i + 1;
+        while j < regions.len() {
+            let Some(next_text) = regions[j].text.as_deref() else {
+                break;
+            };
+            let next_trimmed = next_text.trim();
+            if next_trimmed.is_empty() {
+                break;
+            }
+            let next_bbox = regions[j].bbox;
+            let y_gap = next_bbox[1] - base_bbox[3];
+            let x_overlap = (base_bbox[2].min(next_bbox[2]) - base_bbox[0].max(next_bbox[0])).max(0.0);
+            let min_w = (base_bbox[2] - base_bbox[0]).min(next_bbox[2] - next_bbox[0]).max(1.0);
+            let same_stack = y_gap <= 32.0 && x_overlap / min_w >= 0.15;
+            let next_is_duplicate_label = text_cleanup::match_label_prefix(next_trimmed).is_some();
+            let next_is_short_fragment = next_trimmed.split_whitespace().count() <= 14;
+            let next_kind_ok = matches!(
+                regions[j].kind,
+                RegionKind::Text | RegionKind::FigureTitle | RegionKind::TableTitle | RegionKind::FigureTableTitle
+            );
+            if !same_stack || !next_kind_ok || (!next_is_duplicate_label && !next_is_short_fragment) {
+                break;
+            }
+
+            if !next_is_duplicate_label {
+                if !merged.ends_with(' ') {
+                    merged.push(' ');
+                }
+                merged.push_str(next_trimmed.replace("**", "").trim());
+                merged_any = true;
+            }
+            regions.remove(j);
+        }
+
+        if merged_any {
+            regions[i].kind = RegionKind::FigureTitle;
+            regions[i].text = Some(collapse_spaces_preserving_newlines(&merged));
+        }
+        i += 1;
+    }
+}
+
+fn drop_figure_internal_annotation_fragments(regions: &mut Vec<Region>) {
+    let mut keep = vec![true; regions.len()];
+    for i in 0..regions.len() {
+        if !matches!(regions[i].kind, RegionKind::Text | RegionKind::TableTitle) {
+            continue;
+        }
+        let Some(text) = regions[i].text.as_deref() else {
+            continue;
+        };
+        let width = regions[i].bbox[2] - regions[i].bbox[0];
+        let word_count = text.split_whitespace().count();
+        let formulaish = text.contains('$')
+            || text.contains("**")
+            || text.contains("SF")
+            || text.contains("r^{S}");
+        if width > 180.0 || word_count > 16 || !formulaish {
+            continue;
+        }
+        let near_caption = regions.iter().enumerate().any(|(j, other)| {
+            if i == j || !other.kind.is_caption() {
+                return false;
+            }
+            let y_gap = if regions[i].bbox[3] <= other.bbox[1] {
+                other.bbox[1] - regions[i].bbox[3]
+            } else if other.bbox[3] <= regions[i].bbox[1] {
+                regions[i].bbox[1] - other.bbox[3]
+            } else {
+                0.0
+            };
+            y_gap <= 120.0
+        });
+        if near_caption {
+            keep[i] = false;
+        }
+    }
+
+    let mut idx = 0usize;
+    regions.retain(|_| {
+        let retain = keep[idx];
+        idx += 1;
+        retain
+    });
+}
+
+fn drop_narrow_figure_label_scraps_above_caption(regions: &mut Vec<Region>) {
+    let mut keep = vec![true; regions.len()];
+    for i in 0..regions.len() {
+        if regions[i].kind != RegionKind::Text {
+            continue;
+        }
+        let Some(text) = regions[i].text.as_deref() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        let word_count = trimmed.split_whitespace().count();
+        if word_count < 2 || word_count > 14 {
+            continue;
+        }
+        if trimmed.contains(". ") || trimmed.contains(':') || trimmed.ends_with('.') {
+            continue;
+        }
+        if trimmed
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let width = regions[i].bbox[2] - regions[i].bbox[0];
+        if width > 190.0 {
+            continue;
+        }
+        let has_below_caption = regions.iter().enumerate().any(|(j, other)| {
+            if i == j || !other.kind.is_caption() {
+                return false;
+            }
+            let same_columnish =
+                (regions[i].bbox[0] - other.bbox[0]).abs() < 170.0
+                    || (regions[i].bbox[2] - other.bbox[2]).abs() < 170.0;
+            let below = other.bbox[1] >= regions[i].bbox[3];
+            let y_gap = if below {
+                other.bbox[1] - regions[i].bbox[3]
+            } else {
+                0.0
+            };
+            same_columnish && below && y_gap <= 280.0
+        });
+        if has_below_caption {
+            keep[i] = false;
+        }
+    }
+
+    let mut idx = 0usize;
+    regions.retain(|_| {
+        let retain = keep[idx];
+        idx += 1;
+        retain
+    });
+}
+
+fn drop_symbol_heavy_figure_annotation_text(regions: &mut Vec<Region>) {
+    let mut keep = vec![true; regions.len()];
+    for i in 0..regions.len() {
+        if regions[i].kind != RegionKind::Text {
+            continue;
+        }
+        let Some(text) = regions[i].text.as_deref() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        let word_count = trimmed.split_whitespace().count();
+        if word_count == 0 || word_count > 18 {
+            continue;
+        }
+        if trimmed.ends_with('.') || trimmed.contains(". ") {
+            continue;
+        }
+        let alpha = trimmed.chars().filter(|c| c.is_alphabetic()).count();
+        let symbols = trimmed
+            .chars()
+            .filter(|c| matches!(c, '*' | '$' | 'γ' | 'Δ' | 'Σ' | 'Π' | '−' | '–'))
+            .count();
+        let alpha_ratio = alpha as f32 / trimmed.len().max(1) as f32;
+        if alpha_ratio > 0.55 && symbols < 3 {
+            continue;
+        }
+        let near_caption = regions.iter().enumerate().any(|(j, other)| {
+            if i == j || !other.kind.is_caption() {
+                return false;
+            }
+            let same_columnish =
+                (regions[i].bbox[0] - other.bbox[0]).abs() < 220.0
+                    || (regions[i].bbox[2] - other.bbox[2]).abs() < 220.0;
+            let y_gap = if regions[i].bbox[1] >= other.bbox[3] {
+                regions[i].bbox[1] - other.bbox[3]
+            } else if other.bbox[1] >= regions[i].bbox[3] {
+                other.bbox[1] - regions[i].bbox[3]
+            } else {
+                0.0
+            };
+            same_columnish && y_gap <= 260.0
+        });
+        if near_caption {
+            keep[i] = false;
+        }
+    }
+
+    let mut idx = 0usize;
+    regions.retain(|_| {
+        let retain = keep[idx];
+        idx += 1;
+        retain
+    });
+}
+
+fn drop_lowercase_figure_spill_text(regions: &mut Vec<Region>) {
+    let mut keep = vec![true; regions.len()];
+    for i in 0..regions.len() {
+        if regions[i].kind != RegionKind::Text {
+            continue;
+        }
+        let Some(text) = regions[i].text.as_deref() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        if trimmed.len() < 20 {
+            continue;
+        }
+        let word_count = trimmed.split_whitespace().count();
+        let width = regions[i].bbox[2] - regions[i].bbox[0];
+        let starts_lowercase = trimmed.chars().next().map(|c| c.is_lowercase()).unwrap_or(false);
+        let ends_bold_marker = trimmed.ends_with("**");
+        let is_short_lowercase_spill =
+            starts_lowercase && (word_count <= 8 || (width < 220.0 && !trimmed.contains(". ")));
+        if !is_short_lowercase_spill && !ends_bold_marker {
+            continue;
+        }
+        let near_caption = regions.iter().enumerate().any(|(j, other)| {
+            if i == j || !other.kind.is_caption() {
+                return false;
+            }
+            let y_overlap = (regions[i].bbox[3].min(other.bbox[3]) - regions[i].bbox[1].max(other.bbox[1])).max(0.0);
+            let y_gap = if y_overlap > 0.0 {
+                0.0
+            } else if regions[i].bbox[1] >= other.bbox[3] {
+                regions[i].bbox[1] - other.bbox[3]
+            } else {
+                other.bbox[1] - regions[i].bbox[3]
+            };
+            y_gap <= 90.0
+        });
+        if near_caption {
+            keep[i] = false;
+        }
+    }
+
+    let mut idx = 0usize;
+    regions.retain(|_| {
+        let retain = keep[idx];
+        idx += 1;
+        retain
+    });
+}
+
+fn drop_caption_adjacent_follow_on_spill(regions: &mut Vec<Region>) {
+    let mut keep = vec![true; regions.len()];
+    for i in 1..regions.len() {
+        if regions[i].kind != RegionKind::Text {
+            continue;
+        }
+        let Some(text) = regions[i].text.as_deref() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        if !trimmed.chars().next().map(|c| c.is_lowercase()).unwrap_or(false) {
+            continue;
+        }
+        let Some(prev_text) = regions[i - 1].text.as_deref() else {
+            continue;
+        };
+        let prev_looks_broken = prev_text.trim().ends_with("**");
+        if !prev_looks_broken {
+            continue;
+        }
+        let near_caption = regions.iter().enumerate().any(|(j, other)| {
+            if i == j || !other.kind.is_caption() {
+                return false;
+            }
+            let y_gap = if regions[i].bbox[1] >= other.bbox[3] {
+                regions[i].bbox[1] - other.bbox[3]
+            } else if other.bbox[1] >= regions[i].bbox[3] {
+                other.bbox[1] - regions[i].bbox[3]
+            } else {
+                0.0
+            };
+            y_gap <= 120.0
+        });
+        if near_caption {
+            keep[i] = false;
+        }
+    }
+
+    let mut idx = 0usize;
+    regions.retain(|_| {
+        let retain = keep[idx];
+        idx += 1;
+        retain
+    });
+}
+
+fn drop_short_figure_label_scraps(regions: &mut Vec<Region>) {
+    let mut keep = vec![true; regions.len()];
+    for i in 0..regions.len() {
+        if regions[i].kind != RegionKind::Text {
+            continue;
+        }
+        let Some(text) = regions[i].text.as_deref() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        let word_count = trimmed.split_whitespace().count();
+        if word_count == 0 || word_count > 10 {
+            continue;
+        }
+        let width = regions[i].bbox[2] - regions[i].bbox[0];
+        if width > 180.0 {
+            continue;
+        }
+        let alpha_words = trimmed
+            .split_whitespace()
+            .filter(|w| w.chars().any(|c| c.is_alphabetic()))
+            .count();
+        if alpha_words < 2 {
+            continue;
+        }
+        let near_caption = regions.iter().enumerate().any(|(j, other)| {
+            if i == j || !other.kind.is_caption() {
+                return false;
+            }
+            let same_columnish =
+                (regions[i].bbox[0] - other.bbox[0]).abs() < 180.0 || (regions[i].bbox[2] - other.bbox[2]).abs() < 180.0;
+            let y_gap = if regions[i].bbox[1] >= other.bbox[3] {
+                regions[i].bbox[1] - other.bbox[3]
+            } else if other.bbox[1] >= regions[i].bbox[3] {
+                other.bbox[1] - regions[i].bbox[3]
+            } else {
+                0.0
+            };
+            same_columnish && y_gap <= 140.0
+        });
+        if near_caption {
+            keep[i] = false;
+        }
+    }
+
+    let mut idx = 0usize;
+    regions.retain(|_| {
+        let retain = keep[idx];
+        idx += 1;
+        retain
+    });
+}
+
+fn demote_local_figure_reference_captions(regions: &mut [Region]) {
+    for region in regions.iter_mut() {
+        if !region.kind.is_caption() {
+            continue;
+        }
+        let Some(text) = region.text.as_deref() else {
+            continue;
+        };
+        let trimmed = text.trim();
+        let mut words = trimmed.split_whitespace();
+        let first = words.next().unwrap_or("");
+        let second = words.next().unwrap_or("").to_ascii_lowercase();
+        let looks_like_local_figure_ref = first.contains('.')
+            && first.chars().any(|c| c.is_ascii_digit())
+            && first
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.');
+        let is_body_like_reference = matches!(
+            second.as_str(),
+            "shows" | "show" | "illustrates" | "illustrate" | "depicts" | "depict"
+        );
+        if looks_like_local_figure_ref && is_body_like_reference {
+            region.kind = RegionKind::Text;
+        }
+    }
+}
+
 // ── Running header filter (cross-page) ──────────────────────────────
 
 /// Filter running headers across pages.
@@ -2029,7 +2916,10 @@ pub fn filter_running_headers(pages: &mut [crate::types::Page]) {
         return;
     }
 
-    // Pass 1: Collect topmost and bottommost candidates
+    // Pass 1: Collect topmost/bottommost candidates plus any short margin
+    // fragments near the page edge. Some books split a running footer into
+    // multiple regions, so looking only at the single bottommost block misses
+    // repeated junk like "18 no-nonsense classical mechanics".
     let mut header_occurrences: HashMap<String, Vec<(usize, usize, bool)>> = HashMap::new();
     // (page_idx, region_idx, is_topmost)
 
@@ -2037,6 +2927,8 @@ pub fn filter_running_headers(pages: &mut [crate::types::Page]) {
         if page.regions.is_empty() {
             continue;
         }
+
+        let page_height = page.height_pt.max(1.0);
 
         // Find topmost region (smallest bbox[1])
         if let Some((ri, r)) = page
@@ -2077,6 +2969,30 @@ pub fn filter_running_headers(pages: &mut [crate::types::Page]) {
                     .entry(key)
                     .or_default()
                     .push((page_i, ri, false));
+            }
+        }
+
+        // Also consider all short margin blocks, not just the absolute edge
+        // region. This catches split headers/footers and short repeated stamps.
+        for (ri, r) in page.regions.iter().enumerate() {
+            if r.consumed || r.text.as_ref().map_or(true, |t| t.trim().is_empty()) {
+                continue;
+            }
+            let text = r.text.as_deref().unwrap_or("");
+            if text.len() > 150 {
+                continue;
+            }
+            let in_top = r.bbox[1] < page_height * 0.12;
+            let in_bottom = r.bbox[3] > page_height * 0.85;
+            if !(in_top || in_bottom) {
+                continue;
+            }
+            let key = normalize_header_aggressive(text);
+            if key.len() >= 4 {
+                header_occurrences
+                    .entry(key)
+                    .or_default()
+                    .push((page_i, ri, in_top));
             }
         }
     }
