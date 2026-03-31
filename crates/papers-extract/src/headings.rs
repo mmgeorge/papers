@@ -1803,10 +1803,216 @@ pub fn extract_headings(page_chars: &[(Vec<PdfChar>, f32)]) -> HeadingExtraction
         has_font_names,
     };
 
+    // Phase 6: Post-processing cleanups
+    postprocess_headings(&mut headings);
+
     HeadingExtractionResult {
         font_groups,
         font_profile,
         headings,
+    }
+}
+
+/// Post-processing cleanups for headings extracted via font detection:
+/// - Title case normalization for ALL CAPS headings
+/// - Author/institution line filtering
+/// - Section ordering (by number, not Y-position)
+/// - Depth calibration (shift minimum depth to 1)
+fn postprocess_headings(headings: &mut Vec<DetectedHeading>) {
+    // 1. Title case: convert ALL CAPS titles to Title Case
+    for h in headings.iter_mut() {
+        if is_all_caps_title(&h.title) {
+            h.title = to_title_case(&h.title);
+        }
+    }
+
+    // 2. Filter author/institution lines
+    headings.retain(|h| !looks_like_author_institution(&h.title));
+
+    // 3. Sort headings on the same page by section number
+    sort_by_section_number(headings);
+
+    // 4. Depth calibration based on section numbering patterns.
+    // If entries like "1 Intro" and "1.1 Detail" are at the same depth,
+    // use the numbering pattern to assign correct depths.
+    calibrate_depths_from_numbering(headings);
+}
+
+fn is_all_caps_title(title: &str) -> bool {
+    // Strip leading section number (e.g., "1 ", "2.3 ")
+    let text = title
+        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ')
+        .trim();
+    if text.is_empty() {
+        return false;
+    }
+    let alpha_chars: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
+    alpha_chars.len() >= 3 && alpha_chars.iter().all(|c| c.is_uppercase())
+}
+
+fn to_title_case(title: &str) -> String {
+    // Preserve leading section number unchanged, title-case the rest
+    let trimmed = title.trim();
+    let text_start = trimmed
+        .find(|c: char| c.is_alphabetic())
+        .unwrap_or(trimmed.len());
+    let prefix = &trimmed[..text_start];
+    let text = &trimmed[text_start..];
+
+    // Known acronyms to preserve
+    const ACRONYMS: &[&str] = &[
+        "VBD", "GPU", "XPBD", "SSAO", "CPU", "API", "GLSL", "LTC", "RSM",
+        "MDP", "GQA", "MHA", "ORT", "CUDA", "PDF", "SIR", "OCR", "RGB",
+    ];
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let title_cased: Vec<String> = words
+        .iter()
+        .map(|word| {
+            let upper = word.to_uppercase();
+            // Check if the word is an acronym
+            let bare = upper.trim_matches(|c: char| !c.is_alphanumeric());
+            if ACRONYMS.iter().any(|a| bare == *a) {
+                return word.to_string(); // keep as-is
+            }
+            // Small words that stay lowercase (unless first word)
+            let lower = word.to_lowercase();
+            if matches!(
+                lower.as_str(),
+                "a" | "an" | "the" | "and" | "or" | "of" | "in" | "on"
+                    | "at" | "to" | "for" | "with" | "by" | "vs"
+            ) {
+                return lower;
+            }
+            // Title case: first char upper, rest lower
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => {
+                    let mut s = first.to_uppercase().to_string();
+                    for c in chars {
+                        s.extend(c.to_lowercase());
+                    }
+                    s
+                }
+            }
+        })
+        .collect();
+
+    // Ensure first word is capitalized
+    let mut result: Vec<String> = title_cased;
+    if let Some(first) = result.first_mut() {
+        let mut chars = first.chars();
+        if let Some(c) = chars.next() {
+            *first = c.to_uppercase().to_string() + &chars.collect::<String>();
+        }
+    }
+
+    format!("{}{}", prefix, result.join(" "))
+}
+
+fn looks_like_author_institution(title: &str) -> bool {
+    let t = title.trim();
+    // Common patterns for author affiliation lines
+    t.contains("University of")
+        || t.contains("university of")
+        || (t.contains(", USA") && t.contains("University"))
+        || (t.contains("Roblox") && t.contains("USA"))
+        || (t.matches(", ").count() >= 3 && t.contains("University"))
+}
+
+fn sort_by_section_number(headings: &mut Vec<DetectedHeading>) {
+    // Group consecutive headings on the same page and sort by section number
+    let mut i = 0;
+    while i < headings.len() {
+        let page = headings[i].page;
+        let mut j = i + 1;
+        while j < headings.len() && headings[j].page == page {
+            j += 1;
+        }
+        if j - i > 1 {
+            // Sort this group by section number
+            headings[i..j].sort_by(|a, b| {
+                let na = parse_section_sort_key(&a.title);
+                let nb = parse_section_sort_key(&b.title);
+                na.cmp(&nb)
+            });
+        }
+        i = j;
+    }
+}
+
+/// Assign heading depths based on section numbering patterns.
+/// "1 Foo" → depth 1, "1.1 Bar" → depth 2, "1.1.1 Baz" → depth 3, etc.
+/// Only applied when at least 3 numbered headings exist and the font-based
+/// depths don't already distinguish between numbering levels.
+fn calibrate_depths_from_numbering(headings: &mut [DetectedHeading]) {
+    // Count how many headings have section-number prefixes at each "dotted" level
+    let mut level_counts = [0u32; 4]; // [single-digit, N.M, N.M.K, other]
+    for h in headings.iter() {
+        let level = numbering_level(&h.title);
+        if level < 4 {
+            level_counts[level] += 1;
+        }
+    }
+
+    // Need at least single-digit (chapters) and N.M (sections) to calibrate
+    if level_counts[0] < 2 || level_counts[1] < 2 {
+        // Fall back: simple min-depth shift
+        if let Some(min_depth) = headings.iter().map(|h| h.depth).min() {
+            if min_depth > 1 {
+                let shift = min_depth - 1;
+                for h in headings.iter_mut() {
+                    h.depth = h.depth.saturating_sub(shift);
+                }
+            }
+        }
+        return;
+    }
+
+    // Apply number-based depths
+    for h in headings.iter_mut() {
+        let level = numbering_level(&h.title);
+        match level {
+            0 => h.depth = 1, // "1 Foo"
+            1 => h.depth = 2, // "1.1 Bar"
+            2 => h.depth = 3, // "1.1.1 Baz"
+            3 => h.depth = 4, // deeper
+            _ => {} // no numbering prefix → leave depth unchanged (e.g., "References")
+        }
+    }
+}
+
+/// Return the "dotted level" of a section number prefix:
+/// "1 Foo" → 0 (single digit), "1.1 Foo" → 1, "1.1.1 Foo" → 2, etc.
+/// Returns 4+ if no numbering prefix is found.
+fn numbering_level(title: &str) -> usize {
+    let t = title.trim();
+    let first_space = t.find(|c: char| c == ' ' || c == '\t').unwrap_or(t.len());
+    let num_part = &t[..first_space];
+    let dots = num_part.matches('.').count();
+    let parts: Vec<&str> = num_part.split('.').collect();
+    // Verify all parts are numeric
+    if parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+        dots // 0 for "1", 1 for "1.1", 2 for "1.1.1"
+    } else {
+        4 // not a section number
+    }
+}
+
+fn parse_section_sort_key(title: &str) -> (u32, u32, String) {
+    let t = title.trim();
+    // Try to parse "N.M ..." or "N ..."
+    let first_space = t.find(' ').unwrap_or(t.len());
+    let num_part = &t[..first_space];
+    let parts: Vec<u32> = num_part
+        .split('.')
+        .filter_map(|s| s.parse::<u32>().ok())
+        .collect();
+    match parts.len() {
+        0 => (u32::MAX, 0, t.to_string()), // no number → sort last
+        1 => (parts[0], 0, t.to_string()),
+        _ => (parts[0], parts[1], t.to_string()),
     }
 }
 

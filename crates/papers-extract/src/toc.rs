@@ -322,6 +322,9 @@ struct ClassifiedEntry {
     font_sig: FontSig,
     x_left: f32,
     page_idx: u32,
+    /// True if the leading chapter number was inferred by
+    /// `infer_chapter_numbers_from_children` (not present in the raw PDF TOC).
+    chapter_num_inferred: bool,
 }
 
 // ── Public API ──
@@ -1996,6 +1999,7 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
                 font_sig: line.font_sig,
                 x_left: line.x_left,
                 page_idx: line.page_idx,
+                chapter_num_inferred: false,
             }
         })
         .collect();
@@ -2533,6 +2537,7 @@ fn infer_chapter_numbers_from_children(entries: &mut [ClassifiedEntry]) {
         let first = child_prefixes[0];
         if child_prefixes.iter().all(|&n| n == first) {
             entries[i].title = format!("{} {}", first, entries[i].title);
+            entries[i].chapter_num_inferred = true;
         }
     }
 }
@@ -2614,6 +2619,101 @@ fn resolve_bare_letter_sections(entries: &mut [ClassifiedEntry]) {
 
 // ── Phase 7: Validation ──
 
+/// Drop Part divider entries when the book has numbered chapters.
+///
+/// Two mechanisms:
+/// 1. If chapters form a contiguous 1…N sequence, drop Part entries AND stray
+///    Unknown depth-≤1 entries between chapters (e.g. "Theory", "II Applications").
+/// 2. Always drop entries whose title starts with "PART " followed by a roman
+///    numeral when there are ≥ 4 numbered chapters (e.g. "PART I Particle Physics").
+fn drop_part_dividers_if_continuous_chapters(entries: &mut Vec<ClassifiedEntry>) {
+    // Collect chapter numbers from Chapter entries at depth ≤ 1
+    let chapter_nums: Vec<(usize, u32)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.classification == Classification::Chapter && e.depth <= 1)
+        .filter_map(|(i, e)| {
+            let t = e.title.trim();
+            let num_str: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+            num_str.parse::<u32>().ok().map(|n| (i, n))
+        })
+        .collect();
+
+    let has_enough_chapters = chapter_nums.len() >= 4;
+    if !has_enough_chapters {
+        return;
+    }
+
+    // Check contiguous 1, 2, 3, …, N
+    let is_contiguous = chapter_nums
+        .iter()
+        .enumerate()
+        .all(|(idx, (_, n))| *n == (idx + 1) as u32);
+
+    // Collect page ranges between consecutive chapters (only used if contiguous)
+    let chapter_pages: Vec<i32> = chapter_nums.iter().map(|(i, _)| entries[*i].page_value).collect();
+
+    entries.retain(|e| {
+        // Always keep structural entries
+        if matches!(
+            e.classification,
+            Classification::Chapter
+                | Classification::Section
+                | Classification::Subsection
+                | Classification::SubSubsection
+        ) {
+            return true;
+        }
+        // Always keep FrontMatter and BackMatter
+        if matches!(
+            e.classification,
+            Classification::FrontMatter | Classification::BackMatter
+        ) {
+            return true;
+        }
+
+        // Drop "PART N" entries (any classification) when there are numbered chapters
+        let title_lower = e.title.trim().to_ascii_lowercase();
+        if title_lower.starts_with("part ")
+            && e.page_value > 0
+            && e.title.trim().len() > 5
+        {
+            // Verify the word after "part " looks like a roman numeral or number
+            let after_part = e.title.trim()[5..].trim();
+            let first_word = after_part.split_whitespace().next().unwrap_or("");
+            if headings::is_roman_numeral(first_word)
+                || first_word.chars().all(|c| c.is_ascii_digit())
+            {
+                tracing::debug!("TOC: dropping PART divider: {:?}", e.title);
+                return false;
+            }
+        }
+
+        if is_contiguous {
+            // Drop Part entries with body page values
+            if e.classification == Classification::Part && e.page_value > 0 {
+                tracing::debug!("TOC: dropping Part divider in continuous-chapter book: {:?}", e.title);
+                return false;
+            }
+
+            // Drop Unknown entries at depth ≤ 1 between chapter pages
+            if e.classification == Classification::Unknown && e.depth <= 1 && e.page_value > 0 {
+                for w in chapter_pages.windows(2) {
+                    if e.page_value >= w[0] && e.page_value <= w[1] {
+                        tracing::debug!(
+                            "TOC: dropping Unknown divider between chapters: {:?} (p.{})",
+                            e.title, e.page_value
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
+        true
+    });
+}
+
 fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
     // Remove duplicates (same title + same page)
     let mut seen = std::collections::HashSet::new();
@@ -2621,15 +2721,66 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
 
     for entry in entries.iter_mut() {
         let trimmed_title = entry.title.trim();
-        if should_strip_leading_page_number(trimmed_title, entry.page_value) {
+        let is_structural = matches!(
+            entry.classification,
+            Classification::Chapter
+                | Classification::Section
+                | Classification::Subsection
+                | Classification::SubSubsection
+        );
+        // Decide whether to strip the leading numeric token:
+        //  - Structural entries with inherent numbers (from the raw PDF) → never strip
+        //  - Inferred numbers (added by infer_chapter_numbers_from_children) → tight tolerance
+        //  - Non-structural (Unknown/Part/FrontMatter/BackMatter) → existing wide tolerance
+        let should_strip = if is_structural && !entry.chapter_num_inferred {
+            false
+        } else if entry.chapter_num_inferred {
+            should_strip_leading_page_number_tight(trimmed_title, entry.page_value)
+        } else {
+            should_strip_leading_page_number(trimmed_title, entry.page_value)
+        };
+        if should_strip {
             if let Some(stripped) = strip_initial_numeric_token(trimmed_title) {
                 entry.title = stripped.to_string();
+            }
+        }
+        // Strip trailing period from leading chapter numbers: "1. Title" → "1 Title"
+        // Keep section numbers like "1.1 Title" unchanged.
+        {
+            let t = entry.title.trim();
+            let digit_end = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+            if digit_end > 0 && digit_end < t.len() {
+                let after_digits = &t[digit_end..];
+                if let Some(rest) = after_digits.strip_prefix(". ") {
+                    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+                        entry.title = format!("{} {}", &t[..digit_end], rest);
+                    }
+                }
             }
         }
         if let Some(normalized_part) = normalize_roman_part_title(entry.title.trim()) {
             entry.title = normalized_part;
             entry.classification = Classification::Part;
             entry.depth = 0;
+        }
+    }
+
+    // When chapters are continuously numbered (1, 2, 3, …), Part dividers
+    // and stray Unknown entries at depth ≤1 between them are structural noise.
+    // Drop them so the output is a clean chapter list.
+    drop_part_dividers_if_continuous_chapters(entries);
+
+    // Flatten FrontMatter leaf entries from depth > 1 to depth 1.
+    // FrontMatter items (Preface, Acknowledgments, About the Author, …) are always
+    // top-level in a TOC; depth > 1 is an x-indent artifact.
+    for i in 0..entries.len() {
+        if entries[i].depth > 1
+            && entries[i].classification == Classification::FrontMatter
+        {
+            let is_leaf = i + 1 >= entries.len() || entries[i + 1].depth <= entries[i].depth;
+            if is_leaf {
+                entries[i].depth = 1;
+            }
         }
     }
 
@@ -2829,6 +2980,26 @@ fn should_strip_leading_page_number(title: &str, page_value: i32) -> bool {
     }
 
     rest.starts_with("Global ")
+}
+
+/// Like `should_strip_leading_page_number` but with a tight tolerance (≤ 1).
+/// Used for inferred chapter numbers where we only want to strip when the
+/// inferred number essentially matches the page number (e.g. "1 Intro" at page 1).
+fn should_strip_leading_page_number_tight(title: &str, page_value: i32) -> bool {
+    let tokens = token_spans(title);
+    if tokens.len() < 2 {
+        return false;
+    }
+    let first = &title[tokens[0].0..tokens[0].1];
+    let Some((_, first_value)) =
+        parse_page_ref(first).or_else(|| parse_ocrish_page_ref_token(first))
+    else {
+        return false;
+    };
+    if first_value == 0 {
+        return true;
+    }
+    page_value > 0 && (page_value - first_value).abs() <= 1
 }
 
 fn title_is_enumerated_body_spill(title: &str) -> bool {
@@ -3255,6 +3426,7 @@ mod tests {
             },
             x_left: 90.0,
             page_idx: 0,
+            chapter_num_inferred: false,
         }
     }
 
@@ -3586,6 +3758,7 @@ mod tests {
                 },
                 x_left: 90.0,
                 page_idx: 0,
+                chapter_num_inferred: false,
             },
         );
         validate_entries(&mut entries);
