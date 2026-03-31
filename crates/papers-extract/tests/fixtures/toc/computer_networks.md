@@ -53,8 +53,6 @@
     - 2.3.3 Microwave Transmission, (p. 110)
     - 2.3.4 Infrared Transmission, (p. 114)
     - 2.3.5 Light Transmission, (p. 114)
-  - 2.4 COMMUNICATION SATELLITES*, (p. 116)
-    - 2.4.1 Geostationary Satellites, (p. 117)
     - 2.4.2 Medium-Earth OrbitSatellites, (p. 121)
     - 2.4.3 Low-Earth OrbitSatellites, (p. 121)
     - 2.4.4 SatellitesVersus Fiber, (p. 123)

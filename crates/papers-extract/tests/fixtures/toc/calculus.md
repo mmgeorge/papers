@@ -1,4 +1,4 @@
-- A Context for Calculus (p. 1)
+- 1 A Context for Calculus (p. 1)
   - 1.1 Introduction: Calculus and Prediction (p. 1)
   - 1.2 The Spread of Disease: The SIR Model (p. 2)
     - 1.2.1 Initial Setup (p. 3)
