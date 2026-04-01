@@ -2783,6 +2783,8 @@ mod tests {
         PdfChar {
             codepoint: c,
             bbox: [x, y_top_img, x + w, y_top_img + h],
+            origin_x: x,
+            pdfium_space_before: false,
             space_threshold: 1.5,
             font_name: String::new(),
             font_size: 10.0,
@@ -2954,6 +2956,8 @@ mod tests {
         let top_char = PdfChar {
             codepoint: 'T',
             bbox: [100.0, 0.0, 110.0, 10.0],
+            origin_x: 100.0,
+            pdfium_space_before: false,
             space_threshold: 0.0,
             font_name: String::new(),
             font_size: 10.0,
@@ -2968,6 +2972,8 @@ mod tests {
         let bottom_char = PdfChar {
             codepoint: 'B',
             bbox: [100.0, 790.0, 110.0, 800.0],
+            origin_x: 100.0,
+            pdfium_space_before: false,
             space_threshold: 0.0,
             font_name: String::new(),
             font_size: 10.0,
@@ -3624,6 +3630,8 @@ mod tests {
         PdfChar {
             codepoint: c,
             bbox: [x, y_top_img, x + w, y_top_img + h],
+            origin_x: x,
+            pdfium_space_before: false,
             space_threshold: 1.5,
             font_name: String::new(),
             font_size,
@@ -4002,6 +4010,8 @@ mod tests {
         PdfChar {
             codepoint: c,
             bbox: [x, y_top, x + w, y_top + h],
+            origin_x: x,
+            pdfium_space_before: false,
             space_threshold: 1.5,
             font_name: String::new(),
             font_size,

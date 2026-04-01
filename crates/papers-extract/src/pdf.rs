@@ -19,6 +19,15 @@ pub struct PdfChar {
     /// After normalization: image space (Y-down) where (x1, y1) is top-left
     /// and (x2, y2) is bottom-right.
     pub bbox: [f32; 4],
+    /// Character origin X in the same coordinate space as bbox.
+    /// This is the typographic insertion point from `FPDFText_GetCharOrigin`,
+    /// which reflects glyph advance positioning rather than visual bounding box.
+    /// When unavailable, equals `bbox[0]`.
+    pub origin_x: f32,
+    /// True if pdfium generated a space character immediately before this char
+    /// in its internal text stream. This is the most reliable word-boundary
+    /// signal — it uses pdfium's own advance-width and text-matrix analysis.
+    pub pdfium_space_before: bool,
     /// Pre-computed gap threshold for word boundary detection, in PDF points.
     ///
     /// When the horizontal gap between two consecutive characters exceeds this threshold,
@@ -121,6 +130,7 @@ pub fn extract_page_chars(page: &PdfPage, page_idx: u32) -> Result<Vec<PdfChar>,
 
     let total = chars_collection.len();
     let mut i = 0usize;
+    let mut prev_was_space = false;
     while i < total {
         let Ok(char_info) = chars_collection.get(i) else {
             i += 1;
@@ -143,8 +153,10 @@ pub fn extract_page_chars(page: &PdfPage, page_idx: u32) -> Result<Vec<PdfChar>,
                         &mut chars,
                         decoded,
                         &char_info,
+                        prev_was_space,
                         &mut font_space_ratios,
                     );
+                    prev_was_space = false;
                     continue;
                 }
             }
@@ -153,7 +165,18 @@ pub fn extract_page_chars(page: &PdfPage, page_idx: u32) -> Result<Vec<PdfChar>,
             continue;
         };
 
-        push_char(&mut chars, c, &char_info, &mut font_space_ratios);
+        if c == ' ' {
+            prev_was_space = true;
+            // Still push the space char — downstream code uses space positions
+            // for x-position-based matching. The pdfium_space_before flag on
+            // the NEXT char provides an additional, more reliable signal.
+            push_char(&mut chars, c, &char_info, false, &mut font_space_ratios);
+            i += 1;
+            continue;
+        }
+
+        push_char(&mut chars, c, &char_info, prev_was_space, &mut font_space_ratios);
+        prev_was_space = false;
         i += 1;
     }
 
@@ -165,6 +188,7 @@ fn push_char(
     chars: &mut Vec<PdfChar>,
     c: char,
     char_info: &PdfPageTextChar,
+    pdfium_space_before: bool,
     font_space_ratios: &mut HashMap<String, f32>,
 ) {
     let Ok(rect) = char_info.loose_bounds() else {
@@ -187,6 +211,8 @@ fn push_char(
     // as part of their design (not text bold).
     let is_bold = is_bold_font(&font_name) && !is_math_font(&font_name);
 
+    let origin_x = char_info.origin_x().map(|p| p.value).unwrap_or(rect.left().value);
+
     chars.push(PdfChar {
         codepoint: c,
         bbox: [
@@ -195,6 +221,8 @@ fn push_char(
             rect.right().value,
             rect.top().value,
         ],
+        origin_x,
+        pdfium_space_before,
         space_threshold: font_size * space_ratio / 2.0,
         font_name: font_name.clone(),
         font_size,

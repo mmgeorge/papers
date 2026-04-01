@@ -131,6 +131,10 @@ struct TocChar {
     codepoint: char,
     /// [x1, y1, x2, y2] in image-space (Y-down).
     bbox: [f32; 4],
+    /// Typographic origin X (from `FPDFText_GetCharOrigin`).
+    origin_x: f32,
+    /// True if pdfium generated a space character before this char.
+    pdfium_space_before: bool,
     space_threshold: f32,
     font_name: String,
     font_size: f32,
@@ -172,10 +176,10 @@ impl TocRawLine {
                 // Guard: only trust a pdfium space if the physical gap is at
                 // least 15% of the threshold — some PDFs have space chars at
                 // wrong x-positions that land between adjacent glyphs.
-                let has_pdfium_space = gap >= threshold * 0.15
-                    && self.pdfium_space_xs.iter().any(|&sx| {
-                        sx >= prev.bbox[2] - 0.5 && sx <= ch.bbox[0] + 0.5
-                    });
+                let pdfium_space_present = self.pdfium_space_xs.iter().any(|&sx| {
+                    sx >= prev.bbox[2] - 0.5 && sx <= ch.bbox[0] + 0.5
+                });
+                let has_pdfium_space = gap >= threshold * 0.15 && pdfium_space_present;
                 // Font-family change with a positive gap is also a word
                 // boundary — PDFs often kern across font switches so the
                 // gap is below the normal space threshold, but the glyphs
@@ -195,7 +199,18 @@ impl TocRawLine {
                     && prev.font_name != ch.font_name
                     && font_boundary_ok;
 
-                if gap > threshold || has_pdfium_space || font_change_space {
+                // pdfium_space_before: pdfium's own space detection found a word
+                // boundary here (via advance-width analysis in cpdf_textpage.cpp).
+                // Trust it when the gap is at least slightly positive — this catches
+                // cases like "ofGravity" where the gap is below our threshold but
+                // pdfium correctly detected the space from advance widths.
+                // Guard: require gap > 0 to avoid false spaces from overlapping glyphs.
+                // pdfium_space_before: pdfium's own advance-width analysis
+                // (cpdf_textpage.cpp) detected a word boundary here. This is
+                // the most reliable signal — trust it when the gap is positive.
+                let pdfium_indexed_space = ch.pdfium_space_before && gap > 0.0;
+
+                if gap > threshold || has_pdfium_space || font_change_space || pdfium_indexed_space {
                     result.push(' ');
                 }
             }
@@ -832,6 +847,7 @@ fn build_lines_from_chars(
         })
         .collect();
 
+
     // Convert to TocChar in image-space.
     // Skip literal spaces (we reconstruct spacing from gaps) and control chars.
     // Expand TeX ligatures (0x0B-0x0F) to their component characters.
@@ -853,6 +869,8 @@ fn build_lines_from_chars(
                     toc_chars.push(TocChar {
                         codepoint: lc,
                         bbox: [c.bbox[0] + x_off, y1, c.bbox[0] + x_off + char_w, y2],
+                        origin_x: c.origin_x + x_off,
+                        pdfium_space_before: li == 0 && c.pdfium_space_before,
                         space_threshold: c.space_threshold,
                         font_name: c.font_name.clone(),
                         font_size: c.font_size,
@@ -868,6 +886,8 @@ fn build_lines_from_chars(
         toc_chars.push(TocChar {
             codepoint: c.codepoint,
             bbox: [c.bbox[0], y1, c.bbox[2], y2],
+            origin_x: c.origin_x,
+            pdfium_space_before: c.pdfium_space_before,
             space_threshold: c.space_threshold,
             font_name: c.font_name.clone(),
             font_size: c.font_size,
@@ -4237,6 +4257,8 @@ mod tests {
             chars.push(TocChar {
                 codepoint: ch,
                 bbox: [x, y, x + char_width, y + char_height],
+                origin_x: x,
+                pdfium_space_before: false,
                 space_threshold: 3.0,
                 font_name: "TestFont".to_string(),
                 font_size: 10.0,
