@@ -176,7 +176,26 @@ impl TocRawLine {
                     && self.pdfium_space_xs.iter().any(|&sx| {
                         sx >= prev.bbox[2] - 0.5 && sx <= ch.bbox[0] + 0.5
                     });
-                if gap > threshold || has_pdfium_space {
+                // Font-family change with a positive gap is also a word
+                // boundary — PDFs often kern across font switches so the
+                // gap is below the normal space threshold, but the glyphs
+                // still belong to different words (e.g., bold "C++" then
+                // regular "Classes").
+                // Guard against false positives: don't split before/after
+                // punctuation, brackets, or math symbols — those often
+                // switch fonts for styling without a word break.
+                let prev_ok = prev.codepoint.is_alphanumeric()
+                    || prev.codepoint == '+' || prev.codepoint == ')'
+                    || prev.codepoint == ']' || prev.codepoint == ','
+                    || prev.codepoint == ';' || prev.codepoint == ':';
+                let next_ok = ch.codepoint.is_alphanumeric()
+                    || ch.codepoint == '"' || ch.codepoint == '\u{201C}';
+                let font_boundary_ok = prev_ok && next_ok;
+                let font_change_space = gap > 0.3
+                    && prev.font_name != ch.font_name
+                    && font_boundary_ok;
+
+                if gap > threshold || has_pdfium_space || font_change_space {
                     result.push(' ');
                 }
             }
@@ -375,6 +394,11 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
     // Phase 5: Classify easy cases + learn font signatures + resolve ambiguous
     let mut entries = classify_and_learn(merged);
 
+    // Phase 5b: Infer page numbers for chapter entries that have none.
+    // Some PDFs have chapter titles on separate lines without page numbers;
+    // the page can be inferred from the first child section.
+    infer_chapter_pages(&mut entries);
+
     // Phase 6: Infer chapter numbers from children + resolve bare-letter sections
     infer_chapter_numbers_from_children(&mut entries);
     resolve_bare_letter_sections(&mut entries);
@@ -385,6 +409,12 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
     if entries.len() < 3 {
         return None;
     }
+
+    // Phase 7b: Normalize SubEntry depths using indent analysis
+    normalize_subentry_depths(&mut entries);
+
+    // Phase 8: Synthesize section numbers for entries that don't have them
+    synthesize_section_numbers(&mut entries);
 
     // Build font profile from classified entries
     let font_profile = build_font_profile(&entries);
@@ -533,11 +563,66 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
             }
         }
     }
+    // Track the highest page reference number seen on confirmed TOC pages,
+    // used to check page-number continuity for borderline pages.
+    let mut max_page_ref: i32 = 0;
+
+    // Helper: extract the maximum trailing page-reference number from lines.
+    fn max_trailing_page_number(lines: &[TocRawLine]) -> i32 {
+        let mut max_val: i32 = 0;
+        for line in lines {
+            let text = line.text();
+            let trimmed = text.trim();
+            if let Some(last) = trimmed.split_whitespace().next_back() {
+                if let Ok(n) = last.parse::<i32>() {
+                    if n > max_val {
+                        max_val = n;
+                    }
+                }
+            }
+        }
+        max_val
+    }
+
+    // Gather max page ref from the start page itself.
+    {
+        let (chars, page_height) = &page_chars[start as usize];
+        if !chars.is_empty() {
+            let lines = build_lines_from_chars(chars, *page_height, start);
+            max_page_ref = max_trailing_page_number(&lines);
+        }
+    }
+
+    // Helper: check if a page is a "List of ..." page that terminates the TOC.
+    fn is_list_of_page(lines: &[TocRawLine]) -> bool {
+        let mut top_idx: Vec<(usize, f32)> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (i, l.y_center))
+            .collect();
+        top_idx.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        for &(idx, _) in top_idx.iter().take(3) {
+            let text = lines[idx].text();
+            let trimmed = text.trim().to_ascii_lowercase();
+            if trimmed.starts_with("list of figures")
+                || trimmed.starts_with("list of tables")
+                || trimmed.starts_with("list of algorithms")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    // Number of consecutive blank pages seen.
+    let mut blank_gap: u32 = 0;
+
     for page_idx in (start + 1)..scan_limit as u32 {
         let (chars, page_height) = &page_chars[page_idx as usize];
         if chars.is_empty() {
-            // Allow one blank page gap (two-sided printing)
-            if toc_pages.last() == Some(&(page_idx - 1)) {
+            // Allow up to 2 blank page gaps (two-sided printing can leave blanks).
+            blank_gap += 1;
+            if blank_gap <= 2 {
                 continue;
             }
             break;
@@ -546,28 +631,18 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
         let lines = build_lines_from_chars(chars, *page_height, page_idx);
 
         // Check if this is a "List of Figures/Tables" page (stop).
-        // Use physically topmost lines by Y-position (important for two-column layouts).
-        let mut top_idx2: Vec<(usize, f32)> = lines
-            .iter()
-            .enumerate()
-            .map(|(i, l)| (i, l.y_center))
-            .collect();
-        top_idx2.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        for &(idx, _) in top_idx2.iter().take(3) {
-            let text = lines[idx].text();
-            let trimmed = text.trim().to_ascii_lowercase();
-            if trimmed.starts_with("list of figures")
-                || trimmed.starts_with("list of tables")
-                || trimmed.starts_with("list of algorithms")
-            {
-                return toc_pages;
-            }
+        if is_list_of_page(&lines) {
+            return toc_pages;
         }
 
         // Check TOC signals
         let non_empty_lines: Vec<&TocRawLine> =
             lines.iter().filter(|l| !l.text().trim().is_empty()).collect();
         if non_empty_lines.is_empty() {
+            blank_gap += 1;
+            if blank_gap <= 2 {
+                continue;
+            }
             break;
         }
 
@@ -583,9 +658,55 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
         let pct_numbers = lines_with_trailing_number as f32 / non_empty_lines.len() as f32;
         let pct_dots = lines_with_dots as f32 / non_empty_lines.len() as f32;
 
-        if pct_numbers >= 0.3 || pct_dots >= 0.2 {
+        // Strong match: same thresholds as initial detection.
+        let strong = pct_numbers >= 0.3 || pct_dots >= 0.2;
+
+        // Relaxed match for continuation: lower thresholds, but require
+        // page-number continuity (trailing numbers on this page should
+        // reference pages at or beyond what we've seen so far — the TOC
+        // is monotonically increasing in page references). Also require
+        // a minimum absolute count of numbered lines to avoid false
+        // positives on body text pages that happen to have a few numbers.
+        let page_ref_on_this = max_trailing_page_number(&lines);
+        let has_continuity = page_ref_on_this > 0 && page_ref_on_this >= max_page_ref;
+        let relaxed = (pct_numbers >= 0.15 || pct_dots >= 0.10)
+            && has_continuity
+            && lines_with_trailing_number >= 2;
+
+        // Ultra-relaxed: for the last page(s) of a TOC, which may have very
+        // few entries (e.g., just appendices and an index). Require page-number
+        // continuity and at least 1 numbered line, with very low percentage.
+        let ultra_relaxed = !strong
+            && !relaxed
+            && has_continuity
+            && lines_with_trailing_number >= 1
+            && (pct_numbers >= 0.08 || lines_with_dots >= 1)
+            && blank_gap == 0;
+
+        if strong || relaxed || ultra_relaxed {
+            blank_gap = 0;
             toc_pages.push(page_idx);
+            if page_ref_on_this > max_page_ref {
+                max_page_ref = page_ref_on_this;
+            }
         } else {
+            // This page isn't TOC-like. Before giving up, look ahead one
+            // page: if the NEXT page is strongly TOC-like, skip this gap
+            // page (don't add it to toc_pages) and continue extending.
+            let next = page_idx + 1;
+            if next < scan_limit as u32 {
+                let (next_chars, next_height) = &page_chars[next as usize];
+                if !next_chars.is_empty() {
+                    let next_lines = build_lines_from_chars(next_chars, *next_height, next);
+                    if !is_list_of_page(&next_lines)
+                        && is_toc_like_page(&page_chars[next as usize], next)
+                    {
+                        // The next page is TOC-like — skip this gap page
+                        // and let the next iteration pick it up.
+                        continue;
+                    }
+                }
+            }
             break;
         }
     }
@@ -1740,6 +1861,25 @@ fn merge_multiline_titles(lines: Vec<TocSplitLine>) -> Vec<TocSplitLine> {
                         }
                     }
 
+                    // If font-based merge failed but the last buffer entry is a
+                    // bare chapter/section number (just digits, possibly with a dot),
+                    // force-merge it with the current line regardless of font.
+                    // A bare "3" or "14" by itself is always a number prefix that
+                    // belongs with the following title.
+                    if merge_start >= buffer.len() {
+                        if let Some(last_buf) = buffer.last() {
+                            let trimmed_buf = last_buf.title.trim();
+                            let is_bare_number = !trimmed_buf.is_empty()
+                                && trimmed_buf
+                                    .trim_end_matches('.')
+                                    .chars()
+                                    .all(|c| c.is_ascii_digit());
+                            if is_bare_number {
+                                merge_start = buffer.len() - 1;
+                            }
+                        }
+                    }
+
                     if merge_start < buffer.len() {
                         // Flush entries before the merge range
                         for entry in buffer.drain(..merge_start) {
@@ -1877,8 +2017,22 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
         let mut line = line.clone();
         line.title = trim_to_first_heading_start(&line.title);
         if line.page_label.is_none() && !is_part_pattern(&line.title) {
-            // No page number and not a Part heading → will be dropped
-            continue;
+            // No page number and not a Part heading.
+            // Keep entries that look like chapter headings ("N Title" or
+            // "Chapter N Title") — they may get page numbers inferred from
+            // their first child section later. Only keep if the title is
+            // reasonably short (real chapter titles, not body paragraphs).
+            let t = line.title.trim();
+            // Check it looks like a real chapter title: starts with a digit,
+            // is reasonably short, and doesn't contain watermark/garbage patterns.
+            let has_watermark = t.contains("ptg") || t.contains("PTG");
+            let looks_like_chapter = t.len() < 120 && !has_watermark && {
+                let (class, _) = classify_by_pattern(t, last_classified_depth);
+                matches!(class, Classification::Chapter)
+            };
+            if !looks_like_chapter {
+                continue;
+            }
         }
         let (class, depth) = classify_by_pattern(&line.title, last_classified_depth);
         if class != Classification::Unknown {
@@ -2128,7 +2282,7 @@ fn classify_by_pattern(title: &str, last_depth: u32) -> (Classification, u32) {
         return (Classification::FrontMatter, 1);
     }
 
-    // Rule 9: Sub-entry keywords
+    // Rule 9: Sub-entry keywords (Summary, Exercises, Bibliography, etc.)
     let lower = t.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
@@ -2493,6 +2647,82 @@ fn demote_per_chapter_fm(entries: &mut [ClassifiedEntry]) {
     }
 }
 
+/// Normalize SubEntry depth: if a SubEntry (Summary, Exercises, etc.) was
+/// assigned depth > 2 because `last_depth` was a deep subsection, promote it
+/// to depth 2. But if the preceding entry at a lower depth is a section-level
+/// SubEntry (like "Summary" at depth 2), keep the current SubEntry nested.
+///
+/// The key signal: look at the nearest preceding entry that is NOT a SubEntry.
+/// If that entry is at depth 3+ (a subsection), promote this SubEntry to 2.
+/// If that entry is at depth 2 (a section), this SubEntry is correctly nested.
+fn normalize_subentry_depths(entries: &mut [ClassifiedEntry]) {
+    for i in 0..entries.len() {
+        if entries[i].classification != Classification::SubEntry || entries[i].depth <= 2 {
+            continue;
+        }
+        // Look backward for the nearest non-SubEntry entry.
+        let mut nearest_non_sub_depth = None;
+        for j in (0..i).rev() {
+            if entries[j].classification != Classification::SubEntry {
+                nearest_non_sub_depth = Some(entries[j].depth);
+                break;
+            }
+        }
+        // Also check: is there a SubEntry at depth 2 between us and the last
+        // non-SubEntry? If so, we might be correctly nested under it.
+        let mut has_preceding_sub_at_depth2 = false;
+        for j in (0..i).rev() {
+            if entries[j].classification != Classification::SubEntry {
+                break; // Stop at non-SubEntry
+            }
+            if entries[j].depth == 2 {
+                has_preceding_sub_at_depth2 = true;
+                break;
+            }
+        }
+
+        // Promote to depth 2 if the nearest non-SubEntry is a subsection (depth 3+)
+        // and there's no intervening SubEntry at depth 2 that we'd be nested under.
+        if let Some(nsd) = nearest_non_sub_depth {
+            if nsd >= 3 && !has_preceding_sub_at_depth2 {
+                entries[i].depth = 2;
+            }
+        }
+    }
+}
+
+/// Infer page numbers for chapter-level entries that have no page number.
+/// Uses the page of the first child section (which should be at or near the
+/// chapter start).
+fn infer_chapter_pages(entries: &mut [ClassifiedEntry]) {
+    for i in 0..entries.len() {
+        if entries[i].page_value != 0 || entries[i].page_label != "" {
+            continue; // Already has a page
+        }
+        if entries[i].depth > 1 {
+            continue; // Only chapter-level
+        }
+        if !matches!(
+            entries[i].classification,
+            Classification::Chapter | Classification::Unknown
+        ) {
+            continue;
+        }
+        // Find the first subsequent entry with a positive page value
+        // that is deeper (a child section).
+        for j in (i + 1)..entries.len() {
+            if entries[j].depth <= entries[i].depth {
+                break; // Next chapter — no children found
+            }
+            if entries[j].page_value > 0 {
+                entries[i].page_value = entries[j].page_value;
+                entries[i].page_label = entries[j].page_label.clone();
+                break;
+            }
+        }
+    }
+}
+
 // ── Phase 6b: Infer chapter numbers from children ──
 
 /// If a chapter-depth entry has no section number but its children have
@@ -2718,6 +2948,23 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
     // Remove duplicates (same title + same page)
     let mut seen = std::collections::HashSet::new();
     entries.retain(|e| seen.insert((e.title.clone(), e.page_label.clone(), e.page_value)));
+
+    // Remove "Contents" / "Table of Contents" entries that are running headers
+    // (appear multiple times). A single "Contents" entry is kept — it's likely a
+    // legitimate TOC entry pointing to itself. Multiple copies indicate running
+    // headers that survived the per-page filter.
+    {
+        let contents_count = entries.iter().filter(|e| {
+            let norm = normalize_toc_header_text(&e.title);
+            matches!(norm.as_str(), "contents" | "tableofcontents" | "detailedcontents")
+        }).count();
+        if contents_count > 1 {
+            entries.retain(|e| {
+                let norm = normalize_toc_header_text(&e.title);
+                !matches!(norm.as_str(), "contents" | "tableofcontents" | "detailedcontents")
+            });
+        }
+    }
 
     for entry in entries.iter_mut() {
         let trimmed_title = entry.title.trim();
@@ -3189,6 +3436,212 @@ fn build_font_profile(entries: &[ClassifiedEntry]) -> TocFontProfile {
     levels.sort_by_key(|l| l.depth);
 
     TocFontProfile { levels }
+}
+
+// ── Phase 8: Synthesize section numbers ──
+
+/// Returns true if `title` is a structural end-of-chapter item that should NOT
+/// receive a section number (e.g. "Summary", "Exercises", "Bibliography").
+fn is_structural_toc_title(title: &str) -> bool {
+    let lower = title.to_ascii_lowercase();
+    let lower = lower.trim();
+    matches!(
+        lower,
+        "summary"
+            | "exercises"
+            | "problems"
+            | "references"
+            | "notes"
+            | "notes and references"
+            | "bibliographic notes"
+            | "further reading"
+            | "bibliography"
+            | "conclusions"
+            | "conclusion"
+            | "review problems"
+            | "homework problems"
+            | "solutions to practice problems"
+            | "learning objectives"
+            | "chapter summary and study guide"
+    )
+}
+
+/// Check if a title already starts with a section number like "2.1" or "2.1.3".
+fn title_has_section_number(title: &str) -> bool {
+    let t = title.trim();
+    if let Some(first) = t.chars().next() {
+        if first.is_ascii_digit() {
+            // Check for N.N pattern
+            if let Some(dot_pos) = t.find('.') {
+                let before_dot = &t[..dot_pos];
+                if before_dot.chars().all(|c| c.is_ascii_digit()) {
+                    let after_dot = &t[dot_pos + 1..];
+                    if after_dot.starts_with(|c: char| c.is_ascii_digit()) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract the chapter number from a chapter-level title like "3 The Laws of Motion".
+fn extract_chapter_number(title: &str) -> Option<u32> {
+    let t = title.trim();
+    if let Some(space_pos) = t.find(' ') {
+        let prefix = &t[..space_pos];
+        prefix.parse::<u32>().ok()
+    } else {
+        t.parse::<u32>().ok()
+    }
+}
+
+/// Synthesize hierarchical section numbers for TOC entries that don't have them.
+///
+/// Works per-chapter: for each numbered chapter, checks if its children need
+/// section numbers. Handles mixed cases where some chapters have numbered
+/// sections and others don't, and where depth-2 is numbered but depth-3 isn't.
+fn synthesize_section_numbers(entries: &mut Vec<ClassifiedEntry>) {
+    // Check that we have numbered chapters to anchor on
+    let has_numbered_chapters = entries.iter().any(|e| {
+        e.depth == 1
+            && matches!(
+                e.classification,
+                Classification::Chapter | Classification::Unknown
+            )
+            && extract_chapter_number(&e.title).is_some()
+    });
+    if !has_numbered_chapters {
+        return;
+    }
+
+    // First pass: determine per-chapter whether depth-2 children need numbering.
+    // A chapter needs depth-2 numbering if its non-structural depth-2 children
+    // are mostly unnumbered.
+    let mut chapter_ranges: Vec<(usize, usize, Option<u32>)> = Vec::new(); // (start, end, ch_num)
+    for i in 0..entries.len() {
+        if entries[i].depth == 1 && extract_chapter_number(&entries[i].title).is_some() {
+            let ch_num = extract_chapter_number(&entries[i].title);
+            if let Some(last) = chapter_ranges.last_mut() {
+                last.1 = i;
+            }
+            chapter_ranges.push((i, entries.len(), ch_num));
+        }
+    }
+
+    let mut needs_d2_numbering: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for &(start, end, ch_num_opt) in &chapter_ranges {
+        let Some(ch_num) = ch_num_opt else { continue };
+        let d2_entries: Vec<usize> = (start + 1..end)
+            .filter(|&j| {
+                entries[j].depth == 2
+                    && !is_structural_toc_title(&entries[j].title)
+                    && !matches!(
+                        entries[j].classification,
+                        Classification::FrontMatter
+                            | Classification::BackMatter
+                            | Classification::SubEntry
+                    )
+            })
+            .collect();
+        if d2_entries.is_empty() {
+            continue;
+        }
+        let numbered = d2_entries
+            .iter()
+            .filter(|&&j| title_has_section_number(&entries[j].title))
+            .count();
+        // If less than half of depth-2 content entries have numbers, synthesize them
+        if numbered * 2 < d2_entries.len() {
+            needs_d2_numbering.insert(ch_num);
+        }
+    }
+
+    // Second pass: walk entries and assign section numbers
+    let mut current_chapter: Option<u32> = None;
+    let mut section_counter: u32 = 0;
+    let mut subsection_counter: u32 = 0;
+
+    for i in 0..entries.len() {
+        let entry = &entries[i];
+
+        if entry.depth <= 1 {
+            if entry.depth == 1 {
+                current_chapter = extract_chapter_number(&entry.title);
+                section_counter = 0;
+                subsection_counter = 0;
+            } else {
+                current_chapter = None;
+                section_counter = 0;
+                subsection_counter = 0;
+            }
+            continue;
+        }
+
+        let Some(ch_num) = current_chapter else {
+            continue;
+        };
+
+        // Skip structural items
+        if is_structural_toc_title(&entries[i].title) {
+            continue;
+        }
+
+        // Skip if already has a section number — but track the counter
+        if title_has_section_number(&entries[i].title) {
+            if entry.depth == 2 {
+                if let Some(dot_pos) = entries[i].title.find('.') {
+                    let after_dot = &entries[i].title[dot_pos + 1..];
+                    let sec_end = after_dot
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(after_dot.len());
+                    if let Ok(n) = after_dot[..sec_end].parse::<u32>() {
+                        section_counter = n;
+                        subsection_counter = 0;
+                    }
+                }
+            } else if entry.depth == 3 {
+                let t = entries[i].title.trim();
+                let parts: Vec<&str> = t.splitn(4, '.').collect();
+                if parts.len() >= 3 {
+                    let sec_part = parts[2]
+                        .find(|c: char| !c.is_ascii_digit())
+                        .map(|p| &parts[2][..p])
+                        .unwrap_or(parts[2]);
+                    if let Ok(n) = sec_part.parse::<u32>() {
+                        subsection_counter = n;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Back matter / front matter / sub-entries — don't number
+        if matches!(
+            entries[i].classification,
+            Classification::FrontMatter
+                | Classification::BackMatter
+                | Classification::SubEntry
+        ) {
+            continue;
+        }
+
+        // Assign number based on depth
+        if entry.depth == 2 && needs_d2_numbering.contains(&ch_num) {
+            section_counter += 1;
+            subsection_counter = 0;
+            let prefix = format!("{}.{} ", ch_num, section_counter);
+            entries[i].title = format!("{}{}", prefix, entries[i].title);
+        } else if entry.depth == 3 && section_counter > 0 {
+            // Always number depth-3 entries if they don't have numbers
+            // (even if depth-2 siblings are already numbered)
+            subsection_counter += 1;
+            let prefix =
+                format!("{}.{}.{} ", ch_num, section_counter, subsection_counter);
+            entries[i].title = format!("{}{}", prefix, entries[i].title);
+        }
+    }
 }
 
 // ── Unit tests ──
