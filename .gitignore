@@ -1,6 +1,8 @@
 # Rust
 /target
 /data/dumps
+*.png
+*.gz
 
 # Claude Code
 /.claude

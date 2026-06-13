@@ -60,6 +60,71 @@ If a fix can be done in Stage 1, do it there — the JSON should be clean.
 If it requires document-level context (cross-page heading structure), do
 it in Stage 2. Stage 3 should have almost no logic.
 
+## Pdfium Text Extraction — Reference Implementation
+
+When fixing text extraction bugs (missing spaces, wrong word boundaries, etc.),
+**always consult pdfium's C++ source code as the reference implementation**.
+Pdfium already solves these problems correctly — our job is to replicate its
+behavior, not invent heuristics.
+
+### Key source file
+
+`core/fpdftext/cpdf_textpage.cpp` in the [pdfium repo](https://pdfium.googlesource.com/pdfium/).
+
+### Space detection: two paths
+
+1. **Inter-object** (`ProcessInsertObject`): When a new text object starts,
+   compare its position to where the previous character's advance would have
+   placed the cursor. Threshold uses `NormalizeThreshold(max(lastCharWidth,
+   thisCharWidth), 400, 700, 800) * fontSize / 1000`.
+
+2. **Intra-object** (`CalculateSpaceThreshold`): Within a single text object,
+   TJ kerning displacements are accumulated. If `spacing >= threshold`, a space
+   is inserted. Threshold = `fontSize * font.GetCharWidthF(' ') / 1000 / 2`.
+
+`NormalizeThreshold(t, a, b, c)` divides the input by 2/4/5/6 depending on
+which tier it falls in (< a → /2, < b → /4, < c → /5, else /6).
+
+### What pdfium exposes via its C API
+
+| API | What it gives you | Rust wrapper (pdfium-render) |
+|-----|-------------------|-----------------------------|
+| `FPDFText_GetText` / `FPDFText_GetBoundedText` | Full text with spaces already inserted | `PdfPageText::all()`, `inside_rect()` |
+| `FPDFText_IsGenerated` | Whether a char was synthesized (space, etc.) | `PdfPageTextChar::is_generated()` |
+| `FPDFText_GetCharOrigin` | Typographic origin (advance-based position) | `PdfPageTextChar::origin_x()` |
+| `FPDFText_GetLooseCharBox` | Visual bounding box | `PdfPageTextChar::loose_bounds()` |
+| `FPDFText_CountChars` | Count includes generated chars | `PdfPageTextChars::len()` |
+
+### Common mistakes to avoid
+
+- **Don't invent gap heuristics** when pdfium already solved the problem.
+  `text.all()` returns correct text — if your char-by-char reconstruction
+  disagrees, your code is wrong, not pdfium.
+- **Don't assume origin_x == bbox left**. For italic/kerned glyphs they differ.
+  Use origin for position tracking, bbox for visual extent.
+- **Don't filter out space chars and reconstruct from gaps**. Instead, track
+  which chars had pdfium-generated spaces before them (`pdfium_space_before`
+  on `PdfChar`). This preserves pdfium's advance-width analysis.
+- **Bounding box gaps underestimate real spacing** because bbox is the visual
+  extent (tight around ink), not the advance width. Characters like italic 'f'
+  have bbox extending past the advance, making the gap to the next char appear
+  smaller than the actual word spacing.
+
+### Current implementation
+
+`PdfChar` carries `pdfium_space_before: bool` — set to `true` when the
+preceding character in pdfium's char stream was a generated space. This is
+the most reliable word-boundary signal. In `TocRawLine::text()`, this flag
+is checked alongside gap-based and position-based space detection.
+
+## TOC Fixture Tests
+
+Fixture files in `crates/papers-extract/tests/fixtures/toc/*.md` are the
+**ground truth** of what the TOC parser should produce. When fixtures and
+parser disagree, fix the parser — never silently update fixtures to match
+broken output. The only valid reason to update a fixture is when the parser
+now produces *more correct* output (e.g., fixing a previously-missing space).
+
 ## Benchmarks
 
 Benchmark results go in `benchmarks/<model-name>/`. Each benchmark directory

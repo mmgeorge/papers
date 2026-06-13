@@ -136,7 +136,7 @@ fn toc_fixtures() {
         // Save actual output for debugging regardless of pass/fail.
         std::fs::write(temp_dir.join(format!("{stem}.md")), &actual).ok();
 
-        if actual != expected {
+        if normalize_typography(&actual) != normalize_typography(&expected) {
             let diff = build_diff(stem, &expected, &actual);
             failures.push(diff);
         } else {
@@ -158,6 +158,26 @@ fn toc_fixtures() {
     );
 }
 
+/// Canonicalize typographically-equivalent characters so the comparison ignores
+/// them. pdfium extracts faithfully (curly quotes U+2018/U+2019, en-dash U+2013,
+/// em-dash U+2014) while the fixture corpus is inconsistent — some files were
+/// hand-transcribed to ASCII (' " - and "--" for an em-dash). These variants are
+/// visually equivalent, so treat them as equal rather than churning fixtures or
+/// lossily normalizing extraction.
+fn normalize_typography(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            '\u{201C}' | '\u{201D}' => out.push('"'),
+            '\u{2013}' => out.push('-'),
+            '\u{2014}' => out.push_str("--"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Produce a compact diff showing the first few divergent lines.
 fn build_diff(stem: &str, expected: &str, actual: &str) -> String {
     let exp_lines: Vec<&str> = expected.lines().collect();
@@ -176,7 +196,7 @@ fn build_diff(stem: &str, expected: &str, actual: &str) -> String {
     for i in 0..max {
         let e = exp_lines.get(i).copied().unwrap_or("<missing>");
         let a = act_lines.get(i).copied().unwrap_or("<missing>");
-        if e != a {
+        if normalize_typography(e) != normalize_typography(a) {
             diffs.push(format!(
                 "  line {n}:\n    expected: {e:?}\n    actual:   {a:?}",
                 n = i + 1
