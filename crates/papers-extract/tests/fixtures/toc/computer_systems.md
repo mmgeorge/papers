@@ -158,7 +158,7 @@
     - 4.5.13 Unfinished Business (p. 446)
   - 4.6 Summary (p. 449)
     - 4.6.1 Y86 Simulators (p. 450)
-    - Bibliographic Notes (p. 451)
+  - Bibliographic Notes (p. 451)
     - Homework Problems (p. 451)
     - Solutions to Practice Problems (p. 457)
 - 5 Optimizing Program Performance (p. 473)

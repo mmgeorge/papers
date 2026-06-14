@@ -213,24 +213,6 @@ impl TocRawLine {
                 if gap > threshold || has_pdfium_space || font_change_space || pdfium_indexed_space {
                     result.push(' ');
                 }
-                // Superscript: a raised, smaller alphanumeric glyph denotes an
-                // exponent ("LDL^T", "x^2"). pdfium reports the raised glyph but no
-                // caret, so synthesize one. Gate tightly (clearly raised AND
-                // clearly smaller, alphanumeric) to avoid spurious carets.
-                let prev_h = (prev.bbox[3] - prev.bbox[1]).abs();
-                let this_h = (ch.bbox[3] - ch.bbox[1]).abs();
-                let prev_cy = (prev.bbox[1] + prev.bbox[3]) / 2.0;
-                let this_cy = (ch.bbox[1] + ch.bbox[3]) / 2.0;
-                let raised = prev_h > 0.5 && (prev_cy - this_cy) > prev_h * 0.3;
-                let smaller = this_h < prev_h * 0.8;
-                if ch.codepoint.is_ascii_alphanumeric()
-                    && prev.codepoint.is_ascii_alphanumeric()
-                    && raised
-                    && smaller
-                    && gap.abs() < threshold
-                {
-                    result.push('^');
-                }
             }
             result.push(ch.codepoint);
         }
@@ -2116,6 +2098,20 @@ fn merge_multiline_titles(lines: Vec<TocSplitLine>) -> Vec<TocSplitLine> {
             if is_part_pattern(&line.title) {
                 flush_buffer(&mut buffer, &mut result);
                 result.push(line);
+            } else if buffer.is_empty()
+                && !starts_with_heading_pattern(&line.title)
+                && result
+                    .last()
+                    .is_some_and(|last| last.page_label.is_none() && is_part_pattern(&last.title))
+            {
+                // A no-page, non-heading line immediately after a Part heading is
+                // the Part's wrapped title tail ("Part III … Between" + "Programs").
+                // Absorb it so it is not mistaken for the next chapter's prefix
+                // word. The chapter number that follows ("10") is a heading
+                // pattern and is excluded.
+                if let Some(last) = result.last_mut() {
+                    last.title = join_title_parts(last.title.trim(), line.title.trim());
+                }
             } else {
                 buffer.push(line);
             }
