@@ -1115,6 +1115,184 @@ fn build_lines_from_chars(
 /// Split each line at the gutter, producing separate left/right half-lines,
 /// then reorder: all left-column lines (top to bottom), then all right-column
 /// lines (top to bottom).
+/// Detect a two-column gutter via the line-coverage projection profile.
+///
+/// For each X bin, count how many lines have a character *spanning* it
+/// (Nagy's projection profile). A real column gutter is a near-empty vertical
+/// band (few lines cross it — only full-width headers) flanked by two WIDE dense
+/// columns (Breuel's column-separator evaluation). The "wide column on both
+/// sides" requirement rejects single-column TOCs (whose only interior low-density
+/// band is the narrow strip before the right-aligned page numbers); the
+/// "balanced / nearest the centre" tie-break picks the true gutter over a
+/// column's own internal title→page-number gap. Returns the gutter X if confident.
+fn detect_two_column_gutter(lines: &[Vec<TocChar>], page_left: f32, page_right: f32) -> Option<f32> {
+    let n = lines.len();
+    let span = page_right - page_left;
+    if n < 8 || span < 150.0 {
+        return None;
+    }
+    let bw = 3.0f32;
+    let nb = ((span / bw).ceil() as usize).max(10);
+    let mut cov = vec![0u32; nb];
+    for line in lines {
+        let mut hit = vec![false; nb];
+        for c in line {
+            let lo = (((c.bbox[0] - page_left) / bw).floor().max(0.0) as usize).min(nb - 1);
+            let hi = (((c.bbox[2] - page_left) / bw).floor().max(0.0) as usize).min(nb - 1);
+            for h in hit.iter_mut().take(hi + 1).skip(lo) {
+                *h = true;
+            }
+        }
+        for (b, &h) in hit.iter().enumerate() {
+            if h {
+                cov[b] += 1;
+            }
+        }
+    }
+    let near_zero = (n as f32 * 0.12).max(1.0);
+    let dense = n as f32 * 0.4;
+    let center = nb as f32 / 2.0;
+    let (lo, hi) = (nb / 5, nb * 4 / 5);
+    // (gutter_x, two_column_row_count, distance_to_centre). We pick the valley
+    // that best PARTITIONS the page (Breuel): the true gutter is the one with
+    // the most rows carrying real text on *both* sides (left entry + right
+    // entry). A spurious within-column valley separates far fewer such rows.
+    let mut best: Option<(f32, usize, f32)> = None;
+    let mut b = lo;
+    while b < hi {
+        if (cov[b] as f32) > near_zero {
+            b += 1;
+            continue;
+        }
+        let run_start = b;
+        while b < hi && (cov[b] as f32) <= near_zero {
+            b += 1;
+        }
+        let mid = (run_start + b) as f32 / 2.0;
+        let gutter_x = page_left + mid * bw;
+        // Dense-column extents on each side of this near-empty band.
+        let left: Vec<usize> = (0..run_start).filter(|&k| cov[k] as f32 >= dense).collect();
+        let right: Vec<usize> = (b..nb).filter(|&k| cov[k] as f32 >= dense).collect();
+        if let (Some(&l0), Some(&l1), Some(&r0), Some(&r1)) =
+            (left.first(), left.last(), right.first(), right.last())
+        {
+            let left_w = (l1 - l0) as f32 * bw;
+            let right_w = (r1 - r0) as f32 * bw;
+            // Count rows with real words (≥3 letters) on each side. The right
+            // count is also the gate: a single-column TOC's only interior valley
+            // sits before the right-aligned page numbers / after the dot
+            // leaders, where the right half is just digits and '.' — almost no
+            // letters. The both-sides count drives selection.
+            let alpha = |line: &Vec<TocChar>, want_right: bool| -> usize {
+                line.iter()
+                    .filter(|c| {
+                        let on_right = (c.bbox[0] + c.bbox[2]) / 2.0 > gutter_x;
+                        on_right == want_right && c.codepoint.is_alphabetic()
+                    })
+                    .count()
+            };
+            let alpha_right_rows = lines.iter().filter(|l| alpha(l, true) >= 3).count();
+            let both_sides_rows = lines
+                .iter()
+                .filter(|l| alpha(l, true) >= 3 && alpha(l, false) >= 3)
+                .count();
+            if left_w >= span * 0.2
+                && right_w >= span * 0.2
+                && alpha_right_rows >= 5
+                && (alpha_right_rows as f32) >= n as f32 * 0.25
+            {
+                let dist = (mid - center).abs();
+                let better = match best {
+                    None => true,
+                    Some((_, bc, bd)) => both_sides_rows > bc || (both_sides_rows == bc && dist < bd),
+                };
+                if better {
+                    best = Some((gutter_x, both_sides_rows, dist));
+                }
+            }
+        }
+    }
+    best.map(|(gx, _, _)| gx)
+}
+
+/// Split each line into a left- and right-column half at the column gutter, then
+/// emit every left half (top to bottom) followed by every right half.
+///
+/// Rather than slicing at the fixed `gutter_x`, each row is cut at its own
+/// largest internal whitespace gap that lies *near* the gutter. This is robust
+/// to rows whose right entry starts left of the nominal gutter — e.g. an
+/// unindented right-column chapter heading ("6 Differential Analysis") begins
+/// further left than the indented subsection rows that set the gutter. Slicing
+/// at the gap keeps "6 Differential Analysis" whole on the right instead of
+/// leaving its "6" on the left (where it would be misread as a page number).
+///
+/// A row whose text flows continuously across the gutter (no real gap near it,
+/// e.g. a centred "CONTENTS" header) is kept whole.
+fn split_lines_at_gutter(lines: Vec<Vec<TocChar>>, gutter_x: f32) -> Vec<Vec<TocChar>> {
+    const WINDOW: f32 = 55.0; // how far from the gutter a cut gap may sit
+    const MIN_GAP: f32 = 6.0; // a real column gap, not inter-word spacing
+    let has_alpha = |chars: &[TocChar]| chars.iter().any(|c| c.codepoint.is_alphabetic());
+    let mut left: Vec<(f32, Vec<TocChar>)> = Vec::new();
+    let mut right: Vec<(f32, Vec<TocChar>)> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let y = line.iter().map(|c| (c.bbox[1] + c.bbox[3]) / 2.0).sum::<f32>() / line.len() as f32;
+        // Chars are pre-sorted by left edge. Find the widest gap near the gutter
+        // whose *right side still contains letters* — i.e. a cut that separates
+        // two real entries. This rejects the title→page-number gap of a
+        // left-only row (whose right side would be digits only) so the row stays
+        // whole, while still pulling an unindented right-column heading whole to
+        // the right even when its number sits left of the nominal gutter.
+        // Score = (left side ends in a digit, gap width). Preferring a cut whose
+        // left char is a digit keeps a left entry's trailing page number with
+        // that entry — cutting before it would strand the page, make the entry
+        // look like an open heading, and let it absorb the next row.
+        let mut best_score = (false, 0.0f32);
+        let mut split_at: Option<usize> = None;
+        for i in 1..line.len() {
+            let gap = line[i].bbox[0] - line[i - 1].bbox[2];
+            let mid = (line[i - 1].bbox[2] + line[i].bbox[0]) / 2.0;
+            if gap >= MIN_GAP && (mid - gutter_x).abs() <= WINDOW && has_alpha(&line[i..]) {
+                let score = (line[i - 1].codepoint.is_numeric(), gap);
+                if score > best_score {
+                    best_score = score;
+                    split_at = Some(i);
+                }
+            }
+        }
+        match split_at {
+            Some(i) => {
+                let mut chars = line;
+                let r = chars.split_off(i);
+                if !chars.is_empty() {
+                    left.push((y, chars));
+                }
+                if !r.is_empty() {
+                    right.push((y, r));
+                }
+            }
+            None => {
+                // No qualifying column gap: a row confined to one column or a
+                // full-width header. If every char sits right of the gutter it
+                // belongs to the right column; otherwise keep it left.
+                if line.iter().all(|c| (c.bbox[0] + c.bbox[2]) / 2.0 >= gutter_x) {
+                    right.push((y, line));
+                } else {
+                    left.push((y, line));
+                }
+            }
+        }
+    }
+    left.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    right.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut result = Vec::with_capacity(left.len() + right.len());
+    result.extend(left.into_iter().map(|(_, c)| c));
+    result.extend(right.into_iter().map(|(_, c)| c));
+    result
+}
+
 fn split_two_column_lines(lines: Vec<Vec<TocChar>>, _page_height: f32) -> Vec<Vec<TocChar>> {
     if lines.len() < 4 {
         return lines;
@@ -1134,6 +1312,14 @@ fn split_two_column_lines(lines: Vec<Vec<TocChar>>, _page_height: f32) -> Vec<Ve
 
     if page_span < 100.0 {
         return lines; // page too narrow for two columns
+    }
+
+    // Primary: projection-profile gutter detection (Nagy XY-cut / Breuel
+    // whitespace-column style). Finds a near-empty vertical band flanked by two
+    // wide dense columns — robust where the per-line largest-gap heuristic fails
+    // (the title→page-number gaps dominate each line's biggest gap).
+    if let Some(gutter_x) = detect_two_column_gutter(&lines, page_left, page_right) {
+        return split_lines_at_gutter(lines, gutter_x);
     }
 
     // Middle 80% of the content area — gutter should be here.
