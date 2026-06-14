@@ -19,6 +19,43 @@ crates/papers-extract/scratch.txt
 
 The `.temp/` directory is gitignored. Create it on demand if it doesn't exist.
 
+## Verify PDF Layout by Rendering and Dumping — Do NOT Infer
+
+When reasoning about a PDF's layout (indent levels, columns, depth, which
+glyphs/numbers a line has, why an entry is mis-parsed), **render the actual
+page to an image and look at it, and dump the page's chars.** Do NOT draw
+conclusions from x-coordinate dumps or text dumps alone, and never guess from
+the parser's output what the source "must" look like. A two-minute render
+settles questions that hours of coordinate-inference get wrong (e.g. "is this a
+sub-section or a sibling section?", "does this chapter have a number?", "is the
+gutter real?"). This is mandatory before concluding a fixture is wrong, a page
+is a certain layout, or a defect is "unfixable".
+
+**Render a page to an image (then Read the image):**
+```bash
+# Windows (Ghostscript). Page numbers are 1-indexed.
+gswin64c -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=png16m -r140 \
+  -dFirstPage=8 -dLastPage=8 -sOutputFile=.temp/render/page8.png data/<file>.pdf
+# (pdftoppm / mutool draw / magick are equivalents on other platforms)
+```
+
+**Dump a page's chars (codepoint, bbox, font) — for exact x positions, broken
+glyphs, hanging number columns, sub/superscripts:**
+```bash
+cargo run --release --bin dump_chars -- data/<file>.pdf <page_num>   # 1-indexed
+```
+
+**Dump pdfium's reference text for the whole PDF (find a page, see word
+boundaries / wrap markers):**
+```bash
+cargo run --release --bin dump_text -- data/<file>.pdf .temp/<file>_text.txt
+```
+
+Page-index gotcha: Ghostscript `-dFirstPage` and `dump_chars` are **1-indexed**;
+pypdf and our internal `page_idx` are **0-indexed**. An entry can also appear
+twice in `dump_text` (once in the TOC, once in the body) — confirm you are
+looking at the TOC page, not the body section of the same title.
+
 ## Extraction Pipeline Architecture
 
 The PDF extraction pipeline has three stages. Fixes and logic should go

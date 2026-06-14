@@ -527,6 +527,14 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
             if trimmed.starts_with("list of") || normalized.starts_with("listof") {
                 continue;
             }
+            // "Contents at a Glance" is a brief summary TOC that duplicates the
+            // chapter/appendix headings of the detailed "Table of Contents".
+            // Skip it as a start page so the detailed TOC is used instead; the
+            // glance page then falls outside the ascending main-TOC run and is
+            // not extracted, avoiding duplicated (and phantom wrapped) headings.
+            if normalized.contains("ataglance") {
+                continue;
+            }
             if normalized == "contents"
                 || normalized == "tableofcontents"
                 || normalized == "detailedcontents"
@@ -780,6 +788,20 @@ fn line_ends_with_number(line: &TocRawLine) -> bool {
 
 // ── Phase 2: Line extraction ──
 
+/// True for an appendix-letter heading fragment: a single uppercase letter
+/// followed by a space and a capitalized word ("B Message Crackers, …",
+/// "A The Build Environment"). Used to keep such a wrapped heading on an
+/// offset-page top band, where its page number sits on the continuation line so
+/// the usual number/leader-dot/heading-number signals are absent. A running
+/// header ("Table of Contents") fails because its second word is lowercase.
+fn is_appendix_letter_heading(text: &str) -> bool {
+    let t = text.trim();
+    let mut chars = t.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && chars.next() == Some(' ')
+        && chars.next().is_some_and(|c| c.is_ascii_uppercase())
+}
+
 fn extract_toc_lines(page_chars: &[(Vec<PdfChar>, f32)], toc_pages: &[u32]) -> Vec<TocRawLine> {
     let mut all_lines = Vec::new();
 
@@ -827,7 +849,8 @@ fn extract_toc_lines(page_chars: &[(Vec<PdfChar>, f32)], toc_pages: &[u32]) -> V
                 }
                 return line_ends_with_number(line)
                     || headings::has_leader_dots(&text)
-                    || starts_with_heading_pattern(text.trim());
+                    || starts_with_heading_pattern(text.trim())
+                    || is_appendix_letter_heading(&text);
             }
             true
         });
@@ -880,6 +903,23 @@ fn extract_toc_lines(page_chars: &[(Vec<PdfChar>, f32)], toc_pages: &[u32]) -> V
         }
 
         all_lines.extend(lines);
+    }
+
+    // Drop standalone "Contents" / "Table of Contents" running headers that
+    // REPEAT across pages. A repeated pure-"Contents" line (optionally followed
+    // by a roman page number) sits at an arbitrary, often far-right x and would
+    // otherwise create a spurious indent level and clear the depth-resolution
+    // stack. Gated on ≥2 occurrences so a single real "Contents (p. v)"
+    // front-matter entry (e.g. in `edo`) is preserved. The topmost-line filter
+    // above already handles the once-per-page header in the common case.
+    let is_pure_contents = |l: &TocRawLine| {
+        let norm = normalize_toc_header_text(&l.text());
+        ["contents", "tableofcontents", "detailedcontents"]
+            .iter()
+            .any(|h| norm.starts_with(h) && norm[h.len()..].chars().all(|c| "ivxlcdm".contains(c)))
+    };
+    if all_lines.iter().filter(|l| is_pure_contents(l)).count() >= 2 {
+        all_lines.retain(|l| !is_pure_contents(l));
     }
 
     all_lines
@@ -2551,15 +2591,11 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
         .iter()
         .map(|(l, _, _)| l.x_left)
         .collect();
-    // Normalize x_left per page: subtract each page's minimum x_left so that
-    // indent positions are comparable across pages with different margins.
-    let mut page_min_x: HashMap<u32, f32> = HashMap::new();
-    for (line, _, _) in &entries {
-        let min = page_min_x.entry(line.page_idx).or_insert(f32::MAX);
-        if line.x_left < *min {
-            *min = line.x_left;
-        }
-    }
+    // Normalize x_left per page by a registered baseline so indent positions are
+    // comparable across pages with different margins AND continuation pages that
+    // lack a chapter heading (see `compute_page_offsets`). Indent levels are
+    // count-aware so a stray far-right entry cannot create a spurious deep level.
+    let page_min_x: HashMap<u32, f32> = compute_page_offsets(&entries);
     let x_lefts_normalized: Vec<f32> = entries
         .iter()
         .map(|(l, _, _)| {
@@ -2567,8 +2603,7 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
             l.x_left - page_min
         })
         .collect();
-    let indent_levels = compute_indent_levels(&x_lefts_normalized);
-
+    let indent_levels = compute_indent_levels_counted(&x_lefts_normalized, 3);
 
     // Build a mapping from indent level → most common depth among classified
     // entries at that indent. This lets us anchor indent levels to known depths.
@@ -2839,6 +2874,109 @@ fn compute_indent_levels(x_lefts: &[f32]) -> Vec<f32> {
         }
     }
     levels
+}
+
+/// Like `compute_indent_levels` but drops levels backed by fewer than
+/// `min_count` entries. A single far-right entry (a page-number-column artifact
+/// or a two-column right-edge fragment) would otherwise create a spurious deep
+/// indent level that corrupts depth inference. Never returns empty if the
+/// unfiltered set was non-empty.
+fn compute_indent_levels_counted(x_lefts: &[f32], min_count: usize) -> Vec<f32> {
+    let levels = compute_indent_levels(x_lefts);
+    if levels.len() <= 1 {
+        return levels;
+    }
+    let mut counts = vec![0usize; levels.len()];
+    for &x in x_lefts {
+        counts[quantize_indent(x, &levels) as usize] += 1;
+    }
+    let mut filtered: Vec<f32> = Vec::new();
+    for (i, &l) in levels.iter().enumerate() {
+        if counts[i] >= min_count {
+            filtered.push(l);
+        }
+    }
+    if filtered.is_empty() {
+        levels
+    } else {
+        filtered
+    }
+}
+
+/// Per-page x baseline that registers continuation pages to a canonical indent
+/// grid (offset-invariant depth). A naïve per-page *minimum* fails on a
+/// continuation page that carries only a chapter's sections (no chapter
+/// heading): its leftmost entry is at the *section* level, so subtracting the
+/// page min collapses every entry up a depth. Books also shift recto/verso pages
+/// by a binding margin (Windows Internals offsets odd pages +30pt). So:
+///   - Pages with a Chapter/Part heading anchor on that heading's x (the base
+///     indent, which already encodes the page's physical margin).
+///   - Continuation pages are aligned by the offset that best maps their indent
+///     levels onto the canonical grid (inter-level spacings are stable; only the
+///     absolute offset differs). Pages that do not align cleanly fall back to
+///     their own minimum.
+fn compute_page_offsets(entries: &[(TocSplitLine, Classification, u32)]) -> HashMap<u32, f32> {
+    let mut page_min: HashMap<u32, f32> = HashMap::new();
+    let mut pages: Vec<u32> = Vec::new();
+    for (l, _, _) in entries {
+        if !page_min.contains_key(&l.page_idx) {
+            pages.push(l.page_idx);
+        }
+        let m = page_min.entry(l.page_idx).or_insert(f32::MAX);
+        *m = m.min(l.x_left);
+    }
+    // Anchor each page on its CHAPTER level only. Parts/appendix dividers sit
+    // further left than chapters (one indent above), so anchoring a page on its
+    // part would shift that page's baseline relative to chapter-anchored pages
+    // and smear the indent levels. Pages without a chapter (part-only divider
+    // pages, appendix continuations, mid-chapter continuations) are instead
+    // REGISTERED below by aligning their section/subsection levels to the canon.
+    let mut page_offset: HashMap<u32, f32> = HashMap::new();
+    for (l, class, _) in entries {
+        if *class == Classification::Chapter {
+            let e = page_offset.entry(l.page_idx).or_insert(f32::MAX);
+            *e = e.min(l.x_left);
+        }
+    }
+    if page_offset.is_empty() {
+        return page_min; // no chapter anchor — keep per-page minimum
+    }
+    let canon_xs: Vec<f32> = entries
+        .iter()
+        .filter(|(l, _, _)| page_offset.contains_key(&l.page_idx))
+        .map(|(l, _, _)| l.x_left - page_offset[&l.page_idx])
+        .collect();
+    let canon = compute_indent_levels_counted(&canon_xs, 3);
+    for &p in &pages {
+        if page_offset.contains_key(&p) {
+            continue;
+        }
+        let fallback = page_min.get(&p).copied().unwrap_or(0.0);
+        let page_xs: Vec<f32> = entries
+            .iter()
+            .filter(|(l, _, _)| l.page_idx == p)
+            .map(|(l, _, _)| l.x_left)
+            .collect();
+        let page_levels = compute_indent_levels_counted(&page_xs, 2);
+        let mut best_delta = fallback;
+        let mut best_err = f32::MAX;
+        for &pl in &page_levels {
+            for &cl in &canon {
+                let delta = pl - cl;
+                let err: f32 = page_levels
+                    .iter()
+                    .map(|&x| canon.iter().map(|&c| (x - delta - c).abs()).fold(f32::MAX, f32::min))
+                    .sum();
+                if err < best_err {
+                    best_err = err;
+                    best_delta = delta;
+                }
+            }
+        }
+        let avg_err = best_err / page_levels.len().max(1) as f32;
+        page_offset.insert(p, if avg_err <= 6.0 { best_delta } else { fallback });
+    }
+    page_offset
 }
 
 /// Quantize an x-position to an indent level (0-based).
