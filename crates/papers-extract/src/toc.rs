@@ -1337,23 +1337,51 @@ fn split_lines_at_gutter(lines: Vec<Vec<TocChar>>, gutter_x: f32) -> Vec<Vec<Toc
             continue;
         }
         let y = line.iter().map(|c| (c.bbox[1] + c.bbox[3]) / 2.0).sum::<f32>() / line.len() as f32;
+        // Only split a row that carries real words (letters) on BOTH sides of the
+        // gutter. A row entirely in one column — e.g. a right-column section row
+        // "6.2 Conservation of Mass" whose hanging number sits just right of the
+        // gutter — must go wholly to that side; otherwise the gap between its
+        // number and title (near the gutter) would be sliced, stranding "6.2"
+        // which then leaks onto a neighbouring left entry.
+        let center = |c: &TocChar| (c.bbox[0] + c.bbox[2]) / 2.0;
+        let has_left_alpha = line.iter().any(|c| c.codepoint.is_alphabetic() && center(c) < gutter_x);
+        let has_right_alpha = line.iter().any(|c| c.codepoint.is_alphabetic() && center(c) > gutter_x);
+        if !(has_left_alpha && has_right_alpha) {
+            if has_right_alpha {
+                right.push((y, line));
+            } else {
+                left.push((y, line));
+            }
+            continue;
+        }
         // Chars are pre-sorted by left edge. Find the widest gap near the gutter
         // whose *right side still contains letters* — i.e. a cut that separates
         // two real entries. This rejects the title→page-number gap of a
         // left-only row (whose right side would be digits only) so the row stays
         // whole, while still pulling an unindented right-column heading whole to
         // the right even when its number sits left of the nominal gutter.
-        // Score = (left side ends in a digit, gap width). Preferring a cut whose
-        // left char is a digit keeps a left entry's trailing page number with
-        // that entry — cutting before it would strand the page, make the entry
-        // look like an open heading, and let it absorb the next row.
+        // Score = (left side ends in a PLAIN page number, gap width). Preferring
+        // a cut after a left entry's trailing page number keeps it attached —
+        // cutting before it would strand the page, make the entry look like an
+        // open heading, and let it absorb the next row. A "plain" page number is
+        // a digit run NOT preceded by '.', so a *dotted* right-column section
+        // number ("6.4 Inviscid Flow") does NOT get this preference and stays on
+        // the right where it belongs (otherwise it leaks into the left wrap line
+        // as "…The Linear 6.4 Momentum").
         let mut best_score = (false, 0.0f32);
         let mut split_at: Option<usize> = None;
         for i in 1..line.len() {
             let gap = line[i].bbox[0] - line[i - 1].bbox[2];
             let mid = (line[i - 1].bbox[2] + line[i].bbox[0]) / 2.0;
             if gap >= MIN_GAP && (mid - gutter_x).abs() <= WINDOW && has_alpha(&line[i..]) {
-                let score = (line[i - 1].codepoint.is_numeric(), gap);
+                let left_is_page_num = line[i - 1].codepoint.is_ascii_digit() && {
+                    let mut k = i - 1;
+                    while k > 0 && line[k - 1].codepoint.is_ascii_digit() {
+                        k -= 1;
+                    }
+                    k == 0 || line[k - 1].codepoint != '.'
+                };
+                let score = (left_is_page_num, gap);
                 if score > best_score {
                     best_score = score;
                     split_at = Some(i);
@@ -2421,6 +2449,12 @@ fn starts_with_heading_pattern(title: &str) -> bool {
     if t.starts_with("CHAPTER ") || t.starts_with("Chapter ") {
         return true;
     }
+    // APPENDIX X or Appendix X — a structural heading whose wrapped title tail
+    // ("APPENDIX D Compressible Flow Functions" + "for an Ideal Gas …") must be
+    // recognized as an open heading so the continuation force-merges into it.
+    if t.starts_with("APPENDIX ") || t.starts_with("Appendix ") {
+        return true;
+    }
     // Part N
     if is_part_pattern(t) {
         return true;
@@ -2829,6 +2863,9 @@ fn classify_by_pattern(title: &str, last_depth: u32) -> (Classification, u32) {
             | "bibliographic notes"
             | "further reading"
             | "summary"
+            | "chapter summary"
+            | "chapter summary and study guide"
+            | "summary and study guide"
     ) {
         let sub_depth = (last_depth + 1).min(4);
         return (Classification::SubEntry, sub_depth);
@@ -3391,6 +3428,15 @@ fn infer_chapter_numbers_from_children(entries: &mut [ClassifiedEntry]) {
         let depth = entries[i].depth;
         let title = entries[i].title.trim();
 
+        // A single inferred chapter number only makes sense for a chapter-level
+        // entry. A SubEntry (References, Summary…) or any non-depth-1 entry must
+        // be skipped — otherwise a chapter-tail "References" followed in reading
+        // order by the next chapter's depth-3 children would wrongly absorb that
+        // chapter's number ("8 References").
+        if depth != 1 || entries[i].classification == Classification::SubEntry {
+            continue;
+        }
+
         // Skip if already has a number prefix
         if title.chars().next().map_or(true, |c| c.is_ascii_digit()) {
             continue;
@@ -3479,7 +3525,16 @@ fn resolve_bare_letter_sections(entries: &mut [ClassifiedEntry]) {
     let candidates: Vec<(usize, char, f32)> = entries
         .iter()
         .enumerate()
-        .filter_map(|(i, e)| bare_letter_heading(&e.title).map(|(c, _)| (i, c, e.x_left)))
+        .filter_map(|(i, e)| {
+            // A genuine appendix letter sits at the chapter/part indent. An entry
+            // already classified as a deep subsection ("A Practical Reduced-
+            // Hessian Method" = 18.7.4) merely starts with the article "A" and
+            // must not be promoted to a depth-1 chapter.
+            if e.depth >= 3 {
+                return None;
+            }
+            bare_letter_heading(&e.title).map(|(c, _)| (i, c, e.x_left))
+        })
         .collect();
     if candidates.is_empty() {
         return;
