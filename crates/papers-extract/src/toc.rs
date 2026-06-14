@@ -480,6 +480,53 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
     })
 }
 
+/// Render a document's table of contents as the outline-markdown used by the TOC
+/// fixtures: `- Title (p. N)`, two spaces of indent per depth level beyond 1, and
+/// a trailing newline. Uses the parsed TOC page when one is found, otherwise
+/// falls back to font-detected headings. This is the single source of truth for
+/// fixture rendering — shared by the `toc_fixtures` test (to build the *actual*
+/// side) and the `gen_toc_fixture` tool (to seed new fixtures).
+pub fn render_fixture_markdown(page_chars: &[(Vec<PdfChar>, f32)]) -> String {
+    struct Row {
+        depth: u32,
+        title: String,
+        page: String,
+    }
+    let rows: Vec<Row> = match parse_toc(page_chars) {
+        Some(result) => result
+            .entries
+            .iter()
+            .map(|e| Row {
+                depth: e.depth,
+                title: e.title.clone(),
+                page: e.page_label.clone(),
+            })
+            .collect(),
+        None => headings::extract_headings(page_chars)
+            .headings
+            .iter()
+            .map(|h| Row {
+                depth: h.depth,
+                title: h.title.clone(),
+                page: h.page.to_string(),
+            })
+            .collect(),
+    };
+    let mut lines = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let indent = "  ".repeat(row.depth.saturating_sub(1) as usize);
+        let page = if row.page.is_empty() {
+            String::new()
+        } else {
+            format!(" (p. {})", row.page)
+        };
+        lines.push(format!("{}- {}{}", indent, row.title, page));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
 // ── Phase 1: Find TOC pages ──
 
 /// Check if a page looks like a TOC page based on its content.

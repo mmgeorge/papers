@@ -1,55 +1,8 @@
-use papers_extract::{headings, pdf, toc};
+// Fixture rendering (`- Title (p. N)`, 2-space indent per depth) lives in the
+// library as `toc::render_fixture_markdown`, so the test and the gen_toc_fixture
+// tool produce byte-identical output.
+use papers_extract::{pdf, toc};
 use std::path::PathBuf;
-
-/// A unified heading entry used for fixture comparison, regardless of whether
-/// it came from `parse_toc` (TOC page) or `extract_headings` (font detection).
-struct FixtureEntry {
-    depth: u32,
-    title: String,
-    /// Page label as it should appear in the fixture (e.g. "42", "xvii").
-    page: String,
-}
-
-impl FixtureEntry {
-    fn from_toc(e: &toc::TocEntry) -> Self {
-        Self {
-            depth: e.depth,
-            title: e.title.clone(),
-            page: e.page_label.clone(),
-        }
-    }
-
-    fn from_heading(h: &headings::DetectedHeading) -> Self {
-        Self {
-            depth: h.depth,
-            title: h.title.clone(),
-            page: h.page.to_string(),
-        }
-    }
-}
-
-/// Format entries into the fixture markdown format:
-///
-///   - Title (p. N)          ← depth 1, no indent
-///     - N.M Title (p. N)    ← depth 2, 2-space indent
-///       - N.M.K ...         ← depth 3, 4-space indent
-///
-/// Depth-0 Part entries without a page number are rendered without `(p. …)`.
-fn format_fixture(entries: &[FixtureEntry]) -> String {
-    let mut lines = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let indent = "  ".repeat(entry.depth.saturating_sub(1) as usize);
-        let page = if entry.page.is_empty() {
-            String::new()
-        } else {
-            format!(" (p. {})", entry.page)
-        };
-        lines.push(format!("{}- {}{}", indent, entry.title, page));
-    }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    out
-}
 
 #[test]
 fn toc_fixtures() {
@@ -61,27 +14,35 @@ fn toc_fixtures() {
 
     let pdfium = pdf::load_pdfium(None).expect("load pdfium");
 
-    // Collect all PDFs that have a corresponding fixture, sorted for determinism.
-    let mut pdf_stems: Vec<String> = std::fs::read_dir(&data_dir)
-        .expect("read data dir")
-        .filter_map(|e| {
-            let e = e.ok()?;
-            let path = e.path();
-            if path.extension()?.to_str()? != "pdf" {
-                return None;
+    // Collect (stem, pdf_path, fixture_path) for every PDF that has a fixture.
+    //   curated textbooks:    data/*.pdf       -> tests/fixtures/toc/*.md
+    //   open-licensed corpus: data/open/*.pdf  -> tests/fixtures/toc/open/*.md
+    let mut cases: Vec<(String, PathBuf, PathBuf)> = Vec::new();
+    for (pdf_dir, fix_dir) in [
+        (data_dir.clone(), fixture_dir.clone()),
+        (data_dir.join("open"), fixture_dir.join("open")),
+    ] {
+        let Ok(read_dir) = std::fs::read_dir(&pdf_dir) else {
+            continue;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("pdf") {
+                continue;
             }
-            let stem = path.file_stem()?.to_str()?.to_string();
-            if fixture_dir.join(format!("{stem}.md")).exists() {
-                Some(stem)
-            } else {
-                None
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let fixture_path = fix_dir.join(format!("{stem}.md"));
+            if fixture_path.exists() {
+                cases.push((stem.to_string(), path.clone(), fixture_path));
             }
-        })
-        .collect();
-    pdf_stems.sort();
+        }
+    }
+    cases.sort_by(|a, b| a.0.cmp(&b.0));
 
     assert!(
-        !pdf_stems.is_empty(),
+        !cases.is_empty(),
         "No PDFs with TOC fixtures found. data_dir={}, fixture_dir={}",
         data_dir.display(),
         fixture_dir.display(),
@@ -89,11 +50,8 @@ fn toc_fixtures() {
 
     let mut failures: Vec<String> = Vec::new();
 
-    for stem in &pdf_stems {
-        let pdf_path = data_dir.join(format!("{stem}.pdf"));
-        let fixture_path = fixture_dir.join(format!("{stem}.md"));
-
-        let expected = std::fs::read_to_string(&fixture_path)
+    for (stem, pdf_path, fixture_path) in &cases {
+        let expected = std::fs::read_to_string(fixture_path)
             .unwrap_or_else(|e| panic!("Failed to read fixture {}: {e}", fixture_path.display()))
             .replace("\r\n", "\n");
 
@@ -117,21 +75,10 @@ fn toc_fixtures() {
             })
             .collect();
 
-        // Primary path: explicit TOC page.
-        // Fallback: font-based heading detection for papers without a TOC page.
-        let entries: Vec<FixtureEntry> = match toc::parse_toc(&page_chars) {
-            Some(ref result) => result.entries.iter().map(FixtureEntry::from_toc).collect(),
-            None => {
-                let result = headings::extract_headings(&page_chars);
-                result
-                    .headings
-                    .iter()
-                    .map(FixtureEntry::from_heading)
-                    .collect()
-            }
-        };
-
-        let actual = format_fixture(&entries);
+        // Parse the TOC page (or fall back to font-based heading detection) and
+        // render it as fixture markdown — same code path as the gen_toc_fixture
+        // tool, so generated fixtures and the test compare like-for-like.
+        let actual = toc::render_fixture_markdown(&page_chars);
 
         // Save actual output for debugging regardless of pass/fail.
         std::fs::write(temp_dir.join(format!("{stem}.md")), &actual).ok();
@@ -169,10 +116,7 @@ fn toc_fixtures() {
         );
     }
 
-    eprintln!(
-        "TOC fixtures: {n}/{n} passed",
-        n = pdf_stems.len()
-    );
+    eprintln!("TOC fixtures: {n}/{n} passed", n = cases.len());
 }
 
 /// Canonicalize typographically-equivalent characters so the comparison ignores
