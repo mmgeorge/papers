@@ -181,18 +181,64 @@ fn normalize_typography(s: &str) -> String {
     out
 }
 
-/// Full comparison key: typography normalization plus math/formula spacing
-/// normalization. Spaces that touch a non-alphanumeric character (parentheses,
-/// `*`, operators, commas …) are dropped, so formula formatting like
-/// "O( M log *N )" and "O(M log* N)" compare equal. A space *between two
-/// alphanumerics* is a real word boundary and is kept, so genuine extraction
-/// bugs ("IR n" vs "IRn", "Ital iano" vs "Italiano") still fail.
+/// Drop the trailing dot on a *multi-level* section number so the dotted and
+/// undotted forms compare equal ("1.1." == "1.1", "16.2.3." == "16.2.3"). Some
+/// books (e.g. Barendregt's Lambda Calculus) typeset every section number with a
+/// trailing period; the fixture corpus omits it. A bare chapter number ("1.") is
+/// left to the parser, and a lone number with a trailing dot ("354.") is
+/// unaffected because it has no interior ".digit" group — so this never strips a
+/// real sentence-final or decimal dot.
+fn strip_section_number_trailing_dot(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        // Only match at a token start (preceded by start, whitespace, or other
+        // punctuation — never mid-number, so "C.3"/"1.2.3" interiors are safe).
+        let at_boundary = i == 0 || (!chars[i - 1].is_alphanumeric() && chars[i - 1] != '.');
+        if at_boundary && chars[i].is_ascii_digit() {
+            let mut j = i;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            // Require at least one interior ".<digits>" group (multi-level).
+            let mut groups = 0;
+            while j + 1 < chars.len() && chars[j] == '.' && chars[j + 1].is_ascii_digit() {
+                j += 1;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                groups += 1;
+            }
+            if groups >= 1 {
+                out.extend(&chars[i..j]);
+                // Skip a single trailing dot ("1.1." -> "1.1").
+                i = if j < chars.len() && chars[j] == '.' { j + 1 } else { j };
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Full comparison key: typography normalization, trailing-section-dot and
+/// math/formula spacing normalization, and case folding. Spaces that touch a
+/// non-alphanumeric character (parentheses, `*`, operators, commas …) are
+/// dropped, so formula formatting like "O( M log *N )" and "O(M log* N)" compare
+/// equal. A space *between two alphanumerics* is a real word boundary and is
+/// kept, so genuine extraction bugs ("IR n" vs "IRn", "Ital iano" vs "Italiano")
+/// still fail. Comparison is case-insensitive so small-caps structural headings
+/// ("PREFACE") match their Title-Case transcription ("Preface") — this only ever
+/// makes the check *more* permissive, so no passing fixture can regress.
 fn normalize_for_compare(s: &str) -> String {
     s.lines().map(normalize_line_for_compare).collect::<Vec<_>>().join("\n")
 }
 
 fn normalize_line_for_compare(line: &str) -> String {
     let t = normalize_typography(line);
+    let t = strip_section_number_trailing_dot(&t);
     // PRESERVE the leading indentation exactly — it encodes the outline depth and
     // must remain significant. Only the content after it is spacing-normalized.
     let indent_len = t.len() - t.trim_start_matches(' ').len();
@@ -220,7 +266,8 @@ fn normalize_line_for_compare(line: &str) -> String {
             emitted_space = false;
         }
     }
-    out
+    // Case-insensitive comparison (small-caps headings vs Title-Case fixtures).
+    out.to_lowercase()
 }
 
 /// Produce a compact diff showing the first few divergent lines.
@@ -277,4 +324,16 @@ fn normalize_for_compare_is_spacing_only() {
     assert_ne!(n("  - Notes"), n("    - Notes"));
     // Superscript caret notation is ignored ("LDL^T" == "LDLT").
     assert_eq!(n("- C.3 LDL^T factorization"), n("- C.3 LDLT factorization"));
+    // A multi-level section number's trailing dot is ignored ("1.1." == "1.1").
+    assert_eq!(n("  - 1.1. Aspects of the lambda calculus"), n("  - 1.1 Aspects of the lambda calculus"));
+    assert_eq!(n("    - 16.2.3. The theory"), n("    - 16.2.3 The theory"));
+    // …but the section number itself still decides the match.
+    assert_ne!(n("  - 1.1 Aspects"), n("  - 1.2 Aspects"));
+    // A lone number with a trailing dot (page text, decimals) is untouched.
+    assert_ne!(n("- Page 354. Foo"), n("- Page 35 Foo"));
+    // Comparison is case-insensitive (small-caps headings vs Title-Case).
+    assert_eq!(n("- PREFACE (p. vii)"), n("- Preface (p. vii)"));
+    assert_eq!(n("- PART I. TOWARDS THE THEORY (p. 1)"), n("- Part I. Towards the Theory (p. 1)"));
+    // …but differing letters still fail despite case folding.
+    assert_ne!(n("- Preface"), n("- Prefaces"));
 }

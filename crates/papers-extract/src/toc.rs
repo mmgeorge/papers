@@ -959,7 +959,8 @@ fn build_lines_from_chars(
     // Expand TeX ligatures (0x0B-0x0F) to their component characters.
     let mut toc_chars: Vec<TocChar> = Vec::new();
     let mut last_was_space = false;
-    for c in chars {
+    for idx in 0..chars.len() {
+        let c = &chars[idx];
         if c.codepoint == ' ' {
             last_was_space = true;
             continue;
@@ -994,11 +995,36 @@ fn build_lines_from_chars(
                 continue;
             }
         }
-        if c.codepoint.is_control() {
+        // Recover a wrap hyphen mis-encoded as a control / format code point.
+        // This corpus has fonts whose broken ToUnicode maps the line-break
+        // hyphen glyph to U+0002 (or U+00AD); it still draws as a real hyphen
+        // (non-zero width). Treat it as '-' ONLY when it sits at a line break —
+        // the next glyph is on a different line — so a wrapped word rejoins
+        // ("Ital-" + "iano" -> "Italiano"). A mid-line U+0002 is a stray marker
+        // (e.g. "S , I , R" in a formula) and is dropped as the control char.
+        let codepoint = if matches!(c.codepoint, '\u{2}' | '\u{ad}')
+            && (c.bbox[2] - c.bbox[0]) > 0.5
+        {
+            let cy = (c.bbox[1] + c.bbox[3]) / 2.0;
+            let line_h = (c.bbox[3] - c.bbox[1]).abs().max(1.0);
+            let next_on_new_line = chars[idx + 1..]
+                .iter()
+                .find(|n| n.codepoint != ' ')
+                .map(|n| ((n.bbox[1] + n.bbox[3]) / 2.0 - cy).abs() > line_h * 0.5)
+                .unwrap_or(false);
+            if next_on_new_line {
+                '-'
+            } else {
+                c.codepoint
+            }
+        } else {
+            c.codepoint
+        };
+        if codepoint.is_control() {
             continue;
         }
         toc_chars.push(TocChar {
-            codepoint: c.codepoint,
+            codepoint,
             bbox: [c.bbox[0], y1, c.bbox[2], y2],
             origin_x: c.origin_x,
             pdfium_space_before: has_space_before,
@@ -1149,7 +1175,13 @@ fn detect_two_column_gutter(lines: &[Vec<TocChar>], page_left: f32, page_right: 
             }
         }
     }
-    let near_zero = (n as f32 * 0.12).max(1.0);
+    // A gutter is a deep dip *relative to the column peaks*, not necessarily
+    // near-empty: on dense pages wrapped left-titles overflow into the gutter
+    // band, so an absolute near-zero threshold misses it. Use 35% of the peak
+    // column coverage (with the old absolute 12%-of-rows value as a floor). The
+    // alpha-right / both-sides gates below still reject single-column pages.
+    let col_density = *cov.iter().max().unwrap_or(&1) as f32;
+    let near_zero = (col_density * 0.35).max(n as f32 * 0.12).max(1.0);
     let dense = n as f32 * 0.4;
     let center = nb as f32 / 2.0;
     let (lo, hi) = (nb / 5, nb * 4 / 5);
@@ -1192,14 +1224,40 @@ fn detect_two_column_gutter(lines: &[Vec<TocChar>], page_left: f32, page_right: 
                     .count()
             };
             let alpha_right_rows = lines.iter().filter(|l| alpha(l, true) >= 3).count();
+            // A genuine two-column row has real words on both sides AND a clear
+            // empty band straddling the gutter (the left entry ends, then a gap,
+            // then the right entry begins). A long *single-column* title that
+            // merely flows across the gutter has alpha on both sides but no gap,
+            // so it must NOT count — that false signal is what made the relaxed
+            // valley threshold fire on single-column pages (e.g. opt).
             let both_sides_rows = lines
                 .iter()
-                .filter(|l| alpha(l, true) >= 3 && alpha(l, false) >= 3)
+                .filter(|l| {
+                    if alpha(l, true) < 3 || alpha(l, false) < 3 {
+                        return false;
+                    }
+                    let left_end = l
+                        .iter()
+                        .filter(|c| (c.bbox[0] + c.bbox[2]) / 2.0 < gutter_x)
+                        .map(|c| c.bbox[2])
+                        .fold(f32::MIN, f32::max);
+                    let right_start = l
+                        .iter()
+                        .filter(|c| (c.bbox[0] + c.bbox[2]) / 2.0 >= gutter_x)
+                        .map(|c| c.bbox[0])
+                        .fold(f32::MAX, f32::min);
+                    right_start - left_end >= 6.0
+                })
                 .count();
             if left_w >= span * 0.2
                 && right_w >= span * 0.2
                 && alpha_right_rows >= 5
                 && (alpha_right_rows as f32) >= n as f32 * 0.25
+                // A genuine two-column TOC has many rows carrying real words on
+                // BOTH sides (a left entry AND a right entry). A single-column
+                // page with an incidental interior dip does not, so this guards
+                // the now-relaxed valley threshold against false splits.
+                && (both_sides_rows as f32) >= n as f32 * 0.3
             {
                 let dist = (mid - center).abs();
                 let better = match best {
@@ -2150,15 +2208,19 @@ fn parse_lowercase_roman(s: &str) -> Option<u32> {
 /// "Some Title" + "Continued" → "Some Title Continued"
 fn join_title_parts(left: &str, right: &str) -> String {
     if left.ends_with('-') {
-        // Check if this is a real hyphenated compound word (both sides capitalized)
-        // or a line-break split (second part is lowercase).
-        let right_starts_lower = right.starts_with(|c: char| c.is_lowercase());
-        if right_starts_lower {
-            // Line-break hyphenation: remove hyphen and join directly
-            format!("{}{}", &left[..left.len() - 1], right)
+        // A wrapped title broke at a hyphen. Drop the wrap hyphen AND any space
+        // `TocRawLine::text()` inserted just before it (the right-margin advance
+        // gap reads as a word boundary), otherwise "Ital-" wrapped onto "iano"
+        // rejoins as "Ital iano" instead of "Italiano".
+        let base = left.trim_end_matches('-').trim_end();
+        // Lowercase continuation = mid-word line break: join directly
+        // ("Ital" + "iano" = "Italiano"). Uppercase continuation = a real
+        // compound hyphenated at the wrap: keep one hyphen, no spaces
+        // ("Chung" + "Kuan" = "Chung-Kuan").
+        if right.starts_with(|c: char| c.is_lowercase()) {
+            format!("{}{}", base, right)
         } else {
-            // Compound word like "Self-Adjoint": keep the hyphen
-            format!("{} {}", left, right)
+            format!("{}-{}", base, right)
         }
     } else if left.ends_with('—') || left.ends_with('–') {
         // A title wrapped immediately after an em/en-dash ("First Law of
