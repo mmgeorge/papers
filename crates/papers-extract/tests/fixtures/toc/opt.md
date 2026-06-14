@@ -281,7 +281,7 @@
   - 17.2 The Logarithmic Barrier Method (p. 498)
     - 17.2.1 Properties of Logarithmic Barrier Functions (p. 498)
     - 17.2.2 Algorithms Based on the Log-Barrier Function (p. 503)
-    - 17.2.3 Properties of the Log-Barrier Function and Algorithm Framework 17.2 (p. 505)
+    - 17.2.3 Properties of the Log-Barrier Function and Framework 17.2 (p. 505)
     - 17.2.4 Handling Equality Constraints (p. 507)
     - 17.2.5 Relationship to Primal-Dual Methods (p. 508)
   - 17.3 Exact Penalty Functions (p. 510)

@@ -210,7 +210,22 @@ impl TocRawLine {
                 // the most reliable signal — trust it when the gap is positive.
                 let pdfium_indexed_space = ch.pdfium_space_before && gap > 0.0;
 
-                if gap > threshold || has_pdfium_space || font_change_space || pdfium_indexed_space {
+                // Sub/superscript guard: a glyph markedly smaller than its
+                // neighbour AND sitting on a shifted baseline (e.g. the raised
+                // "n" of IRⁿ, the lowered "₁" of S₁QP) has an inflated bbox gap,
+                // so the gap/font-change heuristics must NOT split a word there
+                // ("IRn"→"IR n", "S1QP"→"S 1QP"). An explicit pdfium space still
+                // counts (pdfium reports "IRn" with no space, so none is added).
+                let h_prev = (prev.bbox[3] - prev.bbox[1]).abs();
+                let cy = (ch.bbox[1] + ch.bbox[3]) / 2.0;
+                let cy_prev = (prev.bbox[1] + prev.bbox[3]) / 2.0;
+                let is_sub_super = h > 0.5
+                    && h_prev > 0.5
+                    && h < h_prev * 0.85
+                    && (cy - cy_prev).abs() > h_prev * 0.18;
+                let gap_space = (gap > threshold || font_change_space) && !is_sub_super;
+
+                if gap_space || has_pdfium_space || pdfium_indexed_space {
                     result.push(' ');
                 }
             }
@@ -422,9 +437,9 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
     // Phase 5: Classify easy cases + learn font signatures + resolve ambiguous
     let mut entries = classify_and_learn(merged);
 
-    // Phase 5b: Infer page numbers for chapter entries that have none.
-    // Some PDFs have chapter titles on separate lines without page numbers;
-    // the page can be inferred from the first child section.
+    // Phase 5b: Infer page numbers for chapter entries that have none, and
+    // correct a misprinted roman page on a numbered body chapter.
+    fix_misprinted_roman_chapter_pages(&mut entries);
     infer_chapter_pages(&mut entries);
 
     // Phase 6: Infer chapter numbers from children + resolve bare-letter sections
@@ -2726,31 +2741,13 @@ fn space_after_section_number(title: &str) -> String {
 }
 
 fn trim_to_first_heading_start(title: &str) -> String {
-    let trimmed = strip_leading_page_ref_garbage(title.trim());
-    if trimmed.is_empty() || looks_like_toc_entry_start(trimmed) {
-        return trimmed.to_string();
-    }
-
-    // Strip at most ONE leading token to reach a heading start, and only when the
-    // remainder is a *textual* heading — a front-matter heading or a keyword
-    // ("Series Foreword" → "Foreword", "A.4 References" → "References"). We never
-    // trim to a remainder that merely starts with a number: a leading real word
-    // followed by a number is part of the title ("Windows 10 and future Windows
-    // versions" must not become "10 and future Windows versions"), and a genuine
-    // leading page-number garbage token is already removed by
-    // strip_leading_page_ref_garbage above. Trimming deeper than one token would
-    // amputate compound titles ("Notes and References", "Proof of Theorem 4.3").
-    let tokens = token_spans(trimmed);
-    if tokens.len() >= 2 {
-        let candidate = trimmed[tokens[1].0..].trim();
-        if looks_like_toc_entry_start(candidate)
-            && !candidate.starts_with(|c: char| c.is_ascii_digit())
-        {
-            return candidate.to_string();
-        }
-    }
-
-    trimmed.to_string()
+    // Only strip a genuine leading page-number garbage token (handled by
+    // strip_leading_page_ref_garbage). We do NOT trim a leading *real word* even
+    // when the remainder happens to be a front-matter keyword: "Series Foreword"
+    // and "Order Notation" are legitimate compound titles, not "Foreword" /
+    // "Notation" with a stray prefix. A capitalized leading word is part of the
+    // title; only page-ref garbage is noise.
+    strip_leading_page_ref_garbage(title.trim()).to_string()
 }
 
 fn strip_leading_page_ref_garbage(title: &str) -> &str {
@@ -3386,6 +3383,38 @@ fn normalize_subentry_depths(entries: &mut [ClassifiedEntry]) {
 /// Infer page numbers for chapter-level entries that have no page number.
 /// Uses the page of the first child section (which should be at or near the
 /// chapter start).
+/// Correct a misprinted roman page label on a numbered body chapter.
+///
+/// A chapter like "1 Introduction" whose printed TOC page is roman ("xxi") while
+/// its child sections are arabic ("2", "4") has a typo in the source — body
+/// chapters are arabic-paginated. (Verified by rendering opt's contents page.)
+/// Replace the roman page with the body page inferred from the first arabic
+/// child: a chapter opener sits one page before its first section. Tightly
+/// scoped (roman page + arabic chapter number + arabic child), so it never
+/// touches legitimate roman front-matter entries.
+fn fix_misprinted_roman_chapter_pages(entries: &mut [ClassifiedEntry]) {
+    let len = entries.len();
+    for i in 0..len {
+        if entries[i].depth != 1
+            || !entries[i].title.trim().starts_with(|c: char| c.is_ascii_digit())
+            || !headings::is_roman_numeral(&entries[i].page_label.trim().to_uppercase())
+        {
+            continue;
+        }
+        for j in (i + 1)..len {
+            if entries[j].depth <= entries[i].depth {
+                break; // reached the next chapter without an arabic child
+            }
+            if entries[j].page_value > 0 {
+                let p = (entries[j].page_value - 1).max(1);
+                entries[i].page_value = p;
+                entries[i].page_label = p.to_string();
+                break;
+            }
+        }
+    }
+}
+
 fn infer_chapter_pages(entries: &mut [ClassifiedEntry]) {
     for i in 0..entries.len() {
         if entries[i].page_value != 0 || entries[i].page_label != "" {
@@ -3841,7 +3870,9 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
         let title_lower = e.title.trim().to_ascii_lowercase();
         let trimmed_title = e.title.trim();
 
-        // Part headings without a page number are always kept
+        // A Part that reached this point with page_value 0 still carries a local
+        // page label (a bare page-less part was already removed by the no-page
+        // filter above) — keep it; sequencing checks don't apply to a divider.
         if pv == 0 && e.classification == Classification::Part {
             return true;
         }
@@ -4830,16 +4861,19 @@ mod tests {
     }
 
     #[test]
-    fn test_demote_bibliography_after_last_chapter() {
+    fn test_demote_lone_bibliography_after_last_chapter_stays_book_level() {
         let mut entries = vec![
             make_classified("1 Introduction", 1, Classification::Chapter, 1),
             make_classified("2 Conclusion", 100, Classification::Chapter, 1),
             make_classified("Bibliography", 115, Classification::FrontMatter, 1),
         ];
         demote_per_chapter_fm(&mut entries);
-        // After last chapter → still demoted (belongs to the last chapter)
-        assert_eq!(entries[2].classification, Classification::SubEntry);
-        assert_eq!(entries[2].depth, 2);
+        // A bibliography that appears only ONCE, after the last chapter, is the
+        // book's back matter — not a per-chapter section — so it is NOT demoted
+        // (it stays a top-level entry). Per-chapter demotion requires the title to
+        // repeat (see test_demote_multiple_per_chapter_bibliographies).
+        assert_eq!(entries[2].classification, Classification::FrontMatter);
+        assert_eq!(entries[2].depth, 1);
     }
 
     #[test]
@@ -4910,38 +4944,46 @@ mod tests {
     // ── Tests for validate_entries ──
 
     #[test]
-    fn test_validate_drops_roman_after_body() {
+    fn test_validate_reorders_misplaced_front_matter() {
         let mut entries = vec![
             make_classified("Preface", -3, Classification::FrontMatter, 1),
             make_classified("1 Intro", 1, Classification::Chapter, 1),
-            make_classified("Contents", -6, Classification::FrontMatter, 1), // wrong!
+            make_classified("Contents", -6, Classification::FrontMatter, 1), // out of order
             make_classified("2 Methods", 25, Classification::Chapter, 1),
         ];
         validate_entries(&mut entries);
-        assert_eq!(entries.len(), 3);
-        assert!(entries.iter().all(|e| e.title != "Contents"));
+        // "Contents" was extracted after chapter 1, but its roman page (vi) places
+        // it in the front matter. validate sorts by page, so it is recovered into
+        // the front-matter group (before the body) and kept, not dropped.
+        assert_eq!(entries.len(), 4);
+        let titles: Vec<&str> = entries.iter().map(|e| e.title.as_str()).collect();
+        assert_eq!(titles, vec!["Preface", "Contents", "1 Intro", "2 Methods"]);
     }
 
     #[test]
-    fn test_validate_drops_backwards_body_page() {
+    fn test_validate_reorders_out_of_order_body_entry() {
         let mut entries = vec![
             make_classified("1 Intro", 1, Classification::Chapter, 1),
             make_classified("2 Methods", 50, Classification::Chapter, 1),
-            make_classified("Spurious", 10, Classification::Section, 2), // backwards
+            make_classified("Spurious", 10, Classification::Section, 2), // out of order
             make_classified("3 Results", 80, Classification::Chapter, 1),
         ];
         validate_entries(&mut entries);
-        assert_eq!(entries.len(), 3);
-        assert!(entries.iter().all(|e| e.title != "Spurious"));
+        // The page-order sort recovers "Spurious" (p.10) to its correct position
+        // between ch1 (p.1) and ch2 (p.50) instead of dropping it — this is the
+        // brief-TOC-then-detailed-TOC recovery path, so the entry is kept.
+        assert_eq!(entries.len(), 4);
+        let pages: Vec<i32> = entries.iter().map(|e| e.page_value).collect();
+        assert_eq!(pages, vec![1, 10, 50, 80]);
     }
 
     #[test]
-    fn test_validate_keeps_part_without_page() {
+    fn test_validate_drops_part_without_page() {
         let mut entries = vec![
             make_classified("1 Intro", 1, Classification::Chapter, 1),
             make_classified("2 End", 50, Classification::Chapter, 1),
         ];
-        // Insert a Part with page_value 0
+        // Insert a Part with page_value 0 and no local page label
         entries.insert(
             0,
             ClassifiedEntry {
@@ -4963,8 +5005,12 @@ mod tests {
             },
         );
         validate_entries(&mut entries);
-        assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].title, "Part I");
+        // A Part with no page number at all (page_value 0, no local label) is a
+        // pure visual divider with no target page — dropped by the no-page filter.
+        // handbook's page-less "Part I: Fundamentals" dividers rely on this (its
+        // fixture omits them). Parts that carry a real page are kept elsewhere.
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.title != "Part I"));
     }
 
     // ── Two-column detection tests ──
@@ -5013,6 +5059,29 @@ mod tests {
         make_char_run(text, 50.0, y)
     }
 
+    /// Titles of *differing* lengths and word positions. Real TOC entries vary
+    /// line to line, so their inter-word spaces never stack into a vertical empty
+    /// band. (Identical synthetic lines would: every line's word-space lands at
+    /// the same X, forging a fake column gutter — see the
+    /// `test_two_col_not_triggered_*` regression.)
+    const VARIED_TITLES: &[&str] = &[
+        "Introduction to the Subject Matter",
+        "A Considerably Longer Section Heading That Carries On",
+        "Brief",
+        "Methods Materials and Experimental Setup",
+        "Results",
+        "An Extended Discussion of the Principal Findings",
+        "Background and Prior Art",
+        "Concluding Remarks",
+        "Foundations of the General Theory Developed Here",
+        "Notation",
+    ];
+
+    fn varied_title(i: usize) -> String {
+        let t = VARIED_TITLES[i % VARIED_TITLES.len()];
+        format!("{}.{} {}", i / 3 + 1, i % 3 + 1, t)
+    }
+
     #[test]
     fn test_two_col_detection_clear_signal() {
         // Build 20 two-column lines with 80pt gutter gap
@@ -5044,14 +5113,12 @@ mod tests {
 
     #[test]
     fn test_two_col_not_triggered_for_single_column() {
-        // Build 20 single-column lines
+        // Build 20 single-column lines with varied titles (real TOC entries
+        // differ, so their word-spaces don't align into a fake gutter).
         let mut lines: Vec<Vec<TocChar>> = Vec::new();
         for i in 0..20 {
             let y = i as f32 * 15.0;
-            let line = make_single_col_line(
-                &format!("{}.{} A Section Title With Some Text {}", i / 3 + 1, i % 3 + 1, i + 10),
-                y,
-            );
+            let line = make_single_col_line(&format!("{} {}", varied_title(i), i + 10), y);
             lines.push(line);
         }
 
@@ -5068,12 +5135,8 @@ mod tests {
         let mut lines: Vec<Vec<TocChar>> = Vec::new();
         for i in 0..20 {
             let y = i as f32 * 15.0;
-            // Long title on left, short page number on right (with large gap)
-            let mut chars = make_char_run(
-                &format!("{}.{} A Detailed Section Title Here", i / 3 + 1, i % 3 + 1),
-                50.0,
-                y,
-            );
+            // Long (varied) title on left, short page number on right (large gap)
+            let mut chars = make_char_run(&varied_title(i), 50.0, y);
             let left_end = chars.last().map(|c| c.bbox[2]).unwrap_or(50.0);
             // Page number far to the right (simulating right-aligned page number)
             let page_chars = make_char_run(&format!("{}", i + 100), left_end + 100.0, y);
@@ -5185,11 +5248,12 @@ mod tests {
                     80.0,
                 ));
             } else {
-                // Remaining 15 are single-column with no large gaps
-                lines.push(make_single_col_line(
-                    &format!("{}.{} A Detailed Section Title Here Page Num", i / 3 + 1, i % 3 + 1),
-                    y,
-                ));
+                // Remaining 15 are short single-column entries (varied words) that
+                // end well left of the 5 two-column lines' gutter, so they add no
+                // spurious both-sides rows there. Only 5/20 rows carry a real
+                // gutter gap — below the detection threshold.
+                let word = ["Aims", "Scope", "Setup", "Recap", "Notes"][i % 5];
+                lines.push(make_single_col_line(&format!("{}.{} {}", i / 3 + 1, i % 3 + 1, word), y));
             }
         }
 

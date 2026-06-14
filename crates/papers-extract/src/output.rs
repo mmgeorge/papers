@@ -1533,10 +1533,13 @@ fn reflow_with_skipped_pages(
                     continue;
                 }
                 if is_labeled_block(&title) {
-                    // Labeled blocks (Example, Tip, Algorithm headings) are content
-                    ReflowNode::Text {
+                    // Labeled blocks (Example, Tip, Algorithm headings) carry an
+                    // intentional "## " heading prefix. Emit them as FormattedText
+                    // (rendered verbatim) rather than Text — a Text node's leading
+                    // "#" is always backslash-escaped (to neutralise code-comment
+                    // lines), which would corrupt the prefix into "\##".
+                    ReflowNode::FormattedText {
                         content: format!("## {title}"),
-                        footnotes: Vec::new(),
                     }
                 } else {
                     let mut depth = infer_heading_depth(&title);

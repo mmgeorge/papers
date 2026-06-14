@@ -1,4 +1,4 @@
-- Foreword (p. xvii)
+- Series Foreword (p. xvii)
 - Figures (p. xix)
 - Tables (p. xxix)
 - Preface (p. xxxi)
@@ -327,5 +327,5 @@
     - A.3.6 Chi-Square Distribution (p. 526)
     - A.3.7 t Distribution (p. 527)
     - A.3.8 F Distribution (p. 527)
-- References (p. 527)
+  - A.4 References (p. 527)
 - Index (p. 529)
