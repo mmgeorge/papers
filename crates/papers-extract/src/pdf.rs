@@ -24,6 +24,11 @@ pub struct PdfChar {
     /// which reflects glyph advance positioning rather than visual bounding box.
     /// When unavailable, equals `bbox[0]`.
     pub origin_x: f32,
+    /// Character origin Y (baseline) in the same coordinate space as bbox.
+    /// From `FPDFText_GetCharOrigin`; the typographic baseline, which is reliable
+    /// even for glyphs with a malformed/oversized bbox (e.g. a math `𝟐` whose
+    /// reported box spans several lines). When unavailable, equals `bbox[3]`.
+    pub origin_y: f32,
     /// True if pdfium generated a space character immediately before this char
     /// in its internal text stream. This is the most reliable word-boundary
     /// signal — it uses pdfium's own advance-width and text-matrix analysis.
@@ -49,6 +54,10 @@ pub struct PdfChar {
     pub is_italic: bool,
     /// Whether the font is bold (excluding symbolic/math fonts).
     pub is_bold: bool,
+    /// True if pdfium SYNTHESIZED this char (a generated space/hyphen not present
+    /// in the page content stream). Used by glyph_recovery to align pdfium's chars
+    /// with the raw content-stream glyph sequence.
+    pub is_generated: bool,
 }
 
 /// Get the CropBox offset for a page.
@@ -90,6 +99,7 @@ pub fn normalize_chars_to_image_space(chars: &mut [PdfChar], page_height_pt: f32
         let img_y2 = page_height_pt - c.bbox[1]; // PDF bottom → image bottom (largest)
         c.bbox[1] = img_y1;
         c.bbox[3] = img_y2;
+        c.origin_y = page_height_pt - c.origin_y; // baseline → image space (Y-down)
     }
 }
 
@@ -212,6 +222,7 @@ fn push_char(
     let is_bold = is_bold_font(&font_name) && !is_math_font(&font_name);
 
     let origin_x = char_info.origin_x().map(|p| p.value).unwrap_or(rect.left().value);
+    let origin_y = char_info.origin_y().map(|p| p.value).unwrap_or(rect.bottom().value);
 
     chars.push(PdfChar {
         codepoint: c,
@@ -222,12 +233,14 @@ fn push_char(
             rect.top().value,
         ],
         origin_x,
+        origin_y,
         pdfium_space_before,
         space_threshold: font_size * space_ratio / 2.0,
         font_name: font_name.clone(),
         font_size,
         is_italic,
         is_bold,
+        is_generated: char_info.is_generated().unwrap_or(false),
     });
 }
 
@@ -261,6 +274,13 @@ pub fn expand_ligature(c: char) -> Option<&'static str> {
         '\u{FB03}' => Some("ffi"),
         '\u{FB04}' => Some("ffl"),
         '\u{FB05}' | '\u{FB06}' => Some("st"),
+        // Latin "ij" / "IJ" ligatures (U+0133/U+0132), e.g. "Bĳections".
+        '\u{0133}' => Some("ij"),
+        '\u{0132}' => Some("IJ"),
+        // A broken /ToUnicode that maps the "ff" ligature glyph to U+21B5 (the
+        // carriage-return arrow), seen in some books (sutton_barto). U+21B5 never
+        // occurs in legitimate prose, so recovering it as "ff" is unambiguous.
+        '\u{21B5}' => Some("ff"),
         // TeX OT1 encoding: control char positions used for ligatures
         '\u{000B}' => Some("ff"),
         '\u{000C}' => Some("fi"),
@@ -274,7 +294,9 @@ pub fn expand_ligature(c: char) -> Option<&'static str> {
 /// Check if a font name matches known math/symbol font patterns.
 /// These fonts report italic as a side effect but are not text italic fonts.
 pub fn is_math_font(name: &str) -> bool {
-    let n = name.to_ascii_uppercase();
+    let full = name.to_ascii_uppercase();
+    // Strip a 6-char subset prefix ("ABCDEF+CMMI10") so the family is matched.
+    let n = full.rsplit('+').next().unwrap_or(full.as_str());
     // TeX math fonts: CMMI (math italic), CMSY (math symbols), CMEX (extensions)
     // Also catch LMMI (Latin Modern Math Italic), MathPI, etc.
     n.starts_with("CMMI") || n.starts_with("CMSY") || n.starts_with("CMEX")

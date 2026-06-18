@@ -1492,6 +1492,8 @@ pub fn is_frontmatter_heading(title: &str) -> bool {
             | "bibliography"
             | "references"
             | "glossary"
+            | "glossary of symbols"
+            | "glossary of notation"
             | "notation"
             | "list of symbols"
             | "acknowledgements"

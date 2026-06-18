@@ -133,6 +133,9 @@ struct TocChar {
     bbox: [f32; 4],
     /// Typographic origin X (from `FPDFText_GetCharOrigin`).
     origin_x: f32,
+    /// Typographic origin Y / baseline (image-space, Y-down). Reliable even when
+    /// the bbox is malformed (oversized math glyphs), used to line-group them.
+    origin_y: f32,
     /// True if pdfium generated a space character before this char.
     pdfium_space_before: bool,
     space_threshold: f32,
@@ -206,9 +209,13 @@ impl TocRawLine {
                 // pdfium correctly detected the space from advance widths.
                 // Guard: require gap > 0 to avoid false spaces from overlapping glyphs.
                 // pdfium_space_before: pdfium's own advance-width analysis
-                // (cpdf_textpage.cpp) detected a word boundary here. This is
-                // the most reliable signal — trust it when the gap is positive.
-                let pdfium_indexed_space = ch.pdfium_space_before && gap > 0.0;
+                // (cpdf_textpage.cpp) detected a word boundary here. Trust it, but
+                // require the physical gap to be a meaningful fraction of the space
+                // threshold — some Computer Modern fonts give 'j'/'f' a negative
+                // left side-bearing, so pdfium reports a generated space at a ~0.1pt
+                // gap inside a word ("Object" → "Ob ject"). The same 15% floor as
+                // has_pdfium_space rejects that without losing real boundaries.
+                let pdfium_indexed_space = ch.pdfium_space_before && gap >= threshold * 0.15;
 
                 // Sub/superscript guard: a glyph markedly smaller than its
                 // neighbour AND sitting on a shifted baseline (e.g. the raised
@@ -349,6 +356,7 @@ impl FontSig {
 enum Classification {
     Part,
     Chapter,
+    Appendix,
     Section,
     Subsection,
     SubSubsection,
@@ -363,6 +371,7 @@ impl Classification {
         match self {
             Self::Part => TocEntryKind::Part,
             Self::Chapter => TocEntryKind::Chapter,
+            Self::Appendix => TocEntryKind::Appendix,
             Self::Section => TocEntryKind::Section,
             Self::Subsection | Self::SubSubsection => TocEntryKind::Subsection,
             Self::FrontMatter => TocEntryKind::FrontMatter,
@@ -429,7 +438,13 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
     }
 
     // Phase 3: Split each line into title + page number
-    let split_lines = split_page_numbers(raw_lines);
+    let mut split_lines = split_page_numbers(raw_lines);
+
+    // Drop copyright/footer lines (ISBN, "the MIT Press", a publisher URL) BEFORE
+    // merging — a footer at the top of a continuation TOC page would otherwise
+    // buffer and absorb the page's first real entry (gpml's "Series Foreword" and
+    // "∗ 6.6 Relevance Vector Machines" were lost this way).
+    split_lines.retain(|l| !is_footer_title(&l.title));
 
     // Phase 4: Merge multi-line titles
     let merged = merge_multiline_titles(split_lines);
@@ -453,7 +468,8 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
         return None;
     }
 
-    // Phase 7b: Normalize SubEntry depths using indent analysis
+    // Phase 7b: Restore front-matter nesting + normalize SubEntry depths.
+    fix_frontmatter_indent_depths(&mut entries);
     normalize_subentry_depths(&mut entries);
 
     // Phase 8: Synthesize section numbers for entries that don't have them
@@ -487,44 +503,475 @@ pub fn parse_toc(page_chars: &[(Vec<PdfChar>, f32)]) -> Option<TocResult> {
 /// fixture rendering — shared by the `toc_fixtures` test (to build the *actual*
 /// side) and the `gen_toc_fixture` tool (to seed new fixtures).
 pub fn render_fixture_markdown(page_chars: &[(Vec<PdfChar>, f32)]) -> String {
-    struct Row {
-        depth: u32,
-        title: String,
-        page: String,
-    }
-    let rows: Vec<Row> = match parse_toc(page_chars) {
-        Some(result) => result
-            .entries
-            .iter()
-            .map(|e| Row {
-                depth: e.depth,
-                title: e.title.clone(),
-                page: e.page_label.clone(),
-            })
-            .collect(),
+    let entries: Vec<TocEntry> = match parse_toc(page_chars) {
+        Some(result) => result.entries,
         None => headings::extract_headings(page_chars)
             .headings
             .iter()
-            .map(|h| Row {
+            .map(|h| TocEntry {
                 depth: h.depth,
                 title: h.title.clone(),
-                page: h.page.to_string(),
+                page_label: h.page.to_string(),
+                page_value: h.page as i32,
+                kind: classify_fallback_heading(&h.title, h.depth),
             })
             .collect(),
     };
+    render_normalized_rows(&normalize_toc_entries(&entries))
+}
+
+struct NormRow {
+    depth: u32,
+    numbered: bool,
+    title: String,
+    page: String,
+}
+
+/// Transform parsed TOC entries into the normalized outline rows: keep parts as
+/// top-level entries with their chapters nested one level under, drop footers,
+/// keep front/back matter and chapter-tail items unnumbered, and strip the
+/// book's printed numbers (the position numbers are assigned in
+/// `render_normalized_rows`).
+fn normalize_toc_entries(entries: &[TocEntry]) -> Vec<NormRow> {
+    // Whether the book has an explicit "Appendices" container heading (a standalone
+    // "Appendices" divider, or a Part titled "… Appendices", e.g. classical
+    // mechanics' "Part IV Appendices"). If it does, appendices nest under it
+    // (depth 2); if not, appendices are top-level chapters (depth 1, the printed
+    // A/B/C becoming position numbers).
+    let has_app_container = entries.iter().any(|e| {
+        let tl = e.title.trim().to_ascii_lowercase();
+        matches!(tl.as_str(), "appendices" | "appendix" | "appendixes")
+            || tl.ends_with(" appendices")
+            || tl.ends_with(" appendixes")
+    });
+    let mut in_part = false;
+    let mut in_body = false;
+    // Set once we pass a "hints/solutions" back-matter container: its following
+    // unnumbered entries are hint topics (children), not new chapters.
+    let mut in_hints = false;
+    // Set once we pass an "Appendices" container: section entries beneath it carry
+    // a lone appendix-letter prefix ("A The Build Environment") that must be
+    // stripped, whereas in the body a lone leading "A" is the article and is kept.
+    let mut seen_app_container = false;
+    // Parse-indent depth of the shallowest entry in the current contiguous
+    // front/back-matter block, used to preserve nesting (a Preface owning its
+    // sub-entries) while still anchoring the block's head at depth 1.
+    let mut front_base: Option<u32> = None;
+    let mut numbered_anc: Vec<bool> = Vec::new();
+    let mut rows: Vec<NormRow> = Vec::new();
+    for e in entries {
+        let t = e.title.trim();
+        if is_footer_title(t) {
+            continue;
+        }
+        // The body begins at the first positive-paged Part or Chapter.
+        if e.page_value > 0 && matches!(e.kind, TocEntryKind::Part | TocEntryKind::Chapter) {
+            in_body = true;
+        }
+        // Front matter = anything the parser tagged FrontMatter, or a roman-paged
+        // entry that appears before the body (the parser often mis-tags a
+        // multi-word "Preface to the Second Edition" as a Chapter). A book that
+        // numbers its Preface as "Chapter 0" with "0.1" subsections is still front
+        // matter in the normalized format (unnumbered), so a dotted number does
+        // NOT exclude it here.
+        // A top-level numbered chapter ("1 Introduction") is never front matter,
+        // even when it carries a roman page (opt prints "1 Introduction" on page
+        // xxi). Match only a BARE integer chapter number (not a dotted "0.1"
+        // subsection, nor "64-Bit Windows"), so front-matter sub-items are kept.
+        let is_numbered_chapter = t
+            .split_whitespace()
+            .next()
+            .is_some_and(|tok| !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit()));
+        let is_front = e.kind == TocEntryKind::FrontMatter
+            || is_front_matter_title(t)
+            || (!in_body
+                && e.page_value < 0
+                && e.kind != TocEntryKind::Part
+                && !is_numbered_chapter);
+        // Front/back matter is a fresh nesting context; reset the base used to
+        // preserve its relative depth when we leave the block.
+        if !is_front {
+            front_base = None;
+        }
+        let offset = if in_part { 1 } else { 0 };
+        let tl = t.to_ascii_lowercase();
+        let is_app_container = matches!(tl.as_str(), "appendices" | "appendix" | "appendixes");
+        if is_app_container || tl.ends_with(" appendices") || tl.ends_with(" appendixes") {
+            seen_app_container = true;
+        }
+        // Beneath an appendices container, a section's lone leading letter is an
+        // appendix letter to strip; in the body it is the article "A" to keep.
+        let strip_section_label =
+            |s: &str| if seen_app_container { strip_label_letter(s) } else { strip_label_numeric(s) };
+        // A hints/solutions container opens an unnumbered back-matter block whose
+        // children are hint topics; a real Part or bare-integer chapter closes it.
+        let is_hints_head = is_hints_container(t);
+        if is_hints_head {
+            in_hints = true;
+        } else if e.kind == TocEntryKind::Part || is_numbered_chapter {
+            in_hints = false;
+        }
+        let part_word = strip_part_word(t);
+        let (depth, numbered, mut title) = if is_hints_head {
+            (1u32, false, t.to_string())
+        } else if in_hints {
+            (2u32, false, strip_label_numeric(t))
+        } else if is_front {
+            // Preserve front-matter nesting (e.g. a Preface owning "About This
+            // Book" / "Using the code"): map the parse indent depth relative to the
+            // shallowest entry of this front block, so the head stays at depth 1
+            // and its indented children nest under it.
+            let base = *front_base.get_or_insert(e.depth.max(1));
+            let rd = e.depth.max(1).saturating_sub(base) + 1;
+            (rd, false, strip_label_numeric(strip_trailing_page_word(t)))
+        } else if is_app_container {
+            // A standalone "Appendices" divider is a numbered top-level container
+            // regardless of how the parser classified it.
+            (1u32, true, t.to_string())
+        } else if let Some(stripped) = strip_appendix_label(t) {
+            // "Appendix A: Title" — a top-level appendix (or nested under an
+            // "Appendices" container), position-numbered like a chapter.
+            if has_app_container {
+                (e.depth.max(1) + offset, true, stripped)
+            } else {
+                in_part = false;
+                (1u32, true, stripped)
+            }
+        } else if let Some(stripped) = part_word {
+            // "Part One/Two/…" — a word-numeral part the parser missed.
+            in_part = true;
+            (1u32, true, stripped)
+        } else {
+            match e.kind {
+                TocEntryKind::Part => {
+                    in_part = true;
+                    (1u32, true, strip_label_part(t))
+                }
+                TocEntryKind::FrontMatter | TocEntryKind::BackMatter => (1, false, t.to_string()),
+                TocEntryKind::Appendix => {
+                    if has_app_container {
+                        // Under an "Appendices" container — keep the parser's
+                        // nesting (the container is the top-level grouping).
+                        (e.depth.max(1) + offset, true, strip_label_letter(t))
+                    } else {
+                        // No container: a top-level appendix, like a chapter,
+                        // outside any part structure (its printed letter becomes a
+                        // position number).
+                        in_part = false;
+                        (1u32, true, strip_label_letter(t))
+                    }
+                }
+                TocEntryKind::SubEntry => {
+                    // A chapter-tail item keeps the column-resolved depth
+                    // (normalize_subentry_depths) plus any part offset. It may be
+                    // one level deeper than its preceding numbered sibling (e.g.
+                    // an "Exercises" that is a child of a subsection-less section)
+                    // but no deeper — that guards an over-deep mis-read.
+                    let prev = rows.last().filter(|r| r.numbered).map(|r| r.depth);
+                    let d = (e.depth.max(2) + offset)
+                        .min(prev.map(|p| p + 1).unwrap_or(u32::MAX));
+                    let parent_numbered = *numbered_anc.get(d.saturating_sub(2) as usize).unwrap_or(&false);
+                    let synth = parent_numbered && !is_tail_title(t);
+                    (d, synth, strip_section_label(t))
+                }
+                _ => (e.depth.max(1) + offset, true, strip_section_label(t)),
+            }
+        };
+        // A chapter-tail item the book printed *without* a number (Conclusion,
+        // Summary, Notes, Exercises…) is rendered unnumbered in the normalized
+        // format. Only fires when the source itself printed no leading number, so
+        // a genuinely numbered "2.5 Summary" stays numbered.
+        let numbered = numbered
+            && !(in_body
+                && !is_front
+                && is_tail_title(t)
+                && !t.trim_start().starts_with(|c: char| c.is_ascii_digit()));
+        // Trim a dangling comma/semicolon left after the page number was split off.
+        let trimmed = title.trim_end_matches([',', ';', ' ']).to_string();
+        if !trimmed.is_empty() {
+            title = trimmed;
+        }
+        // Drop a page-less, unnumbered, non-front/back heading (navigation noise
+        // like "One Last Thing"); page-less Parts stay (they're numbered).
+        if e.page_label.is_empty()
+            && !numbered
+            && !is_front
+            && !matches!(e.kind, TocEntryKind::FrontMatter | TocEntryKind::BackMatter)
+        {
+            continue;
+        }
+        let di = depth as usize;
+        if numbered_anc.len() < di {
+            numbered_anc.resize(di, false);
+        }
+        numbered_anc.truncate(di);
+        numbered_anc[di - 1] = numbered;
+        rows.push(NormRow {
+            depth,
+            numbered,
+            title,
+            page: e.page_label.clone(),
+        });
+    }
+    rows
+}
+
+/// Assign position-based numbers by tree depth and render `- N.M Title (p. X)`.
+fn render_normalized_rows(rows: &[NormRow]) -> String {
+    let mut counters: Vec<u32> = Vec::new();
     let mut lines = Vec::with_capacity(rows.len());
-    for row in &rows {
-        let indent = "  ".repeat(row.depth.saturating_sub(1) as usize);
+    for row in rows {
+        let d = row.depth as usize;
+        let label = if row.numbered {
+            if counters.len() < d {
+                counters.resize(d, 0);
+            }
+            counters.truncate(d);
+            counters[d - 1] += 1;
+            format!(
+                "{} ",
+                counters.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(".")
+            )
+        } else {
+            String::new()
+        };
+        let indent = "  ".repeat(d.saturating_sub(1));
         let page = if row.page.is_empty() {
             String::new()
         } else {
             format!(" (p. {})", row.page)
         };
-        lines.push(format!("{}- {}{}", indent, row.title, page));
+        lines.push(format!("{}- {}{}{}", indent, label, row.title, page));
     }
     let mut out = lines.join("\n");
     out.push('\n');
     out
+}
+
+fn is_footer_title(t: &str) -> bool {
+    let tl = t.to_ascii_lowercase();
+    t.contains('©')
+        || tl.contains("isbn")
+        || tl.contains("published by")
+        || tl.contains("all rights reserved")
+        || tl.contains("massachusetts institute of technology")
+        || tl.contains("the mit press")
+        || t.contains("www.")
+}
+
+fn is_front_matter_title(t: &str) -> bool {
+    // Strip only a leading *bare* integer ("0 Preface" → "Preface"); a dotted
+    // section number ("3.5.9 Acknowledgments", "1.6 References") is left intact so
+    // a genuine numbered subsection is never mistaken for front matter. "Notes
+    // About the finally Block" keeps its "Notes" prefix (dotted number untouched),
+    // so the "about the …" rule below can't catch it.
+    let raw = t.trim();
+    let stripped = match raw.split_once(' ') {
+        Some((tok, rest)) if !tok.is_empty() && tok.chars().all(|c| c.is_ascii_digit()) => {
+            rest.trim_start()
+        }
+        _ => raw,
+    };
+    let tl = stripped.to_ascii_lowercase();
+    matches!(
+        tl.as_str(),
+        "license"
+            | "dedication"
+            | "dedications"
+            | "contributors"
+            | "colophon"
+            | "copyleft notice"
+            | "preface"
+            | "foreword"
+            | "acknowledgments"
+            | "acknowledgements"
+            | "about the author"
+            | "about the authors"
+            | "about this book"
+            | "image credits"
+            | "credits"
+    ) || tl.starts_with("preface to ")
+        || tl.starts_with("preface by ")
+        || tl.starts_with("about the ")
+        || tl.starts_with("about this ")
+        || tl.starts_with("index of ")
+}
+
+/// `"Part One"`, `"Part Two: …"` → the descriptive remainder (or the whole title
+/// when there is none), recognising spelled-out part numbers the parser misses.
+fn strip_part_word(t: &str) -> Option<String> {
+    let rest = t.strip_prefix("Part ").or_else(|| t.strip_prefix("PART "))?;
+    let sp = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let word = rest[..sp].trim_end_matches([':', '.']).to_ascii_lowercase();
+    const WORDS: &[&str] = &[
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+        "twelve", "thirteen", "fourteen",
+    ];
+    if WORDS.contains(&word.as_str()) {
+        let after = rest[sp..].trim_start_matches([':', '.', ' ']);
+        return Some(if after.is_empty() { t.to_string() } else { after.to_string() });
+    }
+    None
+}
+
+/// Strip a stray trailing "page" column-header token that leaked onto a
+/// front-matter title ("Preface page" → "Preface"); only when a title remains.
+fn strip_trailing_page_word(t: &str) -> &str {
+    let t = t.trim_end();
+    if let Some(idx) = t.rfind(char::is_whitespace) {
+        if t[idx..].trim().eq_ignore_ascii_case("page") {
+            let rest = t[..idx].trim_end();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    t
+}
+
+/// A back-matter "hints/solutions/answers" section that lists one unnumbered
+/// entry per chapter (e.g. eloquent_js's "Exercise Hints"). Its child entries are
+/// hint topics, rendered as unnumbered children — NOT new numbered chapters.
+fn is_hints_container(t: &str) -> bool {
+    let tl = t.trim().to_ascii_lowercase();
+    matches!(
+        tl.as_str(),
+        "exercise hints"
+            | "hints to exercises"
+            | "hints for the exercises"
+            | "solutions to exercises"
+            | "answers to exercises"
+            | "selected solutions"
+            | "selected answers"
+    )
+}
+
+/// True when the title begins with a dotted section number ("1.3.2 …", "0.1 …").
+fn starts_with_dotted_number(t: &str) -> bool {
+    let b = t.trim_start().as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    i > 0 && i + 1 < b.len() && b[i] == b'.' && b[i + 1].is_ascii_digit()
+}
+
+fn is_tail_title(t: &str) -> bool {
+    let tl = t.trim().to_ascii_lowercase();
+    const TAIL: &[&str] = &[
+        "exercises", "problems", "summary", "notes", "conclusion", "conclusions",
+        "historical notes", "further reading", "bibliographic note", "references",
+        "bibliography", "review", "key terms", "solutions", "homework",
+        "learning objectives", "study guide", "chapter summary", "chapter review",
+    ];
+    TAIL.iter()
+        .any(|k| tl == *k || tl.starts_with(&format!("{k} ")) || tl.starts_with(&format!("{k},")))
+}
+
+fn classify_fallback_heading(title: &str, depth: u32) -> TocEntryKind {
+    if headings::is_frontmatter_heading(title) {
+        return TocEntryKind::FrontMatter;
+    }
+    let tl = title.trim().to_ascii_lowercase();
+    if matches!(tl.as_str(), "references" | "bibliography" | "index" | "glossary") {
+        return TocEntryKind::BackMatter;
+    }
+    match depth {
+        0 => TocEntryKind::Part,
+        1 => TocEntryKind::Chapter,
+        2 => TocEntryKind::Section,
+        _ => TocEntryKind::Subsection,
+    }
+}
+
+fn is_roman_or_digits(tok: &str) -> bool {
+    !tok.is_empty()
+        && (headings::is_roman_numeral(&tok.to_ascii_uppercase())
+            || tok.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Strip a leading printed label plus its trailing space: a numeric section
+/// number ("3", "3.2.1"), or a lettered appendix subsection ("A.1", "B.2.3").
+/// A *lone* leading uppercase letter ("A Short History of Git") is the article/a
+/// real first word, NOT a label, so it is left intact — only "A.<digit>…" forms
+/// (an appendix sub-number) are stripped.
+fn strip_label_numeric(t: &str) -> String {
+    if let Some(sp) = t.find(' ') {
+        let tok = &t[..sp];
+        if tok.chars().all(|c| c.is_ascii_digit() || c == '.') && tok.chars().any(|c| c.is_ascii_digit()) {
+            return t[sp..].trim_start().to_string();
+        }
+        let mut ch = tok.chars();
+        if ch.next().is_some_and(|c| c.is_ascii_uppercase())
+            && !ch.as_str().is_empty()
+            && ch.as_str().chars().all(|c| c.is_ascii_digit() || c == '.')
+        {
+            return t[sp..].trim_start().to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// If the title is an "Appendix <label> …" heading (e.g. "Appendix A: Git in
+/// Other Environments", "Appendix B Embedding"), return the descriptive remainder
+/// with the "Appendix <label>" prefix removed; otherwise None. The label is a
+/// short alphanumeric token (a letter, roman numeral, or number) optionally
+/// followed by ":" or ".".
+fn strip_appendix_label(t: &str) -> Option<String> {
+    let rest = t
+        .strip_prefix("Appendix ")
+        .or_else(|| t.strip_prefix("APPENDIX "))?;
+    let sp = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let label = rest[..sp].trim_end_matches([':', '.']);
+    if label.is_empty() || label.len() > 3 || !label.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let after = rest[sp..].trim_start();
+    Some(if after.is_empty() {
+        rest.to_string()
+    } else {
+        after.to_string()
+    })
+}
+
+/// Strip a leading appendix letter label ("A", "A.1", "Appendix A").
+fn strip_label_letter(t: &str) -> String {
+    if let Some(rest) = t.strip_prefix("Appendix ").or_else(|| t.strip_prefix("APPENDIX ")) {
+        if let Some(sp) = rest.find(' ') {
+            if rest[..sp].chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                return rest[sp..].trim_start().to_string();
+            }
+        }
+    }
+    if let Some(sp) = t.find(' ') {
+        let tok = &t[..sp];
+        let mut ch = tok.chars();
+        if ch.next().is_some_and(|c| c.is_ascii_uppercase())
+            && ch.as_str().chars().all(|c| c.is_ascii_digit() || c == '.')
+        {
+            return t[sp..].trim_start().to_string();
+        }
+    }
+    strip_label_numeric(t)
+}
+
+/// Strip a leading part label ("Part I", "Part 2:", "I", "III").
+fn strip_label_part(t: &str) -> String {
+    let t = t.trim();
+    if let Some(rest) = t.strip_prefix("Part ").or_else(|| t.strip_prefix("PART ")) {
+        if let Some(sp) = rest.find(char::is_whitespace) {
+            let num = rest[..sp].trim_end_matches([':', '.']);
+            if is_roman_or_digits(num) {
+                return rest[sp..].trim_start().to_string();
+            }
+        }
+    }
+    if let Some(sp) = t.find(' ') {
+        if is_roman_or_digits(&t[..sp]) {
+            return t[sp..].trim_start().to_string();
+        }
+    }
+    strip_label_numeric(t)
 }
 
 // ── Phase 1: Find TOC pages ──
@@ -756,6 +1203,19 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
         let pct_numbers = lines_with_trailing_number as f32 / non_empty_lines.len() as f32;
         let pct_dots = lines_with_dots as f32 / non_empty_lines.len() as f32;
 
+        // Page-number continuity: trailing numbers on a real TOC continuation page
+        // reference pages at or beyond what we've already seen (the TOC is
+        // monotonically increasing in page references).
+        let page_ref_on_this = max_trailing_page_number(&lines);
+        // A real page reference cannot exceed the document's page count by much.
+        // Chapter-map / roadmap pages (mackay's "Dependencies" flowcharts) have
+        // their glyphs doubled by the multi-page merge ("32" → "3322"), inflating
+        // the trailing number past any real page — reject those as non-continuous.
+        let page_bound = total as i32 * 2 + 100;
+        let has_continuity = page_ref_on_this > 0
+            && page_ref_on_this >= max_page_ref
+            && page_ref_on_this <= page_bound;
+
         // Strong match: same thresholds as initial detection.
         // Require a minimum number of entries: a single-line "Chapter N"
         // half-title divider page would otherwise pass the page-number ratio
@@ -763,16 +1223,19 @@ fn find_toc_pages(page_chars: &[(Vec<PdfChar>, f32)]) -> Vec<u32> {
         // >= 4 floor for initial detection; mirror it here. Genuinely sparse
         // final TOC pages (e.g. just "Index 623") still qualify via the
         // continuity-guarded relaxed / ultra-relaxed paths below.
-        let strong = non_empty_lines.len() >= 4 && (pct_numbers >= 0.3 || pct_dots >= 0.2);
+        //
+        // Leader dots are the discriminator between a real TOC page and a
+        // chapter-map / roadmap page (e.g. mackay's "Dependencies" flowcharts,
+        // which list "Title N" boxes with no dotted leaders and chapter numbers
+        // far below the running page reference): a dotless page of trailing
+        // numbers is only accepted when those numbers are page-continuous.
+        let strong = non_empty_lines.len() >= 4
+            && (pct_dots >= 0.2 || (pct_numbers >= 0.3 && has_continuity));
 
         // Relaxed match for continuation: lower thresholds, but require
-        // page-number continuity (trailing numbers on this page should
-        // reference pages at or beyond what we've seen so far — the TOC
-        // is monotonically increasing in page references). Also require
-        // a minimum absolute count of numbered lines to avoid false
-        // positives on body text pages that happen to have a few numbers.
-        let page_ref_on_this = max_trailing_page_number(&lines);
-        let has_continuity = page_ref_on_this > 0 && page_ref_on_this >= max_page_ref;
+        // page-number continuity. Also require a minimum absolute count of
+        // numbered lines to avoid false positives on body text pages that
+        // happen to have a few numbers.
         let relaxed = (pct_numbers >= 0.15 || pct_dots >= 0.10)
             && has_continuity
             && lines_with_trailing_number >= 2;
@@ -1075,6 +1538,53 @@ fn build_lines_from_chars(
         last_was_space = false;
         let y1 = c.bbox[1];
         let y2 = c.bbox[3];
+        // Mathematical Alphanumeric Symbols digits (bold/double-struck/sans/mono,
+        // U+1D7CE–U+1D7FF) are just styled ASCII digits — fold them to 0-9 (e.g. a
+        // math-bold "𝟐" in "𝟐-Categories" → "2"). The five 10-digit runs all map
+        // by `(code - 0x1D7CE) % 10`.
+        let c = if ('\u{1D7CE}'..='\u{1D7FF}').contains(&c.codepoint) {
+            let digit = char::from(b'0' + ((c.codepoint as u32 - 0x1D7CE) % 10) as u8);
+            let mut nc = c.clone();
+            nc.codepoint = digit;
+            nc
+        } else {
+            c.clone()
+        };
+        let c = &c;
+        // In a TeX math-italic font (CMMI/LMMI), the OT1 control-code slots are
+        // NOT text ligatures: slot 0x0F is the math-italic epsilon, not "ffl".
+        // Map it before the ligature expansion below would mis-expand it.
+        if crate::pdf::is_math_font(&c.font_name) && c.codepoint == '\u{000F}' {
+            toc_chars.push(TocChar {
+                codepoint: '\u{03B5}',
+                bbox: [c.bbox[0], y1, c.bbox[2], y2],
+                origin_x: c.origin_x,
+                origin_y: c.origin_y,
+                pdfium_space_before: has_space_before,
+                space_threshold: c.space_threshold,
+                font_name: c.font_name.clone(),
+                font_size: c.font_size,
+                is_italic: false,
+            });
+            continue;
+        }
+        // A Computer Modern / TeX font whose ToUnicode maps the opening curly
+        // double-quote glyph to U+005C (backslash). Emit the proper open quote
+        // (the renderer's normalized compare treats curly/straight quotes as equal).
+        if c.codepoint == '\\' && is_cm_tex_font(&c.font_name) {
+            toc_chars.push(TocChar {
+                codepoint: '\u{201C}',
+                bbox: [c.bbox[0], y1, c.bbox[2], y2],
+                origin_x: c.origin_x,
+                origin_y: c.origin_y,
+                pdfium_space_before: has_space_before,
+                space_threshold: c.space_threshold,
+                font_name: c.font_name.clone(),
+                font_size: c.font_size,
+                is_italic: c.is_italic,
+            });
+            continue;
+        }
         // Expand ligatures: fi, fl, ff, ffi, ffl
         if let Some(ligature) = crate::pdf::expand_ligature(c.codepoint) {
             let has_glyph = (c.bbox[2] - c.bbox[0]) > 0.1;
@@ -1087,6 +1597,7 @@ fn build_lines_from_chars(
                         codepoint: lc,
                         bbox: [c.bbox[0] + x_off, y1, c.bbox[0] + x_off + char_w, y2],
                         origin_x: c.origin_x + x_off,
+                        origin_y: c.origin_y,
                         pdfium_space_before: li == 0 && has_space_before,
                         space_threshold: c.space_threshold,
                         font_name: c.font_name.clone(),
@@ -1129,6 +1640,7 @@ fn build_lines_from_chars(
             codepoint,
             bbox: [c.bbox[0], y1, c.bbox[2], y2],
             origin_x: c.origin_x,
+            origin_y: c.origin_y,
             pdfium_space_before: has_space_before,
             space_threshold: c.space_threshold,
             font_name: c.font_name.clone(),
@@ -1156,12 +1668,28 @@ fn build_lines_from_chars(
     };
     let y_threshold = avg_height * 0.55;
 
-    // Sort by center-Y (top to bottom), then center-X (left to right)
+    // Line-grouping Y for a char. Normally the bbox center, but an abnormally
+    // tall glyph (a math `𝟐`, an integral sign…) has a bbox that spans several
+    // text lines, so its center lands between lines. For those, anchor to the
+    // typographic baseline (origin_y) minus half a normal line — the position a
+    // normal glyph sharing that baseline would have — so it groups with its row.
+    let group_y = |c: &TocChar| -> f32 {
+        let h = (c.bbox[3] - c.bbox[1]).abs();
+        // Only the genuinely malformed boxes (≳3× a normal line) get baseline-
+        // anchored — ordinary tall glyphs (brackets, integrals, accented caps)
+        // have trustworthy centers and must keep them.
+        if h > avg_height * 2.5 {
+            c.origin_y - avg_height / 2.0
+        } else {
+            (c.bbox[1] + c.bbox[3]) / 2.0
+        }
+    };
+
+    // Sort by grouping-Y (top to bottom), then center-X (left to right)
     let mut sorted: Vec<TocChar> = toc_chars;
     sorted.sort_by(|a, b| {
-        let ay = (a.bbox[1] + a.bbox[3]) / 2.0;
-        let by = (b.bbox[1] + b.bbox[3]) / 2.0;
-        ay.partial_cmp(&by)
+        group_y(a)
+            .partial_cmp(&group_y(b))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(
                 a.bbox[0]
@@ -1173,10 +1701,10 @@ fn build_lines_from_chars(
     // Group into lines
     let mut lines: Vec<Vec<TocChar>> = vec![];
     let mut current_line: Vec<TocChar> = vec![sorted[0].clone()];
-    let mut current_y = (sorted[0].bbox[1] + sorted[0].bbox[3]) / 2.0;
+    let mut current_y = group_y(&sorted[0]);
 
     for ch in sorted.into_iter().skip(1) {
-        let ch_y = (ch.bbox[1] + ch.bbox[3]) / 2.0;
+        let ch_y = group_y(&ch);
         if (ch_y - current_y).abs() <= y_threshold {
             current_line.push(ch);
         } else {
@@ -1699,7 +2227,7 @@ fn split_single_line(line: TocRawLine) -> TocSplitLine {
     if let Some(result) = try_split_by_dots(&full_text) {
         let title_chars = get_title_chars(&line.chars, result.0.len());
         return TocSplitLine {
-            title: result.0,
+            title: strip_inline_author(&result.0, &title_chars),
             page_label: Some(result.1.clone()),
             page_value: Some(result.2),
             font_sig: FontSig::from_chars(&title_chars),
@@ -1715,7 +2243,7 @@ fn split_single_line(line: TocRawLine) -> TocSplitLine {
     if let Some(result) = try_split_by_xgap(&line) {
         let title_chars = get_title_chars(&line.chars, result.0.len());
         return TocSplitLine {
-            title: result.0,
+            title: strip_inline_author(&result.0, &title_chars),
             page_label: Some(result.1.clone()),
             page_value: Some(result.2),
             font_sig: FontSig::from_chars(&title_chars),
@@ -1731,7 +2259,7 @@ fn split_single_line(line: TocRawLine) -> TocSplitLine {
     if let Some(result) = try_split_by_last_token(&full_text) {
         let title_chars = get_title_chars(&line.chars, result.0.len());
         return TocSplitLine {
-            title: result.0,
+            title: strip_inline_author(&result.0, &title_chars),
             page_label: Some(result.1.clone()),
             page_value: Some(result.2),
             font_sig: FontSig::from_chars(&title_chars),
@@ -1770,6 +2298,46 @@ fn get_title_chars(chars: &[TocChar], title_text_len: usize) -> Vec<TocChar> {
         count += ch.codepoint.len_utf8();
     }
     result
+}
+
+/// Strip a trailing italic author byline printed after a roman chapter title
+/// ("Analysis of Algorithms Sartaj Sahni" → "Analysis of Algorithms"). Many
+/// reference-handbook TOCs set the chapter title in roman and the contributor
+/// name(s) in italics on the same line. Fires only when a roman prefix is
+/// followed by a *multi-word* italic run beginning with a capital letter, so an
+/// all-roman title, an all-italic title, or a single italic emphasized word is
+/// left untouched.
+fn strip_inline_author(title: &str, title_chars: &[TocChar]) -> String {
+    let n = title.chars().filter(|c| !c.is_whitespace()).count();
+    let tc = &title_chars[..n.min(title_chars.len())];
+    let Some(last_roman) = tc.iter().rposition(|c| !c.is_italic) else {
+        return title.to_string(); // entirely italic — a genuine italic title
+    };
+    let b = last_roman + 1;
+    if b < 4 || b >= tc.len() {
+        return title.to_string(); // trivial roman prefix, or no trailing italic run
+    }
+    if !tc[b].codepoint.is_ascii_uppercase() {
+        return title.to_string();
+    }
+    // Cut the title string after `b` non-space chars.
+    let mut count = 0usize;
+    let mut cut = title.len();
+    for (i, ch) in title.char_indices() {
+        if count == b {
+            cut = i;
+            break;
+        }
+        if !ch.is_whitespace() {
+            count += 1;
+        }
+    }
+    let roman = title[..cut].trim_end();
+    let byline = title[cut..].trim();
+    if roman.is_empty() || !byline.contains(' ') {
+        return title.to_string();
+    }
+    roman.to_string()
 }
 
 /// Strategy A: Split by leader dots.
@@ -2044,11 +2612,35 @@ fn parse_page_ref(s: &str) -> Option<(String, i32)> {
 
 fn parse_local_page_label_parts(s: &str) -> Option<(u32, u32)> {
     let mut parts = s.split('-');
-    let left = parts.next()?.parse::<u32>().ok()?;
+    let left_str = parts.next()?;
     let right = parts.next()?.parse::<u32>().ok()?;
     if parts.next().is_some() {
         return None;
     }
+    // The right component is a (section-local) page number, so it must be a
+    // plausible page value. This rejects a title word with an embedded number
+    // and dash ("x86-64") that would otherwise merge with the real trailing page
+    // ("x86-64" + "268" → "x86-64268", right = 64268) and swallow it.
+    if right == 0 || right >= 10000 {
+        return None;
+    }
+    let left = match left_str.parse::<u32>() {
+        Ok(n) => n,
+        // A section/back-matter prefix like "I" (Index), "SP" (Solutions/Problems),
+        // "A" (appendix): a short alphanumeric token containing a letter. Sort it
+        // after every numeric chapter label (u32::MAX) so a trailing "Index (I-1)"
+        // is never dropped as out-of-sequence.
+        Err(_) => {
+            if left_str.is_empty()
+                || left_str.len() > 3
+                || !left_str.chars().all(|c| c.is_ascii_alphanumeric())
+                || !left_str.chars().any(|c| c.is_ascii_alphabetic())
+            {
+                return None;
+            }
+            u32::MAX
+        }
+    };
     Some((left, right))
 }
 
@@ -2440,18 +3032,23 @@ fn merge_multiline_titles(lines: Vec<TocSplitLine>) -> Vec<TocSplitLine> {
                         for entry in buffer.drain(..merge_start) {
                             result.push(entry);
                         }
-                        // Merge remaining buffer entries + current line
+                        // Merge remaining buffer entries + current line, keeping a
+                        // concatenated char list so a trailing italic author byline
+                        // that *wrapped* across the two lines can still be stripped.
                         let mut merged = buffer.remove(0);
                         for remaining in buffer.drain(..) {
                             merged.title = join_title_parts(
                                 merged.title.trim(),
                                 remaining.title.trim(),
                             );
+                            merged.title_chars.extend(remaining.title_chars);
                         }
                         merged.title = join_title_parts(
                             merged.title.trim(),
                             line.title.trim(),
                         );
+                        merged.title_chars.extend(line.title_chars);
+                        merged.title = strip_inline_author(&merged.title, &merged.title_chars);
                         merged.page_label = line.page_label;
                         merged.page_value = line.page_value;
                         merged.has_leader_dots = line.has_leader_dots;
@@ -2472,8 +3069,10 @@ fn merge_multiline_titles(lines: Vec<TocSplitLine>) -> Vec<TocSplitLine> {
                 result.push(line);
             }
         } else {
-            // No page number — check if it's a Part heading (emit immediately)
-            if is_part_pattern(&line.title) {
+            // No page number — check if it's a Part heading (emit immediately so a
+            // following page-bearing chapter is not merged into it). A bare roman
+            // part ("I Proofs") is treated the same as "Part I …".
+            if is_part_pattern(&line.title) || is_bare_roman_part(&line.title) {
                 flush_buffer(&mut buffer, &mut result);
                 result.push(line);
             } else if buffer.is_empty()
@@ -2567,6 +3166,18 @@ fn starts_with_heading_pattern(title: &str) -> bool {
     false
 }
 
+/// True for a Computer Modern / Latin Modern (TeX) font, allowing for a 6-char
+/// subset prefix ("ABCDEF+CMR10"). Used to recover glyphs whose ToUnicode is
+/// broken in these fonts (e.g. the open-quote → backslash mis-mapping).
+fn is_cm_tex_font(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    let base = n.rsplit('+').next().unwrap_or(n.as_str());
+    base.starts_with("CM")
+        || base.starts_with("LM")
+        || n.contains("COMPUTERMODERN")
+        || n.contains("LATINMODERN")
+}
+
 fn is_part_pattern(title: &str) -> bool {
     let t = title.trim();
     let lower = t.to_ascii_lowercase();
@@ -2577,6 +3188,20 @@ fn is_part_pattern(title: &str) -> bool {
             return first.is_ascii_digit()
                 || matches!(first, 'I' | 'V' | 'X' | 'L' | 'C' | 'D' | 'M');
         }
+    }
+    false
+}
+
+/// A part divider printed as a *bare* roman numeral with no "Part" word, followed
+/// by a Title-Case heading — e.g. "I Proofs", "V Recurrences" (mit_math). Used
+/// only on page-less divider lines, so a body chapter (which carries a page) or a
+/// sentence-y "I am …" (lowercase tail) is never matched.
+fn is_bare_roman_part(title: &str) -> bool {
+    let t = title.trim();
+    if let Some((first, rest)) = t.split_once(char::is_whitespace) {
+        let rest = rest.trim();
+        return headings::is_roman_numeral(&first.to_ascii_uppercase())
+            && rest.chars().next().is_some_and(|c| c.is_ascii_uppercase());
     }
     false
 }
@@ -2615,6 +3240,27 @@ fn classify_and_learn(lines: Vec<TocSplitLine>) -> Vec<ClassifiedEntry> {
             last_classified_depth = depth;
         }
         entries.push((line, class, depth));
+    }
+
+    // Demote a "Notation" entry mis-tagged FrontMatter when it is actually a body
+    // subsection — bracketed by two body entries (discrete_math's bare "Notation"
+    // between "1.3 Sets" and "Relationships Between Sets"). Scoped to "notation"
+    // specifically: other front/back-matter keywords (Bibliography, Summary, Index)
+    // genuinely recur mid-book as per-chapter tail items and must NOT be demoted.
+    let is_body_class = |c: &Classification| {
+        !matches!(
+            c,
+            Classification::FrontMatter | Classification::BackMatter | Classification::Part
+        )
+    };
+    for i in 1..entries.len().saturating_sub(1) {
+        if entries[i].1 == Classification::FrontMatter
+            && entries[i].0.title.trim().eq_ignore_ascii_case("notation")
+            && is_body_class(&entries[i - 1].1)
+            && is_body_class(&entries[i + 1].1)
+        {
+            entries[i].1 = Classification::Unknown;
+        }
     }
 
     // Post-classification: propagate FrontMatter to adjacent Unknown entries
@@ -2794,7 +3440,27 @@ fn trim_to_first_heading_start(title: &str) -> String {
     // and "Order Notation" are legitimate compound titles, not "Foreword" /
     // "Notation" with a stray prefix. A capitalized leading word is part of the
     // title; only page-ref garbage is noise.
-    strip_leading_page_ref_garbage(title.trim()).to_string()
+    let title = strip_advanced_section_marker(title.trim());
+    strip_leading_page_ref_garbage(title).to_string()
+}
+
+/// Strip a leading "advanced/optional section" marker (∗ ⋆ † ‡ or a leading "*")
+/// printed in the chapter-number column, e.g. "∗ 2.7 Incorporating …" → "2.7
+/// Incorporating …". Left in place the non-digit first char breaks section-number
+/// recognition and promotes the line to a phantom top-level chapter. Only a marker
+/// at the very start is stripped, so a mid-title marker that the fixture keeps
+/// (e.g. "2.6.6 *A Unifying Algorithm") is untouched.
+fn strip_advanced_section_marker(title: &str) -> &str {
+    let t = title.trim_start();
+    if !t.starts_with(|c: char| matches!(c, '∗' | '⋆' | '†' | '‡' | '*')) {
+        return t;
+    }
+    let rest = t.trim_start_matches(|c: char| matches!(c, '∗' | '⋆' | '†' | '‡' | '*' | ' '));
+    if rest.is_empty() {
+        t
+    } else {
+        rest
+    }
 }
 
 fn strip_leading_page_ref_garbage(title: &str) -> &str {
@@ -3222,16 +3888,50 @@ fn propagate_frontmatter(entries: &mut [(TocSplitLine, Classification, u32)]) {
 
         for i in (0..entries.len()).rev() {
             let (ref line, ref class, _) = entries[i];
+            let matches_fm = line.font_sig == fm_font && (line.x_left - fm_x).abs() < 5.0;
             // Stop when we hit a classified entry that isn't FM/BackMatter
-            // (i.e., we've reached the body content)
+            // (i.e., we've reached the body content). A trailing SubEntry that
+            // sits in the front-matter column/font (e.g. a standalone "Notes"
+            // after the last appendix) is a top-level back-matter heading, not a
+            // chapter tail — reclassify it; an *indented* SubEntry is a genuine
+            // chapter tail and marks the body boundary.
             match class {
                 Classification::FrontMatter | Classification::BackMatter => continue,
                 Classification::Unknown => {}
+                Classification::SubEntry if matches_fm => {}
                 _ => break,
             }
-            if line.font_sig == fm_font && (line.x_left - fm_x).abs() < 5.0 {
+            if matches_fm {
                 entries[i].1 = Classification::BackMatter;
                 entries[i].2 = fm_depth;
+            }
+        }
+    }
+
+    // Third pass: a trailing run of entries with *local* page labels (e.g.
+    // "SP-1", "I-1") in an otherwise arabic-paginated book is supplementary back
+    // matter ("Questions and Problems", "Index") sitting at the top level.
+    // Reclassify them to depth-1 BackMatter — but skip a book that is locally
+    // paginated throughout (its body legitimately uses local labels).
+    let local_count = entries
+        .iter()
+        .filter(|(l, _, _)| l.page_label.as_deref().is_some_and(is_local_page_label))
+        .count();
+    let mostly_local = local_count >= 3 && local_count * 2 >= entries.len().max(1);
+    if !mostly_local {
+        for i in (0..entries.len()).rev() {
+            let (ref line, ref class, _) = entries[i];
+            if matches!(
+                class,
+                Classification::FrontMatter | Classification::BackMatter
+            ) {
+                continue;
+            }
+            if line.page_label.as_deref().is_some_and(is_local_page_label) {
+                entries[i].1 = Classification::BackMatter;
+                entries[i].2 = 1;
+            } else {
+                break; // reached the arabic-paged body
             }
         }
     }
@@ -3243,7 +3943,8 @@ fn promote_roman_to_parts(entries: &mut [(TocSplitLine, Classification, u32)]) {
         .iter()
         .enumerate()
         .filter(|(_, (line, class, _))| {
-            if *class != Classification::Chapter {
+            // A roman part may be tagged Chapter or left Unknown by the first pass.
+            if !matches!(class, Classification::Chapter | Classification::Unknown) {
                 return false;
             }
             let t = line.title.trim();
@@ -3287,12 +3988,51 @@ fn promote_roman_to_parts(entries: &mut [(TocSplitLine, Classification, u32)]) {
         }
     }
 
-    if !has_restart {
+    // mackay-style: a book that mixes arabic-numbered chapters (1, 2, 3) with a
+    // CONSECUTIVE roman sequence ("I Data Compression", "II Noisy-Channel", …) uses
+    // the roman entries as Parts even when their children are unnumbered (so there
+    // is no chapter-number "restart" to detect). The mix of both numbering styles
+    // at the top level distinguishes this from a roman-numbered-chapter book.
+    let roman_vals: Vec<u32> = roman_indices
+        .iter()
+        .filter_map(|&i| {
+            let t = entries[i].0.title.trim();
+            headings::roman_to_u32(t.split_whitespace().next().unwrap_or(""))
+        })
+        .collect();
+    // The roman parts form a sequence I, II, III, … from 1. A trailing roman-
+    // *looking* entry that breaks the run is not a part but a coincidence — most
+    // often an appendix letter that is also a roman numeral ("C Some Mathematics",
+    // C = 100). Take the longest consecutive-from-1 prefix and promote only that.
+    let mut consec_len = 0usize;
+    if roman_vals.len() == roman_indices.len() {
+        for (k, &v) in roman_vals.iter().enumerate() {
+            if v == k as u32 + 1 {
+                consec_len = k + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    let arabic_chapters = entries
+        .iter()
+        .filter(|(line, class, depth)| {
+            *class == Classification::Chapter
+                && *depth <= 1
+                && line.title.trim().starts_with(|c: char| c.is_ascii_digit())
+        })
+        .count();
+    let mixed_arabic_roman = consec_len >= 2 && arabic_chapters >= 2;
+
+    if !has_restart && !mixed_arabic_roman {
         return;
     }
 
-    // Promote all roman-numeral chapters to Part (depth 0)
-    for &idx in &roman_indices {
+    // Promote the roman-numeral part dividers to Part (depth 0). When the promotion
+    // is driven by the arabic/roman mix, only the consecutive I…N run qualifies;
+    // a restart-detected book promotes every roman entry.
+    let promote_count = if has_restart { roman_indices.len() } else { consec_len };
+    for &idx in &roman_indices[..promote_count] {
         entries[idx].1 = Classification::Part;
         entries[idx].2 = 0;
     }
@@ -3386,43 +4126,93 @@ fn demote_per_chapter_fm(entries: &mut [ClassifiedEntry]) {
     }
 }
 
-/// Normalize SubEntry depth: if a SubEntry (Summary, Exercises, etc.) was
-/// assigned depth > 2 because `last_depth` was a deep subsection, promote it
-/// to depth 2. But if the preceding entry at a lower depth is a section-level
-/// SubEntry (like "Summary" at depth 2), keep the current SubEntry nested.
+/// Normalize SubEntry depth (a "Summary", "Exercises", "Problems", … tail item)
+/// using a document-wide column model.
 ///
-/// The key signal: look at the nearest preceding entry that is NOT a SubEntry.
-/// If that entry is at depth 3+ (a subsection), promote this SubEntry to 2.
-/// If that entry is at depth 2 (a section), this SubEntry is correctly nested.
-fn normalize_subentry_depths(entries: &mut [ClassifiedEntry]) {
-    for i in 0..entries.len() {
-        if entries[i].classification != Classification::SubEntry || entries[i].depth <= 2 {
+/// A chapter-tail item sits in the same x-column as its structural siblings, so
+/// its depth is the depth of whatever heading column it lines up with. We build
+/// a running map of the typical x_left for each heading depth (from the most
+/// recent non-SubEntry entry seen at that depth) and snap each SubEntry to the
+/// nearest known content column (depth ≥ 2).
+///
+/// This is what distinguishes an "Exercises" that aligns with the subsection
+/// column (a section child → depth 3, e.g. discrete_math) from a "Problems" that
+/// aligns with the section column (a chapter child → depth 2, e.g. edo) — even
+/// when both follow a section directly. A book with no subsections at all (edo)
+/// simply has no depth-3 column, so its tail items snap to the section column.
+/// Restore the visual nesting of a front-matter block. Rule-8
+/// (`is_frontmatter_heading`) and front-matter propagation flatten every entry
+/// to depth 1, so a "Preface" that owns indented children ("About This Book",
+/// "Prerequisites", …) loses the nesting. Within each contiguous run of
+/// FrontMatter entries, anchor the shallowest x at depth 1 and treat anything
+/// indented clearly to its right as a depth-2 child.
+fn fix_frontmatter_indent_depths(entries: &mut [ClassifiedEntry]) {
+    let mut i = 0;
+    while i < entries.len() {
+        if entries[i].classification != Classification::FrontMatter {
+            i += 1;
             continue;
         }
-        // Look backward for the nearest non-SubEntry entry (its depth + indent).
-        let mut nearest_non_sub: Option<(u32, f32)> = None;
-        for j in (0..i).rev() {
-            if entries[j].classification != Classification::SubEntry {
-                nearest_non_sub = Some((entries[j].depth, entries[j].x_left));
-                break;
+        let start = i;
+        let mut end = i;
+        while end < entries.len()
+            && entries[end].classification == Classification::FrontMatter
+        {
+            end += 1;
+        }
+        let base_x = entries[start..end]
+            .iter()
+            .map(|e| e.x_left)
+            .fold(f32::INFINITY, f32::min);
+        // Only nest when the block actually has two indent columns — otherwise a
+        // flat block (all at one x) stays flat.
+        let has_indent = entries[start..end].iter().any(|e| e.x_left > base_x + 6.0);
+        if has_indent {
+            for e in &mut entries[start..end] {
+                e.depth = if e.x_left > base_x + 6.0 { 2 } else { 1 };
             }
         }
-        // Is this SubEntry part of a run of ≥2 consecutive SubEntries? A run
-        // (Summary → Exercises → References) is a flat chapter-tail group whose
-        // members all belong at depth 2, even when the source indents them one
-        // level past the section column. A *lone* SubEntry indented further right
-        // than its section (e.g. edo's "Problems" nested under the numbered "1.7
-        // Summary" section) is a genuine deeper child and must be left alone.
-        let len = entries.len();
+        i = end;
+    }
+}
+
+fn normalize_subentry_depths(entries: &mut [ClassifiedEntry]) {
+    let len = entries.len();
+    let mut col_x_at_depth: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
+    for i in 0..entries.len() {
+        if entries[i].classification != Classification::SubEntry {
+            // Record this heading's column for its depth (most recent wins).
+            col_x_at_depth.insert(entries[i].depth, entries[i].x_left);
+            continue;
+        }
+        // A run of ≥2 consecutive SubEntries (Summary → Exercises → References)
+        // is a flat chapter-tail group at the section level (depth 2), even when
+        // the source indents the group near the subsection column.
         let in_run = (i > 0 && entries[i - 1].classification == Classification::SubEntry)
             || (i + 1 < len && entries[i + 1].classification == Classification::SubEntry);
-        // Promote a deep SubEntry to depth 2 when it is a chapter child: either it
-        // sits at (or left of) the nearest non-SubEntry's indentation — a sibling of
-        // the sections — or it is part of a chapter-tail run as described above.
-        if let Some((nsd, nsx)) = nearest_non_sub {
-            if nsd >= 2 && (entries[i].x_left <= nsx + 3.0 || in_run) {
-                entries[i].depth = 2;
+        if in_run {
+            entries[i].depth = 2;
+            continue;
+        }
+        let x = entries[i].x_left;
+        let mut best: Option<(u32, f32)> = None; // (depth, distance)
+        for (&d, &cx) in col_x_at_depth.iter() {
+            if d < 2 {
+                continue;
             }
+            let dist = (x - cx).abs();
+            // Snap to the closest column; on a tie prefer the shallower depth
+            // (and keep HashMap iteration order from leaking in).
+            let better = match best {
+                None => true,
+                Some((bd, bdist)) => dist < bdist || (dist == bdist && d < bd),
+            };
+            if better {
+                best = Some((d, dist));
+            }
+        }
+        if let Some((d, _)) = best {
+            entries[i].depth = d;
         }
     }
 }
@@ -3446,6 +4236,12 @@ fn fix_misprinted_roman_chapter_pages(entries: &mut [ClassifiedEntry]) {
             || !entries[i].title.trim().starts_with(|c: char| c.is_ascii_digit())
             || !headings::is_roman_numeral(&entries[i].page_label.trim().to_uppercase())
         {
+            continue;
+        }
+        // Only "correct" a roman page once we are already in the arabic body (a
+        // prior depth-1 chapter has a positive page). A leading chapter genuinely
+        // paginated in roman (opt's "1 Introduction" at "xxi") keeps its page.
+        if !entries[..i].iter().any(|e| e.depth == 1 && e.page_value > 0) {
             continue;
         }
         for j in (i + 1)..len {
@@ -3678,7 +4474,11 @@ fn resolve_bare_letter_sections(entries: &mut [ClassifiedEntry]) {
         if let Some((_, normalized)) = bare_letter_heading(&entries[idx].title) {
             entries[idx].title = normalized;
         }
-        entries[idx].classification = Classification::Chapter;
+        // Tag as Appendix so the normalizer can place it top-level (no container)
+        // or under an "Appendices" container; container books are unaffected
+        // because the normalizer's Appendix branch mirrors the old Chapter path
+        // when a container is present.
+        entries[idx].classification = Classification::Appendix;
         entries[idx].depth = 1;
     }
 }
@@ -3738,30 +4538,11 @@ fn drop_part_dividers_if_continuous_chapters(entries: &mut Vec<ClassifiedEntry>)
             return true;
         }
 
-        // Drop "PART N" entries (any classification) when there are numbered chapters
-        let title_lower = e.title.trim().to_ascii_lowercase();
-        if title_lower.starts_with("part ")
-            && e.page_value > 0
-            && e.title.trim().len() > 5
-        {
-            // Verify the word after "part " looks like a roman numeral or number
-            let after_part = e.title.trim()[5..].trim();
-            let first_word = after_part.split_whitespace().next().unwrap_or("");
-            if headings::is_roman_numeral(first_word)
-                || first_word.chars().all(|c| c.is_ascii_digit())
-            {
-                tracing::debug!("TOC: dropping PART divider: {:?}", e.title);
-                return false;
-            }
-        }
+        // Part dividers are KEPT in the normalized format (they become top-level
+        // position-numbered entries with their chapters nested underneath — see
+        // `normalize_toc_entries`). We only drop stray *Unknown* dividers below.
 
         if is_contiguous {
-            // Drop Part entries with body page values
-            if e.classification == Classification::Part && e.page_value > 0 {
-                tracing::debug!("TOC: dropping Part divider in continuous-chapter book: {:?}", e.title);
-                return false;
-            }
-
             // Drop Unknown entries at depth ≤ 1 between chapter pages
             if e.classification == Classification::Unknown && e.depth <= 1 && e.page_value > 0 {
                 for w in chapter_pages.windows(2) {
@@ -3868,8 +4649,14 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
         }
     }
 
-    // Drop entries with no page number
-    entries.retain(|e| e.page_value != 0 || is_local_page_label(&e.page_label));
+    // Drop entries with no page number — except Part dividers, which are often
+    // page-less (e.g. handbook's "Part I: Fundamentals") yet kept in the
+    // normalized output as numbered top-level grouping entries.
+    entries.retain(|e| {
+        e.page_value != 0
+            || is_local_page_label(&e.page_label)
+            || e.classification == Classification::Part
+    });
 
     // Sort entries into document page order.
     //
@@ -3883,19 +4670,36 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
     //   front matter (pv < 0): map -pv so smaller roman numerals sort first
     //   body        (pv > 0): pv directly (non-decreasing = correct)
     //   zero-page parts:      stable at top of body (very large key within part group)
-    entries.sort_by_key(|e| {
-        let pv = e.page_value;
+    // A page-less divider (a Part heading printed inline with no page number, e.g.
+    // classical_mechanics' "Part I What Everybody Ought to Know…") precedes its
+    // first page-bearing child in reading order. Give it the page of that next
+    // page-bearing entry so it sorts *just before* its chapters; the stable sort
+    // below keeps the earlier-positioned divider ahead of the equal-keyed child.
+    // Without this it would collapse to the end of the book and its chapters would
+    // lose their nesting (`in_part` never gets set before they are rendered).
+    let mut eff_page: Vec<i32> = entries.iter().map(|e| e.page_value).collect();
+    for i in 0..entries.len() {
+        if entries[i].page_value == 0 {
+            if let Some(pv) = entries[i + 1..].iter().map(|e| e.page_value).find(|&pv| pv != 0) {
+                eff_page[i] = pv;
+            }
+        }
+    }
+    let sort_key = |pv: i32| -> i64 {
         if pv < 0 {
             // page i (-1) sorts before page ii (-2), etc.
             -pv as i64
         } else if pv == 0 {
-            // Part headings with no page — keep in their original relative position.
-            // We use i64::MAX so they sort last (degenerate case; rare).
+            // A divider with no page-bearing child at all — degenerate; sort last.
             i64::MAX
         } else {
             1_000_000i64 + pv as i64
         }
-    });
+    };
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&i| sort_key(eff_page[i]));
+    let reordered: Vec<ClassifiedEntry> = order.into_iter().map(|i| entries[i].clone()).collect();
+    *entries = reordered;
 
     // Drop entries that break page-number sequencing.
     //
@@ -3923,7 +4727,13 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
         if pv == 0 && e.classification == Classification::Part {
             return true;
         }
-        if title_lower.contains("(continued)") || title_lower == "continued" {
+        // Drop a bare continuation stub (a chapter header repeated with a
+        // "(continued)" marker on a later TOC page). A genuinely *numbered*
+        // section whose title happens to end in "(continued)" (e.g. gelman_bda3's
+        // "3.4.6 Example: hierarchical normal model (continued)") is a real entry —
+        // keep it.
+        let starts_numbered = trimmed_title.chars().next().is_some_and(|c| c.is_ascii_digit());
+        if !starts_numbered && (title_lower.contains("(continued)") || title_lower == "continued") {
             tracing::debug!("TOC: dropping continuation stub: {:?}", e.title);
             return false;
         }
@@ -3940,7 +4750,12 @@ fn validate_entries(entries: &mut Vec<ClassifiedEntry>) {
             tracing::debug!("TOC: dropping author-like entry: {:?}", e.title);
             return false;
         }
-        if title_looks_like_first_local_page_author_spill(e) {
+        // Like the author-line heuristic above, only drop an *unclassified* entry:
+        // a positively-classified heading ("Questions and Problems", a Section at
+        // local page SP-1) that merely reads like "Name and Name" is a real entry.
+        if e.classification == Classification::Unknown
+            && title_looks_like_first_local_page_author_spill(e)
+        {
             tracing::debug!("TOC: dropping first-local-page author spill: {:?}", e.title);
             return false;
         }
@@ -4289,6 +5104,7 @@ fn is_structural_toc_title(title: &str) -> bool {
             | "solutions to practice problems"
             | "learning objectives"
             | "chapter summary and study guide"
+            | "chapter review"
     )
 }
 
@@ -5025,7 +5841,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_drops_part_without_page() {
+    fn test_validate_keeps_part_without_page() {
         let mut entries = vec![
             make_classified("1 Intro", 1, Classification::Chapter, 1),
             make_classified("2 End", 50, Classification::Chapter, 1),
@@ -5052,12 +5868,11 @@ mod tests {
             },
         );
         validate_entries(&mut entries);
-        // A Part with no page number at all (page_value 0, no local label) is a
-        // pure visual divider with no target page — dropped by the no-page filter.
-        // handbook's page-less "Part I: Fundamentals" dividers rely on this (its
-        // fixture omits them). Parts that carry a real page are kept elsewhere.
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|e| e.title != "Part I"));
+        // Part dividers are KEPT even with no page number — the normalized output
+        // renders them as top-level grouping entries (e.g. handbook's page-less
+        // "Part I: Fundamentals"). The no-page filter exempts the Part kind.
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().any(|e| e.title == "Part I"));
     }
 
     // ── Two-column detection tests ──
@@ -5079,6 +5894,7 @@ mod tests {
                 codepoint: ch,
                 bbox: [x, y, x + char_width, y + char_height],
                 origin_x: x,
+                origin_y: y + char_height,
                 pdfium_space_before: false,
                 space_threshold: 3.0,
                 font_name: "TestFont".to_string(),

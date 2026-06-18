@@ -2784,12 +2784,14 @@ mod tests {
             codepoint: c,
             bbox: [x, y_top_img, x + w, y_top_img + h],
             origin_x: x,
+            origin_y: y_top_img + h,
             pdfium_space_before: false,
             space_threshold: 1.5,
             font_name: String::new(),
             font_size: 10.0,
             is_italic,
             is_bold: false,
+            is_generated: false,
         }
     }
 
@@ -2957,12 +2959,14 @@ mod tests {
             codepoint: 'T',
             bbox: [100.0, 0.0, 110.0, 10.0],
             origin_x: 100.0,
+            origin_y: 10.0,
             pdfium_space_before: false,
             space_threshold: 0.0,
             font_name: String::new(),
             font_size: 10.0,
             is_italic: false,
             is_bold: false,
+            is_generated: false,
         };
         let img = to_image_char(&top_char, page_h);
         assert!((img.bbox[1] - 0.0).abs() < 0.01, "Top char y1 should be ~0, got {}", img.bbox[1]);
@@ -2973,12 +2977,14 @@ mod tests {
             codepoint: 'B',
             bbox: [100.0, 790.0, 110.0, 800.0],
             origin_x: 100.0,
+            origin_y: 800.0,
             pdfium_space_before: false,
             space_threshold: 0.0,
             font_name: String::new(),
             font_size: 10.0,
             is_italic: false,
             is_bold: false,
+            is_generated: false,
         };
         let img = to_image_char(&bottom_char, page_h);
         assert!((img.bbox[1] - 790.0).abs() < 0.01, "Bottom char y1 should be ~790, got {}", img.bbox[1]);
@@ -3631,12 +3637,14 @@ mod tests {
             codepoint: c,
             bbox: [x, y_top_img, x + w, y_top_img + h],
             origin_x: x,
+            origin_y: y_top_img + h,
             pdfium_space_before: false,
             space_threshold: 1.5,
             font_name: String::new(),
             font_size,
             is_italic: false,
             is_bold: false,
+            is_generated: false,
         }
     }
 
@@ -4011,12 +4019,14 @@ mod tests {
             codepoint: c,
             bbox: [x, y_top, x + w, y_top + h],
             origin_x: x,
+            origin_y: y_top + h,
             pdfium_space_before: false,
             space_threshold: 1.5,
             font_name: String::new(),
             font_size,
             is_italic: false,
             is_bold: false,
+            is_generated: false,
         }
     }
 

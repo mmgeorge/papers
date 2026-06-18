@@ -1,6 +1,7 @@
 pub mod error;
 pub mod figure;
 pub mod formula;
+pub mod glyph_recovery;
 pub mod glm_ocr;
 pub mod headings;
 pub mod html_table;
