@@ -544,7 +544,21 @@ fn normalize_toc_entries(entries: &[TocEntry]) -> Vec<NormRow> {
             || tl.ends_with(" appendices")
             || tl.ends_with(" appendixes")
     });
+    // A book whose appendices the classifier tagged `Appendix` but that prints no
+    // literal "Appendices" container heading. We synthesize a container so the
+    // appendices nest under it (A/B/C → N.1, N.2, N.3) instead of flattening into
+    // the chapter sequence. The trigger reuses the classifier's own appendix
+    // detection — which already excludes roman-numeral parts (zen0) and unlabeled
+    // chapters — so an appendix it misses simply stays a chapter, the prior
+    // behavior.
+    let first_appendix = entries.iter().position(|e| e.kind == TocEntryKind::Appendix);
+    let synth_appendix = !has_app_container && first_appendix.is_some();
+    // Appendices nest under a container in either the explicit or synthesized case.
+    let nest_appendix = has_app_container || synth_appendix;
     let mut in_part = false;
+    // +1 depth offset applied once we enter a synthesized appendices container, so
+    // its appendices (parser depth 1) render at depth 2 and their sections deeper.
+    let mut app_offset = 0u32;
     let mut in_body = false;
     // Set once we pass a "hints/solutions" back-matter container: its following
     // unnumbered entries are hint topics (children), not new chapters.
@@ -559,10 +573,26 @@ fn normalize_toc_entries(entries: &[TocEntry]) -> Vec<NormRow> {
     let mut front_base: Option<u32> = None;
     let mut numbered_anc: Vec<bool> = Vec::new();
     let mut rows: Vec<NormRow> = Vec::new();
-    for e in entries {
+    for (idx, e) in entries.iter().enumerate() {
         let t = e.title.trim();
         if is_footer_title(t) {
             continue;
+        }
+        // At the first appendix of a container-less book, emit the synthesized
+        // "Appendices" top-level container and switch on the +1 nesting offset.
+        if synth_appendix && Some(idx) == first_appendix {
+            in_part = false;
+            app_offset = 1;
+            seen_app_container = true;
+            numbered_anc.truncate(1);
+            numbered_anc.resize(1, false);
+            numbered_anc[0] = true;
+            rows.push(NormRow {
+                depth: 1,
+                numbered: true,
+                title: "Appendices".to_string(),
+                page: String::new(),
+            });
         }
         // The body begins at the first positive-paged Part or Chapter.
         if e.page_value > 0 && matches!(e.kind, TocEntryKind::Part | TocEntryKind::Chapter) {
@@ -593,7 +623,7 @@ fn normalize_toc_entries(entries: &[TocEntry]) -> Vec<NormRow> {
         if !is_front {
             front_base = None;
         }
-        let offset = if in_part { 1 } else { 0 };
+        let offset = if in_part { 1 } else { 0 } + app_offset;
         let tl = t.to_ascii_lowercase();
         let is_app_container = matches!(tl.as_str(), "appendices" | "appendix" | "appendixes");
         if is_app_container || tl.ends_with(" appendices") || tl.ends_with(" appendixes") {
@@ -629,9 +659,9 @@ fn normalize_toc_entries(entries: &[TocEntry]) -> Vec<NormRow> {
             // regardless of how the parser classified it.
             (1u32, true, t.to_string())
         } else if let Some(stripped) = strip_appendix_label(t) {
-            // "Appendix A: Title" — a top-level appendix (or nested under an
-            // "Appendices" container), position-numbered like a chapter.
-            if has_app_container {
+            // "Appendix A: Title" — nested under an explicit or synthesized
+            // "Appendices" container, else a top-level appendix like a chapter.
+            if nest_appendix {
                 (e.depth.max(1) + offset, true, stripped)
             } else {
                 in_part = false;
@@ -649,9 +679,10 @@ fn normalize_toc_entries(entries: &[TocEntry]) -> Vec<NormRow> {
                 }
                 TocEntryKind::FrontMatter | TocEntryKind::BackMatter => (1, false, t.to_string()),
                 TocEntryKind::Appendix => {
-                    if has_app_container {
-                        // Under an "Appendices" container — keep the parser's
-                        // nesting (the container is the top-level grouping).
+                    if nest_appendix {
+                        // Under an explicit or synthesized "Appendices" container,
+                        // the container is the top-level grouping and the appendix
+                        // nests one level beneath (A → N.1, its A.1 → N.1.1).
                         (e.depth.max(1) + offset, true, strip_label_letter(t))
                     } else {
                         // No container: a top-level appendix, like a chapter,
