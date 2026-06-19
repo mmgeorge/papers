@@ -1906,7 +1906,11 @@ fn to_title_case(title: &str) -> String {
     if let Some(first) = result.first_mut() {
         let mut chars = first.chars();
         if let Some(c) = chars.next() {
-            *first = c.to_uppercase().to_string() + &chars.collect::<String>();
+            // Use as_str() (an explicit &str) rather than `+ &String`: the
+            // smartstring dep (pulled in via instant-segment) adds
+            // `Add<SmartString> for String`, which defeats the `String + &String`
+            // deref coercion this line previously relied on.
+            *first = format!("{}{}", c.to_uppercase(), chars.as_str());
         }
     }
 

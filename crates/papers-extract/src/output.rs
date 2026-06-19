@@ -5025,13 +5025,44 @@ fn collapse_spaced_letters(title: &str) -> String {
 ///
 /// Detects `lowercaseUppercase` boundaries (e.g. "OrbitSatellites" → "Orbit Satellites")
 /// and `letterOf`/`letterThe` patterns (e.g. "ofa" → "of a").
-/// Split all-caps concatenated words like "CLASSICALLAMBDACALCULUS".
-///
-/// Uses a dictionary of common academic/technical words. Only applies to
-/// all-uppercase single tokens ≥12 chars. Falls back to original if
-/// the dictionary can't fully decompose the string.
+/// General English word segmenter (instant-segment — a Viterbi segmenter over a
+/// general English unigram corpus, NOT a fixture-specific word list). Built once
+/// from the bundled `assets/en-unigrams.txt` (92k common words + counts). `known`
+/// holds the same words so we can require every split piece to be a real word.
+struct WordSegmenter {
+    seg: instant_segment::Segmenter,
+    known: std::collections::HashSet<String>,
+}
+
+fn word_segmenter() -> Option<&'static WordSegmenter> {
+    static SEG: std::sync::OnceLock<Option<WordSegmenter>> = std::sync::OnceLock::new();
+    SEG.get_or_init(|| {
+        let data = include_str!("../assets/en-unigrams.txt");
+        let mut unigrams: Vec<(String, f64)> = Vec::new();
+        let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in data.lines() {
+            let Some((word, count)) = line.split_once('\t') else { continue };
+            let Ok(count) = count.trim().parse::<f64>() else { continue };
+            known.insert(word.to_string());
+            unigrams.push((word.to_string(), count));
+        }
+        if unigrams.len() < 1000 {
+            return None; // corpus missing/corrupt — disable rather than mis-split
+        }
+        let seg = instant_segment::Segmenter::new(
+            unigrams.into_iter().map(|(w, c)| (w.into(), c)),
+            std::iter::empty(),
+        );
+        Some(WordSegmenter { seg, known })
+    })
+    .as_ref()
+}
+
+/// Split all-caps concatenated words like "CLASSICALLAMBDACALCULUS" using general
+/// English word segmentation. Only applies to all-uppercase single tokens ≥12
+/// chars; falls back to the original if the segmenter can't decompose the token
+/// into real words.
 fn split_concatenated_allcaps(title: &str) -> String {
-    // Process each word in the title independently
     let words: Vec<&str> = title.split_whitespace().collect();
     let mut any_split = false;
     let mut result_words: Vec<String> = Vec::new();
@@ -5054,50 +5085,31 @@ fn split_concatenated_allcaps(title: &str) -> String {
     }
 }
 
+/// Segment a concatenated ALL-CAPS token into words via general English word
+/// segmentation. FAITHFUL (space-only): the letters are unchanged — we only
+/// insert spaces — and the split is accepted ONLY when it decomposes into ≥2
+/// KNOWN dictionary words (each ≥2 letters), so a real single word or an unknown
+/// token is left intact. Returns the re-uppercased split, or None.
 fn try_split_allcaps(s: &str) -> Option<String> {
-    // Common words in academic headings, sorted longest-first for greedy match
-    static DICT: &[&str] = &[
-        "INTRODUCTION", "DEFINITIONS", "CONSTRUCTION", "COMBINATORY",
-        "INTERSECTION", "APPLICATIONS", "OPTIMIZATION",
-        "FUNDAMENTAL", "INDEPENDENT", "ARBITRARILY", "PROGRAMMING",
-        "STRATEGIES", "APPENDICES", "REFERENCES", "ALGORITHMS", "SEARCHING",
-        "DIMENSIONS", "STRUCTURES",
-        "CLASSICAL", "VARIABLES", "REDUCTION", "GEOMETRIC", "NUMERICAL",
-        "SEARCHING", "GENERALIZED",
-        "LABELLED", "SENSIBLE", "CALCULUS", "APPENDIX", "THEORIES",
-        "PROBLEMS", "ORIENTED", "PARALLEL", "RESULTS", "SUMMARY",
-        "OBJECTS", "MODELS", "LAMBDA", "GROUPS", "OTHER", "TYPED",
-        "INDEX", "DATA", "TYPE", "FREE", "PURE",
-    ];
-
-    let mut result = Vec::new();
-    let mut remaining = s;
-
-    while !remaining.is_empty() {
-        let mut found = false;
-        for word in DICT {
-            if remaining.starts_with(word) {
-                result.push(*word);
-                remaining = &remaining[word.len()..];
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            // Single char left over after successful splits? Skip.
-            if remaining.len() <= 2 && !result.is_empty() {
-                result.push(remaining);
-                return Some(result.join(" "));
-            }
-            return None;
-        }
+    let segmenter = word_segmenter()?;
+    let lower = s.to_ascii_lowercase(); // instant-segment requires lowercase ASCII
+    let mut search = instant_segment::Search::default();
+    let words: Vec<String> = segmenter
+        .seg
+        .segment(&lower, &mut search)
+        .ok()?
+        .map(|w| w.to_string())
+        .collect();
+    if words.len() < 2 || words.iter().any(|w| w.len() < 2 || !segmenter.known.contains(w)) {
+        return None;
     }
-
-    if result.len() >= 2 {
-        Some(result.join(" "))
-    } else {
-        None
-    }
+    Some(
+        words
+            .iter()
+            .map(|w| w.to_ascii_uppercase())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 fn fix_missing_spaces_in_title(title: &str) -> String {
@@ -7459,5 +7471,28 @@ mod tests {
         ];
         dedup_heading_echo(&mut nodes);
         assert_eq!(nodes.len(), 2, "echo past formula should be removed");
+    }
+
+    #[test]
+    fn test_allcaps_segmenter_general_and_faithful() {
+        // Splits a genuine concatenation of general English words (no
+        // fixture-specific dictionary — these are common words in the corpus).
+        assert_eq!(
+            try_split_allcaps("CLASSICALLAMBDACALCULUS").as_deref(),
+            Some("CLASSICAL LAMBDA CALCULUS")
+        );
+        // A real single word is NOT split (>=2 known words required).
+        assert_eq!(try_split_allcaps("APPLICATIONS"), None);
+        assert_eq!(try_split_allcaps("CLASSIFICATION"), None);
+        // Conservative & faithful: when a piece is NOT a known common word
+        // ("combinators" is absent from the general corpus), we decline to split
+        // rather than risk a wrong split — the token is left intact.
+        assert_eq!(try_split_allcaps("THEORYOFCOMBINATORS"), None);
+        // Faithful: any accepted split only inserts spaces (letters unchanged).
+        if let Some(split) = try_split_allcaps("CLASSICALLAMBDACALCULUS") {
+            assert_eq!(split.replace(' ', ""), "CLASSICALLAMBDACALCULUS");
+        }
+        // split_concatenated_allcaps leaves non-all-caps / short tokens alone.
+        assert_eq!(split_concatenated_allcaps("Lambda Calculus"), "Lambda Calculus");
     }
 }

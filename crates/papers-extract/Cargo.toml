@@ -38,6 +38,7 @@ dirs = { workspace = true }
 tracing = "0.1"
 ttf-parser = "0.25"
 lopdf = "0.36"
+instant-segment = "0.11"
 reqwest = { workspace = true, features = ["blocking"] }
 # NOTE: default-features disabled to avoid esaxx-rs/cpp which forces static CRT (/MT),
 # conflicting with clipper2c-sys's dynamic CRT (/MD). We only need inference (decode),
