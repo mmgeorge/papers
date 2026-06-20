@@ -4,6 +4,10 @@
 *.png
 *.gz
 
+# Corpus PDFs live in the sibling ../papers-corpus repo, not here
+/data/*.pdf
+/data/open/*.pdf
+
 # Claude Code
 /.claude
 
