@@ -19,6 +19,28 @@ crates/papers-extract/scratch.txt
 
 The `.temp/` directory is gitignored. Create it on demand if it doesn't exist.
 
+## Source PDF Corpus — lives in the sibling `../papers-corpus` repo
+
+The copyrighted source PDFs and their ground-truth TOC fixtures are **not** in
+this public repo. They live in a separate private repo cloned as a **sibling
+directory**:
+
+```
+D:\code\
+  papers\          (this repo)
+  papers-corpus\   (the corpus — clone it here)
+    pdfs\          curated source PDFs        (e.g. ../papers-corpus/pdfs/vbd.pdf)
+    pdfs\open\     open-licensed source PDFs  (e.g. ../papers-corpus/pdfs/open/d2l.pdf)
+    fixtures\toc\        ground-truth TOC fixtures (*.md), one per curated PDF
+    fixtures\toc\open\   ground-truth TOC fixtures for the open set
+```
+
+`/data/*.pdf` is gitignored, so **commands in this doc that say `data/<file>.pdf`
+now resolve to `../papers-corpus/pdfs/<file>.pdf`** (or `pdfs/open/` for the open
+set). The `toc_fixtures` integration test reads the corpus from this sibling path
+and skips gracefully (printing a `SKIP` line) when it is absent — a public
+checkout without the corpus still builds and passes.
+
 ## Verify PDF Layout by Rendering and Dumping — Do NOT Infer
 
 When reasoning about a PDF's layout (indent levels, columns, depth, which
@@ -35,20 +57,20 @@ is a certain layout, or a defect is "unfixable".
 ```bash
 # Windows (Ghostscript). Page numbers are 1-indexed.
 gswin64c -q -dNOPAUSE -dBATCH -dSAFER -sDEVICE=png16m -r140 \
-  -dFirstPage=8 -dLastPage=8 -sOutputFile=.temp/render/page8.png data/<file>.pdf
+  -dFirstPage=8 -dLastPage=8 -sOutputFile=.temp/render/page8.png ../papers-corpus/pdfs/<file>.pdf
 # (pdftoppm / mutool draw / magick are equivalents on other platforms)
 ```
 
 **Dump a page's chars (codepoint, bbox, font) — for exact x positions, broken
 glyphs, hanging number columns, sub/superscripts:**
 ```bash
-cargo run --release --bin dump_chars -- data/<file>.pdf <page_num>   # 1-indexed
+cargo run --release --bin dump_chars -- ../papers-corpus/pdfs/<file>.pdf <page_num>   # 1-indexed
 ```
 
 **Dump pdfium's reference text for the whole PDF (find a page, see word
 boundaries / wrap markers):**
 ```bash
-cargo run --release --bin dump_text -- data/<file>.pdf .temp/<file>_text.txt
+cargo run --release --bin dump_text -- ../papers-corpus/pdfs/<file>.pdf .temp/<file>_text.txt
 ```
 
 Page-index gotcha: Ghostscript `-dFirstPage` and `dump_chars` are **1-indexed**;
@@ -156,11 +178,14 @@ is checked alongside gap-based and position-based space detection.
 
 ## TOC Fixture Tests
 
-Fixture files in `crates/papers-extract/tests/fixtures/toc/*.md` are the
-**ground truth** of what the TOC parser should produce. When fixtures and
-parser disagree, fix the parser — never silently update fixtures to match
-broken output. The only valid reason to update a fixture is when the parser
-now produces *more correct* output (e.g., fixing a previously-missing space).
+Fixture files in `../papers-corpus/fixtures/toc/*.md` (curated) and
+`../papers-corpus/fixtures/toc/open/*.md` (open set) are the **ground truth** of
+what the TOC parser should produce. When fixtures and parser disagree, fix the
+parser — never silently update fixtures to match broken output. The only valid
+reason to update a fixture is when the parser now produces *more correct* output
+(e.g., fixing a previously-missing space). The `toc_fixtures` integration test
+pairs each `pdfs/<stem>.pdf` with its `fixtures/toc/<stem>.md` in the sibling
+corpus (see "Source PDF Corpus" above).
 
 ## Benchmarks
 
@@ -171,10 +196,12 @@ should contain a `README.md` with findings and the raw `results.json` output.
 
 1. **Dump layout** from a PDF (one-time per paper):
    ```bash
-   cargo run --release --bin dump -- data/<paper>.pdf data/dumps/<paper>
+   cargo run --release --bin dump -- ../papers-corpus/pdfs/<paper>.pdf data/dumps/<paper>
    ```
-   This creates `data/dumps/<paper>/layout.json` and cropped region images
-   organized by type (e.g. `DisplayFormula/`, `Text/`, `Algorithm/`).
+   The source PDF comes from the sibling corpus; the dump output stays under
+   `data/dumps/` (gitignored). This creates `data/dumps/<paper>/layout.json` and
+   cropped region images organized by type (e.g. `DisplayFormula/`, `Text/`,
+   `Algorithm/`).
 
 2. **Run a model** on dumped regions:
    ```bash
