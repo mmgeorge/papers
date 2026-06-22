@@ -7,20 +7,32 @@ use std::path::PathBuf;
 #[test]
 fn toc_fixtures() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let data_dir = manifest_dir.join("../../data");
-    let fixture_dir = manifest_dir.join("tests/fixtures/toc");
+    // The test corpus (copyrighted source PDFs + their ground-truth TOC fixtures)
+    // lives in a sibling repo, `../papers-corpus`, to keep it out of this public
+    // repo. A checkout without that sibling present simply skips this test.
+    let corpus_dir = manifest_dir.join("../../../papers-corpus");
+    let pdf_root = corpus_dir.join("pdfs");
+    let fixture_root = corpus_dir.join("fixtures/toc");
     let temp_dir = manifest_dir.join("../../.temp/toc-fixture-tests");
     std::fs::create_dir_all(&temp_dir).ok();
+
+    if !corpus_dir.exists() {
+        eprintln!(
+            "SKIP toc_fixtures: corpus not found at {} - clone papers-corpus beside this repo to run it",
+            corpus_dir.display(),
+        );
+        return;
+    }
 
     let pdfium = pdf::load_pdfium(None).expect("load pdfium");
 
     // Collect (stem, pdf_path, fixture_path) for every PDF that has a fixture.
-    //   curated textbooks:    data/*.pdf       -> tests/fixtures/toc/*.md
-    //   open-licensed corpus: data/open/*.pdf  -> tests/fixtures/toc/open/*.md
+    //   curated textbooks:    pdfs/*.pdf       -> fixtures/toc/*.md
+    //   open-licensed corpus: pdfs/open/*.pdf  -> fixtures/toc/open/*.md
     let mut cases: Vec<(String, PathBuf, PathBuf)> = Vec::new();
     for (pdf_dir, fix_dir) in [
-        (data_dir.clone(), fixture_dir.clone()),
-        (data_dir.join("open"), fixture_dir.join("open")),
+        (pdf_root.clone(), fixture_root.clone()),
+        (pdf_root.join("open"), fixture_root.join("open")),
     ] {
         let Ok(read_dir) = std::fs::read_dir(&pdf_dir) else {
             continue;
@@ -43,9 +55,8 @@ fn toc_fixtures() {
 
     assert!(
         !cases.is_empty(),
-        "No PDFs with TOC fixtures found. data_dir={}, fixture_dir={}",
-        data_dir.display(),
-        fixture_dir.display(),
+        "Corpus present at {} but no PDF+fixture pairs found (expected pdfs/ + fixtures/toc/).",
+        corpus_dir.display(),
     );
 
     let mut failures: Vec<String> = Vec::new();
